@@ -1,0 +1,148 @@
+# ==========================================
+# 휴리스틱 모드 정책 파라미터 (decision.mode=heuristic)
+# ==========================================
+# 이 파일의 값이 규칙 기반 의사결정/디스패칭 동작을 결정한다.
+# "모든 Task 설명"은 아래 world.battery + world.task_priority 주석을 참고.
+
+world:
+  # Day 1 시작 시 공유 규범(norms) 초기값
+  initial_norms:
+    # 머신 1대당 하루 최소 PM 횟수 기본값
+    min_pm_per_machine_per_day: 1
+    # 품질 관련 점수 가중치 기본값
+    quality_weight: 1.0
+
+  # Task scoring 보정 규칙
+  task_scoring:
+    # 병목 공정일 때 가점을 줄 task 종류
+    bottleneck_task_types: [SETUP_MACHINE, TRANSFER]
+    # 병목 공정 가점 배수
+    bottleneck_multiplier: 1.2
+
+  battery:
+    # ---- BATTERY_SWAP ----
+    # 배터리 잔량(분)이 이 값 이하이면 BATTERY_SWAP을 강제 우선 선택
+    mandatory_swap_threshold_min: 15.0
+    # BATTERY_SWAP 우선순위 점수
+
+    # ---- Battery delivery (task type: TRANSFER, transfer_kind=battery_delivery) ----
+    # 타 에이전트 잔량(분)이 이 값 이하이거나 이미 방전이면 전달 후보
+    deliver_to_others_threshold_min: 50.0
+    # 대상이 방전 상태일 때 배터리 전달(TRANSFER) 우선순위
+    deliver_priority_discharged: 149.0
+    # 대상이 저전력(방전 전)일 때 배터리 전달(TRANSFER) 우선순위
+    deliver_priority_low_battery: 140.0
+
+  # -----------------------------------------
+  # Task 우선순위(후보 생성 시 기본 priority)
+  # -----------------------------------------
+  task_priority:
+    battery_swap: 150.0
+    # REPAIR_MACHINE:
+    # 고장난 머신을 수리해서 라인 재가동
+    repair_machine: 115.0
+
+    # UNLOAD_MACHINE:
+    # 가공 완료 후 머신 내부 output을 꺼내 라인 block 해소
+    unload_machine: 110.0
+
+    # SETUP_MACHINE:
+    # material/component를 머신 입력으로 셋업
+    # (현재 1회에 1개만 운반 가능하므로 필요 시 2단계로 진행)
+    setup_machine: 90.0
+
+    # TRANSFER:
+    # 공정 간 output buffer -> 다음 공정 queue 이송
+    # (Station3 output은 Product를 Inspection(Product Queue)로 이송)
+    transfer: 85.0
+
+    # TRANSFER (material supply):
+    # Warehouse에서 Material Queue로 자재 보충
+    # warehouse_material priority is merged into transfer priority.
+
+    # INSPECT_PRODUCT:
+    # Inspection에서 Product 검사(pass/fail)
+    inspect_product: 72.0
+
+    # PREVENTIVE_MAINTENANCE:
+    # 예방정비(PM) 수행으로 고장률 완화
+    preventive_maintenance: 65.0
+
+decision:
+  # Phase 1: reflect()
+  reflect:
+    # 관측 정보가 부족할 때 기본 병목 공정
+    default_bottleneck_station: 2
+    # 전일 고장 횟수가 이 값 초과면 maintenance 강화 메모/편향 적용
+    break_notes_threshold: 2
+    # 전일 scrap rate가 이 값 초과면 quality 강화 메모/편향 적용
+    scrap_notes_threshold: 0.08
+    # flow 가중치를 높일 병목 공정 목록
+    flow_bias_stations: [2, 3]
+    # flow category 배수
+    flow_bias_multiplier: 1.2
+    # maintenance category 배수
+    maintenance_bias_multiplier: 1.2
+    # quality category 배수
+    quality_bias_multiplier: 1.2
+
+  # Phase 2: propose_jobs()
+  propose_jobs:
+    # category별 기본 가중치
+    base_task_weights:
+      safety: 1.0
+      blocking: 1.0
+      flow: 1.0
+      supply: 1.0
+      quality: 1.0
+      maintenance: 1.0
+      support: 1.0
+
+    # 하루 목표량(quota) 기본값
+    base_quotas:
+      warehouse_material_runs: 20
+      setup_runs: 40
+      transfer_runs: 40
+      inspection_runs: 35
+
+    # PM quota 배수:
+    # pm_runs = min_pm_per_machine_per_day * pm_runs_per_machine_multiplier * 머신수(현재 6)
+    pm_runs_per_machine_multiplier: 1
+
+    # 병목 공정일 때 quota 보너스 적용 대상
+    bottleneck_stations_extra: [2, 3]
+    # 병목 시 추가 quota
+    bottleneck_quota_bonus:
+      setup_runs: 8
+      transfer_runs: 8
+
+    # Inspection backlog가 이 값 초과면 검사 quota/quality 가중치 상향
+    inspection_backlog_threshold: 10
+    inspection_quota_bonus: 10
+    inspection_quality_weight_multiplier: 1.2
+
+  # Phase 3: discuss() - 전일 결과 기반 규범 업데이트
+  discuss:
+    min_pm_cap: 3
+    machine_breakdown_raise_threshold: 3
+    machine_breakdown_raise_step: 1
+    machine_breakdown_lower_when_zero: true
+    quality_weight_raise_scrap_threshold: 0.08
+    quality_weight_raise_step: 0.1
+    quality_weight_raise_cap: 1.8
+    quality_weight_lower_scrap_threshold: 0.03
+    quality_weight_lower_step: 0.05
+    quality_weight_floor: 1.0
+
+  # 실행 중 돌발 상황 대응(urgent chat)
+  urgent:
+    machine_breakdown_weight_updates:
+      blocking: 1.4
+      maintenance: 1.5
+    agent_discharged_weight_updates:
+      support: 1.4
+      blocking: 1.2
+    battery_risk_weight_updates:
+      safety: 1.5
+    inspection_backlog_threshold: 15
+    inspection_quality_min_weight: 1.3

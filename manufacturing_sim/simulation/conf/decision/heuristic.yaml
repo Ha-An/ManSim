@@ -1,0 +1,19 @@
+# 의사결정 모드 선택 파일(휴리스틱 버전)
+# - heuristic: 규칙 기반 정책 사용
+# - llm: LLM 서버 연동 정책 사용(추후 구현)
+mode: heuristic
+
+llm:
+  # heuristic 모드에서는 사용되지 않지만,
+  # 모드 전환 시 같은 구조를 유지하기 위해 키를 보존한다.
+  enabled: false
+  # 서버 타입(향후 LLM 어댑터 구현 시 사용)
+  provider: openai_compatible
+  # LLM API 엔드포인트
+  server_url: "http://localhost:8000/v1"
+  # 모델명(heuristic 모드에서는 무시)
+  model: ""
+  # 요청 타임아웃(초)
+  timeout_sec: 30
+  # 샘플링 온도
+  temperature: 0.2
