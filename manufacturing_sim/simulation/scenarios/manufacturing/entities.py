@@ -55,8 +55,13 @@ class Agent:
     suspended_task: Any = None
     battery_service_owner: Optional[str] = None
     awaiting_battery_from: Optional[str] = None
+    in_transit_from: Optional[str] = None
+    in_transit_to: Optional[str] = None
+    in_transit_progress: float = 0.0
+    in_transit_total_min: float = 0.0
     carrying_item_id: Optional[str] = None
     carrying_item_type: Optional[str] = None
+    battery_swap_critical: bool = False
     total_task_time_min: dict[str, float] = field(default_factory=dict)
 
 

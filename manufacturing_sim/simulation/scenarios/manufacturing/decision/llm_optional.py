@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 import warnings
+from datetime import datetime, timezone
 from typing import Any
 
 from .base import DecisionModule, JobPlan, StrategyState
@@ -39,6 +41,8 @@ class OptionalLLMDecisionModule(DecisionModule):
         self.shared_norms_memory: list[dict[str, Any]] = []
         self.shared_discussion_memory: list[dict[str, Any]] = []
         self.agent_memories: dict[str, list[dict[str, Any]]] = {aid: [] for aid in self.agent_ids}
+        self._llm_exchange_records: list[dict[str, Any]] = []
+        self._llm_call_seq = 0
 
         if not self.enabled:
             self._fail("decision.mode=llm but llm.enabled=false.")
@@ -60,6 +64,12 @@ class OptionalLLMDecisionModule(DecisionModule):
 
     def is_communication_enabled(self) -> bool:
         return bool(self.communication_enabled)
+
+    def get_llm_exchange_records(self) -> list[dict[str, Any]]:
+        return list(self._llm_exchange_records)
+
+    def _record_llm_exchange(self, record: dict[str, Any]) -> None:
+        self._llm_exchange_records.append(record)
 
     def _append_bounded(self, seq: list[dict[str, Any]], item: dict[str, Any]) -> None:
         seq.append(item)
@@ -147,7 +157,14 @@ class OptionalLLMDecisionModule(DecisionModule):
                 return None
         return None
 
-    def _call_llm_json(self, user_prompt: str, system_prompt: str) -> dict[str, Any]:
+    def _call_llm_json(
+        self,
+        user_prompt: str,
+        system_prompt: str,
+        *,
+        call_name: str,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         url = self.server_url.rstrip("/") + "/chat/completions"
         body = {
             "model": self.model,
@@ -159,25 +176,122 @@ class OptionalLLMDecisionModule(DecisionModule):
             ],
         }
         raw = json.dumps(body).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
+        headers_for_log = {"Content-Type": "application/json"}
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers_for_log["Authorization"] = "Bearer ***"
 
-        req = urllib.request.Request(url=url, data=raw, headers=headers, method="POST")
+        started_ts = time.time()
+        started_at_utc = datetime.now(timezone.utc).isoformat()
+        self._llm_call_seq += 1
+        call_id = self._llm_call_seq
+
+        req_headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            req_headers["Authorization"] = f"Bearer {self.api_key}"
+
+        req = urllib.request.Request(url=url, data=raw, headers=req_headers, method="POST")
+
+        payload: dict[str, Any] | None = None
+        content = ""
+        error_message = ""
+        status = "ok"
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            self._fail(f"LLM call failed: {exc}")
+            try:
+                content = str(payload["choices"][0]["message"]["content"])
+            except (KeyError, IndexError, TypeError) as exc:
+                status = "error"
+                error_message = f"LLM response format error: {exc}"
+                self._record_llm_exchange(
+                    {
+                        "call_id": call_id,
+                        "call_name": call_name,
+                        "status": status,
+                        "started_at_utc": started_at_utc,
+                        "latency_sec": round(time.time() - started_ts, 3),
+                        "context": context or {},
+                        "request": {
+                            "url": url,
+                            "headers": headers_for_log,
+                            "payload": body,
+                        },
+                        "response": payload if isinstance(payload, dict) else {},
+                        "response_text": content,
+                        "parsed": {},
+                        "error": error_message,
+                    }
+                )
+                self._fail(error_message)
 
-        try:
-            content = str(payload["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError) as exc:
-            self._fail(f"LLM response format error: {exc}")
-        parsed = self._extract_json_object(content)
-        if not isinstance(parsed, dict):
-            self._fail("Failed to parse JSON object from LLM response.")
-        return parsed
+            parsed = self._extract_json_object(content)
+            if not isinstance(parsed, dict):
+                status = "error"
+                error_message = "Failed to parse JSON object from LLM response."
+                self._record_llm_exchange(
+                    {
+                        "call_id": call_id,
+                        "call_name": call_name,
+                        "status": status,
+                        "started_at_utc": started_at_utc,
+                        "latency_sec": round(time.time() - started_ts, 3),
+                        "context": context or {},
+                        "request": {
+                            "url": url,
+                            "headers": headers_for_log,
+                            "payload": body,
+                        },
+                        "response": payload if isinstance(payload, dict) else {},
+                        "response_text": content,
+                        "parsed": {},
+                        "error": error_message,
+                    }
+                )
+                self._fail(error_message)
+
+            self._record_llm_exchange(
+                {
+                    "call_id": call_id,
+                    "call_name": call_name,
+                    "status": status,
+                    "started_at_utc": started_at_utc,
+                    "latency_sec": round(time.time() - started_ts, 3),
+                    "context": context or {},
+                    "request": {
+                        "url": url,
+                        "headers": headers_for_log,
+                        "payload": body,
+                    },
+                    "response": payload if isinstance(payload, dict) else {},
+                    "response_text": content,
+                    "parsed": parsed,
+                    "error": "",
+                }
+            )
+            return parsed
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            status = "error"
+            error_message = f"LLM call failed: {exc}"
+            self._record_llm_exchange(
+                {
+                    "call_id": call_id,
+                    "call_name": call_name,
+                    "status": status,
+                    "started_at_utc": started_at_utc,
+                    "latency_sec": round(time.time() - started_ts, 3),
+                    "context": context or {},
+                    "request": {
+                        "url": url,
+                        "headers": headers_for_log,
+                        "payload": body,
+                    },
+                    "response": payload if isinstance(payload, dict) else {},
+                    "response_text": content,
+                    "parsed": {},
+                    "error": error_message,
+                }
+            )
+            self._fail(error_message)
 
     @staticmethod
     def _as_float_map(src: Any, base: dict[str, float]) -> dict[str, float]:
@@ -266,6 +380,8 @@ class OptionalLLMDecisionModule(DecisionModule):
         llm_obj = self._call_llm_json(
             user_prompt=prompt,
             system_prompt="You are a manufacturing strategy planner. Return exactly one JSON object with no markdown.",
+            call_name="reflect",
+            context={"phase": "reflect", "day": observation.get("day")},
         )
         return self._build_strategy(llm_obj, fallback)
 
@@ -298,6 +414,8 @@ class OptionalLLMDecisionModule(DecisionModule):
         llm_obj = self._call_llm_json(
             user_prompt=prompt,
             system_prompt="You are a manufacturing operations planner. Return exactly one JSON object with no markdown.",
+            call_name="propose_jobs",
+            context={"phase": "propose_jobs", "day": observation.get("day")},
         )
         return self._build_job_plan(llm_obj, fallback)
 
@@ -320,6 +438,8 @@ class OptionalLLMDecisionModule(DecisionModule):
             llm_obj = self._call_llm_json(
                 user_prompt=prompt,
                 system_prompt="You are a townhall moderator. Return exactly one JSON object with no markdown.",
+                call_name="discuss_norm_update",
+                context={"phase": "discuss_norm_update", "day": day_summary.get("day"), "communication_enabled": False},
             )
             if "updated_norms" not in llm_obj or not isinstance(llm_obj["updated_norms"], dict):
                 self._fail("discussion response missing updated_norms.")
@@ -360,6 +480,8 @@ class OptionalLLMDecisionModule(DecisionModule):
                         "You are one agent in a manufacturing townhall discussion. "
                         "Produce one concise utterance and optional proposal as JSON."
                     ),
+                    call_name="townhall_round",
+                    context={"phase": "townhall_round", "day": day_summary.get("day"), "round": ridx, "agent_id": aid},
                 )
                 utterance = str(llm_obj.get("utterance", "")).strip()
                 if not utterance:
@@ -382,6 +504,8 @@ class OptionalLLMDecisionModule(DecisionModule):
         synthesis = self._call_llm_json(
             user_prompt=synthesis_prompt,
             system_prompt="You are a townhall moderator. Build consensus and return updated_norms JSON.",
+            call_name="townhall_synthesis",
+            context={"phase": "townhall_synthesis", "day": day_summary.get("day"), "rounds": self.comm_rounds},
         )
         if "updated_norms" not in synthesis or not isinstance(synthesis["updated_norms"], dict):
             self._fail("discussion synthesis missing updated_norms.")
@@ -414,5 +538,9 @@ class OptionalLLMDecisionModule(DecisionModule):
         llm_obj = self._call_llm_json(
             user_prompt=prompt,
             system_prompt="You are an urgent response coordinator. Return exactly one JSON object.",
+            call_name="urgent_discuss",
+            context={"phase": "urgent_discuss", "event_type": event.get("event_type", "")},
         )
         return self._build_urgent(llm_obj, fallback)
+
+

@@ -32,6 +32,14 @@ def _open_artifact(path: Path) -> None:
             pass
 
 
+def _iter_output_artifacts(output_dir: Path) -> list[Path]:
+    artifacts: list[Path] = []
+    for path in sorted(output_dir.iterdir()):
+        if path.is_file() and not path.name.startswith("."):
+            artifacts.append(path)
+    return artifacts
+
+
 def _open_url(url: str) -> None:
     try:
         if os.name == "nt":
@@ -113,20 +121,40 @@ def main(cfg: DictConfig) -> None:
     result = run(experiment_cfg=experiment_cfg, output_dir=runtime_output_dir)
     print(json.dumps(result["kpi"], indent=2))
 
-    auto_open = bool(cfg.get("ui", {}).get("auto_open_results", False))
-    if auto_open:
-        artifact_names = list(cfg.get("ui", {}).get("open_artifacts", []))
-        for artifact_name in artifact_names:
-            _open_artifact(runtime_output_dir / artifact_name)
+    ui_cfg = cfg.get("ui", {})
 
-    auto_open_streamlit = bool(cfg.get("ui", {}).get("auto_open_streamlit", False))
+    auto_open = bool(ui_cfg.get("auto_open_results", False))
+    if auto_open:
+        open_all_artifacts = bool(ui_cfg.get("open_all_artifacts", False))
+        opened_paths: set[Path] = set()
+
+        def _open_once(path: Path) -> None:
+            resolved = path.resolve()
+            if resolved in opened_paths:
+                return
+            opened_paths.add(resolved)
+            _open_artifact(path)
+
+        if open_all_artifacts:
+            for artifact_path in _iter_output_artifacts(runtime_output_dir):
+                _open_once(artifact_path)
+        else:
+            artifact_names = list(ui_cfg.get("open_artifacts", []))
+            for artifact_name in artifact_names:
+                _open_once(runtime_output_dir / str(artifact_name))
+
+        llm_trace_path = str(result.get("llm_trace_path", "")).strip()
+        if llm_trace_path:
+            _open_once(Path(llm_trace_path))
+
+    auto_open_streamlit = bool(ui_cfg.get("auto_open_streamlit", False))
     if auto_open_streamlit:
         app_path = Path(__file__).resolve().parent / "scenarios" / "manufacturing" / "viz" / "replay_app.py"
         events_path = Path(result["events_path"])
-        port_cfg = cfg.get("ui", {}).get("streamlit_port_range", {})
+        port_cfg = ui_cfg.get("streamlit_port_range", {})
         range_start = int(port_cfg.get("start", 8505))
         range_end = int(port_cfg.get("end", 8555))
-        preferred_port = int(cfg.get("ui", {}).get("streamlit_preferred_port", 8505))
+        preferred_port = int(ui_cfg.get("streamlit_preferred_port", 8505))
         _launch_streamlit_dashboard(
             app_path=app_path,
             events_path=events_path,
@@ -138,3 +166,5 @@ def main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     main()
+
+

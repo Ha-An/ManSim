@@ -1,148 +1,155 @@
-# ==========================================
-# 휴리스틱 모드 정책 파라미터 (decision.mode=heuristic)
-# ==========================================
-# 이 파일의 값이 규칙 기반 의사결정/디스패칭 동작을 결정한다.
-# "모든 Task 설명"은 아래 world.battery + world.task_priority 주석을 참고.
+# Rule set used by `adaptive_priority` and `fixed_priority` decision modes.
+# - 이 파일은 "의사결정 우선순위"와 "긴급상황 반응 규칙"을 정의합니다.
+# - LLM 모드에서도 일부 월드 로직(배터리/태스크 점수 계산)이 이 값을 참조할 수 있습니다.
 
 world:
-  # Day 1 시작 시 공유 규범(norms) 초기값
+  # 시뮬레이션 시작 시 적용되는 전역 규범값
   initial_norms:
-    # 머신 1대당 하루 최소 PM 횟수 기본값
+    # 기계 1대당 하루 최소 예방정비(PM) 목표 횟수
     min_pm_per_machine_per_day: 1
-    # 품질 관련 점수 가중치 기본값
+    # 품질 관련 태스크 점수에 곱해지는 기본 가중치
     quality_weight: 1.0
 
-  # Task scoring 보정 규칙
+  # 태스크 점수 계산 규칙
   task_scoring:
-    # 병목 공정일 때 가점을 줄 task 종류
+    # 병목 스테이션 보정(가산/증폭)을 적용할 태스크 타입 목록
     bottleneck_task_types: [SETUP_MACHINE, TRANSFER]
-    # 병목 공정 가점 배수
+    # 병목 스테이션에 해당하면 최종 점수에 곱하는 배수
     bottleneck_multiplier: 1.2
 
+  # 배터리 관련 의사결정 규칙
   battery:
-    # ---- BATTERY_SWAP ----
-    # 배터리 잔량(분)이 이 값 이하이면 BATTERY_SWAP을 강제 우선 선택
+    # 남은 배터리(분)가 이 값 이하이면 강제 BATTERY_SWAP 후보 생성
     mandatory_swap_threshold_min: 15.0
-    # BATTERY_SWAP 우선순위 점수
-
-    # ---- Battery delivery (task type: TRANSFER, transfer_kind=battery_delivery) ----
-    # 타 에이전트 잔량(분)이 이 값 이하이거나 이미 방전이면 전달 후보
+    # 다른 에이전트 지원 판단 임계치(남은 배터리 분)
+    # (상대가 이 값 이하이면 battery_delivery 후보가 생길 수 있음)
     deliver_to_others_threshold_min: 50.0
-    # 대상이 방전 상태일 때 배터리 전달(TRANSFER) 우선순위
+    # 상대가 이미 방전(discharged) 상태일 때 battery_delivery 우선순위
     deliver_priority_discharged: 149.0
-    # 대상이 저전력(방전 전)일 때 배터리 전달(TRANSFER) 우선순위
+    # 상대가 저배터리(방전 전) 상태일 때 battery_delivery 우선순위
     deliver_priority_low_battery: 140.0
 
-  # -----------------------------------------
-  # Task 우선순위(후보 생성 시 기본 priority)
-  # -----------------------------------------
+  # 태스크 타입별 기본 우선순위 (클수록 우선)
   task_priority:
+    # 자가/보조 배터리 교체 안전태스크 우선순위
     battery_swap: 150.0
-    # REPAIR_MACHINE:
-    # 고장난 머신을 수리해서 라인 재가동
+    # 고장 수리
     repair_machine: 115.0
-
-    # UNLOAD_MACHINE:
-    # 가공 완료 후 머신 내부 output을 꺼내 라인 block 해소
+    # 기계 언로드(완료품/중간품 회수)
     unload_machine: 110.0
-
-    # SETUP_MACHINE:
-    # material/component를 머신 입력으로 셋업
-    # (현재 1회에 1개만 운반 가능하므로 필요 시 2단계로 진행)
+    # 기계 셋업(투입 준비)
     setup_machine: 90.0
-
-    # TRANSFER:
-    # 공정 간 output buffer -> 다음 공정 queue 이송
-    # (Station3 output은 Product를 Inspection(Product Queue)로 이송)
+    # 운반(자재/중간품/완제품 이동)
     transfer: 85.0
-
-    # TRANSFER (material supply):
-    # Warehouse에서 Material Queue로 자재 보충
-    # warehouse_material priority is merged into transfer priority.
-
-    # INSPECT_PRODUCT:
-    # Inspection에서 Product 검사(pass/fail)
+    # 검사 태스크
     inspect_product: 72.0
-
-    # PREVENTIVE_MAINTENANCE:
-    # 예방정비(PM) 수행으로 고장률 완화
+    # 예방정비(PM)
     preventive_maintenance: 65.0
 
 decision:
-  # Phase 1: reflect()
+  # reflect 단계(일일 전략 수립) 기본 규칙
   reflect:
-    # 관측 정보가 부족할 때 기본 병목 공정
+    # 별도 신호가 없을 때 기본 병목 스테이션으로 간주할 번호
     default_bottleneck_station: 2
-    # 전일 고장 횟수가 이 값 초과면 maintenance 강화 메모/편향 적용
+    # 전일 고장 건수가 이 값 이상이면 전략 노트에 고장 이슈 반영
     break_notes_threshold: 2
-    # 전일 scrap rate가 이 값 초과면 quality 강화 메모/편향 적용
+    # 전일 불량률이 이 값 이상이면 품질 이슈 노트 반영
     scrap_notes_threshold: 0.08
-    # flow 가중치를 높일 병목 공정 목록
-    flow_bias_stations: [2, 3]
-    # flow category 배수
+    # 흐름(flow) 편향을 적용할 스테이션 목록
+    flow_bias_stations: [2]
+    # 흐름(flow) 편향 배수
     flow_bias_multiplier: 1.2
-    # maintenance category 배수
+    # 정비(maintenance) 편향 배수
     maintenance_bias_multiplier: 1.2
-    # quality category 배수
+    # 품질(quality) 편향 배수
     quality_bias_multiplier: 1.2
 
-  # Phase 2: propose_jobs()
+  # propose_jobs 단계(당일 작업계획 제안) 기본 규칙
   propose_jobs:
-    # category별 기본 가중치
+    # 카테고리별 기본 가중치(점수 계산 시 곱해짐)
     base_task_weights:
+      # 안전 관련(배터리/위험 대응)
       safety: 1.0
+      # 병목 해소/블로킹 제거(수리/언로드)
       blocking: 1.0
+      # 생산 흐름 유지(셋업/이송)
       flow: 1.0
+      # 자재 공급
       supply: 1.0
+      # 검사/품질
       quality: 1.0
+      # 예방정비
       maintenance: 1.0
+      # 지원성 업무
       support: 1.0
 
-    # 하루 목표량(quota) 기본값
+    # 일일 작업 할당량(쿼터) 기본값
     base_quotas:
+      # 창고->스테이션 자재 공급 런 목표 횟수
       warehouse_material_runs: 20
+      # 셋업 작업 목표 횟수
       setup_runs: 40
+      # 이송 작업 목표 횟수
       transfer_runs: 40
+      # 검사 작업 목표 횟수
       inspection_runs: 35
 
-    # PM quota 배수:
-    # pm_runs = min_pm_per_machine_per_day * pm_runs_per_machine_multiplier * 머신수(현재 6)
+    # 기계 수 대비 PM 런 증감 배수
+    # (예: 기계 수 * 배수 기반으로 PM 목표를 계산할 때 사용)
     pm_runs_per_machine_multiplier: 1
 
-    # 병목 공정일 때 quota 보너스 적용 대상
-    bottleneck_stations_extra: [2, 3]
-    # 병목 시 추가 quota
+    # 병목 스테이션 추가 보정 대상
+    bottleneck_stations_extra: [2]
+    # 병목일 때 해당 쿼터에 더해줄 보너스
     bottleneck_quota_bonus:
       setup_runs: 8
       transfer_runs: 8
 
-    # Inspection backlog가 이 값 초과면 검사 quota/quality 가중치 상향
+    # 검사 대기열이 이 값 이상이면 검사 쿼터 보정 발동
     inspection_backlog_threshold: 10
+    # 검사 쿼터 추가치
     inspection_quota_bonus: 10
+    # 검사/품질 가중치에 곱하는 보정 배수
     inspection_quality_weight_multiplier: 1.2
 
-  # Phase 3: discuss() - 전일 결과 기반 규범 업데이트
+  # discuss 단계(일일 종료 후 규범 업데이트) 기본 규칙
   discuss:
+    # PM 목표 상한의 최소값(너무 낮아지지 않게 방지)
     min_pm_cap: 3
+    # 고장 건수가 이 값 이상이면 정비/블로킹 비중 상향 트리거
     machine_breakdown_raise_threshold: 3
+    # 상향 시 PM 관련 목표/비중을 얼마나 올릴지 단계값
     machine_breakdown_raise_step: 1
+    # 고장 건수가 0이면 완화(하향)할지 여부
     machine_breakdown_lower_when_zero: true
+    # 불량률이 이 값 이상이면 quality_weight 상향
     quality_weight_raise_scrap_threshold: 0.08
+    # 상향 폭
     quality_weight_raise_step: 0.1
+    # quality_weight 상한
     quality_weight_raise_cap: 1.8
+    # 불량률이 이 값 이하이면 quality_weight 하향
     quality_weight_lower_scrap_threshold: 0.03
+    # 하향 폭
     quality_weight_lower_step: 0.05
+    # quality_weight 하한
     quality_weight_floor: 1.0
 
-  # 실행 중 돌발 상황 대응(urgent chat)
+  # urgent 단계(긴급 이벤트 즉시 반응) 규칙
   urgent:
+    # 기계 고장 시 카테고리 가중치 즉시 업데이트
     machine_breakdown_weight_updates:
       blocking: 1.4
       maintenance: 1.5
+    # 에이전트 방전 시 카테고리 가중치 즉시 업데이트
     agent_discharged_weight_updates:
       support: 1.4
       blocking: 1.2
+    # 배터리 리스크 감지 시 안전 가중치 강화
     battery_risk_weight_updates:
       safety: 1.5
+    # 검사 백로그가 이 값 이상이면 품질 비중 강화 트리거
     inspection_backlog_threshold: 15
+    # 강화 시 quality 가중치의 최소 보장값
     inspection_quality_min_weight: 1.3
+

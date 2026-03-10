@@ -1,25 +1,24 @@
 # Basic experiment scenario
 name: mfg_basic
 # Random seed for simulation stochastic events (machine failure, quality defects, etc.).
-# Same config + same seed => reproducible run (heuristic mode).
+# Same config + same seed => reproducible run for the rule-based modes.
 seed: 7
 
 horizon:
   # Total simulation days
-  num_days: 1
-  # Minutes per day (480=8h, 1440=24h)
-  minutes_per_day: 480
+  num_days: 30
+  # Minutes per day (240=4h, 480=8h, 1440=24h)
+  minutes_per_day: 240
 
 factory:
   # Number of mobile agents
-  num_agents: 2
-  # Machines per station for Station1~3
+  num_agents: 3
+  # Machines per station for Station1~2
   machines_per_station: 2
 
   processing_time_min:
     station1: 20
     station2: 30
-    station3: 25
 
   # Inspection time model: base/sqrt(k), lower-bounded by inspection_min_time_min
   inspection_base_time_min: 10
@@ -37,10 +36,10 @@ movement:
   default_min: 6
 
 quality:
-  defect_prob: 0.05
+  defect_prob: 0.00
 
 machine_failure:
-  mean_time_to_fail_min: 900
+  mean_time_to_fail_min: .inf
   repair_time_min: 120
   pm_time_min: 30
   pm_effect_duration_min: 720
@@ -48,7 +47,7 @@ machine_failure:
   pm_interval_target_min: 480
 
 agent:
-  battery_swap_period_min: 180
+  battery_swap_period_min: 200
   battery_pickup_time_min: 5
   battery_delivery_extra_min: 4
 
@@ -56,11 +55,9 @@ inventory_targets:
   material:
     station1: 10
     station2: 10
-    station3: 10
   component:
-    # Station1 is material-only; component/product queues are Station2~4 only.
+    # Station1 is material-only; component/product queues are Station2 and Station4(Inspection) only.
     station2: 10
-    station3: 10
     station4: 10
 
 # Initial queue fill at simulation start (bootstrap only).
@@ -70,8 +67,8 @@ initial_inventory:
   material:
     station1: 0
     station2: 0
-    station3: 0
 
 dispatcher:
   urgent_chat_cooldown_min: 5
   snapshot_interval_min: 1
+

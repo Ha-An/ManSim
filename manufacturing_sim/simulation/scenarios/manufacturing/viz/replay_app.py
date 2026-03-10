@@ -13,37 +13,33 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from manufacturing_sim.simulation.scenarios.manufacturing.decision.modes import (
+    format_decision_mode_label,
+    normalize_decision_mode,
+)
 
 ZONE_LAYOUT: dict[str, dict[str, float]] = {
     "Station1": {"x0": 4.2, "x1": 5.9, "y0": 1.05, "y1": 2.25},
     "Station2": {"x0": 6.1, "x1": 7.8, "y0": 1.05, "y1": 2.25},
-    "Station3": {"x0": 8.0, "x1": 9.7, "y0": 1.05, "y1": 2.25},
-    "Inspection": {"x0": 9.9, "x1": 11.6, "y0": 1.05, "y1": 2.25},
-    # Repositioned per latest UI request:
-    # - Warehouse: top-center above station row
-    # - BatteryStation: bottom, shifted to the right-center
-    "Warehouse": {"x0": 7.0, "x1": 8.7, "y0": 2.45, "y1": 3.25},
-    "BatteryStation": {"x0": 7.0, "x1": 8.7, "y0": 0.15, "y1": 0.95},
+    "Inspection": {"x0": 8.0, "x1": 9.7, "y0": 1.05, "y1": 2.25},
+    # Repositioned for 2-station flow (Station1 -> Station2 -> Inspection)
+    "Warehouse": {"x0": 6.1, "x1": 7.8, "y0": 2.45, "y1": 3.25},
+    "BatteryStation": {"x0": 6.1, "x1": 7.8, "y0": 0.15, "y1": 0.95},
 }
 
 ROUTE_EDGES: list[tuple[str, str]] = [
-    # Station-to-station routes (all pairs connected)
+    # Station-to-station routes
     ("Station1", "Station2"),
-    ("Station1", "Station3"),
     ("Station1", "Inspection"),
-    ("Station2", "Station3"),
     ("Station2", "Inspection"),
-    ("Station3", "Inspection"),
     # Warehouse supply routes
     ("Warehouse", "Station1"),
     ("Warehouse", "Station2"),
-    ("Warehouse", "Station3"),
     ("Warehouse", "Inspection"),
     # Battery logistics routes
     ("BatteryStation", "Warehouse"),
     ("BatteryStation", "Station1"),
     ("BatteryStation", "Station2"),
-    ("BatteryStation", "Station3"),
     ("BatteryStation", "Inspection"),
 ]
 
@@ -104,6 +100,68 @@ def _latest_events_path(root: Path) -> Path | None:
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+@st.cache_data(show_spinner=False)
+def _load_battery_period_min(events_path_str: str, default: float = 180.0) -> float:
+    events_path = Path(events_path_str)
+    hydra_cfg_path = events_path.parent / ".hydra" / "config.yaml"
+    try:
+        text = hydra_cfg_path.read_text(encoding="utf-8")
+    except OSError:
+        return float(default)
+    m = re.search(r"(?m)^\s*battery_swap_period_min\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*$", text)
+    if not m:
+        return float(default)
+    try:
+        value = float(m.group(1))
+    except ValueError:
+        return float(default)
+    return value if value > 0 else float(default)
+
+
+@st.cache_data(show_spinner=False)
+def _load_run_meta(events_path_str: str) -> dict[str, Any]:
+    out = {"mode": "unknown", "model": "", "server_url": "", "communication_enabled": None}
+    events_path = Path(events_path_str)
+
+    run_meta_path = events_path.parent / "run_meta.json"
+    if run_meta_path.exists():
+        try:
+            run_meta_obj = json.loads(run_meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            run_meta_obj = {}
+        if isinstance(run_meta_obj, dict):
+            mode = normalize_decision_mode(str(run_meta_obj.get("decision_mode", "")))
+            if mode:
+                out["mode"] = mode
+            llm = run_meta_obj.get("llm", {}) if isinstance(run_meta_obj.get("llm", {}), dict) else {}
+            out["model"] = str(llm.get("model", "")).strip()
+            out["server_url"] = str(llm.get("server_url", "")).strip()
+            if "communication_enabled" in llm:
+                out["communication_enabled"] = bool(llm.get("communication_enabled"))
+            if out["mode"] != "unknown":
+                return out
+
+    hydra_cfg_path = events_path.parent / ".hydra" / "config.yaml"
+    try:
+        text = hydra_cfg_path.read_text(encoding="utf-8")
+    except OSError:
+        return out
+
+    m_mode = re.search(r"(?m)^\s{2}mode\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*$", text)
+    if m_mode:
+        out["mode"] = str(m_mode.group(1)).strip().lower()
+    m_model = re.search(r'(?m)^\s{4}model\s*:\s*"?([^"\n]+)"?\s*$', text)
+    if m_model:
+        out["model"] = str(m_model.group(1)).strip()
+    m_server = re.search(r'(?m)^\s{4}server_url\s*:\s*"?([^"\n]+)"?\s*$', text)
+    if m_server:
+        out["server_url"] = str(m_server.group(1)).strip()
+    m_comm = re.search(r"(?m)^\s{6}enabled\s*:\s*(true|false)\s*$", text)
+    if m_comm:
+        out["communication_enabled"] = str(m_comm.group(1)).strip().lower() == "true"
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -188,8 +246,10 @@ def _task_target(task_type: str, payload: dict[str, Any]) -> str:
         from_station = int(payload.get("from_station", 0))
         if from_station == 4:
             return "Inspection->Warehouse"
+        if from_station >= 2:
+            return f"Station{from_station}->Inspection"
         to_station = from_station + 1
-        return f"Station{from_station}->" + ("Inspection" if to_station >= 4 else f"Station{to_station}")
+        return f"Station{from_station}->Station{to_station}"
     if "station" in payload:
         station = int(payload["station"])
         return "Inspection" if station == 4 else f"Station{station}"
@@ -206,10 +266,10 @@ def _task_carrying(task_type: str, payload: dict[str, Any]) -> str:
         if transfer_kind == "material_supply":
             return "material"
         from_station = int(payload.get("from_station", 0))
-        return "product" if from_station >= 3 else "component"
+        return "product" if from_station in {2, 4} else "component"
     if task_type == "UNLOAD_MACHINE":
         station = int(payload.get("station", 0) or (_station_from_machine(str(payload.get("machine_id", ""))) or 0))
-        return "product" if station == 3 else "component"
+        return "product" if station == 2 else "component"
     if task_type == "INSPECT_PRODUCT":
         # Queue 4 is product queue (final item before pass/fail)
         return "product"
@@ -242,8 +302,10 @@ def _target_zone(task_type: str, payload: dict[str, Any], fallback_zone: str) ->
         from_station = int(payload.get("from_station", 1))
         if from_station == 4:
             return "Warehouse"
+        if from_station >= 2:
+            return "Inspection"
         to_station = from_station + 1
-        return "Inspection" if to_station >= 4 else f"Station{to_station}"
+        return f"Station{to_station}"
     if task_type == "BATTERY_SWAP":
         return "BatteryStation"
     if task_type == "INSPECT_PRODUCT":
@@ -437,10 +499,10 @@ def _simulation_datetime(events_df: pd.DataFrame, current_t: float) -> tuple[int
 
 def _compute_queue_snapshot(events_df: pd.DataFrame, current_t: float) -> dict[str, dict[int, list[str]]]:
     filtered = events_df[events_df["t"] <= current_t]
-    material: dict[int, list[str]] = {1: [], 2: [], 3: []}
+    material: dict[int, list[str]] = {1: [], 2: []}
     # Station1 is material-only; component/product queues start from Station2.
-    component: dict[int, list[str]] = {2: [], 3: [], 4: []}
-    output_buffer: dict[int, list[str]] = {1: [], 2: [], 3: [], 4: []}
+    component: dict[int, list[str]] = {2: [], 4: []}
+    output_buffer: dict[int, list[str]] = {1: [], 2: [], 4: []}
     warehouse_completed: list[str] = []
     active_transfer_from_station: dict[str, int] = {}
 
@@ -892,6 +954,15 @@ def _compute_agent_states(
         states[aid]["task"] = task_type
         states[aid]["target"] = _task_target(task_type, payload)
         states[aid]["carrying"] = carrying_now.get(aid, "-")
+        transfer_kind = str(payload.get("transfer_kind", "")).lower() if isinstance(payload, dict) else ""
+        if (
+            task_type == "TRANSFER"
+            and transfer_kind == "battery_delivery"
+            and states[aid]["carrying"] == "-"
+            and bool(payload.get("battery_loaded", False))
+        ):
+            # Replay safety: show loaded fresh battery even if PICK event is missing.
+            states[aid]["carrying"] = "battery_fresh"
         states[aid]["eta"] = round(eta_task, 2)
 
         source_zone = _canonical_zone(str(active.get("start_zone", states[aid]["zone"])))
@@ -1207,7 +1278,7 @@ def _draw_factory_map(
     station_counts: dict[int, int] = defaultdict(int)
     for machine_id in sorted(machine_states):
         station = _station_from_machine(machine_id)
-        if station is None or station not in (1, 2, 3):
+        if station is None or station not in (1, 2):
             continue
         zone_name = f"Station{station}"
         z = ZONE_LAYOUT[zone_name]
@@ -1220,7 +1291,7 @@ def _draw_factory_map(
         machine_positions[machine_id] = (x, y)
 
     output_buffer_snapshot = queue_snapshot.get("output_buffer", {})
-    for station in (1, 2, 3, 4):
+    for station in (1, 2, 4):
         zone_name = "Inspection" if station == 4 else f"Station{station}"
         z = ZONE_LAYOUT[zone_name]
         ob_items = output_buffer_snapshot.get(station, [])
@@ -1264,7 +1335,7 @@ def _draw_factory_map(
         ob_y: list[float] = []
         ob_c: list[str] = []
         ob_h: list[str] = []
-        for station in (1, 2, 3, 4):
+        for station in (1, 2, 4):
             ob_items = output_buffer_snapshot.get(station, [])
             if not ob_items:
                 continue
@@ -1521,13 +1592,216 @@ def _draw_factory_map(
     fig.update_layout(
         title=f"Factory Map | Sim Time: {sim_datetime_label} | Completed Products: {completed_products}",
         showlegend=False,
-        xaxis=dict(visible=False, range=[4.0, 11.8]),
+        xaxis=dict(visible=False, range=[4.0, 10.0]),
         yaxis=dict(visible=False, range=[0.05, 3.45]),
         height=430,
         margin=dict(l=6, r=6, t=55, b=4),
     )
     return fig
 
+
+
+
+def _collect_townhall_events(events_df: pd.DataFrame, current_t: float) -> list[dict[str, Any]]:
+    filtered = events_df[(events_df["t"] <= current_t) & (events_df["type"] == "CHAT_TOWNHALL")]
+    sessions: list[dict[str, Any]] = []
+
+    for row in filtered.itertuples(index=False):
+        details = row.details if isinstance(row.details, dict) else {}
+        trace = details.get("discussion_trace", [])
+
+        transcript: list[dict[str, Any]] = []
+        moderator_summary = ""
+        rounds = 0
+        memory_update: dict[str, Any] = {}
+
+        if isinstance(trace, list):
+            for item in trace:
+                if not isinstance(item, dict):
+                    continue
+                if "agent_id" in item:
+                    try:
+                        ridx = int(item.get("round", 0))
+                    except (TypeError, ValueError):
+                        ridx = 0
+                    rounds = max(rounds, ridx)
+                    transcript.append(
+                        {
+                            "round": ridx,
+                            "agent_id": str(item.get("agent_id", "")).strip(),
+                            "utterance": str(item.get("utterance", "")).strip(),
+                            "proposal": item.get("proposal", {}) if isinstance(item.get("proposal", {}), dict) else {},
+                        }
+                    )
+                    continue
+
+                role = str(item.get("role", "")).strip().lower()
+                summary = str(item.get("summary", "")).strip()
+                if role == "moderator" or summary:
+                    if summary:
+                        moderator_summary = summary
+                    try:
+                        rounds = max(rounds, int(item.get("rounds", rounds)))
+                    except (TypeError, ValueError):
+                        pass
+                    if isinstance(item.get("memory_update", {}), dict):
+                        memory_update = item.get("memory_update", {})
+
+        day_summary = details.get("day_summary", {}) if isinstance(details.get("day_summary", {}), dict) else {}
+        updated_norms = details.get("updated_norms", {}) if isinstance(details.get("updated_norms", {}), dict) else {}
+        communication_enabled = bool(details.get("communication_enabled", False))
+
+        sessions.append(
+            {
+                "t": float(row.t),
+                "day": int(row.day),
+                "communication_enabled": communication_enabled,
+                "rounds": int(rounds),
+                "messages": len(transcript),
+                "transcript": transcript,
+                "moderator_summary": moderator_summary,
+                "day_summary": day_summary,
+                "updated_norms": updated_norms,
+                "memory_update": memory_update,
+            }
+        )
+
+    return sessions
+
+
+def _phase_details_for_day(events_df: pd.DataFrame, day: int, current_t: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    filtered = events_df[(events_df["t"] <= current_t) & (events_df["day"] == int(day))]
+    strategy: dict[str, Any] = {}
+    assignment: dict[str, Any] = {}
+
+    for row in filtered.itertuples(index=False):
+        details = row.details if isinstance(row.details, dict) else {}
+        if row.type == "PHASE_STRATEGY" and not strategy:
+            strategy = details
+        elif row.type == "PHASE_JOB_ASSIGNMENT" and not assignment:
+            assignment = details
+        if strategy and assignment:
+            break
+
+    return strategy, assignment
+
+
+def _render_townhall_conversation_panel(events_df: pd.DataFrame, current_t: float) -> None:
+    st.markdown("### Townhall Conversation")
+    sessions = _collect_townhall_events(events_df, current_t)
+    if not sessions:
+        st.info("No townhall conversation is available at the current replay time.")
+        return
+
+    overview_rows = [
+        {
+            "day": s["day"],
+            "time(min)": round(float(s["t"]), 1),
+            "communication": "on" if s["communication_enabled"] else "off",
+            "rounds": int(s["rounds"]),
+            "messages": int(s["messages"]),
+            "has_summary": bool(str(s.get("moderator_summary", "")).strip()),
+        }
+        for s in sessions
+    ]
+    st.dataframe(pd.DataFrame(overview_rows), use_container_width=True, hide_index=True)
+
+    option_indices = list(range(len(sessions)))
+    selected_idx = st.selectbox(
+        "Select townhall session",
+        options=option_indices,
+        index=len(option_indices) - 1,
+        key="townhall_session_idx",
+        format_func=lambda i: (
+            f"Day {sessions[i]['day']} | t={sessions[i]['t']:.1f} | "
+            f"rounds {sessions[i]['rounds']} | messages {sessions[i]['messages']}"
+        ),
+    )
+    session = sessions[int(selected_idx)]
+    strategy, assignment = _phase_details_for_day(events_df, int(session["day"]), current_t)
+
+    left_col, right_col = st.columns([2.2, 1.3])
+
+    with left_col:
+        transcript = session.get("transcript", [])
+        if not transcript:
+            st.info("This session has no per-agent transcript.")
+        else:
+            transcript_rows = [
+                {
+                    "round": int(msg.get("round", 0)),
+                    "agent": str(msg.get("agent_id", "")).strip(),
+                    "utterance": str(msg.get("utterance", "")).strip(),
+                    "has_proposal": bool(msg.get("proposal", {})),
+                }
+                for msg in transcript
+            ]
+            st.dataframe(pd.DataFrame(transcript_rows), use_container_width=True, hide_index=True)
+
+            round_ids = sorted({int(msg.get("round", 0)) for msg in transcript if int(msg.get("round", 0)) > 0})
+            if round_ids:
+                tabs = st.tabs([f"Round {rid}" for rid in round_ids])
+                for tab, rid in zip(tabs, round_ids):
+                    with tab:
+                        for msg in transcript:
+                            if int(msg.get("round", 0)) != rid:
+                                continue
+                            speaker = str(msg.get("agent_id", "")).strip() or "Agent"
+                            utterance = str(msg.get("utterance", "")).strip() or "-"
+                            st.markdown(f"**{speaker}**")
+                            st.write(utterance)
+                            proposal = msg.get("proposal", {})
+                            if isinstance(proposal, dict) and proposal:
+                                with st.expander(f"{speaker} proposal", expanded=False):
+                                    st.json(proposal)
+            else:
+                for msg in transcript:
+                    speaker = str(msg.get("agent_id", "")).strip() or "Agent"
+                    utterance = str(msg.get("utterance", "")).strip() or "-"
+                    st.markdown(f"**{speaker}**")
+                    st.write(utterance)
+                    proposal = msg.get("proposal", {})
+                    if isinstance(proposal, dict) and proposal:
+                        with st.expander(f"{speaker} proposal", expanded=False):
+                            st.json(proposal)
+
+        moderator_summary = str(session.get("moderator_summary", "")).strip()
+        if moderator_summary:
+            st.markdown("**Moderator Summary**")
+            st.info(moderator_summary)
+
+    with right_col:
+        day_summary = session.get("day_summary", {}) if isinstance(session.get("day_summary", {}), dict) else {}
+        products = int(day_summary.get("products", 0))
+        scrap = int(day_summary.get("scrap", 0))
+        breakdowns = int(day_summary.get("machine_breakdowns", 0))
+        backlog = int(day_summary.get("inspection_backlog_end", 0))
+
+        m1, m2 = st.columns(2)
+        m1.metric("Products", products)
+        m2.metric("Scrap", scrap)
+        m3, m4 = st.columns(2)
+        m3.metric("Breakdowns", breakdowns)
+        m4.metric("Inspection Backlog", backlog)
+
+        with st.expander("Daily Summary JSON", expanded=False):
+            st.json(day_summary)
+        if strategy:
+            with st.expander("Day Start Strategy", expanded=False):
+                st.json(strategy)
+        if assignment:
+            with st.expander("Day Start Job Assignment", expanded=False):
+                st.json(assignment)
+
+        updated_norms = session.get("updated_norms", {}) if isinstance(session.get("updated_norms", {}), dict) else {}
+        if updated_norms:
+            with st.expander("Updated Norms", expanded=False):
+                st.json(updated_norms)
+
+        memory_update = session.get("memory_update", {}) if isinstance(session.get("memory_update", {}), dict) else {}
+        if memory_update:
+            with st.expander("Memory Update", expanded=False):
+                st.json(memory_update)
 
 def _render_kpi_panel(output_dir: Path) -> None:
     kpi_path = output_dir / "kpi.json"
@@ -1675,6 +1949,17 @@ def main() -> None:
         st.warning("No events found.")
         st.stop()
 
+    run_meta = _load_run_meta(str(events_path))
+    mode = str(run_meta.get("mode", "unknown")).strip().lower() or "unknown"
+    if mode == "llm":
+        comm = run_meta.get("communication_enabled", None)
+        comm_label = "on" if bool(comm) else "off"
+        st.info(
+            f"Run mode: LLM | model={run_meta.get('model', '-') or '-'} | communication={comm_label} | server={run_meta.get('server_url', '-') or '-'}"
+        )
+    else:
+        st.info(f"Run mode: {format_decision_mode_label(mode)}")
+
     max_t = float(events_df["t"].max())
     if "replay_t" not in st.session_state:
         st.session_state.replay_t = 0.0
@@ -1707,7 +1992,8 @@ def main() -> None:
 
     machine_states = _compute_machine_states(events_df, current_t)
     machine_inputs = _compute_machine_inputs(events_df, current_t)
-    agent_df = _compute_agent_states(events_df, current_t, battery_period_min=180.0)
+    battery_period_min = _load_battery_period_min(str(events_path))
+    agent_df = _compute_agent_states(events_df, current_t, battery_period_min=battery_period_min)
     queue_snapshot = _compute_queue_snapshot(events_df, current_t)
     sim_day, sim_datetime_label = _simulation_datetime(events_df, current_t)
     completed_products = int((events_df[(events_df["t"] <= current_t) & (events_df["type"] == "INSPECT_PASS")]).shape[0])
@@ -1761,6 +2047,8 @@ def main() -> None:
         ].copy()
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
+    _render_townhall_conversation_panel(events_df, current_t)
+
     st.markdown("### Recent Events")
     recent_df = events_df[events_df["t"] <= current_t].tail(40)
     st.dataframe(recent_df, use_container_width=True, hide_index=True)
@@ -1779,3 +2067,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+

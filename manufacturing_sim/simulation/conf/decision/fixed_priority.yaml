@@ -1,0 +1,12 @@
+# Rule-based decision mode with fixed task priorities.
+# Task/category weights stay constant during the run.
+mode: fixed_priority
+fixed_task_priority: true
+
+llm:
+  enabled: false
+  provider: openai_compatible
+  server_url: "http://localhost:8000/v1"
+  model: ""
+  timeout_sec: 30
+  temperature: 0.2

@@ -1,0 +1,11 @@
+# Rule-based decision mode with runtime task-priority adaptation.
+# This is the recommended non-LLM mode for first runs and CI checks.
+mode: adaptive_priority
+
+llm:
+  enabled: false
+  provider: openai_compatible
+  server_url: "http://localhost:8000/v1"
+  model: ""
+  timeout_sec: 30
+  temperature: 0.2

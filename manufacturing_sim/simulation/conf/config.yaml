@@ -1,38 +1,43 @@
-# Hydra 기본 조합 순서
-# - experiment: 공장/공정/시간/자원 등 시뮬레이션 환경 파라미터
-# - decision: 휴리스틱 모드인지 LLM 모드인지 선택
-# - heuristic_rules: 휴리스틱 모드에서 사용하는 규칙/임계값 모음
-# - _self_: 현재 파일의 값(ui 등)을 마지막에 병합
+# Global root config for ManSim (Hydra).
 defaults:
+  # Experiment scenario (factory layout, timing, inventory, failures).
   - experiment: mfg_basic
-  - decision: heuristic
+  # Decision mode:
+  # - adaptive_priority: rule-based mode with runtime priority adaptation
+  # - fixed_priority: rule-based mode with fixed task priorities
+  # - llm: LLM-based decision making
+  # Backward-compatible aliases are still supported: heuristic, heuristic_fixed
+  # Override example: decision=adaptive_priority / decision=fixed_priority / decision=llm
+  - decision: llm
+  # Shared rule set used by the rule-based modes and by parts of the world logic.
   - heuristic_rules: default
+  # Keep values from this file after defaults merge.
   - _self_
 
-# 런 이름(로그/출력 식별용 메타 데이터)
+# Run label for logs/metadata.
 run_name: manufacturing_sim
 
-# Global simulation seed override.
-# - null: use `experiment.seed` from the selected experiment file
-# - int: force this seed regardless of experiment file value
-seed: null
+# Random seed:
+# - null: non-deterministic
+# - integer: reproducible run
+seed: 2026
 
 ui:
-  # 시뮬레이션 종료 후 결과 HTML 파일 자동 오픈 여부
+  # Auto-open result artifacts after simulation ends.
   auto_open_results: true
-
-  # 자동 오픈할 산출물 목록(출력 폴더 기준 파일명)
+  # If true, open all generated top-level artifacts in the output folder.
+  # If false, only open artifacts listed under open_artifacts.
+  open_all_artifacts: false
+  # Used only when open_all_artifacts=false.
   open_artifacts:
     - kpi_dashboard.html
     - gantt.html
-
-  # 시뮬레이션 종료 후 Streamlit 리플레이 대시보드 자동 실행 여부
+    - task_priority_dashboard.html
+  # Auto-launch Streamlit replay UI.
   auto_open_streamlit: true
-
-  # Streamlit 우선 포트(이미 사용 중이면 range에서 대체 포트 탐색)
+  # Preferred port (falls back to range if occupied).
   streamlit_preferred_port: 8505
+  # Streamlit port scan range.
   streamlit_port_range:
-    # 자동 탐색 시작 포트
     start: 8505
-    # 자동 탐색 종료 포트
     end: 8555

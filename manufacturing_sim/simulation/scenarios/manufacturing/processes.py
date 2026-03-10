@@ -123,6 +123,10 @@ def agent_battery_monitor(env: simpy.Environment, world: ManufacturingWorld, age
         if agent.discharged:
             yield env.timeout(1)
             continue
+        if getattr(agent, "battery_swap_critical", False):
+            # Keep battery-delivery handover atomic once it has started.
+            yield env.timeout(0.5)
+            continue
 
         remaining = world.battery_remaining(agent)
         if remaining <= eps:

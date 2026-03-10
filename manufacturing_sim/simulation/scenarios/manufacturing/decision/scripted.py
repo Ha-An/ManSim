@@ -3,13 +3,24 @@ from __future__ import annotations
 from typing import Any
 
 from .base import DecisionModule, JobPlan, StrategyState
+from .modes import is_fixed_priority_mode, normalize_decision_mode
 
 
 class ScriptedDecisionModule(DecisionModule):
+    """Rule-based controller used by both non-LLM decision modes."""
+
     def __init__(self, cfg: dict[str, Any]) -> None:
         self.cfg = cfg
         rules_root = cfg.get("heuristic_rules", {}) if isinstance(cfg.get("heuristic_rules", {}), dict) else {}
         self.rules = rules_root.get("decision", {}) if isinstance(rules_root.get("decision", {}), dict) else {}
+
+        decision_cfg = cfg.get("decision", {}) if isinstance(cfg.get("decision", {}), dict) else {}
+        self.decision_mode = normalize_decision_mode(str(decision_cfg.get("mode", "adaptive_priority")))
+        # `fixed_priority` disables all runtime weight adaptation while keeping
+        # the same task-generation logic and world rules.
+        self.fixed_task_priority = is_fixed_priority_mode(self.decision_mode) or bool(
+            decision_cfg.get("fixed_task_priority", False)
+        )
 
     def _rule(self, dotted_path: str, default: Any) -> Any:
         node: Any = self.rules
@@ -40,16 +51,20 @@ class ScriptedDecisionModule(DecisionModule):
         maintenance_bias_multiplier = float(self._rule("reflect.maintenance_bias_multiplier", 1.2))
         quality_bias_multiplier = float(self._rule("reflect.quality_bias_multiplier", 1.2))
 
+        priority_bias = {
+            "flow": flow_bias_multiplier if int(bottleneck_station) in flow_bias_stations else 1.0,
+            "maintenance": maintenance_bias_multiplier
+            if observation.get("last_day_machine_breaks", 0) > break_notes_threshold
+            else 1.0,
+            "quality": quality_bias_multiplier if observation.get("last_day_scrap_rate", 0.0) > scrap_notes_threshold else 1.0,
+        }
+        if self.fixed_task_priority:
+            priority_bias = {"flow": 1.0, "maintenance": 1.0, "quality": 1.0}
+
         return StrategyState(
             bottleneck_station=int(bottleneck_station),
             notes=notes,
-            priority_bias={
-                "flow": flow_bias_multiplier if int(bottleneck_station) in flow_bias_stations else 1.0,
-                "maintenance": maintenance_bias_multiplier
-                if observation.get("last_day_machine_breaks", 0) > break_notes_threshold
-                else 1.0,
-                "quality": quality_bias_multiplier if observation.get("last_day_scrap_rate", 0.0) > scrap_notes_threshold else 1.0,
-            },
+            priority_bias=priority_bias,
         )
 
     def propose_jobs(
@@ -82,7 +97,8 @@ class ScriptedDecisionModule(DecisionModule):
         if isinstance(base_task_weights, dict):
             for key, value in base_task_weights.items():
                 weights[str(key)] = float(value)
-        weights.update(strategy.priority_bias)
+        if not self.fixed_task_priority:
+            weights.update(strategy.priority_bias)
 
         min_pm = int(norms.get("min_pm_per_machine_per_day", 1))
         base_quotas = self._rule(
@@ -115,12 +131,15 @@ class ScriptedDecisionModule(DecisionModule):
         quality_boost = float(self._rule("propose_jobs.inspection_quality_weight_multiplier", 1.2))
         if observation.get("inspection_backlog", 0) > backlog_threshold:
             quotas["inspection_runs"] = int(quotas.get("inspection_runs", 0)) + backlog_bonus
-            weights["quality"] *= quality_boost
+            if not self.fixed_task_priority:
+                weights["quality"] *= quality_boost
 
         rationale = (
             f"Bottleneck station={strategy.bottleneck_station}, "
             f"notes={'; '.join(strategy.notes) if strategy.notes else 'none'}"
         )
+        if self.fixed_task_priority:
+            rationale += ", fixed_task_priority=true"
         return JobPlan(task_weights=weights, quotas=quotas, rationale=rationale)
 
     def discuss(self, day_summary: dict[str, Any], norms: dict[str, Any]) -> dict[str, Any]:
@@ -139,22 +158,26 @@ class ScriptedDecisionModule(DecisionModule):
             min_pm -= 1
 
         inspect_weight = float(updated.get("quality_weight", 1.0))
-        raise_scrap_threshold = float(self._rule("discuss.quality_weight_raise_scrap_threshold", 0.08))
-        raise_step_weight = float(self._rule("discuss.quality_weight_raise_step", 0.1))
-        raise_cap = float(self._rule("discuss.quality_weight_raise_cap", 1.8))
-        lower_scrap_threshold = float(self._rule("discuss.quality_weight_lower_scrap_threshold", 0.03))
-        lower_step_weight = float(self._rule("discuss.quality_weight_lower_step", 0.05))
-        lower_floor = float(self._rule("discuss.quality_weight_floor", 1.0))
-        if scrap_rate > raise_scrap_threshold:
-            inspect_weight = min(raise_cap, inspect_weight + raise_step_weight)
-        elif scrap_rate < lower_scrap_threshold:
-            inspect_weight = max(lower_floor, inspect_weight - lower_step_weight)
+        if not self.fixed_task_priority:
+            raise_scrap_threshold = float(self._rule("discuss.quality_weight_raise_scrap_threshold", 0.08))
+            raise_step_weight = float(self._rule("discuss.quality_weight_raise_step", 0.1))
+            raise_cap = float(self._rule("discuss.quality_weight_raise_cap", 1.8))
+            lower_scrap_threshold = float(self._rule("discuss.quality_weight_lower_scrap_threshold", 0.03))
+            lower_step_weight = float(self._rule("discuss.quality_weight_lower_step", 0.05))
+            lower_floor = float(self._rule("discuss.quality_weight_floor", 1.0))
+            if scrap_rate > raise_scrap_threshold:
+                inspect_weight = min(raise_cap, inspect_weight + raise_step_weight)
+            elif scrap_rate < lower_scrap_threshold:
+                inspect_weight = max(lower_floor, inspect_weight - lower_step_weight)
 
         updated["min_pm_per_machine_per_day"] = min_pm
         updated["quality_weight"] = round(inspect_weight, 3)
         return updated
 
     def urgent_discuss(self, event: dict[str, Any], local_state: dict[str, Any]) -> dict[str, Any]:
+        if self.fixed_task_priority:
+            return {"weight_updates": {}}
+
         event_type = event.get("event_type")
         weight_updates: dict[str, float] = {}
 

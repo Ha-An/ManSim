@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import itertools
 import math
@@ -39,11 +39,22 @@ class ManufacturingWorld:
         self.machines_per_station = int(factory_cfg["machines_per_station"])
 
         process_cfg = factory_cfg["processing_time_min"]
-        self.processing_time_min = {
-            1: float(process_cfg["station1"]),
-            2: float(process_cfg["station2"]),
-            3: float(process_cfg["station3"]),
-        }
+        station_time_pairs: list[tuple[int, float]] = []
+        for key, value in process_cfg.items():
+            key_str = str(key)
+            if not key_str.startswith("station"):
+                continue
+            suffix = key_str.replace("station", "", 1)
+            if not suffix.isdigit():
+                continue
+            station_time_pairs.append((int(suffix), float(value)))
+        if not station_time_pairs:
+            raise ValueError("factory.processing_time_min must define at least one stationN entry.")
+        station_time_pairs.sort(key=lambda x: x[0])
+        self.stations = [station for station, _ in station_time_pairs]
+        self.last_processing_station = max(self.stations)
+        self.inspection_queue_station = 4
+        self.processing_time_min = {station: proc_time for station, proc_time in station_time_pairs}
         self.inspection_base_time_min = float(factory_cfg["inspection_base_time_min"])
         self.inspection_min_time_min = float(factory_cfg["inspection_min_time_min"])
 
@@ -73,14 +84,18 @@ class ManufacturingWorld:
             "quality_weight": float(self._rule("world.initial_norms.quality_weight", 1.0)),
         }
 
-        self.material_queues: dict[int, deque[str]] = {1: deque(), 2: deque(), 3: deque()}
+        self.material_queues: dict[int, deque[str]] = {station: deque() for station in self.stations}
         # Station1 does not consume component; component queues start at Station2.
-        self.component_queues: dict[int, deque[str]] = {2: deque(), 3: deque(), 4: deque()}
+        self.component_queues: dict[int, deque[str]] = {
+            station: deque() for station in self.stations if self._station_requires_component(station)
+        }
+        self.component_queues[self.inspection_queue_station] = deque()
         # Output buffers for each stage.
-        # 1~3: machine output before next transfer
-        # 4: inspection-pass output waiting transfer to Warehouse
-        self.output_buffers: dict[int, deque[str]] = {1: deque(), 2: deque(), 3: deque(), 4: deque()}
-        self.material_supply_owner: dict[int, str | None] = {1: None, 2: None, 3: None}
+        # processing stations: machine output before next transfer
+        # inspection queue station: inspection-pass output waiting transfer to Warehouse
+        self.output_buffers: dict[int, deque[str]] = {station: deque() for station in self.stations}
+        self.output_buffers[self.inspection_queue_station] = deque()
+        self.material_supply_owner: dict[int, str | None] = {station: None for station in self.stations}
 
         self.items: dict[str, Item] = {}
         self.item_counter = itertools.count(1)
@@ -88,7 +103,7 @@ class ManufacturingWorld:
         self.machine_cycle_counter = itertools.count(1)
 
         self.machines: dict[str, Machine] = {}
-        self.machines_by_station: dict[int, list[str]] = {1: [], 2: [], 3: []}
+        self.machines_by_station: dict[int, list[str]] = {station: [] for station in self.stations}
         self._build_machines()
 
         self.agents: dict[str, Agent] = {}
@@ -110,6 +125,7 @@ class ManufacturingWorld:
         self.terminated = False
         self.termination_reason = ""
         self.termination_event = self.env.event()
+        self.active_battery_delivery_owner: str | None = None
 
     def _rule(self, dotted_path: str, default: Any) -> Any:
         node: Any = self.heuristic_rules
@@ -124,7 +140,7 @@ class ManufacturingWorld:
         return station >= 2
 
     def _build_machines(self) -> None:
-        for station in (1, 2, 3):
+        for station in self.stations:
             for idx in range(1, self.machines_per_station + 1):
                 machine_id = f"S{station}M{idx}"
                 machine = Machine(
@@ -146,7 +162,7 @@ class ManufacturingWorld:
 
         initial_inventory_cfg = self.cfg.get("initial_inventory", {})
         initial_material_cfg = initial_inventory_cfg.get("material", {}) if isinstance(initial_inventory_cfg, dict) else {}
-        for station in (1, 2, 3):
+        for station in self.stations:
             initial_material = int(initial_material_cfg.get(f"station{station}", 0))
             for _ in range(max(0, initial_material)):
                 self._warehouse_push_material(station)
@@ -199,7 +215,7 @@ class ManufacturingWorld:
             "day": self.current_day,
             "component_queue_lengths": {k: len(v) for k, v in self.component_queues.items()},
             "material_queue_lengths": {k: len(v) for k, v in self.material_queues.items()},
-            "inspection_backlog": len(self.component_queues[4]),
+            "inspection_backlog": len(self.component_queues[self.inspection_queue_station]),
             "machine_states": {mid: m.state.value for mid, m in self.machines.items()},
             "last_day_machine_breaks": 0 if not last_day_summary else last_day_summary.get("machine_breakdowns", 0),
             "last_day_scrap_rate": 0.0 if not last_day_summary else last_day_summary.get("scrap_rate", 0.0),
@@ -207,7 +223,7 @@ class ManufacturingWorld:
 
     def local_state_for_urgent(self) -> dict[str, Any]:
         return {
-            "inspection_backlog": len(self.component_queues[4]),
+            "inspection_backlog": len(self.component_queues[self.inspection_queue_station]),
             "broken_machines": sum(1 for m in self.machines.values() if m.broken),
             "discharged_agents": sum(1 for a in self.agents.values() if a.discharged),
         }
@@ -249,7 +265,7 @@ class ManufacturingWorld:
                 day=self.day_for_time(self.env.now),
                 event_type="AGENT_PICK_REJECTED",
                 entity_id=agent.agent_id,
-                location=agent.location,
+                location=self.agent_display_location(agent),
                 details={
                     "reason": "already_carrying",
                     "current_item_id": agent.carrying_item_id or "",
@@ -266,7 +282,7 @@ class ManufacturingWorld:
             day=self.day_for_time(self.env.now),
             event_type="AGENT_PICK_ITEM",
             entity_id=agent.agent_id,
-            location=agent.location,
+            location=self.agent_display_location(agent),
             details={"item_id": agent.carrying_item_id, "item_type": agent.carrying_item_type},
         )
         return True
@@ -282,7 +298,7 @@ class ManufacturingWorld:
                 day=self.day_for_time(self.env.now),
                 event_type="AGENT_DROP_ITEM",
                 entity_id=agent.agent_id,
-                location=agent.location,
+                location=self.agent_display_location(agent),
                 details={"item_id": item_id or "", "item_type": (item_type or ""), "to": destination},
             )
         agent.carrying_item_id = None
@@ -317,8 +333,8 @@ class ManufacturingWorld:
         if station not in self.component_queues:
             raise ValueError(f"component queue for station {station} is not defined")
         self.component_queues[station].append(item_id)
-        location = "Inspection" if station == 4 else f"Station{station}"
-        queue_name = "product" if station == 4 else "component"
+        location = "Inspection" if station == self.inspection_queue_station else f"Station{station}"
+        queue_name = "product" if station == self.inspection_queue_station else "component"
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -334,8 +350,8 @@ class ManufacturingWorld:
         if not self.component_queues[station]:
             return None
         item_id = self.component_queues[station].popleft()
-        location = "Inspection" if station == 4 else f"Station{station}"
-        queue_name = "product" if station == 4 else "component"
+        location = "Inspection" if station == self.inspection_queue_station else f"Station{station}"
+        queue_name = "product" if station == self.inspection_queue_station else "component"
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -380,6 +396,14 @@ class ManufacturingWorld:
         t = self.env.now if at_t is None else float(at_t)
         return max(0.0, self.battery_swap_period_min - max(0.0, t - float(agent.last_battery_swap)))
 
+    def _battery_interrupt_exempt(self, agent: Agent) -> bool:
+        return bool(getattr(agent, "battery_swap_critical", False))
+
+    def _should_interrupt_for_battery(self, agent: Agent, eps: float = 1e-6) -> bool:
+        if self._battery_interrupt_exempt(agent):
+            return False
+        return agent.discharged or self.battery_remaining(agent) <= eps
+
     def check_all_agents_discharged(self) -> None:
         if self.terminated:
             return
@@ -397,6 +421,174 @@ class ManufacturingWorld:
             if not self.termination_event.triggered:
                 self.termination_event.succeed(self.termination_reason)
 
+    def _clear_in_transit(self, agent: Agent) -> None:
+        agent.in_transit_from = None
+        agent.in_transit_to = None
+        agent.in_transit_progress = 0.0
+        agent.in_transit_total_min = 0.0
+
+    def _set_in_transit(self, agent: Agent, from_zone: str, to_zone: str, progress: float, total_min: float) -> None:
+        agent.in_transit_from = str(from_zone)
+        agent.in_transit_to = str(to_zone)
+        agent.in_transit_progress = min(1.0, max(0.0, float(progress)))
+        agent.in_transit_total_min = max(0.0, float(total_min))
+
+    def _has_in_transit_position(self, agent: Agent) -> bool:
+        if not agent.in_transit_from or not agent.in_transit_to:
+            return False
+        if agent.in_transit_total_min <= 1e-9:
+            return False
+        p = float(agent.in_transit_progress)
+        return 1e-6 < p < (1.0 - 1e-6)
+
+    def _edge_location_label(self, from_zone: str, to_zone: str, progress: float) -> str:
+        pct = int(round(min(1.0, max(0.0, float(progress))) * 100.0))
+        return f"{from_zone}->{to_zone}({pct}%)"
+
+    def agent_display_location(self, agent: Agent) -> str:
+        if self._has_in_transit_position(agent):
+            return self._edge_location_label(str(agent.in_transit_from), str(agent.in_transit_to), float(agent.in_transit_progress))
+        return str(agent.location)
+
+    def _move_on_edge(
+        self,
+        agent: Agent,
+        edge_from: str,
+        edge_to: str,
+        start_progress: float,
+        end_progress: float,
+        *,
+        emit_move_events: bool = True,
+    ):
+        total = max(1e-6, self.travel_time(edge_from, edge_to))
+        start_p = min(1.0, max(0.0, float(start_progress)))
+        end_p = min(1.0, max(0.0, float(end_progress)))
+        duration = abs(end_p - start_p) * total
+        self._set_in_transit(agent, edge_from, edge_to, start_p, total)
+
+        if duration <= 1e-9:
+            self._set_in_transit(agent, edge_from, edge_to, end_p, total)
+            return
+
+        eps = 1e-6
+        if self._should_interrupt_for_battery(agent, eps):
+            if not agent.discharged:
+                self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
+            raise simpy.Interrupt("battery_depleted")
+
+        if emit_move_events:
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="AGENT_EDGE_MOVE_START",
+                entity_id=agent.agent_id,
+                location=self.agent_display_location(agent),
+                details={
+                    "from": edge_from,
+                    "to": edge_to,
+                    "duration": round(duration, 3),
+                    "start_progress": round(start_p, 4),
+                    "end_progress": round(end_p, 4),
+                },
+            )
+
+        move_start_t = self.env.now
+        try:
+            yield self.env.timeout(duration)
+        except simpy.Interrupt as intr:
+            elapsed = max(0.0, self.env.now - move_start_t)
+            frac = min(1.0, max(0.0, elapsed / max(1e-6, duration)))
+            current_p = start_p + (end_p - start_p) * frac
+            self._set_in_transit(agent, edge_from, edge_to, current_p, total)
+            if emit_move_events:
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="AGENT_EDGE_MOVE_INTERRUPTED",
+                    entity_id=agent.agent_id,
+                    location=self.agent_display_location(agent),
+                    details={
+                        "from": edge_from,
+                        "to": edge_to,
+                        "duration": round(duration, 3),
+                        "elapsed": round(elapsed, 3),
+                        "progress": round(current_p, 4),
+                        "reason": str(intr.cause),
+                    },
+                )
+            raise
+
+        if self._should_interrupt_for_battery(agent, eps):
+            self._set_in_transit(agent, edge_from, edge_to, end_p, total)
+            if not agent.discharged:
+                self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
+            raise simpy.Interrupt("battery_depleted")
+
+        self._set_in_transit(agent, edge_from, edge_to, end_p, total)
+        if emit_move_events:
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="AGENT_EDGE_MOVE_END",
+                entity_id=agent.agent_id,
+                location=self.agent_display_location(agent),
+                details={
+                    "from": edge_from,
+                    "to": edge_to,
+                    "duration": round(duration, 3),
+                    "start_progress": round(start_p, 4),
+                    "end_progress": round(end_p, 4),
+                },
+            )
+
+    def _move_agent_to_in_transit_position(
+        self,
+        mover: Agent,
+        target: Agent,
+        *,
+        emit_move_events: bool = True,
+    ) -> str | None:
+        if not self._has_in_transit_position(target):
+            yield from self.move_agent(mover, target.location, emit_move_events=emit_move_events)
+            for _ in range(2):
+                if mover.location == target.location:
+                    break
+                yield from self.move_agent(mover, target.location, emit_move_events=emit_move_events)
+            if mover.location != target.location:
+                return None
+            return str(target.location)
+
+        edge_from = str(target.in_transit_from)
+        edge_to = str(target.in_transit_to)
+        progress = float(target.in_transit_progress)
+        total = max(1e-6, float(target.in_transit_total_min))
+        dist_from = progress * total
+        dist_to = (1.0 - progress) * total
+
+        via_from = self.travel_time(mover.location, edge_from) + dist_from
+        via_to = self.travel_time(mover.location, edge_to) + dist_to
+
+        if via_from <= via_to:
+            entry_zone = edge_from
+            start_p = 0.0
+            end_p = progress
+        else:
+            entry_zone = edge_to
+            start_p = 1.0
+            end_p = progress
+
+        yield from self.move_agent(mover, entry_zone, emit_move_events=emit_move_events)
+        if abs(end_p - start_p) > 1e-9:
+            yield from self._move_on_edge(
+                mover,
+                edge_from,
+                edge_to,
+                start_p,
+                end_p,
+                emit_move_events=emit_move_events,
+            )
+        return self._edge_location_label(edge_from, edge_to, progress)
+
     def discharge_agent(
         self,
         agent: Agent,
@@ -407,13 +599,22 @@ class ManufacturingWorld:
             return
         agent.discharged = True
         agent.discharged_since = self.env.now
+        details: dict[str, Any] = {"reason": reason}
+        if self._has_in_transit_position(agent):
+            details.update(
+                {
+                    "in_transit_from": str(agent.in_transit_from),
+                    "in_transit_to": str(agent.in_transit_to),
+                    "in_transit_progress": round(float(agent.in_transit_progress), 4),
+                }
+            )
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
             event_type="AGENT_DISCHARGED",
             entity_id=agent.agent_id,
-            location=agent.location,
-            details={"reason": reason},
+            location=self.agent_display_location(agent),
+            details=details,
         )
         self.trigger_urgent_chat("agent_discharged", agent.agent_id, {"reason": reason})
         if interrupt_process and agent.process_ref is not None and agent.process_ref.is_alive:
@@ -446,7 +647,7 @@ class ManufacturingWorld:
             day=self.day_for_time(start_t),
             event_type="AGENT_TASK_START",
             entity_id=agent.agent_id,
-            location=agent.location,
+            location=self.agent_display_location(agent),
             details={"task_id": task.task_id, "task_type": task.task_type, "payload": task.payload, "category": task.category},
         )
 
@@ -461,7 +662,7 @@ class ManufacturingWorld:
             day=self.day_for_time(end_t),
             event_type="AGENT_TASK_END",
             entity_id=agent.agent_id,
-            location=agent.location,
+            location=self.agent_display_location(agent),
             details={
                 "task_id": task.task_id,
                 "task_type": task.task_type,
@@ -503,7 +704,7 @@ class ManufacturingWorld:
                 day=self.day_for_time(self.env.now),
                 event_type="TASK_SUSPENDED",
                 entity_id=agent.agent_id,
-                location=agent.location,
+                location=self.agent_display_location(agent),
                 details={"task_type": task.task_type, "task_id": task.task_id, "reason": reason},
             )
             return
@@ -555,7 +756,7 @@ class ManufacturingWorld:
         elif task.task_type == "INSPECT_PRODUCT":
             product_id = task.payload.pop("inspection_product_id", None)
             if product_id is not None:
-                self.component_queues[4].appendleft(product_id)
+                self.component_queues[self.inspection_queue_station].appendleft(product_id)
 
         elif task.task_type == "REPAIR_MACHINE":
             machine = self.machines.get(task.payload.get("machine_id"))
@@ -582,7 +783,7 @@ class ManufacturingWorld:
             day=self.day_for_time(self.env.now),
             event_type="TASK_INTERRUPTED",
             entity_id=agent.agent_id,
-            location=agent.location,
+            location=self.agent_display_location(agent),
             details={"task_type": task.task_type, "task_id": task.task_id, "reason": reason},
         )
         self._clear_agent_carrying(agent, emit_event=False)
@@ -677,7 +878,7 @@ class ManufacturingWorld:
                         task_type="TRANSFER",
                         category="safety",
                         priority=deliver_priority,
-                        location=other.location,
+                        location=self.agent_display_location(other),
                         payload={"transfer_kind": "battery_delivery", "target_agent_id": other.agent_id},
                     )
                 )
@@ -756,7 +957,7 @@ class ManufacturingWorld:
 
         for station, buffer in self.output_buffers.items():
             if buffer:
-                task_location = "Inspection" if station == 4 else f"Station{station}"
+                task_location = "Inspection" if station == self.inspection_queue_station else f"Station{station}"
                 tasks.append(
                     Task(
                         task_id=self._next_task_id("TR"),
@@ -768,7 +969,7 @@ class ManufacturingWorld:
                     )
                 )
 
-        for station in (1, 2, 3):
+        for station in self.stations:
             material_target = int(self.inventory_targets["material"][f"station{station}"])
             if len(self.material_queues[station]) < material_target and self.material_supply_owner.get(station) is None:
                 tasks.append(
@@ -782,7 +983,7 @@ class ManufacturingWorld:
                     )
                 )
 
-        if self.component_queues[4]:
+        if self.component_queues[self.inspection_queue_station]:
             tasks.append(
                 Task(
                     task_id=self._next_task_id("INS"),
@@ -812,14 +1013,33 @@ class ManufacturingWorld:
         return float(self.movement_cfg["default_min"])
 
     def move_agent(self, agent: Agent, dst: str, emit_move_events: bool = True):
+        eps = 1e-6
+
+        # If the agent is currently on an edge, first walk to the best endpoint.
+        if self._has_in_transit_position(agent):
+            edge_from = str(agent.in_transit_from)
+            edge_to = str(agent.in_transit_to)
+            progress = float(agent.in_transit_progress)
+            total = max(1e-6, float(agent.in_transit_total_min))
+            via_from = progress * total + self.travel_time(edge_from, dst)
+            via_to = (1.0 - progress) * total + self.travel_time(edge_to, dst)
+            if via_from <= via_to:
+                yield from self._move_on_edge(agent, edge_from, edge_to, progress, 0.0, emit_move_events=emit_move_events)
+                agent.location = edge_from
+            else:
+                yield from self._move_on_edge(agent, edge_from, edge_to, progress, 1.0, emit_move_events=emit_move_events)
+                agent.location = edge_to
+            self._clear_in_transit(agent)
+
         src = agent.location
         move_t = self.travel_time(src, dst)
-        eps = 1e-6
+
         # A discharged agent cannot initiate movement.
-        if agent.discharged or self.battery_remaining(agent) <= eps:
+        if self._should_interrupt_for_battery(agent, eps):
             if not agent.discharged:
                 self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
             raise simpy.Interrupt("battery_depleted")
+
         if move_t > 0:
             if emit_move_events:
                 self.logger.log(
@@ -831,18 +1051,20 @@ class ManufacturingWorld:
                     details={"from": src, "to": dst, "duration": round(move_t, 3)},
                 )
             move_start_t = self.env.now
+            self._set_in_transit(agent, src, dst, 0.0, move_t)
             try:
                 yield self.env.timeout(move_t)
             except simpy.Interrupt as intr:
                 elapsed = max(0.0, self.env.now - move_start_t)
                 progress = min(1.0, max(0.0, elapsed / max(1e-6, move_t)))
+                self._set_in_transit(agent, src, dst, progress, move_t)
                 if emit_move_events:
                     self.logger.log(
                         t=self.env.now,
                         day=self.day_for_time(self.env.now),
                         event_type="AGENT_MOVE_INTERRUPTED",
                         entity_id=agent.agent_id,
-                        location=src,
+                        location=self.agent_display_location(agent),
                         details={
                             "from": src,
                             "to": dst,
@@ -853,13 +1075,15 @@ class ManufacturingWorld:
                         },
                     )
                 raise
-            # Prevent race at the exact depletion timestamp:
-            # if battery expires during move, keep the agent at source.
-            if agent.discharged or self.battery_remaining(agent) <= eps:
+            # If battery expires exactly at arrival boundary, keep edge location for handover logic.
+            if self._should_interrupt_for_battery(agent, eps):
+                self._set_in_transit(agent, src, dst, 1.0, move_t)
                 if not agent.discharged:
                     self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
                 raise simpy.Interrupt("battery_depleted")
+
         agent.location = dst
+        self._clear_in_transit(agent)
         if move_t > 0:
             if emit_move_events:
                 self.logger.log(
@@ -969,7 +1193,7 @@ class ManufacturingWorld:
                     return False
                 output_id = machine.output_component
                 if output_id is not None:
-                    carried_kind = "product" if machine.station == 3 else "component"
+                    carried_kind = "product" if machine.station == self.last_processing_station else "component"
                     if not self._set_agent_carrying(agent, carried_kind, output_id):
                         return False
                 machine.output_component = None
@@ -1000,6 +1224,9 @@ class ManufacturingWorld:
                     return False
                 if agent.discharged:
                     return False
+                if self.active_battery_delivery_owner is not None and self.active_battery_delivery_owner != agent.agent_id:
+                    return False
+                self.active_battery_delivery_owner = agent.agent_id
                 target_agent.battery_service_owner = agent.agent_id
                 try:
                     was_discharged = target_agent.discharged
@@ -1011,7 +1238,6 @@ class ManufacturingWorld:
                         if not battery_item_id:
                             battery_item_id = self._next_item_id("BAT")
                             task.payload["transfer_item_id"] = battery_item_id
-                        # Fresh battery loaded at BatteryStation for delivery.
                         if not self._set_agent_carrying(agent, "battery_fresh", battery_item_id):
                             return False
                         task.payload["battery_loaded"] = True
@@ -1021,56 +1247,64 @@ class ManufacturingWorld:
                             task.payload["transfer_item_id"] = battery_item_id
                         if not self._set_agent_carrying(agent, "battery_fresh", battery_item_id):
                             return False
-                    # Move battery to the target agent's current position.
-                    yield from self.move_agent(agent, target_agent.location, emit_move_events=True)
-                    # If target moved during travel, catch up before handover.
-                    for _ in range(2):
-                        if agent.location == target_agent.location:
-                            break
-                        yield from self.move_agent(agent, target_agent.location, emit_move_events=True)
-                    if agent.location != target_agent.location:
+
+                    agent.battery_swap_critical = True
+                    target_agent.battery_swap_critical = True
+                    handover_location = yield from self._move_agent_to_in_transit_position(
+                        agent,
+                        target_agent,
+                        emit_move_events=True,
+                    )
+                    if handover_location is None:
                         return False
+
                     if not target_agent.discharged and target_agent.awaiting_battery_from is None:
-                        # Pause receiver only after physical contact (same zone) is established.
                         target_agent.awaiting_battery_from = agent.agent_id
                         self.logger.log(
                             t=self.env.now,
                             day=self.day_for_time(self.env.now),
                             event_type="BATTERY_SWAP_WAIT_START",
                             entity_id=target_agent.agent_id,
-                            location=target_agent.location,
+                            location=self.agent_display_location(target_agent),
                             details={"from_agent_id": agent.agent_id},
                         )
                         if target_agent.process_ref is not None and target_agent.process_ref.is_alive:
                             target_agent.process_ref.interrupt("battery_swap_wait")
+
                     yield self.env.timeout(float(self.agent_cfg["battery_delivery_extra_min"]))
-                    # Safety check: no remote handover allowed.
-                    if agent.location != target_agent.location:
-                        yield from self.move_agent(agent, target_agent.location, emit_move_events=True)
-                    if agent.location != target_agent.location:
-                        return False
-                    # Re-evaluate discharge at handover completion time.
-                    # The target may become discharged while the helper is in transit.
+
+                    if not self._has_in_transit_position(target_agent):
+                        if agent.location != target_agent.location:
+                            yield from self.move_agent(agent, target_agent.location, emit_move_events=True)
+                        if agent.location != target_agent.location:
+                            return False
+                        handover_location = str(target_agent.location)
+                    else:
+                        handover_location = yield from self._move_agent_to_in_transit_position(
+                            agent,
+                            target_agent,
+                            emit_move_events=True,
+                        )
+                        if handover_location is None:
+                            return False
+
                     became_discharged_during_delivery = target_agent.discharged
                     target_agent.last_battery_swap = self.env.now
                     target_agent.discharged = False
                     target_agent.discharged_since = None
-                    # Fresh battery is handed over to the target agent.
-                    self._clear_agent_carrying(agent, destination=target_agent.location)
-                    # Immediately pick the used battery and return it to BatteryStation.
+                    self._clear_agent_carrying(agent, destination=handover_location)
                     spent_battery_id = str(task.payload.get("spent_battery_item_id", ""))
                     if not spent_battery_id:
                         spent_battery_id = self._next_item_id("BAT-USED")
                         task.payload["spent_battery_item_id"] = spent_battery_id
                     if not self._set_agent_carrying(agent, "battery_spent", spent_battery_id):
                         return False
-                    # Swap completion event: battery is considered reset at this exact moment.
                     self.logger.log(
                         t=self.env.now,
                         day=self.day_for_time(self.env.now),
                         event_type="BATTERY_SWAP",
                         entity_id=target_agent.agent_id,
-                        location=target_agent.location,
+                        location=handover_location,
                         details={"target_agent_id": target_agent.agent_id, "by": agent.agent_id},
                     )
                     self.logger.log(
@@ -1078,21 +1312,19 @@ class ManufacturingWorld:
                         day=self.day_for_time(self.env.now),
                         event_type="BATTERY_DELIVERED",
                         entity_id=agent.agent_id,
-                        location=target_agent.location,
+                        location=handover_location,
                         details={"target_agent_id": target_id},
                     )
-                    if was_discharged or became_discharged_during_delivery:
-                        self.logger.log(
-                            t=self.env.now,
-                            day=self.day_for_time(self.env.now),
-                            event_type="AGENT_RECHARGED",
-                            entity_id=target_agent.agent_id,
-                            location=target_agent.location,
-                            details={"by": agent.agent_id},
-                        )
-                        # If discharge happened during self battery swap, the recharge resolves it.
-                        if target_agent.suspended_task is not None and target_agent.suspended_task.task_type == "BATTERY_SWAP":
-                            target_agent.suspended_task = None
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type="AGENT_RECHARGED",
+                        entity_id=target_agent.agent_id,
+                        location=handover_location,
+                        details={"by": agent.agent_id, "was_discharged": bool(was_discharged or became_discharged_during_delivery)},
+                    )
+                    if target_agent.suspended_task is not None and target_agent.suspended_task.task_type == "BATTERY_SWAP":
+                        target_agent.suspended_task = None
                     yield from self.move_agent(agent, "BatteryStation", emit_move_events=True)
                     self._clear_agent_carrying(agent, destination="BatteryStation")
                     task.payload.pop("battery_loaded", None)
@@ -1100,6 +1332,10 @@ class ManufacturingWorld:
                     task.payload.pop("spent_battery_item_id", None)
                     return True
                 finally:
+                    agent.battery_swap_critical = False
+                    target_agent.battery_swap_critical = False
+                    if self.active_battery_delivery_owner == agent.agent_id:
+                        self.active_battery_delivery_owner = None
                     if target_agent.awaiting_battery_from == agent.agent_id:
                         target_agent.awaiting_battery_from = None
                         self.logger.log(
@@ -1107,7 +1343,7 @@ class ManufacturingWorld:
                             day=self.day_for_time(self.env.now),
                             event_type="BATTERY_SWAP_WAIT_END",
                             entity_id=target_agent.agent_id,
-                            location=target_agent.location,
+                            location=self.agent_display_location(target_agent),
                             details={"from_agent_id": agent.agent_id},
                         )
                     if target_agent.battery_service_owner == agent.agent_id:
@@ -1117,22 +1353,22 @@ class ManufacturingWorld:
                 from_station = int(task.payload["from_station"])
                 moved_item_id = str(task.payload.get("transfer_item_id", ""))
                 if not moved_item_id:
-                    from_location = "Inspection" if from_station == 4 else f"Station{from_station}"
+                    from_location = "Inspection" if from_station == self.inspection_queue_station else f"Station{from_station}"
                     yield from self.move_agent(agent, from_location, emit_move_events=True)
                     if not self.output_buffers[from_station]:
                         return False
                     moved_item_id = self.output_buffers[from_station].popleft()
                     task.payload["transfer_item_id"] = moved_item_id
-                    moved_item_kind = "product" if from_station >= 3 else "component"
+                    moved_item_kind = "product" if from_station >= self.last_processing_station else "component"
                     if not self._set_agent_carrying(agent, moved_item_kind, moved_item_id):
                         self.output_buffers[from_station].appendleft(moved_item_id)
                         task.payload.pop("transfer_item_id", None)
                         return False
                 elif agent.carrying_item_id != moved_item_id:
-                    moved_item_kind = "product" if from_station >= 3 else "component"
+                    moved_item_kind = "product" if from_station >= self.last_processing_station else "component"
                     if not self._set_agent_carrying(agent, moved_item_kind, moved_item_id):
                         return False
-                if from_station == 4:
+                if from_station == self.inspection_queue_station:
                     # Final logistics leg: inspected product -> Warehouse.
                     to_location = "Warehouse"
                     yield from self.move_agent(agent, to_location, emit_move_events=True)
@@ -1141,17 +1377,21 @@ class ManufacturingWorld:
                         self.items[moved_item_id].current_station = None
                 else:
                     to_station = from_station + 1
-                    to_location = f"Station{to_station}" if to_station <= 3 else "Inspection"
+                    to_location = f"Station{to_station}" if to_station <= self.last_processing_station else "Inspection"
                     yield from self.move_agent(agent, to_location, emit_move_events=True)
-                    target_queue_station = to_station if to_station <= 3 else 4
+                    target_queue_station = to_station if to_station <= self.last_processing_station else self.inspection_queue_station
                     self._push_component_queue(target_queue_station, moved_item_id)
                 task.payload.pop("transfer_item_id", None)
-                moved_item_kind = "product" if from_station >= 3 else "component"
+                moved_item_kind = "product" if from_station >= self.last_processing_station else "component"
                 self._clear_agent_carrying(agent, destination=to_location)
-                if from_station == 4:
+                if from_station == self.inspection_queue_station:
                     move_to = "Warehouse"
                 else:
-                    move_to = "product_queue_4" if (from_station + 1) == 4 else f"component_queue_{from_station + 1}"
+                    move_to = (
+                        f"product_queue_{self.inspection_queue_station}"
+                        if (from_station + 1) == self.inspection_queue_station
+                        else f"component_queue_{from_station + 1}"
+                    )
                 self.logger.log(
                     t=self.env.now,
                     day=self.day_for_time(self.env.now),
@@ -1164,7 +1404,7 @@ class ManufacturingWorld:
                         "item_type": moved_item_kind,
                     },
                 )
-                if from_station == 4:
+                if from_station == self.inspection_queue_station:
                     self.logger.log(
                         t=self.env.now,
                         day=self.day_for_time(self.env.now),
@@ -1312,7 +1552,7 @@ class ManufacturingWorld:
                         machine.state = MachineState.WAIT_INPUT
         if task_type == "INSPECT_PRODUCT":
             product_id = str(task.payload.get("inspection_product_id", ""))
-            if not product_id and not self.component_queues[4]:
+            if not product_id and not self.component_queues[self.inspection_queue_station]:
                 return False
             yield from self.move_agent(agent, "Inspection", emit_move_events=True)
             if not product_id:
@@ -1322,7 +1562,7 @@ class ManufacturingWorld:
                 product_id = popped
                 task.payload["inspection_product_id"] = product_id
             if not self._set_agent_carrying(agent, "product", product_id):
-                self.component_queues[4].appendleft(product_id)
+                self.component_queues[self.inspection_queue_station].appendleft(product_id)
                 task.payload.pop("inspection_product_id", None)
                 return False
             self.inspection_active_agents += 1
@@ -1360,9 +1600,13 @@ class ManufacturingWorld:
                     event_type="ITEM_MOVED",
                     entity_id=product_id,
                     location="Inspection",
-                    details={"from": "Inspection", "to": "output_buffer_station_4", "item_type": "product"},
+                    details={
+                        "from": "Inspection",
+                        "to": f"output_buffer_station_{self.inspection_queue_station}",
+                        "item_type": "product",
+                    },
                 )
-                self.output_buffers[4].append(product_id)
+                self.output_buffers[self.inspection_queue_station].append(product_id)
                 self.logger.log(
                     t=self.env.now,
                     day=self.day_for_time(self.env.now),
@@ -1371,7 +1615,10 @@ class ManufacturingWorld:
                     location="Inspection",
                     details={"inspector": agent.agent_id},
                 )
-                self._clear_agent_carrying(agent, destination="output_buffer_station_4")
+                self._clear_agent_carrying(
+                    agent,
+                    destination=f"output_buffer_station_{self.inspection_queue_station}",
+                )
             task.payload.pop("inspection_product_id", None)
             return True
 
@@ -1429,7 +1676,7 @@ class ManufacturingWorld:
         return cycle_id
 
     def complete_machine_cycle(self, machine: Machine, cycle_id: str) -> None:
-        if machine.station == 3:
+        if machine.station == self.last_processing_station:
             output_id = self._next_item_id("PRODUCT")
             output_type = "product"
         else:
@@ -1509,7 +1756,7 @@ class ManufacturingWorld:
             "machine_processing_min": processing_delta,
             "machine_broken_min": broken_delta,
             "machine_pm_min": pm_delta,
-            "inspection_backlog_end": len(self.component_queues[4]),
+            "inspection_backlog_end": len(self.component_queues[self.inspection_queue_station]),
         }
         self.daily_summaries.append(summary)
         return summary
@@ -1534,7 +1781,7 @@ class ManufacturingWorld:
             "station_throughput": dict(self.station_throughput),
             "avg_daily_products": round(self.product_count / self.num_days, 4),
             "avg_wip_material": round(
-                mean(s["material_queue_lengths"][1] + s["material_queue_lengths"][2] + s["material_queue_lengths"][3] for s in self.minute_snapshots),
+                mean(sum(s["material_queue_lengths"].values()) for s in self.minute_snapshots),
                 4,
             )
             if self.minute_snapshots
@@ -1549,3 +1796,5 @@ class ManufacturingWorld:
             "terminated": self.terminated,
             "termination_reason": self.termination_reason,
         }
+
+

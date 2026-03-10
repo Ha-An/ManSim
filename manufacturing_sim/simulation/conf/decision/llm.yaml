@@ -1,18 +1,18 @@
-mode: llm
+﻿mode: llm
 
 llm:
   enabled: true
   provider: openai_compatible
-  server_url: "http://localhost:8000/v1"
-  model: "your-llm-model-name"
-  timeout_sec: 30
-  temperature: 0.2
+  server_url: "http://localhost:11434/v1"
+  model: "qwen2.5:14b"
+  timeout_sec: 120
+  temperature: 0.0
   max_tokens: 800
 
   communication:
     # GovSim-style townhall chat rounds among agents
     enabled: true
-    rounds: 2
+    rounds: 3
     # number of latest chat messages kept as transcript context for each next turn
     max_transcript_messages: 24
 

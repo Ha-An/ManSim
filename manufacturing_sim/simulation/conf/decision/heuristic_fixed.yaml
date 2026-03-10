@@ -1,7 +1,8 @@
-# Backward-compatible alias for `decision=adaptive_priority`.
+# Backward-compatible alias for `decision=fixed_priority`.
 # Prefer the new name in docs and new configs, but keep this alias so old
 # commands and saved Hydra overrides continue to run unchanged.
-mode: heuristic
+mode: heuristic_fixed
+fixed_task_priority: true
 
 llm:
   enabled: false

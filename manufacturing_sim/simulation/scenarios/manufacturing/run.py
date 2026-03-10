@@ -6,10 +6,15 @@ from typing import Any
 import simpy
 
 from manufacturing_sim.simulation.scenarios.manufacturing.decision.llm_optional import OptionalLLMDecisionModule
+from manufacturing_sim.simulation.scenarios.manufacturing.decision.modes import normalize_decision_mode
 from manufacturing_sim.simulation.scenarios.manufacturing.decision.scripted import ScriptedDecisionModule
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.dashboard import export_kpi_dashboard
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.gantt import export_gantt
+from manufacturing_sim.simulation.scenarios.manufacturing.viz.llm_trace import export_llm_trace_dashboard
+from manufacturing_sim.simulation.scenarios.manufacturing.viz.task_priority_dashboard import (
+    export_task_priority_dashboard,
+)
 from manufacturing_sim.simulation.scenarios.manufacturing.world import ManufacturingWorld
 
 
@@ -19,16 +24,24 @@ def run(
     decision_modules: Any | None = None,
     output_dir: Path | None = None,
 ) -> dict[str, Any]:
+    """Execute one manufacturing simulation run and export result artifacts."""
+
     output_root = Path(output_dir or Path.cwd() / "outputs")
     output_root.mkdir(parents=True, exist_ok=True)
 
     event_logger = logger or EventLogger(output_root)
+
+    decision_cfg = experiment_cfg.get("decision", {}) if isinstance(experiment_cfg.get("decision", {}), dict) else {}
+    decision_mode = normalize_decision_mode(str(decision_cfg.get("mode", "adaptive_priority")))
+
+    run_meta: dict[str, Any] = {
+        "decision_mode": decision_mode,
+    }
+
     if decision_modules is not None:
         decision_module = decision_modules
     else:
-        decision_cfg = experiment_cfg.get("decision", {})
-        decision_mode = str(decision_cfg.get("mode", "heuristic")).strip().lower()
-        if decision_mode == "heuristic":
+        if decision_mode in {"adaptive_priority", "fixed_priority"}:
             decision_module = ScriptedDecisionModule(experiment_cfg)
         elif decision_mode == "llm":
             try:
@@ -38,11 +51,22 @@ def run(
                 )
             except NotImplementedError as exc:
                 raise RuntimeError(
-                    "decision.mode=llm is selected, but LLM adapter is not implemented yet. "
-                    "Use decision=heuristic for now or implement decision/llm_optional.py."
+                    "decision.mode=llm is selected, but the configured LLM backend is unavailable. "
+                    "Use decision=adaptive_priority for a local rule-based run or configure the LLM server."
                 ) from exc
         else:
             raise ValueError(f"Unsupported decision mode: {decision_mode}")
+
+    if decision_mode == "llm":
+        llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
+        comm_cfg = llm_cfg.get("communication", {}) if isinstance(llm_cfg.get("communication", {}), dict) else {}
+        run_meta["llm"] = {
+            "provider": str(llm_cfg.get("provider", "")),
+            "server_url": str(llm_cfg.get("server_url", "")),
+            "model": str(llm_cfg.get("model", "")),
+            "communication_enabled": bool(comm_cfg.get("enabled", True)),
+            "communication_rounds": int(comm_cfg.get("rounds", 0)),
+        }
 
     env = simpy.Environment()
     world = ManufacturingWorld(env=env, cfg=experiment_cfg, logger=event_logger, decision_module=decision_module)
@@ -107,14 +131,37 @@ def run(
             break
 
     kpi = world.finalize_kpis()
+    kpi["run_meta"] = run_meta
+
     event_logger.write_json("daily_summary.json", {"days": world.daily_summaries})
     event_logger.write_json("kpi.json", kpi)
+    event_logger.write_json("run_meta.json", run_meta)
     event_logger.write_json("minute_snapshots.json", {"snapshots": world.minute_snapshots})
+
+    llm_trace_path: str = ""
+    if decision_mode == "llm" and hasattr(decision_module, "get_llm_exchange_records"):
+        get_logs = getattr(decision_module, "get_llm_exchange_records")
+        if callable(get_logs):
+            try:
+                llm_records = get_logs()
+            except Exception:
+                llm_records = []
+            if isinstance(llm_records, list) and llm_records:
+                event_logger.write_json("llm_exchange.json", {"run_meta": run_meta, "records": llm_records})
+                trace_dashboard_path = export_llm_trace_dashboard(records=llm_records, output_dir=output_root)
+                if trace_dashboard_path is not None:
+                    llm_trace_path = str(trace_dashboard_path)
+
     export_gantt(events=event_logger.events, output_dir=output_root)
     dashboard_path = export_kpi_dashboard(
         kpi=kpi,
         daily_summary=world.daily_summaries,
         output_dir=output_root,
+    )
+    task_priority_dashboard_path = export_task_priority_dashboard(
+        output_dir=output_root,
+        events=event_logger.events,
+        heuristic_rules=experiment_cfg.get("heuristic_rules", {}),
     )
     event_logger.close()
 
@@ -125,6 +172,9 @@ def run(
         "events_path": str(output_root / "events.jsonl"),
         "gantt_path": str(output_root / "gantt.html"),
         "kpi_dashboard_path": str(dashboard_path) if dashboard_path else "",
+        "task_priority_dashboard_path": str(task_priority_dashboard_path) if task_priority_dashboard_path else "",
+        "llm_trace_path": llm_trace_path,
         "terminated": world.terminated,
         "termination_reason": world.termination_reason,
+        "decision_mode": decision_mode,
     }

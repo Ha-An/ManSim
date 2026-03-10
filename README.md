@@ -1,52 +1,87 @@
-# Manufacturing Simulation (Hydra + SimPy)
+# ManSim
+
+ManSim is a manufacturing-floor multi-agent simulation built with Hydra and SimPy. It supports rule-based scheduling, fixed-priority baselines, and an LLM-driven mode with townhall-style inter-agent discussion.
+
+## Setup
+
+```powershell
+C:\Github\ManSim\.venv\Scripts\python.exe -m pip install -r C:\Github\ManSim\requirements.txt
+```
 
 ## Run
 
+Current default config in `manufacturing_sim/simulation/conf/config.yaml` uses `decision=llm`.
+
 ```powershell
-C:\Github\mansim\.venv\Scripts\python.exe -m pip install -r C:\Github\mansim\requirements.txt
-C:\Github\mansim\.venv\Scripts\python.exe -m manufacturing_sim.simulation.main
+C:\Github\ManSim\.venv\Scripts\python.exe -m manufacturing_sim.simulation.main
 ```
 
-## Policy Mode
-
-- Default mode is `heuristic` (rule-based).
-- Switch to LLM mode:
+Recommended first run without an LLM server:
 
 ```powershell
-C:\Github\mansim\.venv\Scripts\python.exe -m manufacturing_sim.simulation.main decision=llm
+C:\Github\ManSim\.venv\Scripts\python.exe -m manufacturing_sim.simulation.main decision=adaptive_priority
 ```
 
-Current LLM mode is a stub and will raise an explicit error until `decision/llm_optional.py` is connected to your LLM server.
-
-## Heuristic Rules
-
-All heuristic policy knobs are centralized in:
-
-- `manufacturing_sim/simulation/conf/heuristic_rules/default.yaml`
-
-You can override individual heuristic values with Hydra, for example:
+Fixed-priority baseline:
 
 ```powershell
-C:\Github\mansim\.venv\Scripts\python.exe -m manufacturing_sim.simulation.main heuristic_rules.world.battery.mandatory_swap_threshold_min=20
+C:\Github\ManSim\.venv\Scripts\python.exe -m manufacturing_sim.simulation.main decision=fixed_priority
+```
+
+LLM mode:
+
+```powershell
+C:\Github\ManSim\.venv\Scripts\python.exe -m manufacturing_sim.simulation.main decision=llm
+```
+
+If you use Ollama through WSL, the helper script below restarts the service and runs the simulation:
+
+```powershell
+.\run_llm.ps1
+```
+
+## Decision Modes
+
+- `adaptive_priority`: rule-based controller that adjusts task/category priorities from daily outcomes and urgent events.
+- `fixed_priority`: rule-based baseline that keeps task/category priorities fixed during the run.
+- `llm`: LLM-backed controller with optional townhall communication.
+
+Backward-compatible aliases are still supported:
+
+- `heuristic` -> `adaptive_priority`
+- `heuristic_fixed` -> `fixed_priority`
+
+## Main Config Files
+
+- `manufacturing_sim/simulation/conf/config.yaml`: root Hydra config, default decision mode, UI auto-open options.
+- `manufacturing_sim/simulation/conf/experiment/mfg_basic.yaml`: factory layout, timings, battery policy, failure/quality parameters.
+- `manufacturing_sim/simulation/conf/heuristic_rules/default.yaml`: task priorities, norms, urgent-response weights.
+- `manufacturing_sim/simulation/conf/decision/*.yaml`: per-mode configuration presets.
+
+Example override:
+
+```powershell
+C:\Github\ManSim\.venv\Scripts\python.exe -m manufacturing_sim.simulation.main decision=adaptive_priority heuristic_rules.world.battery.mandatory_swap_threshold_min=20
 ```
 
 ## Outputs
 
-- `events.jsonl`: event log for replay
-- `daily_summary.json`: day-level metrics
-- `kpi.json`: final KPI summary
-- `minute_snapshots.json`: minute-level system snapshots
-- `gantt_segments.csv`: intervals for machine/agent gantt
-- `gantt.html`: gantt chart
-- `kpi_dashboard.html`: KPI dashboard chart bundle
+Each run writes to `outputs/YYYY-MM-DD/HH-MM-SS/`.
 
-By default, simulation run auto-opens:
-- `kpi_dashboard.html`
-- `gantt.html`
-- Streamlit replay dashboard (`events.jsonl` of the latest run is passed via URL query)
+- `events.jsonl`: event log used by the replay UI.
+- `daily_summary.json`: day-level summary metrics.
+- `kpi.json`: final KPI summary.
+- `run_meta.json`: run mode and LLM metadata.
+- `minute_snapshots.json`: minute-level snapshots for replay/debugging.
+- `gantt.html`: machine/agent timeline dashboard.
+- `kpi_dashboard.html`: KPI dashboard.
+- `task_priority_dashboard.html`: task-priority trend dashboard.
+- `llm_trace.html`: LLM request/response trace dashboard for LLM runs.
+
+By default, the simulation opens selected HTML artifacts plus the Streamlit replay UI after the run finishes.
 
 ## Replay UI
 
 ```powershell
-C:\Github\mansim\.venv\Scripts\streamlit.exe run C:\Github\mansim\manufacturing_sim\simulation\scenarios\manufacturing\viz\replay_app.py
+C:\Github\ManSim\.venv\Scripts\streamlit.exe run C:\Github\ManSim\manufacturing_sim\simulation\scenarios\manufacturing\viz\replay_app.py
 ```
