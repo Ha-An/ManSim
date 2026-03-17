@@ -15,6 +15,10 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from manufacturing_sim.simulation.scenarios.manufacturing.run import run
+from manufacturing_sim.simulation.scenarios.manufacturing.viz.dashboard import export_kpi_dashboard
+from manufacturing_sim.simulation.scenarios.manufacturing.viz.gantt import export_gantt
+from manufacturing_sim.simulation.scenarios.manufacturing.viz.llm_trace import export_llm_trace_dashboard
+from manufacturing_sim.simulation.scenarios.manufacturing.viz.task_priority_dashboard import export_task_priority_dashboard
 
 
 def _open_artifact(path: Path) -> None:
@@ -51,6 +55,114 @@ def _open_url(url: str) -> None:
             webbrowser.open_new_tab(url)
         except Exception:
             pass
+
+
+def _load_json(path: Path) -> dict | list | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _recover_artifacts_if_possible(output_dir: Path, experiment_cfg: dict[str, object]) -> dict[str, object] | None:
+    progress = _load_json(output_dir / "progress.json")
+    progress_status = str(progress.get("status", "")) if isinstance(progress, dict) else ""
+    if progress_status not in {"exporting_artifacts", "completed"}:
+        return None
+
+    kpi = _load_json(output_dir / "kpi.json")
+    daily_summary_blob = _load_json(output_dir / "daily_summary.json")
+    run_meta = _load_json(output_dir / "run_meta.json")
+    if not isinstance(kpi, dict) or not isinstance(daily_summary_blob, dict):
+        return None
+    daily_summary = daily_summary_blob.get("days", []) if isinstance(daily_summary_blob.get("days", []), list) else []
+    events_path = output_dir / "events.jsonl"
+    if not events_path.exists():
+        return None
+
+    try:
+        events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except Exception:
+        return None
+
+    artifact_status: dict[str, object] = {"generated": {}, "errors": {}, "recovered": True}
+
+    gantt_path = output_dir / "gantt.html"
+    try:
+        export_gantt(events=events, output_dir=output_dir)
+        if gantt_path.exists():
+            artifact_status["generated"]["gantt"] = str(gantt_path)
+        else:
+            artifact_status["errors"]["gantt"] = "gantt export completed without creating gantt.html"
+    except BaseException as exc:
+        artifact_status["errors"]["gantt"] = f"{type(exc).__name__}: {exc}"
+
+    dashboard_path = None
+    try:
+        dashboard_path = export_kpi_dashboard(kpi=kpi, daily_summary=daily_summary, output_dir=output_dir)
+        if dashboard_path is not None and Path(dashboard_path).exists():
+            artifact_status["generated"]["kpi_dashboard"] = str(dashboard_path)
+        else:
+            artifact_status["errors"]["kpi_dashboard"] = "kpi dashboard export returned no HTML path"
+    except BaseException as exc:
+        artifact_status["errors"]["kpi_dashboard"] = f"{type(exc).__name__}: {exc}"
+
+    task_priority_dashboard_path = None
+    try:
+        task_priority_dashboard_path = export_task_priority_dashboard(
+            output_dir=output_dir,
+            events=events,
+            heuristic_rules=experiment_cfg.get("heuristic_rules", {}),
+        )
+        if task_priority_dashboard_path is not None and Path(task_priority_dashboard_path).exists():
+            artifact_status["generated"]["task_priority_dashboard"] = str(task_priority_dashboard_path)
+        else:
+            artifact_status["errors"]["task_priority_dashboard"] = "task priority dashboard export returned no HTML path"
+    except BaseException as exc:
+        artifact_status["errors"]["task_priority_dashboard"] = f"{type(exc).__name__}: {exc}"
+
+    llm_trace_path = ""
+    llm_exchange_blob = _load_json(output_dir / "llm_exchange.json")
+    records = llm_exchange_blob.get("records", []) if isinstance(llm_exchange_blob, dict) and isinstance(llm_exchange_blob.get("records", []), list) else []
+    if records:
+        try:
+            trace_path = export_llm_trace_dashboard(records=records, output_dir=output_dir)
+            if trace_path is not None and Path(trace_path).exists():
+                llm_trace_path = str(trace_path)
+                artifact_status["generated"]["llm_trace"] = llm_trace_path
+            else:
+                artifact_status["errors"]["llm_trace"] = "llm trace export returned no HTML path"
+        except BaseException as exc:
+            artifact_status["errors"]["llm_trace"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        (output_dir / "artifact_status.json").write_text(json.dumps(artifact_status, indent=2, ensure_ascii=True), encoding="utf-8")
+    except Exception:
+        pass
+
+    if isinstance(progress, dict):
+        progress["status"] = "completed"
+        progress["message"] = "simulation finished"
+        try:
+            (output_dir / "progress.json").write_text(json.dumps(progress, indent=2, ensure_ascii=True), encoding="utf-8")
+        except Exception:
+            pass
+
+    return {
+        "kpi": kpi,
+        "daily_summary": daily_summary,
+        "output_dir": str(output_dir),
+        "events_path": str(events_path),
+        "gantt_path": str(gantt_path),
+        "kpi_dashboard_path": str(dashboard_path) if dashboard_path else "",
+        "task_priority_dashboard_path": str(task_priority_dashboard_path) if task_priority_dashboard_path else "",
+        "llm_trace_path": llm_trace_path,
+        "terminated": bool(kpi.get("terminated", False)),
+        "termination_reason": str(kpi.get("termination_reason", "")),
+        "decision_mode": str((run_meta or {}).get("decision_mode", "")) if isinstance(run_meta, dict) else "",
+    }
 
 
 def _is_port_open(port: int) -> bool:
@@ -94,7 +206,7 @@ def _launch_streamlit_dashboard(
     try:
         subprocess.Popen(
             cmd,
-            cwd=str(app_path.parent.parent.parent.parent.parent),
+            cwd=str(app_path.parents[5]),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -118,50 +230,74 @@ def main(cfg: DictConfig) -> None:
     experiment_cfg["decision"] = OmegaConf.to_container(cfg.get("decision", {}), resolve=True)
     experiment_cfg["heuristic_rules"] = OmegaConf.to_container(cfg.get("heuristic_rules", {}), resolve=True)
     runtime_output_dir = Path(HydraConfig.get().runtime.output_dir)
-    result = run(experiment_cfg=experiment_cfg, output_dir=runtime_output_dir)
-    print(json.dumps(result["kpi"], indent=2))
-
-    ui_cfg = cfg.get("ui", {})
-
-    auto_open = bool(ui_cfg.get("auto_open_results", False))
-    if auto_open:
-        open_all_artifacts = bool(ui_cfg.get("open_all_artifacts", False))
-        opened_paths: set[Path] = set()
-
-        def _open_once(path: Path) -> None:
-            resolved = path.resolve()
-            if resolved in opened_paths:
-                return
-            opened_paths.add(resolved)
-            _open_artifact(path)
-
-        if open_all_artifacts:
-            for artifact_path in _iter_output_artifacts(runtime_output_dir):
-                _open_once(artifact_path)
+    print(f"[run] output_dir={runtime_output_dir}", flush=True)
+    print(f"[run] progress_path={runtime_output_dir / 'progress.json'}", flush=True)
+    result: dict[str, object] | None = None
+    try:
+        try:
+            result = run(experiment_cfg=experiment_cfg, output_dir=runtime_output_dir)
+        except BaseException:
+            recovered = _recover_artifacts_if_possible(runtime_output_dir, experiment_cfg)
+            if recovered is None:
+                raise
+            print("[run] artifact recovery completed after post-simulation failure", flush=True)
+            result = recovered
         else:
-            artifact_names = list(ui_cfg.get("open_artifacts", []))
-            for artifact_name in artifact_names:
-                _open_once(runtime_output_dir / str(artifact_name))
+            recovered = _recover_artifacts_if_possible(runtime_output_dir, experiment_cfg)
+            if recovered is not None:
+                result.update({k: v for k, v in recovered.items() if k.endswith('_path') or k in {'output_dir', 'events_path'}})
 
-        llm_trace_path = str(result.get("llm_trace_path", "")).strip()
-        if llm_trace_path:
-            _open_once(Path(llm_trace_path))
+        print(json.dumps(result["kpi"], indent=2))
 
-    auto_open_streamlit = bool(ui_cfg.get("auto_open_streamlit", False))
-    if auto_open_streamlit:
-        app_path = Path(__file__).resolve().parent / "scenarios" / "manufacturing" / "viz" / "replay_app.py"
-        events_path = Path(result["events_path"])
-        port_cfg = ui_cfg.get("streamlit_port_range", {})
-        range_start = int(port_cfg.get("start", 8505))
-        range_end = int(port_cfg.get("end", 8555))
-        preferred_port = int(ui_cfg.get("streamlit_preferred_port", 8505))
-        _launch_streamlit_dashboard(
-            app_path=app_path,
-            events_path=events_path,
-            preferred_port=preferred_port,
-            range_start=range_start,
-            range_end=range_end,
-        )
+        ui_cfg = cfg.get("ui", {})
+
+        auto_open = bool(ui_cfg.get("auto_open_results", False))
+        if auto_open:
+            open_all_artifacts = bool(ui_cfg.get("open_all_artifacts", False))
+            opened_paths: set[Path] = set()
+
+            def _open_once(path: Path) -> None:
+                resolved = path.resolve()
+                if resolved in opened_paths:
+                    return
+                opened_paths.add(resolved)
+                _open_artifact(path)
+
+            if open_all_artifacts:
+                for artifact_path in _iter_output_artifacts(runtime_output_dir):
+                    _open_once(artifact_path)
+            else:
+                artifact_names = list(ui_cfg.get("open_artifacts", []))
+                for artifact_name in artifact_names:
+                    _open_once(runtime_output_dir / str(artifact_name))
+
+            llm_trace_path = str(result.get("llm_trace_path", "")).strip()
+            if llm_trace_path:
+                _open_once(Path(llm_trace_path))
+
+        auto_open_streamlit = bool(ui_cfg.get("auto_open_streamlit", False))
+        if auto_open_streamlit:
+            app_path = Path(__file__).resolve().parent / "scenarios" / "manufacturing" / "viz" / "replay_app.py"
+            events_path = Path(result["events_path"])
+            port_cfg = ui_cfg.get("streamlit_port_range", {})
+            range_start = int(port_cfg.get("start", 8505))
+            range_end = int(port_cfg.get("end", 8555))
+            preferred_port = int(ui_cfg.get("streamlit_preferred_port", 8505))
+            _launch_streamlit_dashboard(
+                app_path=app_path,
+                events_path=events_path,
+                preferred_port=preferred_port,
+                range_start=range_start,
+                range_end=range_end,
+            )
+    except BaseException:
+        recovered = _recover_artifacts_if_possible(runtime_output_dir, experiment_cfg)
+        if recovered is None:
+            raise
+        if result is None:
+            print("[run] artifact recovery completed after post-simulation failure", flush=True)
+            print(json.dumps(recovered["kpi"], indent=2))
+        return
 
 
 if __name__ == "__main__":

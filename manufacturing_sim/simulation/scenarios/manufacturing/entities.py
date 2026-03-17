@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -23,8 +23,8 @@ class Machine:
     process_time_min: float
     state: MachineState = MachineState.WAIT_INPUT
     input_material: Optional[str] = None
-    input_component: Optional[str] = None
-    output_component: Optional[str] = None
+    input_intermediate: Optional[str] = None
+    output_intermediate: Optional[str] = None
     broken: bool = False
     failed_since: Optional[float] = None
     pm_until: float = 0.0
@@ -69,10 +69,11 @@ class Agent:
 class Task:
     task_id: str
     task_type: str
-    category: str
+    priority_key: str
     priority: float
     location: str
     payload: dict[str, Any] = field(default_factory=dict)
+    selection_meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

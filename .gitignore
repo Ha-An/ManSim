@@ -1,4 +1,4 @@
-﻿.venv/
+.venv/
 outputs/
 __pycache__/
 *.pyc
@@ -7,3 +7,4 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+_tmp_kor_test.txt

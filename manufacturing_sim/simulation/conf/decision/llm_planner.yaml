@@ -1,0 +1,37 @@
+﻿# LLM planner 모드
+# - LLM이 하루 단위 진단, task-priority weight, quota, norm update를 담당한다.
+# - 실제 runtime task dispatch는 엔진 점수 기반으로 수행한다.
+mode: llm_planner
+
+# breakdown / discharge 같은 긴급 이벤트 대응 on/off
+urgent_discuss:
+  enabled: false
+
+# false면 shared norm을 planning에서 숨기고, norm update도 수행하지 않는다.
+norms:
+  enabled: true
+
+llm:
+  enabled: true
+  provider: openai_compatible
+  server_url: "http://localhost:11434/v1"
+  model: "qwen2.5:14b"
+  timeout_sec: 120
+  temperature: 0.0
+  max_tokens: 800
+
+  communication:
+    # GovSim-style townhall 대화 on/off
+    enabled: true
+    # townhall 자연어 발언 언어: KOR 또는 ENG
+    language: KOR
+    rounds: 5
+    # 각 발화에서 transcript context로 유지할 최근 메시지 수
+    max_transcript_messages: 24
+
+  memory:
+    # discussion memory에 유지할 최근 day 수
+    history_window_days: 7
+    # per-agent memory snippet을 프롬프트에 포함할지 여부
+    include_agent_memory: true
+

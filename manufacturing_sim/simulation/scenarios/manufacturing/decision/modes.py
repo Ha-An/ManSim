@@ -1,20 +1,20 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Final
 
 
 _MODE_ALIASES: Final[dict[str, str]] = {
-    "heuristic": "adaptive_priority",
     "adaptive_priority": "adaptive_priority",
-    "heuristic_fixed": "fixed_priority",
     "fixed_priority": "fixed_priority",
-    "llm": "llm",
+    "llm_planner": "llm_planner",
+    "llm_task_selector": "llm_task_selector",
 }
 
 _MODE_LABELS: Final[dict[str, str]] = {
     "adaptive_priority": "Adaptive Priority",
     "fixed_priority": "Fixed Priority",
-    "llm": "LLM",
+    "llm_planner": "LLM Planner",
+    "llm_task_selector": "LLM Task Selector",
 }
 
 
@@ -32,3 +32,11 @@ def format_decision_mode_label(value: str | None) -> str:
 
 def is_fixed_priority_mode(value: str | None) -> bool:
     return normalize_decision_mode(value) == "fixed_priority"
+
+
+def is_llm_mode(value: str | None) -> bool:
+    return normalize_decision_mode(value) in {"llm_planner", "llm_task_selector"}
+
+
+def uses_llm_task_selector(value: str | None) -> bool:
+    return normalize_decision_mode(value) == "llm_task_selector"

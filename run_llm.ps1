@@ -1,8 +1,8 @@
-# Helper script for local LLM runs through Ollama on WSL.
+﻿# Helper script for local LLM runs through Ollama on WSL.
 # It keeps the WSL distro alive long enough to restart Ollama and then runs
 # the ManSim entry point with the requested decision preset.
 param(
-    [string]$Decision = "llm",
+    [string]$Decision = "llm_planner",
     [string]$Distro = "Ubuntu-24.04",
     [string]$PythonPath = ".\.venv\Scripts\python.exe",
     [string[]]$ExtraArgs = @()

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
+
+# Allow direct `streamlit run replay_app.py` from arbitrary working directories.
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 import re
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
@@ -15,6 +21,7 @@ import streamlit as st
 
 from manufacturing_sim.simulation.scenarios.manufacturing.decision.modes import (
     format_decision_mode_label,
+    is_llm_mode,
     normalize_decision_mode,
 )
 
@@ -61,7 +68,7 @@ MACHINE_STATUS_COLOR = {
 
 CARGO_COLOR = {
     "material": "#8e44ad",
-    "component": "#16a085",
+    "intermediate": "#16a085",
     "product": "#e67e22",
     "battery": "#f1c40f",
     "battery_fresh": "#f1c40f",
@@ -70,7 +77,7 @@ CARGO_COLOR = {
 
 CARGO_MARKER_SYMBOL = {
     "material": "diamond",
-    "component": "diamond",
+    "intermediate": "diamond",
     "product": "diamond",
     "battery": "triangle-up",
     "battery_fresh": "triangle-up",
@@ -122,7 +129,7 @@ def _load_battery_period_min(events_path_str: str, default: float = 180.0) -> fl
 
 @st.cache_data(show_spinner=False)
 def _load_run_meta(events_path_str: str) -> dict[str, Any]:
-    out = {"mode": "unknown", "model": "", "server_url": "", "communication_enabled": None}
+    out = {"mode": "unknown", "model": "", "server_url": "", "communication_enabled": None, "communication_language": ""}
     events_path = Path(events_path_str)
 
     run_meta_path = events_path.parent / "run_meta.json"
@@ -140,6 +147,7 @@ def _load_run_meta(events_path_str: str) -> dict[str, Any]:
             out["server_url"] = str(llm.get("server_url", "")).strip()
             if "communication_enabled" in llm:
                 out["communication_enabled"] = bool(llm.get("communication_enabled"))
+            out["communication_language"] = str(llm.get("communication_language", "")).strip().upper()
             if out["mode"] != "unknown":
                 return out
 
@@ -151,7 +159,7 @@ def _load_run_meta(events_path_str: str) -> dict[str, Any]:
 
     m_mode = re.search(r"(?m)^\s{2}mode\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*$", text)
     if m_mode:
-        out["mode"] = str(m_mode.group(1)).strip().lower()
+        out["mode"] = normalize_decision_mode(str(m_mode.group(1)).strip().lower())
     m_model = re.search(r'(?m)^\s{4}model\s*:\s*"?([^"\n]+)"?\s*$', text)
     if m_model:
         out["model"] = str(m_model.group(1)).strip()
@@ -266,19 +274,19 @@ def _task_carrying(task_type: str, payload: dict[str, Any]) -> str:
         if transfer_kind == "material_supply":
             return "material"
         from_station = int(payload.get("from_station", 0))
-        return "product" if from_station in {2, 4} else "component"
+        return "product" if from_station in {2, 4} else "intermediate"
     if task_type == "UNLOAD_MACHINE":
         station = int(payload.get("station", 0) or (_station_from_machine(str(payload.get("machine_id", ""))) or 0))
-        return "product" if station == 2 else "component"
+        return "product" if station == 2 else "intermediate"
     if task_type == "INSPECT_PRODUCT":
         # Queue 4 is product queue (final item before pass/fail)
         return "product"
     if task_type == "SETUP_MACHINE":
         # Setup now enforces one-item carry at a time.
         has_material = bool(payload.get("material_id"))
-        has_component = bool(payload.get("component_id"))
-        if has_component and not has_material:
-            return "component"
+        has_intermediate = bool(payload.get("intermediate_id"))
+        if has_intermediate and not has_material:
+            return "intermediate"
         return "material"
     return "-"
 
@@ -398,7 +406,7 @@ def _compute_machine_inputs(events_df: pd.DataFrame, current_t: float) -> dict[s
             machine_ids.add(drop_to)
 
     slots: dict[str, dict[str, Any]] = {
-        mid: {"material": False, "component": False, "output": ""}
+        mid: {"material": False, "intermediate": False, "output": ""}
         for mid in machine_ids
     }
 
@@ -417,27 +425,27 @@ def _compute_machine_inputs(events_df: pd.DataFrame, current_t: float) -> dict[s
                 if item_type == "material":
                     slots[machine_id]["material"] = True
                     slots[machine_id]["output"] = ""
-                elif item_type == "component":
-                    slots[machine_id]["component"] = True
+                elif item_type == "intermediate":
+                    slots[machine_id]["intermediate"] = True
                     slots[machine_id]["output"] = ""
 
         elif et == "MACHINE_START":
             machine_id = str(row.entity_id)
             if machine_id in slots:
                 slots[machine_id]["material"] = _has_val(details.get("input_material"))
-                slots[machine_id]["component"] = _has_val(details.get("input_component"))
+                slots[machine_id]["intermediate"] = _has_val(details.get("input_intermediate"))
                 slots[machine_id]["output"] = ""
 
         elif et == "MACHINE_END":
             machine_id = str(row.entity_id)
             if machine_id in slots:
                 slots[machine_id]["material"] = False
-                slots[machine_id]["component"] = False
-                output_id = str(details.get("output_component", "")).strip()
+                slots[machine_id]["intermediate"] = False
+                output_id = str(details.get("output_intermediate", "")).strip()
                 if output_id.upper().startswith("PRODUCT"):
                     slots[machine_id]["output"] = "product"
                 elif output_id:
-                    slots[machine_id]["output"] = "component"
+                    slots[machine_id]["output"] = "intermediate"
                 else:
                     slots[machine_id]["output"] = "product"
 
@@ -450,7 +458,7 @@ def _compute_machine_inputs(events_df: pd.DataFrame, current_t: float) -> dict[s
             machine_id = str(row.entity_id)
             if machine_id in slots:
                 slots[machine_id]["material"] = False
-                slots[machine_id]["component"] = False
+                slots[machine_id]["intermediate"] = False
                 slots[machine_id]["output"] = ""
 
     return slots
@@ -500,8 +508,8 @@ def _simulation_datetime(events_df: pd.DataFrame, current_t: float) -> tuple[int
 def _compute_queue_snapshot(events_df: pd.DataFrame, current_t: float) -> dict[str, dict[int, list[str]]]:
     filtered = events_df[events_df["t"] <= current_t]
     material: dict[int, list[str]] = {1: [], 2: []}
-    # Station1 is material-only; component/product queues start from Station2.
-    component: dict[int, list[str]] = {2: [], 4: []}
+    # Station1 is material-only; intermediate/product queues start from Station2.
+    intermediate: dict[int, list[str]] = {2: [], 4: []}
     output_buffer: dict[int, list[str]] = {1: [], 2: [], 4: []}
     warehouse_completed: list[str] = []
     active_transfer_from_station: dict[str, int] = {}
@@ -567,12 +575,12 @@ def _compute_queue_snapshot(events_df: pd.DataFrame, current_t: float) -> dict[s
         entity = str(row.entity_id)
         queue_kind = str(details.get("queue", ""))
         item_id = str(details.get("item_id", ""))
-        m = re.match(r"(material|component)_queue_(\d+)", entity)
+        m = re.match(r"(material|intermediate)_queue_(\d+)", entity)
         if not m:
             continue
         station = int(m.group(2))
 
-        target = material if queue_kind == "material" else component
+        target = material if queue_kind == "material" else intermediate
         if station not in target:
             continue
 
@@ -587,7 +595,7 @@ def _compute_queue_snapshot(events_df: pd.DataFrame, current_t: float) -> dict[s
 
     return {
         "material": material,
-        "component": component,
+        "intermediate": intermediate,
         "output_buffer": output_buffer,
         "warehouse_completed": warehouse_completed,
     }
@@ -595,6 +603,18 @@ def _compute_queue_snapshot(events_df: pd.DataFrame, current_t: float) -> dict[s
 
 def _format_inventory(items: list[str]) -> str:
     return str(len(items))
+
+
+def _decision_source_label(source: str) -> str:
+    normalized = str(source or "").strip().lower()
+    labels = {
+        "hard_constraint": "Hard Constraint",
+        "single_candidate": "Single Candidate",
+        "priority_score": "Priority Score",
+        "priority_score_fallback": "Score Fallback",
+        "llm_task_selector": "LLM Selector",
+    }
+    return labels.get(normalized, "-" if not normalized else normalized.replace("_", " ").title())
 
 
 def _compute_agent_states(
@@ -621,6 +641,9 @@ def _compute_agent_states(
                 "zone",
                 "location_mode",
                 "task",
+                "decision",
+                "decision_rule",
+                "decision_rationale",
                 "target",
                 "battery",
                 "carrying",
@@ -640,6 +663,9 @@ def _compute_agent_states(
             "zone": "Warehouse",
             "location_mode": "zone",
             "task": "-",
+            "decision": "-",
+            "decision_rule": "-",
+            "decision_rationale": "",
             "target": "-",
             "carrying": "-",
             "status": "IDLE",
@@ -680,11 +706,13 @@ def _compute_agent_states(
         if et == "AGENT_TASK_START" and aid in states:
             task_type = str(details.get("task_type", "-"))
             payload = details.get("payload", {}) if isinstance(details.get("payload", {}), dict) else {}
+            selection = details.get("selection", {}) if isinstance(details.get("selection", {}), dict) else {}
             paused_in_transit.pop(aid, None)
             active_tasks[aid] = {
                 "task_id": str(details.get("task_id", "")),
                 "task_type": task_type,
                 "payload": payload,
+                "selection": selection,
                 "start_t": float(row.t),
                 "start_zone": states[aid]["zone"],
             }
@@ -817,6 +845,9 @@ def _compute_agent_states(
         elapsed_since_swap = max(0.0, current_t - float(last_swap.get(aid, 0.0)))
         battery_remaining = max(0.0, battery_period_min - elapsed_since_swap)
         states[aid]["battery"] = round(battery_remaining, 2)
+        states[aid]["decision"] = "-"
+        states[aid]["decision_rule"] = "-"
+        states[aid]["decision_rationale"] = ""
 
         if aid in discharged_agents:
             states[aid]["status"] = "DISCHARGED"
@@ -951,7 +982,11 @@ def _compute_agent_states(
         elapsed = max(0.0, current_t - start_t)
         eta_task = max(0.0, est_duration - elapsed)
 
+        selection = active.get("selection", {}) if isinstance(active.get("selection", {}), dict) else {}
         states[aid]["task"] = task_type
+        states[aid]["decision"] = _decision_source_label(str(selection.get("decision_source", "")))
+        states[aid]["decision_rule"] = str(selection.get("decision_rule", "")).strip() or "-"
+        states[aid]["decision_rationale"] = str(selection.get("decision_rationale", "")).strip()
         states[aid]["target"] = _task_target(task_type, payload)
         states[aid]["carrying"] = carrying_now.get(aid, "-")
         transfer_kind = str(payload.get("transfer_kind", "")).lower() if isinstance(payload, dict) else ""
@@ -1132,7 +1167,7 @@ def _draw_factory_map(
             x = anchor_x - idx * 0.06 if right_align else anchor_x + idx * 0.06
             queue_x.append(x)
             queue_y.append(anchor_y)
-            queue_c.append(CARGO_COLOR.get(item_kind, CARGO_COLOR["component"]))
+            queue_c.append(CARGO_COLOR.get(item_kind, CARGO_COLOR["intermediate"]))
             queue_h.append(f"{queue_label}<br>item_id={item_id}<br>item_type={item_kind}")
         if len(items) > 5:
             ellipsis_x = anchor_x - 5 * 0.06 if right_align else anchor_x - 0.06
@@ -1208,10 +1243,10 @@ def _draw_factory_map(
                     right_align=False,
                 )
             else:
-                comp_items = queue_snapshot["component"].get(station, [])
+                comp_items = queue_snapshot["intermediate"].get(station, [])
                 queue_text = (
                     f"Material Queue: {_format_inventory(mat_items)}<br>"
-                    f"Component Queue: {_format_inventory(comp_items)}"
+                    f"Intermediate Queue: {_format_inventory(comp_items)}"
                 )
                 add_queue_markers(
                     items=mat_items,
@@ -1223,10 +1258,10 @@ def _draw_factory_map(
                 )
                 add_queue_markers(
                     items=comp_items,
-                    item_kind="component",
+                    item_kind="intermediate",
                     anchor_x=z["x0"] + 0.18,
                     anchor_y=((z["y0"] + z["y1"]) / 2.0) - 0.06,
-                    queue_label=f"Station{station} Component Queue",
+                    queue_label=f"Station{station} Intermediate Queue",
                     right_align=False,
                 )
             fig.add_annotation(
@@ -1240,7 +1275,7 @@ def _draw_factory_map(
                 font=dict(size=9, color="#34495e"),
             )
         elif zone_name == "Inspection":
-            inspect_items = queue_snapshot["component"].get(4, [])
+            inspect_items = queue_snapshot["intermediate"].get(4, [])
             queue_text = f"Product Queue: {_format_inventory(inspect_items)}"
             add_queue_markers(
                 items=inspect_items,
@@ -1361,10 +1396,10 @@ def _draw_factory_map(
             for idx, item_id in enumerate(visible_items):
                 dx = idx * 0.06
                 item_upper = str(item_id).upper()
-                item_kind = "product" if item_upper.startswith("PRODUCT") else "component"
+                item_kind = "product" if item_upper.startswith("PRODUCT") else "intermediate"
                 ob_x.append(anchor_x + dx)
                 ob_y.append(anchor_y)
-                ob_c.append(CARGO_COLOR.get(item_kind, CARGO_COLOR["component"]))
+                ob_c.append(CARGO_COLOR.get(item_kind, CARGO_COLOR["intermediate"]))
                 ob_h.append(
                     f"station=Station{station}<br>output_buffer_item={item_id}<br>item_type={item_kind}"
                 )
@@ -1392,7 +1427,7 @@ def _draw_factory_map(
                 )
             )
 
-        # Visualize machine-internal loaded inputs (material/component).
+        # Visualize machine-internal loaded inputs (material/intermediate).
         in_x: list[float] = []
         in_y: list[float] = []
         in_c: list[str] = []
@@ -1404,13 +1439,13 @@ def _draw_factory_map(
                 in_y.append(my0 + 0.028)
                 in_c.append(CARGO_COLOR["material"])
                 in_h.append(f"{machine_id}<br>in_machine=material")
-            if slots.get("component", False):
+            if slots.get("intermediate", False):
                 in_x.append(mx0 - 0.028)
                 in_y.append(my0 - 0.028)
-                in_c.append(CARGO_COLOR["component"])
-                in_h.append(f"{machine_id}<br>in_machine=component")
+                in_c.append(CARGO_COLOR["intermediate"])
+                in_h.append(f"{machine_id}<br>in_machine=intermediate")
             output_kind = str(slots.get("output", "")).strip().lower()
-            if output_kind in {"component", "product"}:
+            if output_kind in {"intermediate", "product"}:
                 in_x.append(mx0 + 0.03)
                 in_y.append(my0)
                 in_c.append(CARGO_COLOR.get(output_kind, CARGO_COLOR["product"]))
@@ -1536,6 +1571,9 @@ def _draw_factory_map(
                         f"agent_id={row.agent_id}",
                         f"battery_remaining={row.battery:.1f} min",
                         f"current_task_type={row.task}",
+                        f"decision={getattr(row, 'decision', '-')}",
+                        f"decision_rule={getattr(row, 'decision_rule', '-')}",
+                        f"decision_note={getattr(row, 'decision_rationale', '') or '-'}",
                         f"carrying={row.carrying}",
                         f"eta={row.eta:.1f} min",
                         f"status={row.status}",
@@ -1544,15 +1582,15 @@ def _draw_factory_map(
                 )
             )
             carrying = str(row.carrying).strip().lower()
-            if carrying == "material+component":
+            if carrying == "material+intermediate":
                 cargo_x.extend([x - 0.035, x + 0.035])
                 cargo_y.extend([y, y])
-                cargo_color.extend([CARGO_COLOR["material"], CARGO_COLOR["component"]])
-                cargo_symbol.extend([_cargo_symbol("material"), _cargo_symbol("component")])
+                cargo_color.extend([CARGO_COLOR["material"], CARGO_COLOR["intermediate"]])
+                cargo_symbol.extend([_cargo_symbol("material"), _cargo_symbol("intermediate")])
                 cargo_hovers.extend(
                     [
                         f"agent_id={row.agent_id}<br>carrying=material",
-                        f"agent_id={row.agent_id}<br>carrying=component",
+                        f"agent_id={row.agent_id}<br>carrying=intermediate",
                     ]
                 )
             elif carrying in CARGO_COLOR:
@@ -1877,10 +1915,10 @@ def _render_map_legend() -> None:
     st.markdown("<div style='font-size:12px;font-weight:700;margin-top:6px;'>Cargo Items</div>", unsafe_allow_html=True)
     cargo_labels = {
         "material": "Material",
-        "component": "Component",
+        "intermediate": "Intermediate",
         "product": "Product",
     }
-    cargo_order = ["material", "component", "product"]
+    cargo_order = ["material", "intermediate", "product"]
     for cargo_kind in cargo_order:
         if cargo_kind not in CARGO_COLOR:
             continue
@@ -1951,11 +1989,11 @@ def main() -> None:
 
     run_meta = _load_run_meta(str(events_path))
     mode = str(run_meta.get("mode", "unknown")).strip().lower() or "unknown"
-    if mode == "llm":
+    if is_llm_mode(mode):
         comm = run_meta.get("communication_enabled", None)
         comm_label = "on" if bool(comm) else "off"
         st.info(
-            f"Run mode: LLM | model={run_meta.get('model', '-') or '-'} | communication={comm_label} | server={run_meta.get('server_url', '-') or '-'}"
+            f"Run mode: {format_decision_mode_label(mode)} | model={run_meta.get('model', '-') or '-'} | communication={comm_label} | server={run_meta.get('server_url', '-') or '-'}"
         )
     else:
         st.info(f"Run mode: {format_decision_mode_label(mode)}")
@@ -2043,7 +2081,7 @@ def main() -> None:
                 axis=1,
             )
         display_df = display_df[
-            ["agent_id", "zone", "status", "task", "target", "battery", "carrying", "down_reason", "eta"]
+            ["agent_id", "zone", "status", "task", "decision", "target", "battery", "carrying", "down_reason", "eta"]
         ].copy()
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 

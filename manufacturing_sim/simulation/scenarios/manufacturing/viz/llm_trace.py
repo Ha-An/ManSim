@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from html import escape
@@ -46,6 +46,104 @@ def export_llm_trace_dashboard(*, records: list[dict[str, Any]], output_dir: Pat
         except (TypeError, ValueError):
             return default
 
+    def _pretty_json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+
+    def _render_text_block(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            return escape(_pretty_json(value))
+
+        text_value = str(value)
+        stripped = text_value.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                return escape(_pretty_json(parsed))
+
+        normalized = text_value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "    ")
+        return escape(normalized)
+
+    def _structured_prompt_content_html(role: str, content: Any) -> str:
+        role_label = escape(role.title())
+        content_text = str(content)
+        normalized = content_text.replace("\r\n", "\n").replace("\n", "\n")
+
+        if role.lower() != "user" or "\nInput JSON:\n" not in normalized:
+            return f"<div><h4>{role_label} Prompt</h4><pre>{_render_text_block(content_text)}</pre></div>"
+
+        title, remainder = normalized.split("\nInput JSON:\n", 1)
+        schema_marker = "\n\nReturn JSON schema:\n"
+        input_json_text = remainder
+        schema_text = ""
+        if schema_marker in remainder:
+            input_json_text, schema_text = remainder.split(schema_marker, 1)
+
+        blocks: list[str] = [f"<div><h4>{role_label} Prompt</h4>"]
+        if title.strip():
+            blocks.append(f"<div><h5>Instruction</h5><pre>{_render_text_block(title.strip())}</pre></div>")
+        if input_json_text.strip():
+            blocks.append(f"<div><h5>Input JSON</h5><pre>{_render_text_block(input_json_text.strip())}</pre></div>")
+        if schema_text.strip():
+            blocks.append(f"<div><h5>Return JSON Schema</h5><pre>{_render_text_block(schema_text.strip())}</pre></div>")
+        blocks.append("</div>")
+        return "".join(blocks)
+
+    def _request_prompt_html(req: dict[str, Any]) -> str:
+        payload = req.get("payload", {}) if isinstance(req.get("payload", {}), dict) else {}
+        messages = payload.get("messages", []) if isinstance(payload.get("messages", []), list) else []
+        blocks: list[str] = []
+
+        req_meta = {k: v for k, v in req.items() if k != "payload"}
+        if req_meta:
+            blocks.append(f"<div><h4>Transport</h4><pre>{escape(_pretty_json(req_meta))}</pre></div>")
+
+        payload_meta = {k: v for k, v in payload.items() if k != "messages"}
+        if payload_meta:
+            blocks.append(f"<div><h4>Request Meta</h4><pre>{escape(_pretty_json(payload_meta))}</pre></div>")
+
+        for idx, msg in enumerate(messages, start=1):
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", f"message_{idx}")).strip() or f"message_{idx}"
+            content = msg.get("content", "")
+            blocks.append(_structured_prompt_content_html(role, content))
+
+        return "".join(blocks) if blocks else "<pre>-</pre>"
+
+    def _response_content_html(rec: dict[str, Any], resp: dict[str, Any], parsed: dict[str, Any]) -> str:
+        blocks: list[str] = []
+
+        if parsed:
+            blocks.append(f"<div><h4>Parsed JSON</h4><pre>{escape(_pretty_json(parsed))}</pre></div>")
+
+        response_text = rec.get("response_text", "")
+        if str(response_text).strip():
+            blocks.append(f"<div><h4>Response Content</h4><pre>{_render_text_block(response_text)}</pre></div>")
+
+        if resp:
+            compact_resp = dict(resp)
+            try:
+                choices = compact_resp.get("choices", [])
+                if isinstance(choices, list) and choices:
+                    first_choice = choices[0] if isinstance(choices[0], dict) else {}
+                    message = first_choice.get("message", {}) if isinstance(first_choice.get("message", {}), dict) else {}
+                    if "content" in message:
+                        message = dict(message)
+                        message["content"] = "<see Response Content>"
+                        first_choice = dict(first_choice)
+                        first_choice["message"] = message
+                        compact_resp["choices"] = [first_choice] + choices[1:]
+            except Exception:
+                pass
+            blocks.append(
+                f"<div><h4>Raw Response Envelope</h4><pre>{escape(_pretty_json(compact_resp))}</pre></div>"
+            )
+
+        return "".join(blocks) if blocks else "<pre>-</pre>"
+
     summary_rows: list[dict[str, Any]] = []
     for rec in records:
         ctx = rec.get("context", {}) if isinstance(rec.get("context", {}), dict) else {}
@@ -79,48 +177,6 @@ def export_llm_trace_dashboard(*, records: list[dict[str, Any]], output_dir: Pat
         )
 
     summary_rows = sorted(summary_rows, key=lambda x: x["call_id"])
-
-    y_labels = [f"#{r['call_id']} {r['phase']}" for r in summary_rows]
-    x_latency = [float(r["latency_sec"]) for r in summary_rows]
-    colors = ["#2a9d8f" if str(r["status"]).lower() == "ok" else "#e76f51" for r in summary_rows]
-    hover = [
-        "<br>".join(
-            [
-                f"call_id={r['call_id']}",
-                f"phase={r['phase']}",
-                f"day={r['day']}",
-                f"round={r['round']}",
-                f"agent={r['agent_id'] or '-'}",
-                f"status={r['status']}",
-                f"latency={r['latency_sec']}s",
-                f"prompt_chars={r['prompt_chars']}",
-                f"response_chars={r['response_chars']}",
-                f"started_at_utc={r['started_at_utc']}",
-            ]
-        )
-        for r in summary_rows
-    ]
-
-    latency_fig = go.Figure(
-        data=[
-            go.Bar(
-                x=x_latency,
-                y=y_labels,
-                orientation="h",
-                marker=dict(color=colors),
-                hovertext=hover,
-                hoverinfo="text",
-                name="latency_sec",
-            )
-        ]
-    )
-    latency_fig.update_layout(
-        title="LLM Call Latency by Step",
-        xaxis_title="Latency (sec)",
-        yaxis_title="Call",
-        height=max(420, 34 * max(1, len(summary_rows)) + 140),
-        margin=dict(l=120, r=40, t=60, b=40),
-    )
 
     table_fig = go.Figure(
         data=[
@@ -180,15 +236,13 @@ def export_llm_trace_dashboard(*, records: list[dict[str, Any]], output_dir: Pat
                     f"<summary>#{call_id} | {escape(call_name)} | status={escape(status)} | latency={latency:.3f}s</summary>",
                     "<div class='meta'>",
                     f"<div><strong>started_at_utc</strong>: {escape(str(rec.get('started_at_utc', '')))}</div>",
-                    f"<div><strong>context</strong><pre>{escape(json.dumps(ctx, ensure_ascii=False, indent=2))}</pre></div>",
+                    f"<div><strong>context</strong><pre>{escape(_pretty_json(ctx))}</pre></div>",
                     "</div>",
                     "<div class='grid'>",
-                    f"<div><h4>Request</h4><pre>{escape(json.dumps(req, ensure_ascii=False, indent=2))}</pre></div>",
-                    f"<div><h4>Response</h4><pre>{escape(json.dumps(resp, ensure_ascii=False, indent=2))}</pre></div>",
+                    f"<div><h3>Request</h3>{_request_prompt_html(req)}</div>",
+                    f"<div><h3>Response</h3>{_response_content_html(rec, resp, parsed)}</div>",
                     "</div>",
-                    f"<div><h4>Parsed JSON</h4><pre>{escape(json.dumps(parsed, ensure_ascii=False, indent=2))}</pre></div>",
-                    f"<div><h4>Response Content</h4><pre>{escape(str(rec.get('response_text', '')))}</pre></div>",
-                    f"<div><h4>Error</h4><pre>{escape(str(rec.get('error', '')))}</pre></div>",
+                    f"<div><h4>Error</h4><pre>{_render_text_block(rec.get('error', ''))}</pre></div>",
                     "</details>",
                 ]
             )
@@ -212,8 +266,9 @@ def export_llm_trace_dashboard(*, records: list[dict[str, Any]], output_dir: Pat
             ".call { border:1px solid #d1d5db; border-radius:8px; padding:8px 10px; margin:10px 0; background:#fff; }",
             ".call summary { cursor:pointer; font-weight:600; }",
             ".meta { margin-top:10px; font-size:13px; }",
-            ".grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:10px; }",
-            "pre { background:#f8fafc; border:1px solid #e5e7eb; border-radius:6px; padding:10px; overflow:auto; white-space:pre-wrap; word-break:break-word; }",
+            ".grid { display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1fr); gap:12px; margin-top:10px; align-items:start; }",
+            "pre { background:#f8fafc; border:1px solid #e5e7eb; border-radius:6px; padding:10px; overflow:auto; white-space:pre-wrap; word-break:break-word; line-height:1.5; }",
+            ".grid h3, .grid h4 { margin-top: 6px; }",
             "h1, h2, h3, h4 { margin: 8px 0; }",
             "</style>",
             "</head>",
@@ -226,10 +281,9 @@ def export_llm_trace_dashboard(*, records: list[dict[str, Any]], output_dir: Pat
             f"<div class='badge'><strong>{escape(format_run_mode_line(meta))}</strong></div>",
             "<div class='badge'><strong>Source</strong>: simulation decision.llm calls</div>",
             "</div>",
-            latency_fig.to_html(full_html=False, include_plotlyjs=True),
-            table_fig.to_html(full_html=False, include_plotlyjs=False),
+            table_fig.to_html(full_html=False, include_plotlyjs=True),
             "<h2>Request / Response Detail</h2>",
-            "<p>Expand each row to inspect full request payload, raw server response, parsed JSON, and errors.</p>",
+            "<p>Expand each row to inspect request prompts, response content, parsed JSON, and errors.</p>",
             *detail_blocks,
             "</body>",
             "</html>",
@@ -238,4 +292,3 @@ def export_llm_trace_dashboard(*, records: list[dict[str, Any]], output_dir: Pat
 
     html_path.write_text(html, encoding="utf-8")
     return html_path
-

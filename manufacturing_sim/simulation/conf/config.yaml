@@ -1,43 +1,45 @@
-# Global root config for ManSim (Hydra).
+# ManSim 전체 root 설정 (Hydra)
 defaults:
-  # Experiment scenario (factory layout, timing, inventory, failures).
+  # 실험 시나리오: 공장 구조, 처리 시간, 재고 목표, 고장/품질 파라미터
   - experiment: mfg_basic
-  # Decision mode:
-  # - adaptive_priority: rule-based mode with runtime priority adaptation
-  # - fixed_priority: rule-based mode with fixed task priorities
-  # - llm: LLM-based decision making
-  # Backward-compatible aliases are still supported: heuristic, heuristic_fixed
-  # Override example: decision=adaptive_priority / decision=fixed_priority / decision=llm
-  - decision: llm
-  # Shared rule set used by the rule-based modes and by parts of the world logic.
+  # decision preset 선택
+  # - adaptive_priority: 규칙 기반, 실행 중 priority 적응
+  # - fixed_priority: 규칙 기반, task-priority weight 고정 베이스라인
+  # - llm_planner: LLM이 일일 진단/weight/quota/norm을 계획
+  # - llm_task_selector: 엔진이 후보를 만들고 LLM이 next task 선택
+  - decision: llm_planner
+  # 규칙 기반 모드와 일부 world 기본값이 참조하는 공통 rule set
   - heuristic_rules: default
-  # Keep values from this file after defaults merge.
+  # defaults 병합 후 이 파일 값을 유지
   - _self_
 
-# Run label for logs/metadata.
+# 실행 이름. 로그와 메타데이터에 남는다.
 run_name: manufacturing_sim
 
-# Random seed:
-# - null: non-deterministic
-# - integer: reproducible run
+# 랜덤 seed
+# - null: 비결정적 실행
+# - integer: 같은 설정에서 재현 가능한 실행
 seed: 2026
 
 ui:
-  # Auto-open result artifacts after simulation ends.
+  # 시뮬레이션 종료 후 결과 HTML 자동 오픈 여부
   auto_open_results: true
-  # If true, open all generated top-level artifacts in the output folder.
-  # If false, only open artifacts listed under open_artifacts.
+  # true면 output 폴더의 최상위 HTML을 전부 연다.
+  # false면 open_artifacts에 적은 파일만 연다.
   open_all_artifacts: false
-  # Used only when open_all_artifacts=false.
   open_artifacts:
     - kpi_dashboard.html
     - gantt.html
     - task_priority_dashboard.html
-  # Auto-launch Streamlit replay UI.
-  auto_open_streamlit: true
-  # Preferred port (falls back to range if occupied).
+  # Streamlit replay UI 자동 실행 여부
+  auto_open_streamlit: false
+  # 우선 사용할 포트. 이미 점유돼 있으면 port_range 안에서 탐색
   streamlit_preferred_port: 8505
-  # Streamlit port scan range.
   streamlit_port_range:
     start: 8505
     end: 8555
+
+# 각 decision preset 파일에서 주로 정의하는 항목
+# - urgent_discuss.enabled: breakdown/discharge 같은 긴급 이벤트 대응 on/off
+# - norms.enabled: shared norm을 planning에 반영할지 여부
+# - llm.*: LLM 서버, 모델, communication, selector 세부 설정

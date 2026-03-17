@@ -1,6 +1,15 @@
-# Rule-based decision mode with runtime task-priority adaptation.
-# This is the recommended non-LLM mode for first runs and CI checks.
+﻿# 규칙 기반 적응형 모드
+# - direct task-priority weight를 실행 중 조정한다.
+# - LLM 서버 없이도 돌릴 수 있는 기본 비LLM 모드다.
 mode: adaptive_priority
+
+# breakdown / discharge 같은 긴급 이벤트 대응 on/off
+urgent_discuss:
+  enabled: true
+
+# shared norm을 planning에 반영할지 여부
+norms:
+  enabled: true
 
 llm:
   enabled: false

@@ -18,13 +18,13 @@ def machine_lifecycle(env: simpy.Environment, world: ManufacturingWorld, machine
             yield env.timeout(1)
             continue
 
-        if machine.output_component is not None:
+        if machine.output_intermediate is not None:
             machine.state = MachineState.DONE_WAIT_UNLOAD
             yield env.timeout(1)
             continue
 
-        needs_component = world._station_requires_component(machine.station)
-        if machine.input_material is None or (needs_component and machine.input_component is None):
+        needs_intermediate = world._station_requires_intermediate(machine.station)
+        if machine.input_material is None or (needs_intermediate and machine.input_intermediate is None):
             machine.state = MachineState.WAIT_INPUT
             yield env.timeout(1)
             continue
