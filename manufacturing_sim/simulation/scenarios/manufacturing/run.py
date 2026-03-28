@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,14 +8,16 @@ from typing import Any
 
 import simpy
 
-from manufacturing_sim.simulation.scenarios.manufacturing.decision.llm_optional import OptionalLLMDecisionModule
-from manufacturing_sim.simulation.scenarios.manufacturing.decision.llm_task_selector import LLMTaskSelectorDecisionModule
+from manufacturing_sim.simulation.scenarios.manufacturing.decision.llm_common import OptionalLLMDecisionModule
+from manufacturing_sim.simulation.scenarios.manufacturing.decision.openclaw_orchestrated import OpenClawOrchestratedDecisionModule
 from manufacturing_sim.simulation.scenarios.manufacturing.decision.modes import is_llm_mode, normalize_decision_mode
 from manufacturing_sim.simulation.scenarios.manufacturing.decision.scripted import ScriptedDecisionModule
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
+from manufacturing_sim.simulation.scenarios.manufacturing.viz.orchestration_intelligence_dashboard import export_orchestration_intelligence_dashboard
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.dashboard import export_kpi_dashboard
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.gantt import export_gantt
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.llm_trace import export_llm_trace_dashboard
+from manufacturing_sim.simulation.scenarios.manufacturing.viz.openclaw_workspace_dashboard import export_openclaw_workspace_dashboard
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.task_priority_dashboard import (
     export_task_priority_dashboard,
 )
@@ -41,6 +43,161 @@ def _write_progress(output_root: Path, payload: dict[str, Any]) -> None:
     progress_path = output_root / "progress.json"
     progress_path.write_text(__import__("json").dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
+
+
+def _safe_float_val(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _quantile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    if q <= 0:
+        return values[0]
+    if q >= 1:
+        return values[-1]
+    ordered = sorted(values)
+    idx = (len(ordered) - 1) * q
+    lo = int(idx)
+    hi = min(lo + 1, len(ordered) - 1)
+    if lo == hi:
+        return float(ordered[lo])
+    frac = idx - lo
+    return float(ordered[lo] + (ordered[hi] - ordered[lo]) * frac)
+
+
+def _latency_stats_ms(rows: list[dict[str, Any]]) -> dict[str, float]:
+    latencies = [_safe_float_val(rec.get("latency_ms"), 0.0) for rec in rows if _safe_float_val(rec.get("latency_ms"), 0.0) >= 0]
+    if not latencies:
+        return {
+            "count": 0,
+            "p50_ms": 0.0,
+            "p90_ms": 0.0,
+            "p95_ms": 0.0,
+            "p99_ms": 0.0,
+            "mean_ms": 0.0,
+            "min_ms": 0.0,
+            "max_ms": 0.0,
+        }
+
+    ordered = sorted(latencies)
+    count = len(ordered)
+    return {
+        "count": count,
+        "p50_ms": round(_quantile(ordered, 0.50), 3),
+        "p90_ms": round(_quantile(ordered, 0.90), 3),
+        "p95_ms": round(_quantile(ordered, 0.95), 3),
+        "p99_ms": round(_quantile(ordered, 0.99), 3),
+        "mean_ms": round(sum(ordered) / float(count), 3),
+        "min_ms": round(ordered[0], 3),
+        "max_ms": round(ordered[-1], 3),
+    }
+
+
+def _summarize_llm_transport_metrics(records: list[dict[str, Any]] | None) -> dict[str, Any]:
+    rows = records if isinstance(records, list) else []
+    total_calls = len(rows)
+    requested_native = sum(1 for rec in rows if str(rec.get("transport_requested", "")).strip() == "native_local")
+    used_native = sum(1 for rec in rows if str(rec.get("transport_used", "")).strip() == "native_local")
+    used_chat = sum(1 for rec in rows if str(rec.get("transport_used", "")).strip() == "chat_compat")
+    fallback_count = sum(1 for rec in rows if bool(rec.get("native_fallback_used", False)))
+    default_contract_count = sum(1 for rec in rows if bool(rec.get("native_default_contract_used", False)) or "native_default_contract_used" in str(rec.get("error", "")))
+
+    backend_checked = 0
+    backend_healthy = 0
+    backend_failed = 0
+    by_phase: dict[str, dict[str, Any]] = {}
+
+    for rec in rows:
+        ctx = rec.get("context", {}) if isinstance(rec.get("context", {}), dict) else {}
+        phase = str(ctx.get("phase", rec.get("call_name", "llm_call"))).strip() or str(rec.get("call_name", "llm_call")).strip() or "llm_call"
+
+        phase_entry = by_phase.setdefault(
+            phase,
+            {
+                "calls": 0,
+                "requested_native": 0,
+                "used_native": 0,
+                "used_chat": 0,
+                "native_fallback_count": 0,
+                "native_default_contract_count": 0,
+                "latencies_ms": [],
+                "attempt_counts": [],
+                "backend_health_ok": 0,
+                "backend_health_checked": 0,
+            },
+        )
+        phase_entry["calls"] += 1
+        if str(rec.get("transport_requested", "")).strip() == "native_local":
+            phase_entry["requested_native"] += 1
+        if str(rec.get("transport_used", "")).strip() == "native_local":
+            phase_entry["used_native"] += 1
+        if str(rec.get("transport_used", "")).strip() == "chat_compat":
+            phase_entry["used_chat"] += 1
+        if bool(rec.get("native_fallback_used", False)):
+            phase_entry["native_fallback_count"] += 1
+        if bool(rec.get("native_default_contract_used", False)) or "native_default_contract_used" in str(rec.get("error", "")):
+            phase_entry["native_default_contract_count"] += 1
+
+        latency_ms = _safe_float_val(rec.get("latency_ms"), -1.0)
+        if latency_ms >= 0:
+            phase_entry["latencies_ms"].append(latency_ms)
+
+        attempt_count = _safe_float_val(rec.get("attempt_count", 0), 0.0)
+        phase_entry["attempt_counts"].append(attempt_count)
+
+        backend_raw = rec.get("backend_health", None)
+        backend = backend_raw if isinstance(backend_raw, dict) else None
+        backend_checked_flag = isinstance(backend, dict) and (
+            "ok" in backend or "checked_at" in backend or "gateway" in backend or "backend" in backend
+        )
+        if backend_checked_flag:
+            phase_entry["backend_health_checked"] += 1
+            backend_checked += 1
+            if bool(backend.get("ok", False)):
+                phase_entry["backend_health_ok"] += 1
+                backend_healthy += 1
+            else:
+                backend_failed += 1
+
+    for phase_entry in by_phase.values():
+        denom = int(phase_entry.get("requested_native", 0) or 0)
+        phase_entry["native_fallback_ratio"] = round((float(phase_entry.get("native_fallback_count", 0) or 0) / denom), 6) if denom > 0 else 0.0
+        phase_entry["native_default_contract_ratio"] = round((float(phase_entry.get("native_default_contract_count", 0) or 0) / denom), 6) if denom > 0 else 0.0
+
+        lat_rows = [{"latency_ms": x} for x in phase_entry.pop("latencies_ms", [])]
+        phase_entry["latency_stats_ms"] = _latency_stats_ms(lat_rows)
+        attempts = [float(a) for a in phase_entry.pop("attempt_counts", []) if float(a) >= 0]
+        phase_entry["avg_attempts"] = round((sum(attempts) / float(len(attempts))), 6) if attempts else 0.0
+        checked = phase_entry.get("backend_health_checked", 0) or 0
+        phase_entry["backend_health_ok_ratio"] = round((float(phase_entry.get("backend_health_ok", 0) or 0) / checked), 6) if checked > 0 else 0.0
+
+    all_lat_rows = [{"latency_ms": _safe_float_val(rec.get("latency_ms"), -1.0)} for rec in rows if _safe_float_val(rec.get("latency_ms"), -1.0) >= 0]
+    latency_stats = _latency_stats_ms(all_lat_rows)
+    attempts = [float(_safe_float_val(rec.get("attempt_count", 0), 0.0)) for rec in rows]
+    attempts = [x for x in attempts if x >= 0]
+    avg_attempts = round((sum(attempts) / float(len(attempts))), 6) if attempts else 0.0
+
+    return {
+        "total_calls": total_calls,
+        "requested_native_local": requested_native,
+        "used_native_local": used_native,
+        "used_chat_compat": used_chat,
+        "native_fallback_count": fallback_count,
+        "native_fallback_ratio": round((float(fallback_count) / float(requested_native)), 6) if requested_native > 0 else 0.0,
+        "native_default_contract_count": default_contract_count,
+        "native_default_contract_ratio": round((float(default_contract_count) / float(requested_native)), 6) if requested_native > 0 else 0.0,
+        "latency_stats_ms": latency_stats,
+        "avg_attempts": avg_attempts,
+        "backend_health_checked": backend_checked,
+        "backend_health_ok": backend_healthy,
+        "backend_health_failed": backend_failed,
+        "backend_health_ok_ratio": round((float(backend_healthy) / float(backend_checked)), 6) if backend_checked > 0 else 0.0,
+        "by_phase": by_phase,
+    }
 
 def _build_progress_payload(
     *,
@@ -95,7 +252,7 @@ def run(
     decision_modules: Any | None = None,
     output_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Execute one manufacturing simulation run and export result artifacts."""
+    """제조 시뮬레이션 한 번을 실행하고 결과 아티팩트를 내보낸다."""
 
     output_root = Path(output_dir or Path.cwd() / "outputs")
     output_root.mkdir(parents=True, exist_ok=True)
@@ -127,25 +284,25 @@ def run(
         if decision_mode in {"adaptive_priority", "fixed_priority"}:
             decision_module = ScriptedDecisionModule(experiment_cfg)
         elif decision_mode == "llm_planner":
+            # ?? LLM ??? OpenClaw ??? ??? ????.
+            # OpenClaw? ?? ?? ????? OptionalLLMDecisionModule? fallback?? ????.
             try:
-                decision_module = OptionalLLMDecisionModule(
-                    cfg=experiment_cfg,
-                    llm_cfg=decision_cfg.get("llm", {}),
-                )
+                llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
+                provider = str(llm_cfg.get("provider", "")).strip().lower()
+                orchestration_cfg = llm_cfg.get("orchestration", {}) if isinstance(llm_cfg.get("orchestration", {}), dict) else {}
+                if provider == "openclaw" and bool(orchestration_cfg.get("enabled", True)):
+                    decision_module = OpenClawOrchestratedDecisionModule(
+                        cfg=experiment_cfg,
+                        llm_cfg=llm_cfg,
+                    )
+                else:
+                    decision_module = OptionalLLMDecisionModule(
+                        cfg=experiment_cfg,
+                        llm_cfg=llm_cfg,
+                    )
             except RuntimeError as exc:
                 raise RuntimeError(
                     "decision.mode=llm_planner is selected, but the configured LLM backend is unavailable. "
-                    "Use decision=adaptive_priority for a local rule-based run or configure the LLM server."
-                ) from exc
-        elif decision_mode == "llm_task_selector":
-            try:
-                decision_module = LLMTaskSelectorDecisionModule(
-                    cfg=experiment_cfg,
-                    llm_cfg=decision_cfg.get("llm", {}),
-                )
-            except RuntimeError as exc:
-                raise RuntimeError(
-                    "decision.mode=llm_task_selector is selected, but the configured LLM backend is unavailable. "
                     "Use decision=adaptive_priority for a local rule-based run or configure the LLM server."
                 ) from exc
         else:
@@ -154,19 +311,63 @@ def run(
     if is_llm_mode(decision_mode):
         llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
         comm_cfg = llm_cfg.get("communication", {}) if isinstance(llm_cfg.get("communication", {}), dict) else {}
-        selector_cfg = llm_cfg.get("task_selector", {}) if isinstance(llm_cfg.get("task_selector", {}), dict) else {}
+        openclaw_cfg = llm_cfg.get("openclaw", {}) if isinstance(llm_cfg.get("openclaw", {}), dict) else {}
+        llm_language = str(llm_cfg.get("language", comm_cfg.get("language", "ENG"))).strip().upper() or "ENG"
         run_meta["llm"] = {
             "mode_variant": decision_mode,
             "provider": str(llm_cfg.get("provider", "")),
             "server_url": str(llm_cfg.get("server_url", "")),
             "model": str(llm_cfg.get("model", "")),
+            "language": llm_language,
             "communication_enabled": bool(comm_cfg.get("enabled", True)),
+            "coordination_review_enabled": bool(orchestration_cfg.get("daily_review_enabled", True)) if provider == "openclaw" else bool(comm_cfg.get("enabled", True)),
             "communication_rounds": int(comm_cfg.get("rounds", 0)),
-            "communication_language": str(comm_cfg.get("language", "ENG")).strip().upper() or "ENG",
-            "task_selector_max_candidates": int(selector_cfg.get("max_candidates", 0)),
-            "task_selector_include_score_hints": bool(selector_cfg.get("include_score_hints", False)),
+            "communication_language": llm_language,
             "urgent_discuss_enabled": bool(urgent_cfg.get("enabled", True)),
         }
+        if str(llm_cfg.get("provider", "")).strip().lower() == "openclaw":
+            backend_cfg = openclaw_cfg.get("backend", {}) if isinstance(openclaw_cfg.get("backend", {}), dict) else {}
+            run_meta["llm"]["openclaw"] = {
+                "gateway_url": str(openclaw_cfg.get("gateway_url", llm_cfg.get("gateway_url", llm_cfg.get("server_url", "")))),
+                "profile_name": str(openclaw_cfg.get("profile_name", "mansim_repo")),
+                "profile_config_path": str(openclaw_cfg.get("profile_config_path", "")),
+                "session_namespace": str(openclaw_cfg.get("session_namespace", "mansim")),
+                "manager_agent_id": str(openclaw_cfg.get("manager_agent_id", "MANAGER")),
+                "worker_agent_ids": list(openclaw_cfg.get("worker_agent_ids", [])) if isinstance(openclaw_cfg.get("worker_agent_ids", []), list) else [],
+                "workspace_root": str(openclaw_cfg.get("workspace_root", "openclaw/workspaces")),
+                "backend": {
+                    "provider": str(backend_cfg.get("provider", "")),
+                    "model": str(backend_cfg.get("model", "")),
+                    "model_name": str(backend_cfg.get("model_name", "")),
+                    "base_url": str(backend_cfg.get("base_url", "")),
+                    "api": str(backend_cfg.get("api", "")),
+                    "context_window": int(backend_cfg.get("context_window", 0) or 0),
+                    "max_output_tokens": int(backend_cfg.get("max_output_tokens", 0) or 0),
+                    "reasoning": bool(backend_cfg.get("reasoning", False)),
+                    "api_key_configured": bool(str(backend_cfg.get("api_key", "")).strip()),
+                },
+            }
+
+    if hasattr(decision_module, "prepare_run_context"):
+        prepare_fn = getattr(decision_module, "prepare_run_context")
+        if callable(prepare_fn):
+            runtime_info = prepare_fn(output_root)
+            if isinstance(runtime_info, dict) and is_llm_mode(decision_mode):
+                run_meta.setdefault("llm", {})
+                if str(run_meta["llm"].get("provider", "")).strip().lower() == "openclaw":
+                    run_meta["llm"].setdefault("openclaw", {})
+                    run_meta["llm"]["openclaw"]["runtime"] = runtime_info
+                    client = getattr(decision_module, "openclaw_client", None)
+                    client_backend = getattr(client, "backend", None)
+                    if isinstance(client_backend, dict):
+                        backend_meta = run_meta["llm"]["openclaw"].setdefault("backend", {})
+                        backend_meta["effective_base_url"] = str(client_backend.get("base_url", backend_meta.get("base_url", "")))
+                        if bool(client_backend.get("resolved_via_local_proxy", False)):
+                            backend_meta["resolved_via_local_proxy"] = True
+                        if str(client_backend.get("resolved_wsl_distro", "")).strip():
+                            backend_meta["resolved_wsl_distro"] = str(client_backend.get("resolved_wsl_distro", "")).strip()
+                        if str(client_backend.get("resolved_wsl_ipv4", "")).strip():
+                            backend_meta["resolved_wsl_ipv4"] = str(client_backend.get("resolved_wsl_ipv4", "")).strip()
 
     env = simpy.Environment()
     world = ManufacturingWorld(env=env, cfg=experiment_cfg, logger=event_logger, decision_module=decision_module)
@@ -252,6 +453,7 @@ def run(
     llm_trace_path: str = ""
     dashboard_path: Path | None = None
     task_priority_dashboard_path: Path | None = None
+    orchestration_intelligence_dashboard_path: Path | None = None
     gantt_path = output_root / "gantt.html"
     artifact_status: dict[str, Any] = {"generated": {}, "errors": {}}
 
@@ -306,28 +508,32 @@ def run(
                         maybe_trace = consume_profile_fn()
                         if isinstance(maybe_trace, dict):
                             agent_priority_update_trace = maybe_trace
-                townhall_details: dict[str, Any] = {"day_summary": day_summary, "updated_norms": world.norms}
+                coordination_review_details: dict[str, Any] = {"day_summary": day_summary, "updated_norms": world.norms}
                 if comm_enabled is not None:
-                    townhall_details["communication_enabled"] = comm_enabled
+                    coordination_review_details["coordination_review_enabled"] = comm_enabled
+                    coordination_review_details["communication_enabled"] = comm_enabled
                 if discussion_trace:
-                    townhall_details["discussion_trace"] = discussion_trace
+                    coordination_review_details["review_trace"] = discussion_trace
+                    coordination_review_details["discussion_trace"] = discussion_trace
                 if agent_priority_update_trace:
-                    townhall_details["agent_priority_update_trace"] = agent_priority_update_trace
+                    coordination_review_details["agent_priority_update_trace"] = agent_priority_update_trace
                     event_logger.log(
                         t=env.now,
                         day=day,
                         event_type="AGENT_PRIORITY_PROFILE_UPDATE",
                         entity_id="system",
-                        location="TownHall",
+                        location="OperationsReview",
                         details=agent_priority_update_trace,
                     )
+                # ?? ?? ???? ?? ?? ???.
+                # replay? ? ???? ????? ????? ????.
                 event_logger.log(
                     t=env.now,
                     day=day,
-                    event_type="CHAT_TOWNHALL",
+                    event_type="CHAT_DAILY_REVIEW",
                     entity_id="system",
-                    location="TownHall",
-                    details=townhall_details,
+                    location="CoordinationReview",
+                    details=coordination_review_details,
                 )
             last_summary = day_summary
 
@@ -358,6 +564,8 @@ def run(
         event_logger.write_json("run_meta.json", run_meta)
         event_logger.write_json("minute_snapshots.json", {"snapshots": world.minute_snapshots})
 
+        llm_records: list[dict[str, Any]] = []
+        transport_metrics: dict[str, Any] = {}
         try:
             if is_llm_mode(decision_mode) and hasattr(decision_module, "get_llm_exchange_records"):
                 get_logs = getattr(decision_module, "get_llm_exchange_records")
@@ -366,6 +574,12 @@ def run(
                         llm_records = get_logs()
                     except BaseException:
                         llm_records = []
+                    if isinstance(llm_records, list):
+                        transport_metrics = _summarize_llm_transport_metrics(llm_records)
+                        if transport_metrics and is_llm_mode(decision_mode):
+                            run_meta.setdefault("llm", {})
+                            run_meta["llm"]["transport_metrics"] = transport_metrics
+                            kpi["llm_transport_metrics"] = transport_metrics
                     if isinstance(llm_records, list) and llm_records:
                         try:
                             event_logger.write_json("llm_exchange.json", {"run_meta": run_meta, "records": llm_records})
@@ -380,6 +594,14 @@ def run(
                                 artifact_status["errors"]["llm_trace"] = "llm trace export returned no HTML path"
                         except BaseException as exc:
                             artifact_status["errors"]["llm_trace"] = f"{type(exc).__name__}: {exc}"
+                        try:
+                            workspace_dashboard_path = export_openclaw_workspace_dashboard(output_dir=output_root, run_meta=run_meta, records=llm_records)
+                            if workspace_dashboard_path is not None and Path(workspace_dashboard_path).exists():
+                                artifact_status["generated"]["openclaw_workspace_dashboard"] = str(workspace_dashboard_path)
+                            else:
+                                artifact_status["errors"]["openclaw_workspace_dashboard"] = "openclaw workspace dashboard export returned no HTML path"
+                        except BaseException as exc:
+                            artifact_status["errors"]["openclaw_workspace_dashboard"] = f"{type(exc).__name__}: {exc}"
 
             try:
                 export_gantt(events=event_logger.events, output_dir=output_root)
@@ -415,6 +637,19 @@ def run(
                     artifact_status["errors"]["task_priority_dashboard"] = "task priority dashboard export returned no HTML path"
             except BaseException as exc:
                 artifact_status["errors"]["task_priority_dashboard"] = f"{type(exc).__name__}: {exc}"
+
+            try:
+                orchestration_intelligence_dashboard_path = export_orchestration_intelligence_dashboard(
+                    output_dir=output_root,
+                    daily_summary=world.daily_summaries,
+                    llm_records=llm_records,
+                )
+                if orchestration_intelligence_dashboard_path is not None and Path(orchestration_intelligence_dashboard_path).exists():
+                    artifact_status["generated"]["orchestration_intelligence_dashboard"] = str(orchestration_intelligence_dashboard_path)
+                else:
+                    artifact_status["errors"]["orchestration_intelligence_dashboard"] = "orchestration intelligence dashboard export returned no HTML path"
+            except BaseException as exc:
+                artifact_status["errors"]["orchestration_intelligence_dashboard"] = f"{type(exc).__name__}: {exc}"
         except BaseException as exc:
             artifact_status["errors"]["artifact_export_fatal"] = f"{type(exc).__name__}: {exc}"
 
@@ -459,8 +694,14 @@ def run(
         "gantt_path": str(output_root / "gantt.html"),
         "kpi_dashboard_path": str(dashboard_path) if dashboard_path else "",
         "task_priority_dashboard_path": str(task_priority_dashboard_path) if task_priority_dashboard_path else "",
+        "orchestration_intelligence_dashboard_path": str(orchestration_intelligence_dashboard_path) if orchestration_intelligence_dashboard_path else "",
         "llm_trace_path": llm_trace_path,
         "terminated": world.terminated,
         "termination_reason": world.termination_reason,
         "decision_mode": decision_mode,
     }
+
+
+
+
+

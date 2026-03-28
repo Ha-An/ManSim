@@ -17,6 +17,8 @@ def load_artifact_meta(output_dir: Path) -> dict[str, Any]:
         "model": "",
         "server_url": "",
         "communication_enabled": None,
+        "coordination_review_enabled": None,
+        "language": "",
         "communication_language": "",
         "events_path": str((output_dir / "events.jsonl").resolve()),
         "wall_clock_human": "",
@@ -43,7 +45,10 @@ def load_artifact_meta(output_dir: Path) -> dict[str, Any]:
     out["server_url"] = str(llm.get("server_url", "")).strip()
     if "communication_enabled" in llm:
         out["communication_enabled"] = bool(llm.get("communication_enabled"))
-    out["communication_language"] = str(llm.get("communication_language", "")).strip().upper()
+    if "coordination_review_enabled" in llm:
+        out["coordination_review_enabled"] = bool(llm.get("coordination_review_enabled"))
+    out["language"] = str(llm.get("language", llm.get("communication_language", ""))).strip().upper()
+    out["communication_language"] = out["language"]
 
     out["wall_clock_human"] = str(run_meta.get("wall_clock_human", "")).strip()
 
@@ -55,13 +60,13 @@ def format_run_mode_line(meta: dict[str, Any]) -> str:
     if is_llm_mode(mode):
         model = str(meta.get("model", "")).strip() or "-"
         server = str(meta.get("server_url", "")).strip() or "-"
-        comm = meta.get("communication_enabled", None)
-        comm_label = "on" if bool(comm) else "off"
-        language = str(meta.get("communication_language", "")).strip().upper()
+        review_enabled = meta.get("coordination_review_enabled", meta.get("communication_enabled", None))
+        comm_label = "on" if bool(review_enabled) else "off"
+        language = str(meta.get("language", meta.get("communication_language", ""))).strip().upper()
         language_part = f" | language={language}" if language else ""
         return (
             f"Run mode: {format_decision_mode_label(mode)} | "
-            f"model={model} | communication={comm_label}{language_part} | server={server}"
+            f"model={model} | review={comm_label}{language_part} | server={server}"
         )
 
     return f"Run mode: {format_decision_mode_label(mode)}"

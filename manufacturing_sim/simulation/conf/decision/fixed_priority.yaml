@@ -6,7 +6,7 @@ fixed_task_priority: true
 
 # breakdown / discharge 같은 긴급 이벤트 대응 on/off
 urgent_discuss:
-  enabled: true
+  enabled: false
 
 # shared norm을 planning에 반영할지 여부
 norms:

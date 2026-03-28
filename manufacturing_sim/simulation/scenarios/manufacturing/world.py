@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import itertools
 import math
@@ -73,6 +73,13 @@ class ManufacturingWorld:
         self.inventory_targets = cfg["inventory_targets"]
         self.dispatcher_cfg = cfg["dispatcher"]
         self.heuristic_rules = cfg.get("heuristic_rules", {}) if isinstance(cfg.get("heuristic_rules", {}), dict) else {}
+        llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
+        orchestration_cfg = llm_cfg.get("orchestration", {}) if isinstance(llm_cfg.get("orchestration", {}), dict) else {}
+        # The manager may queue more work than the runtime should examine; limit the local queue window here.
+        self.worker_queue_limit = max(
+            1,
+            int(getattr(decision_module, "worker_queue_limit", orchestration_cfg.get("worker_queue_limit", 4)) or 4),
+        )
 
         mean_ttf = float(self.machine_failure_cfg["mean_time_to_fail_min"])
         self.machine_failure_base_lambda = 1.0 / max(1.0, mean_ttf)
@@ -90,6 +97,7 @@ class ManufacturingWorld:
             rationale="default",
             agent_priority_multipliers=default_agent_priority_multipliers([f"A{i}" for i in range(1, self.num_agents + 1)]),
         )
+        self.manager_queue_skipped_counts: dict[str, int] = defaultdict(int)
         decision_cfg = self.cfg.get("decision", {}) if isinstance(self.cfg.get("decision", {}), dict) else {}
         norms_cfg = decision_cfg.get("norms", {}) if isinstance(decision_cfg.get("norms", {}), dict) else {}
         self.norms_enabled = bool(norms_cfg.get("enabled", True))
@@ -212,7 +220,7 @@ class ManufacturingWorld:
     def start_day(self, day: int, strategy: StrategyState, job_plan: JobPlan) -> None:
         self.current_day = day
         self.current_strategy = strategy
-        job_plan.ensure_agent_priority_multipliers(tuple(sorted(self.agents.keys())))
+        job_plan.ensure_runtime_context(tuple(sorted(self.agents.keys())))
         self.current_job_plan = job_plan
         self.day_baseline = {
             "products": self.product_count,
@@ -235,7 +243,7 @@ class ManufacturingWorld:
             day=day,
             event_type="PHASE_JOB_ASSIGNMENT",
             entity_id="system",
-            location="TownHall",
+            location="CoordinationReview",
             details={
                 "task_priority_weights": job_plan.task_priority_weights,
                 "shared_task_priority_weights": job_plan.task_priority_weights,
@@ -244,6 +252,12 @@ class ManufacturingWorld:
                     agent_id: job_plan.effective_task_priority_weights(agent_id) for agent_id in sorted(self.agents.keys())
                 },
                 "quotas": job_plan.quotas,
+                "agent_roles": dict(job_plan.agent_roles),
+                "personal_queues": dict(job_plan.personal_queues),
+                "mailbox": dict(job_plan.mailbox),
+                "parallel_groups": list(job_plan.parallel_groups),
+                "reason_trace": list(job_plan.reason_trace),
+                "manager_summary": str(job_plan.manager_summary or ""),
             },
         )
 
@@ -650,6 +664,8 @@ class ManufacturingWorld:
             meta["fallback_reason"] = fallback_reason
         else:
             meta.pop("fallback_reason", None)
+        meta["decision_trace_id"] = str(task.task_id)
+        meta["expected_task_signature"] = self._task_signature(task)
         task.selection_meta = meta
         return task
 
@@ -682,195 +698,6 @@ class ManufacturingWorld:
             if transfer_kind == "inter_station":
                 return "inter_station_transfer"
         return str(task.priority_key).strip() or str(task.task_type).strip().lower()
-
-    def _candidate_summary_for_selector(self, agent: Agent, task: Task, *, include_score_hint: bool) -> dict[str, Any]:
-        summary = {
-            "task_id": task.task_id,
-            "task_type": task.task_type,
-            "priority_key": self._task_priority_key(task),
-            "location": task.location,
-            "priority": round(float(task.priority), 3),
-            "payload": self._serialize_task_payload(task.payload),
-        }
-        if include_score_hint:
-            summary["score_hint"] = round(float(self._task_score(task, agent)), 3)
-        return summary
-
-    def _selector_related_entities(self, candidates: list[Task]) -> tuple[set[str], set[str], set[int]]:
-        machine_ids: set[str] = set()
-        agent_ids: set[str] = set()
-        stations: set[int] = set()
-        station_order = list(self.stations)
-        station_index = {station: idx for idx, station in enumerate(station_order)}
-
-        for task in candidates:
-            payload = task.payload if isinstance(task.payload, dict) else {}
-            machine_id = str(payload.get("machine_id", "")).strip()
-            if machine_id:
-                machine_ids.add(machine_id)
-            target_agent_id = str(payload.get("target_agent_id", "")).strip()
-            if target_agent_id:
-                agent_ids.add(target_agent_id)
-            raw_station = payload.get("station")
-            if isinstance(raw_station, (int, float)):
-                stations.add(int(raw_station))
-            transfer_kind = str(payload.get("transfer_kind", "")).strip().lower()
-            if transfer_kind == "inter_station":
-                from_station = payload.get("from_station")
-                if isinstance(from_station, (int, float)):
-                    from_station_int = int(from_station)
-                    stations.add(from_station_int)
-                    next_idx = station_index.get(from_station_int)
-                    if next_idx is not None and next_idx + 1 < len(station_order):
-                        stations.add(int(station_order[next_idx + 1]))
-            elif transfer_kind == "material_supply":
-                station = payload.get("station")
-                if isinstance(station, (int, float)):
-                    stations.add(int(station))
-        return machine_ids, agent_ids, stations
-
-    def _selector_machine_needs_detail(self, machine_id: str, machine_obs: dict[str, Any], related_machine_ids: set[str]) -> bool:
-        if machine_id in related_machine_ids:
-            return True
-        if bool(machine_obs.get("broken", False)):
-            return True
-        if bool(machine_obs.get("has_output_waiting_unload", False)):
-            return True
-        if machine_obs.get("minutes_since_failure_started") is not None:
-            return True
-        owners = machine_obs.get("owners", {}) if isinstance(machine_obs.get("owners", {}), dict) else {}
-        if any(owner for owner in owners.values()):
-            return True
-        state = str(machine_obs.get("state", "")).strip().upper()
-        if state in {"BROKEN", "DONE_WAIT_UNLOAD", "SETUP", "REPAIR", "PM"}:
-            return True
-        return False
-
-    def _selector_agent_needs_detail(self, agent_id: str, agent_obs: dict[str, Any], related_agent_ids: set[str]) -> bool:
-        if agent_id in related_agent_ids:
-            return True
-        if bool(agent_obs.get("discharged", False)) or bool(agent_obs.get("low_battery", False)):
-            return True
-        if agent_obs.get("awaiting_battery_from") is not None:
-            return True
-        if agent_obs.get("battery_service_owner") is not None:
-            return True
-        if agent_obs.get("in_transit") is not None:
-            return True
-        if agent_obs.get("current_task_type"):
-            return True
-        status = str(agent_obs.get("status", "")).strip().upper()
-        if status not in {"", "IDLE"}:
-            return True
-        return False
-
-
-    def _compact_strategy_diagnosis_for_selector(self) -> dict[str, Any]:
-        diagnosis = dict(getattr(self.current_strategy, "diagnosis", {}) or {})
-        compact: dict[str, Any] = {}
-        summary = str(getattr(self.current_strategy, "summary", "") or "").strip()
-        if summary:
-            compact["summary"] = summary
-        for key in ("flow_risks", "maintenance_risks", "inspection_risks", "battery_risks"):
-            values = diagnosis.get(key, []) if isinstance(diagnosis.get(key, []), list) else []
-            cleaned = [str(item).strip() for item in values if str(item).strip()]
-            if cleaned:
-                compact[key] = cleaned[:2]
-        return compact
-
-    def _build_task_selection_context(
-        self,
-        agent: Agent,
-        candidates: list[Task],
-        *,
-        include_score_hints: bool,
-    ) -> dict[str, Any]:
-        observation = self.build_observation(getattr(self, "last_day_summary", None))
-        agents_obs = observation.get("agents", {}) if isinstance(observation.get("agents", {}), dict) else {}
-        agents_by_id = agents_obs.get("by_id", {}) if isinstance(agents_obs.get("by_id", {}), dict) else {}
-        machines_obs = observation.get("machines", {}) if isinstance(observation.get("machines", {}), dict) else {}
-        machines_by_id = machines_obs.get("by_id", {}) if isinstance(machines_obs.get("by_id", {}), dict) else {}
-        candidate_tasks = [
-            self._candidate_summary_for_selector(agent, task, include_score_hint=include_score_hints) for task in candidates
-        ]
-        related_machine_ids, related_agent_ids, related_station_ids = self._selector_related_entities(candidates)
-        focused_machines_by_id = {
-            machine_id: data
-            for machine_id, data in machines_by_id.items()
-            if self._selector_machine_needs_detail(machine_id, data, related_machine_ids)
-        }
-        peer_agents_by_id = {
-            other_id: data
-            for other_id, data in agents_by_id.items()
-            if other_id != agent.agent_id and self._selector_agent_needs_detail(other_id, data, related_agent_ids)
-        }
-        agent_snapshot = dict(agents_by_id.get(agent.agent_id, {}))
-        agent_snapshot["agent_id"] = agent.agent_id
-        agent_experience_summary: dict[str, Any] = {}
-        selector_experience_fn = getattr(self.decision_module, "selector_agent_experience_view", None)
-        if callable(selector_experience_fn):
-            try:
-                candidate = selector_experience_fn(agent.agent_id)
-                if isinstance(candidate, dict):
-                    agent_experience_summary = candidate
-            except Exception:
-                agent_experience_summary = {}
-        return {
-            "agent_id": agent.agent_id,
-            "mode": self.decision_mode,
-            "selection_rules": {
-                "hard_constraints_already_applied": True,
-                "must_choose_one_candidate_task_id": True,
-                "do_not_invent_new_tasks": True,
-                "candidate_task_ids": [str(task.task_id) for task in candidates],
-                "engine_resolved_before_selector": [
-                    "discharged_agent",
-                    "awaiting_battery_delivery",
-                    "suspended_task_resume",
-                    "mandatory_battery_swap",
-                    "single_candidate_shortcut",
-                ],
-            },
-            "agent": agent_snapshot,
-            "agent_experience_summary": agent_experience_summary,
-            "plant_state": {
-                "time": {
-                    key: value
-                    for key, value in (observation.get("time", {}) if isinstance(observation.get("time", {}), dict) else {}).items()
-                    if key in {"day", "minutes_per_day", "day_elapsed_min", "day_progress"}
-                },
-                "queues": observation.get("queues", {}),
-                "machines": {
-                    "summary": machines_obs.get("summary", {}),
-                    "focus_machine_ids": sorted(focused_machines_by_id.keys()),
-                    "related_candidate_machine_ids": sorted(related_machine_ids),
-                    "by_id": focused_machines_by_id,
-                },
-                "agents": {
-                    "summary": agents_obs.get("summary", {}),
-                    "focus_peer_agent_ids": sorted(peer_agents_by_id.keys()),
-                    "related_candidate_agent_ids": sorted(related_agent_ids),
-                    "peer_agents_by_id": peer_agents_by_id,
-                },
-                "flow": observation.get("flow", {}),
-                "recent_history": observation.get("recent_history", {}),
-                "trends": observation.get("trends", {}),
-                "focus": {
-                    "candidate_station_ids": sorted(related_station_ids),
-                },
-                "local_state": self.local_state_for_urgent(),
-            },
-            "current_policy": {
-                # Selector gets the current agent's effective priorities plus compact peer/profile context.
-                "strategy_diagnosis": self._compact_strategy_diagnosis_for_selector(),
-                "shared_task_priority_weights": dict(self.current_job_plan.task_priority_weights or {}),
-                "agent_priority_profile": self._agent_priority_profile_summary(agent_ids=[agent.agent_id]).get(agent.agent_id, {}),
-                "effective_task_priority_weights": self.current_effective_task_priority_weights(agent.agent_id),
-                "peer_priority_profiles": self._agent_priority_profile_summary(agent_ids=[aid for aid in sorted(self.agents.keys()) if aid != agent.agent_id]),
-                "quotas": dict(self.current_job_plan.quotas or {}),
-            },
-            "candidate_tasks": candidate_tasks,
-        }
 
     def capture_snapshot(self) -> None:
         t = self.env.now
@@ -1005,6 +832,242 @@ class ManufacturingWorld:
             details={"item_id": item_id, "queue": queue_name},
         )
         return item_id
+
+    def _agent_discharged_intervals(self) -> list[tuple[str, float, float]]:
+        active: dict[str, float] = {}
+        intervals: list[tuple[str, float, float]] = []
+        sim_end = float(self.env.now)
+        for event in self.logger.events:
+            event_type = str(event.get("type", "")).strip()
+            agent_id = str(event.get("entity_id", "")).strip()
+            t = float(event.get("t", 0.0) or 0.0)
+            if not agent_id:
+                continue
+            if event_type == "AGENT_DISCHARGED":
+                active[agent_id] = t
+            elif event_type == "AGENT_RECHARGED":
+                start = active.pop(agent_id, None)
+                if start is not None and t > start:
+                    intervals.append((agent_id, start, t))
+        for agent_id, start in active.items():
+            if sim_end > start:
+                intervals.append((agent_id, start, sim_end))
+        return intervals
+
+    def _agent_discharged_metrics(self) -> dict[str, Any]:
+        by_agent: dict[str, float] = {agent_id: 0.0 for agent_id in sorted(self.agents.keys())}
+        for agent_id, start, end in self._agent_discharged_intervals():
+            by_agent[agent_id] = by_agent.get(agent_id, 0.0) + max(0.0, float(end) - float(start))
+        total = sum(by_agent.values())
+        total_agent_time = max(1.0, float(self.env.now) * max(1, len(self.agents)))
+        discharged_ratio = total / total_agent_time
+        return {
+            "total_min": round(total, 3),
+            "avg_min_per_agent": round(total / max(1, len(self.agents)), 3),
+            "by_agent": {agent_id: round(float(minutes), 3) for agent_id, minutes in sorted(by_agent.items())},
+            "availability_ratio": round(max(0.0, 1.0 - discharged_ratio), 6),
+            "discharged_ratio": round(min(1.0, max(0.0, discharged_ratio)), 6),
+            "ratio_by_agent": {
+                agent_id: round(float(minutes) / max(1.0, float(self.env.now)), 6)
+                for agent_id, minutes in sorted(by_agent.items())
+            },
+        }
+
+    def _buffer_wait_metrics(self) -> dict[str, Any]:
+        wait_totals: dict[str, float] = defaultdict(float)
+        wait_counts: dict[str, int] = defaultdict(int)
+        queue_entries: dict[tuple[str, str, str], float] = {}
+        output_entries: dict[tuple[str, str], float] = {}
+        metric_keys = ("material_input", "intermediate_input", "product_input", "intermediate_output", "product_output")
+
+        def _output_category(buffer_name: str) -> str:
+            try:
+                station = int(str(buffer_name).rsplit("_", 1)[-1])
+            except ValueError:
+                station = 0
+            return "product_output" if station >= int(self.last_processing_station) else "intermediate_output"
+
+        def _queue_category(queue_name: str) -> str:
+            return {
+                "material": "material_input",
+                "intermediate": "intermediate_input",
+                "product": "product_input",
+            }[queue_name]
+
+        for event in self.logger.events:
+            event_type = str(event.get("type", "")).strip()
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            item_id = str(details.get("item_id", "")).strip()
+            t = float(event.get("t", 0.0) or 0.0)
+
+            if event_type == "QUEUE_PUSH":
+                queue_name = str(details.get("queue", "")).strip().lower()
+                queue_entity = str(event.get("entity_id", "")).strip()
+                if item_id and queue_name in {"material", "intermediate", "product"} and queue_entity:
+                    queue_entries[(queue_entity, queue_name, item_id)] = t
+                continue
+
+            if event_type == "QUEUE_POP":
+                queue_name = str(details.get("queue", "")).strip().lower()
+                queue_entity = str(event.get("entity_id", "")).strip()
+                if item_id and queue_name in {"material", "intermediate", "product"} and queue_entity:
+                    start = queue_entries.pop((queue_entity, queue_name, item_id), None)
+                    if start is not None and t >= start:
+                        category = _queue_category(queue_name)
+                        wait_totals[category] += t - start
+                        wait_counts[category] += 1
+                continue
+
+            if event_type != "ITEM_MOVED" or not item_id:
+                continue
+
+            source_name = str(details.get("from", "")).strip()
+            dest_name = str(details.get("to", "")).strip()
+            if dest_name.startswith("output_buffer_station_"):
+                output_entries[(dest_name, item_id)] = t
+            if source_name.startswith("output_buffer_station_"):
+                start = output_entries.pop((source_name, item_id), None)
+                if start is not None and t >= start:
+                    category = _output_category(source_name)
+                    wait_totals[category] += t - start
+                    wait_counts[category] += 1
+
+        sim_end = float(self.env.now)
+        active_wait_totals: dict[str, float] = defaultdict(float)
+        active_wait_counts: dict[str, int] = defaultdict(int)
+        for (_, queue_name, _item_id), start in queue_entries.items():
+            category = _queue_category(queue_name)
+            if sim_end >= start:
+                active_wait_totals[category] += sim_end - start
+                active_wait_counts[category] += 1
+        for (buffer_name, _item_id), start in output_entries.items():
+            category = _output_category(buffer_name)
+            if sim_end >= start:
+                active_wait_totals[category] += sim_end - start
+                active_wait_counts[category] += 1
+
+        averages = {
+            key: round(wait_totals[key] / wait_counts[key], 3) if wait_counts[key] > 0 else 0.0
+            for key in metric_keys
+        }
+        counts = {key: int(wait_counts.get(key, 0)) for key in metric_keys}
+        inclusive_averages = {
+            key: round((wait_totals[key] + active_wait_totals[key]) / (wait_counts[key] + active_wait_counts[key]), 3)
+            if (wait_counts[key] + active_wait_counts[key]) > 0
+            else 0.0
+            for key in metric_keys
+        }
+        active_counts = {key: int(active_wait_counts.get(key, 0)) for key in metric_keys}
+        return {
+            "avg_wait_min": averages,
+            "completed_wait_count": counts,
+            "avg_wait_min_including_open": inclusive_averages,
+            "open_wait_count": active_counts,
+        }
+
+    def _completed_product_lead_time_metrics(self) -> dict[str, float]:
+        lead_times: list[float] = []
+        for event in self.logger.events:
+            if str(event.get("type", "")).strip() != "COMPLETED_PRODUCT":
+                continue
+            item_id = str(event.get("entity_id", "")).strip()
+            item = self.items.get(item_id)
+            if item is None:
+                continue
+            lead_time = float(event.get("t", 0.0) or 0.0) - float(item.created_at)
+            if lead_time >= 0.0:
+                lead_times.append(lead_time)
+        if not lead_times:
+            return {"avg_min": 0.0, "p95_min": 0.0}
+        ordered = sorted(lead_times)
+        p95_index = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * 0.95) - 1))
+        return {
+            "avg_min": round(sum(ordered) / len(ordered), 3),
+            "p95_min": round(float(ordered[p95_index]), 3),
+        }
+
+    def _machine_time_metrics(self) -> dict[str, Any]:
+        totals_by_machine: dict[str, dict[str, float]] = {
+            machine_id: {"processing": 0.0, "broken": 0.0, "pm": 0.0}
+            for machine_id in self.machines.keys()
+        }
+        active_processing: dict[str, float] = {}
+        active_broken: dict[str, float] = {}
+        active_pm: dict[str, float] = {}
+        sim_end = float(self.env.now)
+
+        for event in self.logger.events:
+            event_type = str(event.get("type", "")).strip()
+            machine_id = str(event.get("entity_id", "")).strip()
+            if machine_id not in self.machines:
+                continue
+            t = float(event.get("t", 0.0) or 0.0)
+            if event_type == "MACHINE_START":
+                active_processing[machine_id] = t
+            elif event_type in {"MACHINE_END", "MACHINE_ABORTED"}:
+                start = active_processing.pop(machine_id, None)
+                if start is not None and t >= start:
+                    totals_by_machine[machine_id]["processing"] += t - start
+            elif event_type == "MACHINE_BROKEN":
+                active_broken[machine_id] = t
+            elif event_type == "MACHINE_REPAIRED":
+                start = active_broken.pop(machine_id, None)
+                if start is not None and t >= start:
+                    totals_by_machine[machine_id]["broken"] += t - start
+            elif event_type == "MACHINE_PM_START":
+                active_pm[machine_id] = t
+            elif event_type == "MACHINE_PM_END":
+                start = active_pm.pop(machine_id, None)
+                if start is not None and t >= start:
+                    totals_by_machine[machine_id]["pm"] += t - start
+
+        for machine_id, start in active_processing.items():
+            if sim_end >= start:
+                totals_by_machine[machine_id]["processing"] += sim_end - start
+        for machine_id, start in active_broken.items():
+            if sim_end >= start:
+                totals_by_machine[machine_id]["broken"] += sim_end - start
+        for machine_id, start in active_pm.items():
+            if sim_end >= start:
+                totals_by_machine[machine_id]["pm"] += sim_end - start
+
+        total_time = max(1.0, sim_end)
+        n_machines = len(self.machines)
+        machine_capacity_min = max(1.0, total_time * max(1, n_machines))
+        total_processing = sum(metrics["processing"] for metrics in totals_by_machine.values())
+        total_broken = sum(metrics["broken"] for metrics in totals_by_machine.values())
+        total_pm = sum(metrics["pm"] for metrics in totals_by_machine.values())
+        processing_ratio = total_processing / machine_capacity_min
+        broken_ratio = total_broken / machine_capacity_min
+        pm_ratio = total_pm / machine_capacity_min
+
+        by_station: dict[str, dict[str, float]] = {}
+        for station in self.stations:
+            machine_ids = self.machines_by_station.get(station, [])
+            station_capacity_min = max(1.0, total_time * max(1, len(machine_ids)))
+            station_processing = sum(totals_by_machine[machine_id]["processing"] for machine_id in machine_ids)
+            station_broken = sum(totals_by_machine[machine_id]["broken"] for machine_id in machine_ids)
+            station_pm = sum(totals_by_machine[machine_id]["pm"] for machine_id in machine_ids)
+            station_processing_ratio = station_processing / station_capacity_min
+            station_broken_ratio = station_broken / station_capacity_min
+            station_pm_ratio = station_pm / station_capacity_min
+            by_station[f"station{station}"] = {
+                "processing": round(station_processing_ratio, 6),
+                "broken": round(station_broken_ratio, 6),
+                "pm": round(station_pm_ratio, 6),
+                "other": round(max(0.0, 1.0 - station_processing_ratio - station_broken_ratio - station_pm_ratio), 6),
+            }
+
+        return {
+            "total_processing_min": round(total_processing, 3),
+            "total_broken_min": round(total_broken, 3),
+            "total_pm_min": round(total_pm, 3),
+            "utilization_ratio": round(processing_ratio, 6),
+            "broken_ratio": round(broken_ratio, 6),
+            "pm_ratio": round(pm_ratio, 6),
+            "other_ratio": round(max(0.0, 1.0 - processing_ratio - broken_ratio - pm_ratio), 6),
+            "ratio_by_station": by_station,
+        }
 
     def _warehouse_push_material(self, station: int) -> str:
         item_id = self._next_item_id(f"MAT-S{station}")
@@ -1272,8 +1335,24 @@ class ManufacturingWorld:
             return
         event = {"event_type": event_type, "entity_id": entity_id, "time": self.env.now, "details": details}
         updates = self.decision_module.urgent_discuss(event, self.local_state_for_urgent())
-        priority_updates = updates.get("priority_updates", {})
-        self.current_job_plan.task_priority_weights.update(priority_updates)
+        priority_updates = updates.get("priority_updates", {}) if isinstance(updates, dict) else {}
+        agent_priority_updates = updates.get("agent_priority_updates", {}) if isinstance(updates, dict) else {}
+        mailbox_updates = updates.get("mailbox_updates", {}) if isinstance(updates, dict) else {}
+        reason_trace = updates.get("reason_trace", []) if isinstance(updates, dict) else []
+        if isinstance(priority_updates, dict):
+            self.current_job_plan.task_priority_weights.update(priority_updates)
+        if isinstance(agent_priority_updates, dict):
+            for agent_id, row in agent_priority_updates.items():
+                current_row = self.current_job_plan.agent_priority_multipliers.setdefault(str(agent_id), default_task_priority_weights())
+                if isinstance(row, dict):
+                    current_row.update({str(key): float(value) for key, value in row.items() if str(key) in current_row})
+        if isinstance(mailbox_updates, dict):
+            for agent_id, items in mailbox_updates.items():
+                if not isinstance(items, list):
+                    continue
+                self.current_job_plan.mailbox.setdefault(str(agent_id), []).extend(items)
+        if isinstance(reason_trace, list):
+            self.current_job_plan.reason_trace.extend(reason_trace)
         self.last_urgent_chat_t = self.env.now
         self.logger.log(
             t=self.env.now,
@@ -1281,7 +1360,7 @@ class ManufacturingWorld:
             event_type="CHAT_URGENT",
             entity_id="system",
             location="urgent",
-            details={"event": event, "priority_updates": priority_updates},
+            details={"event": event, "priority_updates": priority_updates, "agent_priority_updates": agent_priority_updates, "mailbox_updates": mailbox_updates, "reason_trace": reason_trace, "summary": updates.get("summary", "") if isinstance(updates, dict) else ""},
         )
 
     def start_agent_task(self, agent: Agent, task: Task, start_t: float) -> None:
@@ -1295,6 +1374,7 @@ class ManufacturingWorld:
             "priority_key": self._task_priority_key(task),
             "payload": task.payload,
             "selection": selection,
+            "agent_role": self.current_agent_role(agent.agent_id),
         }
         if selection:
             if "decision_source" in selection:
@@ -1303,6 +1383,10 @@ class ManufacturingWorld:
                 details["decision_rule"] = selection.get("decision_rule")
             if "decision_rationale" in selection:
                 details["decision_rationale"] = selection.get("decision_rationale")
+            if "decision_trace_id" in selection:
+                details["decision_trace_id"] = selection.get("decision_trace_id")
+            if "expected_task_signature" in selection:
+                details["expected_task_signature"] = selection.get("expected_task_signature")
         self.logger.log(
             t=start_t,
             day=self.day_for_time(start_t),
@@ -1347,10 +1431,28 @@ class ManufacturingWorld:
                 "duration": duration,
                 "decision_source": str(selection.get("decision_source", "")),
                 "decision_rule": str(selection.get("decision_rule", "")),
+                "decision_trace_id": str(selection.get("decision_trace_id", "")),
+                "expected_task_signature": selection.get("expected_task_signature", {}),
             }
         )
         if status == "completed":
             agent.total_task_time_min[task.task_type] = agent.total_task_time_min.get(task.task_type, 0.0) + duration
+            consumed_orders = self._consume_personal_queue_matches(agent.agent_id, task)
+            consumed_messages = self._consume_mailbox_matches(agent.agent_id, task)
+            if consumed_orders or consumed_messages:
+                self.logger.log(
+                    t=end_t,
+                    day=self.day_for_time(end_t),
+                    event_type="ORCHESTRATION_ACK",
+                    entity_id=agent.agent_id,
+                    location=self.agent_display_location(agent),
+                    details={
+                        "task_id": task.task_id,
+                        "task_type": task.task_type,
+                        "consumed_orders": consumed_orders,
+                        "consumed_messages": consumed_messages,
+                    },
+                )
         agent.current_task_id = None
         agent.current_task_type = None
         agent.current_task_started_at = None
@@ -1478,7 +1580,232 @@ class ManufacturingWorld:
             )
         return None
 
+    def current_personal_queue(self, agent_id: str) -> list[dict[str, Any]]:
+        queue = self.current_job_plan.personal_queues.get(str(agent_id), []) if isinstance(self.current_job_plan.personal_queues, dict) else []
+        return list(queue) if isinstance(queue, list) else []
+
+    def current_mailbox(self, agent_id: str) -> list[dict[str, Any]]:
+        mailbox = self.current_job_plan.mailbox.get(str(agent_id), []) if isinstance(self.current_job_plan.mailbox, dict) else []
+        return list(mailbox) if isinstance(mailbox, list) else []
+
+    def current_agent_role(self, agent_id: str) -> str:
+        roles = self.current_job_plan.agent_roles if isinstance(self.current_job_plan.agent_roles, dict) else {}
+        return str(roles.get(str(agent_id), "")).strip()
+
+    def _task_target_station(self, task: Task) -> int | None:
+        if task.task_type == "TRANSFER":
+            transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
+            if transfer_kind == "material_supply":
+                try:
+                    return int(task.payload.get("station"))
+                except (TypeError, ValueError):
+                    return None
+            if transfer_kind == "inter_station":
+                try:
+                    return int(task.payload.get("from_station"))
+                except (TypeError, ValueError):
+                    return None
+        if task.task_type in {"SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
+            try:
+                return int(task.payload.get("station")) if task.payload.get("station") not in {None, ""} else None
+            except (TypeError, ValueError):
+                machine_id = str(task.payload.get("machine_id", ""))
+                machine = self.machines.get(machine_id)
+                return int(machine.station) if machine is not None else None
+        if task.task_type == "INSPECT_PRODUCT":
+            return self.inspection_queue_station
+        return None
+
+    def _task_target_id(self, task: Task) -> str:
+        if task.task_type in {"SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
+            return str(task.payload.get("machine_id", ""))
+        if task.task_type == "TRANSFER":
+            transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
+            if transfer_kind == "battery_delivery":
+                return str(task.payload.get("target_agent_id", ""))
+            if transfer_kind == "material_supply":
+                return f"station{task.payload.get('station', '')}"
+            if transfer_kind == "inter_station":
+                return f"station{task.payload.get('from_station', '')}"
+        return ""
+
+    def _task_target_type(self, task: Task) -> str:
+        if task.task_type in {"SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
+            return "machine"
+        if task.task_type == "INSPECT_PRODUCT":
+            return "station"
+        if task.task_type == "TRANSFER":
+            transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
+            if transfer_kind == "battery_delivery":
+                return "agent"
+            if transfer_kind in {"material_supply", "inter_station"}:
+                return "station"
+        return "none"
+
+    def _task_signature(self, task: Task) -> dict[str, Any]:
+        return {
+            "task_type": str(task.task_type),
+            "priority_key": self._task_priority_key(task),
+            "target_type": self._task_target_type(task),
+            "target_id": self._task_target_id(task),
+            "target_station": self._task_target_station(task),
+        }
+
+    def _work_order_matches_task(self, order: dict[str, Any], task: Task) -> bool:
+        if not isinstance(order, dict):
+            return False
+        if str(order.get("task_family", "")).strip() != self._task_priority_key(task):
+            return False
+        target_type = str(order.get("target_type", "none")).strip().lower() or "none"
+        if target_type == "none":
+            return True
+        if target_type == "station":
+            try:
+                target_station = int(order.get("target_station"))
+            except (TypeError, ValueError):
+                return False
+            return self._task_target_station(task) == target_station
+        if target_type == "machine":
+            return str(order.get("target_id", "")).strip() == self._task_target_id(task)
+        if target_type == "agent":
+            return str(order.get("target_id", "")).strip() == self._task_target_id(task)
+        if target_type == "location":
+            return str(order.get("target_id", "")).strip() == str(task.location)
+        return True
+
+
+    def _mailbox_message_matches_task(self, message: dict[str, Any], task: Task) -> bool:
+        if not isinstance(message, dict):
+            return False
+        priority_key = self._task_priority_key(task)
+        target_station = self._task_target_station(task)
+        target_id = self._task_target_id(task)
+        message_task = str(message.get("task_family", "")).strip()
+        if message_task and message_task != priority_key:
+            return False
+        message_target_type = str(message.get("target_type", "none")).strip().lower() or "none"
+        if message_target_type == "none":
+            return True
+        if message_target_type == "station":
+            try:
+                return int(message.get("target_station")) == target_station
+            except (TypeError, ValueError):
+                return False
+        if message_target_type in {"machine", "agent"}:
+            return str(message.get("target_id", "")).strip() == target_id
+        if message_target_type == "location":
+            return str(message.get("target_id", "")).strip() == str(task.location)
+        return False
+
+    def _matching_personal_queue_candidates(self, candidates: list[Task], agent: Agent) -> list[Task]:
+        queue = self.current_personal_queue(agent.agent_id)
+        if not queue:
+            return []
+        return [task for task in candidates if any(self._work_order_matches_task(order, task) for order in queue[: self.worker_queue_limit])]
+
+    def _record_manager_queue_skip(self, agent_id: str, count: int) -> None:
+        if int(count or 0) <= 0:
+            return
+        self.manager_queue_skipped_counts[str(agent_id)] += int(count)
+
+    def _select_planner_queue_task(self, candidates: list[Task], agent: Agent) -> Task | None:
+        queue = self.current_personal_queue(agent.agent_id)
+        if not queue:
+            return None
+        window = list(queue[: self.worker_queue_limit])
+        tail = list(queue[self.worker_queue_limit :])
+        skipped = 0
+        for idx, order in enumerate(window):
+            matching = [task for task in candidates if self._work_order_matches_task(order, task)]
+            if not matching:
+                skipped += 1
+                continue
+            self.current_job_plan.personal_queues[str(agent.agent_id)] = list(window[idx:]) + tail
+            self._record_manager_queue_skip(agent.agent_id, skipped)
+            return sorted(matching, key=lambda task: self._task_sort_key(task, agent))[0]
+        self.current_job_plan.personal_queues[str(agent.agent_id)] = tail
+        self._record_manager_queue_skip(agent.agent_id, skipped)
+        return None
+
+    def _matching_mailbox_candidates(self, candidates: list[Task], agent: Agent) -> list[Task]:
+        mailbox = self.current_mailbox(agent.agent_id)
+        if not mailbox:
+            return []
+        return [task for task in candidates if any(self._mailbox_message_matches_task(message, task) for message in mailbox[: self.worker_queue_limit])]
+
+    def _task_sort_key(self, task: Task, agent: Agent) -> tuple[float, float, float, str, str]:
+        return (
+            -self._task_score(task, agent),
+            float(self.travel_time(agent.location, task.location)),
+            -float(task.priority),
+            self._task_priority_key(task),
+            str(task.location),
+        )
+
+
+    def _selection_bias_snapshot(self, task: Task, agent: Agent) -> dict[str, Any]:
+        priority_key = self._task_priority_key(task)
+        effective_weights = self.current_effective_task_priority_weights(agent.agent_id)
+        shared_weight = float((self.current_job_plan.task_priority_weights or {}).get(priority_key, 1.0))
+        effective_weight = float(effective_weights.get(priority_key, shared_weight))
+        queue = self.current_personal_queue(agent.agent_id)
+        mailbox = self.current_mailbox(agent.agent_id)
+        return {
+            "priority_key": priority_key,
+            "shared_weight": round(shared_weight, 3),
+            "effective_weight": round(effective_weight, 3),
+            "queue_match": any(self._work_order_matches_task(order, task) for order in queue[: self.worker_queue_limit]),
+            "mailbox_match": any(self._mailbox_message_matches_task(message, task) for message in mailbox[: self.worker_queue_limit]),
+            "travel_time_min": round(float(self.travel_time(agent.location, task.location)), 3),
+            "agent_role": self.current_agent_role(agent.agent_id),
+            "personal_queue": queue[:2],
+            "mailbox": mailbox[:2],
+        }
+
+    def _consume_personal_queue_matches(self, agent_id: str, task: Task) -> list[dict[str, Any]]:
+        if not isinstance(self.current_job_plan.personal_queues, dict):
+            return []
+        queue = self.current_job_plan.personal_queues.get(str(agent_id), [])
+        if not isinstance(queue, list) or not queue:
+            return []
+        kept: list[dict[str, Any]] = []
+        consumed: list[dict[str, Any]] = []
+        for item in queue:
+            if not consumed and self._work_order_matches_task(item, task):
+                consumed.append(dict(item) if isinstance(item, dict) else {"value": item})
+                continue
+            kept.append(item)
+        self.current_job_plan.personal_queues[str(agent_id)] = kept
+        return consumed
+
+    def _consume_mailbox_matches(self, agent_id: str, task: Task) -> list[dict[str, Any]]:
+        if not isinstance(self.current_job_plan.mailbox, dict):
+            return []
+        mailbox = self.current_job_plan.mailbox.get(str(agent_id), [])
+        if not isinstance(mailbox, list) or not mailbox:
+            return []
+        priority_key = self._task_priority_key(task)
+        target_station = self._task_target_station(task)
+        target_id = self._task_target_id(task)
+        kept: list[dict[str, Any]] = []
+        consumed: list[dict[str, Any]] = []
+        for message in mailbox:
+            if not isinstance(message, dict):
+                kept.append(message)
+                continue
+            if self._mailbox_message_matches_task(message, task):
+                consumed.append(dict(message))
+            else:
+                kept.append(message)
+        self.current_job_plan.mailbox[str(agent_id)] = kept
+        return consumed
+
+
+    # Runtime execution stays deterministic. The manager supplies queue/mailbox/focus
+    # context, and the world converts that context into a local task choice for each worker.
     def select_task_for_agent(self, agent: Agent) -> Task | None:
+        # Final task choice remains deterministic. MANAGER queues are authoritative before
+        # mailbox or generic priority scoring, so the planner can act as a real operating planner.
         if agent.discharged:
             return None
         if agent.awaiting_battery_from is not None:
@@ -1505,93 +1832,78 @@ class ManufacturingWorld:
         if not candidates:
             return None
 
-        scored_candidates = sorted(candidates, key=lambda task: self._task_score(task, agent), reverse=True)
-        if len(scored_candidates) == 1:
+        queue_task = self._select_planner_queue_task(candidates, agent)
+        if queue_task is not None:
+            bias = self._selection_bias_snapshot(queue_task, agent)
+            focus = [str(bias.get("priority_key", ""))]
+            queue = bias.get("personal_queue", []) if isinstance(bias.get("personal_queue", []), list) else []
+            for item in queue[:2]:
+                if isinstance(item, dict) and str(item.get("task_family", "")).strip():
+                    focus.append(str(item.get("task_family", "")).strip())
+            return self._annotate_task_selection(
+                queue_task,
+                decision_source="manager_queue",
+                decision_rule="personal_queue_dispatch",
+                rationale="Engine executed the first feasible planner queue order before considering mailbox or generic priority scoring.",
+                candidate_count=1,
+                score_hint=self._task_score(queue_task, agent),
+                decision_focus=[item for item in focus if item],
+                fallback_reason="personal_queue",
+            )
+
+        mailbox_candidates = self._matching_mailbox_candidates(candidates, agent)
+        if mailbox_candidates:
+            scored_candidates = sorted(mailbox_candidates, key=lambda task: self._task_sort_key(task, agent))
             task = scored_candidates[0]
+            bias = self._selection_bias_snapshot(task, agent)
+            focus = [str(bias.get("priority_key", ""))]
+            queue = bias.get("personal_queue", []) if isinstance(bias.get("personal_queue", []), list) else []
+            for item in queue[:2]:
+                if isinstance(item, dict) and str(item.get("task_family", "")).strip():
+                    focus.append(str(item.get("task_family", "")).strip())
             return self._annotate_task_selection(
                 task,
-                decision_source="single_candidate",
-                decision_rule="single_feasible_candidate",
-                rationale="Only one feasible task is available.",
-                candidate_count=1,
+                decision_source="manager_queue",
+                decision_rule="mailbox_dispatch",
+                rationale="Engine selected the highest priority mailbox-matched feasible task after no feasible planner queue order was available.",
+                candidate_count=len(mailbox_candidates),
                 score_hint=self._task_score(task, agent),
+                decision_focus=[item for item in focus if item],
+                fallback_reason="mailbox",
             )
 
-        select_fn = getattr(self.decision_module, "select_next_task", None)
-        if callable(select_fn):
-            max_candidates = max(0, int(getattr(self.decision_module, "task_selector_max_candidates", 0)))
-            include_score_hints = bool(getattr(self.decision_module, "task_selector_include_score_hints", False))
-            selector_candidates = scored_candidates[:max_candidates] if max_candidates > 0 else list(scored_candidates)
-            selection_context = self._build_task_selection_context(
-                agent,
-                selector_candidates,
-                include_score_hints=include_score_hints,
-            )
-            try:
-                selection = select_fn(selection_context)
-            except Exception as exc:
-                fallback = scored_candidates[0]
-                return self._annotate_task_selection(
-                    fallback,
-                    decision_source="priority_score_fallback",
-                    decision_rule="llm_task_selector_error",
-                    rationale="LLM task selection failed; fallback to engine score dispatch.",
-                    candidate_count=len(selector_candidates),
-                    score_hint=self._task_score(fallback, agent),
-                    fallback_reason=str(exc),
-                )
-
-            selected_task_id = str(selection.get("selected_task_id", "")).strip() if isinstance(selection, dict) else ""
-            chosen_task = next((task for task in selector_candidates if task.task_id == selected_task_id), None)
-            if chosen_task is not None:
-                rationale = str(selection.get("rationale", "")).strip() if isinstance(selection, dict) else ""
-                focus_raw = selection.get("decision_focus", []) if isinstance(selection, dict) else []
-                decision_focus = [
-                    str(item).strip() for item in focus_raw if isinstance(item, str) and str(item).strip()
-                ]
-                return self._annotate_task_selection(
-                    chosen_task,
-                    decision_source="llm_task_selector",
-                    decision_rule="llm_candidate_selection",
-                    rationale=rationale or "LLM selected one feasible candidate task.",
-                    candidate_count=len(selector_candidates),
-                    score_hint=self._task_score(chosen_task, agent),
-                    decision_focus=decision_focus,
-                )
-
-            fallback = scored_candidates[0]
-            return self._annotate_task_selection(
-                fallback,
-                decision_source="priority_score_fallback",
-                decision_rule="invalid_llm_task_choice",
-                rationale="LLM returned an invalid task_id; fallback to engine score dispatch.",
-                candidate_count=len(selector_candidates),
-                score_hint=self._task_score(fallback, agent),
-                fallback_reason=selected_task_id,
-            )
-
+        scored_candidates = sorted(candidates, key=lambda task: self._task_sort_key(task, agent))
         task = scored_candidates[0]
+        bias = self._selection_bias_snapshot(task, agent)
+        focus = [str(bias.get("priority_key", ""))]
+        queue = bias.get("personal_queue", []) if isinstance(bias.get("personal_queue", []), list) else []
+        for item in queue[:2]:
+            if isinstance(item, dict) and str(item.get("task_family", "")).strip():
+                focus.append(str(item.get("task_family", "")).strip())
         return self._annotate_task_selection(
             task,
             decision_source="priority_score",
             decision_rule="priority_score_dispatch",
-            rationale="Engine selected the highest scored feasible task.",
-            candidate_count=len(scored_candidates),
+            rationale="Engine selected the highest priority feasible task only after no feasible planner queue order was available.",
+            candidate_count=len(candidates),
             score_hint=self._task_score(task, agent),
+            decision_focus=[item for item in focus if item],
+            fallback_reason="generic",
         )
 
+    # shared weight는 하루 단위 의도를 나타내고, agent multiplier는 그 의도를 개인별로 미세 조정한다.
+    # queue와 mailbox는 이미 상위 선택 tier에서 처리하므로 최종 점수식은 단순하게 유지한다.
     def _task_score(self, task: Task, agent: Agent | str | None = None) -> float:
-        # LLM modes can personalize the score per agent by multiplying the shared baseline
-        # with that agent's learned overlay. Heuristic modes effectively stay on the baseline.
         priority_key = self._task_priority_key(task)
         if isinstance(agent, Agent):
             effective = self.current_effective_task_priority_weights(agent.agent_id)
             weight = float(effective.get(priority_key, 1.0))
-        elif isinstance(agent, str) and agent.strip():
+            return float(task.priority) * weight
+        if isinstance(agent, str) and agent.strip():
             effective = self.current_effective_task_priority_weights(agent.strip())
             weight = float(effective.get(priority_key, 1.0))
-        else:
-            weight = float((self.current_job_plan.task_priority_weights or {}).get(priority_key, 1.0))
+            return float(task.priority) * weight
+        weight = float((self.current_job_plan.task_priority_weights or {}).get(priority_key, 1.0))
         return float(task.priority) * weight
 
     def _candidate_tasks(self, agent: Agent) -> list[Task]:
@@ -1751,8 +2063,6 @@ class ManufacturingWorld:
             return float(self.movement_cfg["warehouse_to_station_min"])
         if src == "BatteryStation" or dst == "BatteryStation":
             return float(self.movement_cfg["to_battery_station_min"])
-        if src == "TownHall" or dst == "TownHall":
-            return float(self.movement_cfg["to_townhall_min"])
         return float(self.movement_cfg["default_min"])
 
     def move_agent(self, agent: Agent, dst: str, emit_move_events: bool = True):
@@ -2459,7 +2769,7 @@ class ManufacturingWorld:
 
     def _agent_day_experience(self, task_slice: list[dict[str, Any]]) -> dict[str, Any]:
         # Build the per-agent behavioral summary that feeds next-day overlay updates and
-        # becomes the compact personal memory shown to townhall and selector prompts.
+        # becomes the compact personal memory shown to daily review artifacts and workspace memory updates.
         experience: dict[str, Any] = {}
         downstream_keys = {"unload_machine", "inter_station_transfer", "inspect_product"}
         reliability_keys = {"repair_machine", "preventive_maintenance"}
@@ -2519,6 +2829,7 @@ class ManufacturingWorld:
                 "interrupted_counts": {key: int(value) for key, value in interrupted_counts.items()},
                 "skipped_counts": {key: int(value) for key, value in skipped_counts.items()},
                 "decision_source_counts": dict(decision_source_counts),
+                "manager_queue_skipped_count": int(self.manager_queue_skipped_counts.get(agent_id, 0)),
                 "contribution_signals": contribution_signals,
                 "top_completed_task_families": [
                     {"priority_key": key, "completed_minutes": round(float(value), 3), "completed_count": int(completed_counts.get(key, 0))}
@@ -2600,6 +2911,17 @@ class ManufacturingWorld:
                     break
                 days_since_last_product += 1
 
+        total_machine_time_day = max(1.0, float(self.minutes_per_day) * max(1, len(self.machines)))
+        discharged_intervals = self._agent_discharged_intervals()
+        day_start_t = float((day - 1) * self.minutes_per_day)
+        day_end_t = float(day * self.minutes_per_day)
+        agent_discharged_min = 0.0
+        for _agent_id, start_t, end_t in discharged_intervals:
+            overlap_start = max(day_start_t, float(start_t))
+            overlap_end = min(day_end_t, float(end_t))
+            if overlap_end > overlap_start:
+                agent_discharged_min += overlap_end - overlap_start
+
         summary = {
             "day": day,
             "products": products_today,
@@ -2615,33 +2937,47 @@ class ManufacturingWorld:
             "station1_output_buffer_end": len(self.output_buffers[1]),
             "station2_output_buffer_end": len(self.output_buffers[2]),
             "agent_discharged_count": int(agent_discharged_count),
+            "agent_discharged_min": round(agent_discharged_min, 3),
             "battery_delivery_count": int(battery_delivery_count),
             "days_since_last_product": int(days_since_last_product),
             "task_minutes": dict(task_breakdown),
             "machine_processing_min": processing_delta,
             "machine_broken_min": broken_delta,
             "machine_pm_min": pm_delta,
+            "machine_utilization": round(sum(processing_delta.values()) / total_machine_time_day, 6),
+            "machine_broken_ratio": round(sum(broken_delta.values()) / total_machine_time_day, 6),
+            "machine_pm_ratio": round(sum(pm_delta.values()) / total_machine_time_day, 6),
             "inspection_backlog_end": len(self.intermediate_queues[self.inspection_queue_station]),
+            "manager_queue_skipped_total": int(sum(self.manager_queue_skipped_counts.values())),
+            "manager_queue_skipped_by_agent": {agent_id: int(self.manager_queue_skipped_counts.get(agent_id, 0)) for agent_id in sorted(self.agents.keys())},
             "agent_experience": agent_experience,
             "shared_task_priority_weights": dict(self.current_job_plan.task_priority_weights or {}),
             "agent_priority_multipliers": {agent_id: self.current_agent_priority_multipliers(agent_id) for agent_id in sorted(self.agents.keys())},
             "agent_effective_task_priority_weights": {agent_id: self.current_effective_task_priority_weights(agent_id) for agent_id in sorted(self.agents.keys())},
         }
         self.daily_summaries.append(summary)
+        self.manager_queue_skipped_counts = defaultdict(int)
         return summary
 
     def finalize_kpis(self) -> dict[str, Any]:
         total_checked = self.product_count + self.scrap_count
         total_time = max(1.0, float(self.env.now))
-        n_machines = len(self.machines)
-        total_machine_processing = sum(m.total_processing_min for m in self.machines.values())
-        total_machine_broken = sum(m.total_broken_min for m in self.machines.values())
-        total_machine_pm = sum(m.total_pm_min for m in self.machines.values())
 
         task_totals: dict[str, float] = defaultdict(float)
         for rec in self.task_records:
             if rec["status"] == "completed":
                 task_totals[rec["task_type"]] += rec["duration"]
+
+        discharged_metrics = self._agent_discharged_metrics()
+        buffer_wait_metrics = self._buffer_wait_metrics()
+        lead_time_metrics = self._completed_product_lead_time_metrics()
+        machine_time_metrics = self._machine_time_metrics()
+        downstream_closure_ratio = round(
+            (self.product_count / max(1.0, float(self.station_throughput.get(self.last_processing_station, 0) or 0.0)))
+            if float(self.station_throughput.get(self.last_processing_station, 0) or 0.0) > 0.0
+            else 0.0,
+            6,
+        )
 
         return {
             "total_products": self.product_count,
@@ -2649,6 +2985,7 @@ class ManufacturingWorld:
             "scrap_rate": round((self.scrap_count / total_checked) if total_checked > 0 else 0.0, 6),
             "station_throughput": dict(self.station_throughput),
             "avg_daily_products": round(self.product_count / self.num_days, 4),
+            "throughput_per_sim_hour": round(self.product_count / max(1e-6, total_time / 60.0), 4),
             "avg_wip_material": round(
                 mean(sum(s["material_queue_lengths"].values()) for s in self.minute_snapshots),
                 4,
@@ -2658,10 +2995,36 @@ class ManufacturingWorld:
             "avg_wip_intermediate": round(mean(sum(s["intermediate_queue_lengths"].values()) for s in self.minute_snapshots), 4)
             if self.minute_snapshots
             else 0.0,
-            "machine_utilization": round(total_machine_processing / max(1.0, total_time * n_machines), 6),
-            "machine_broken_ratio": round(total_machine_broken / max(1.0, total_time * n_machines), 6),
-            "machine_pm_ratio": round(total_machine_pm / max(1.0, total_time * n_machines), 6),
+            "avg_wip_output": round(mean(sum(s["output_buffer_lengths"].values()) for s in self.minute_snapshots), 4)
+            if self.minute_snapshots
+            else 0.0,
+            "machine_processing_min": machine_time_metrics["total_processing_min"],
+            "machine_broken_min": machine_time_metrics["total_broken_min"],
+            "machine_pm_min": machine_time_metrics["total_pm_min"],
+            "machine_utilization": machine_time_metrics["utilization_ratio"],
+            "machine_broken_ratio": machine_time_metrics["broken_ratio"],
+            "machine_pm_ratio": machine_time_metrics["pm_ratio"],
+            "machine_other_ratio": machine_time_metrics["other_ratio"],
+            "machine_ratio_by_station": machine_time_metrics["ratio_by_station"],
             "agent_task_minutes": dict(task_totals),
+            "agent_discharged_time_min_total": discharged_metrics["total_min"],
+            "agent_discharged_time_min_avg": discharged_metrics["avg_min_per_agent"],
+            "agent_discharged_time_min_by_agent": discharged_metrics["by_agent"],
+            "agent_discharged_ratio": discharged_metrics["discharged_ratio"],
+            "agent_discharged_ratio_by_agent": discharged_metrics["ratio_by_agent"],
+            "agent_availability_ratio": discharged_metrics["availability_ratio"],
+            "buffer_wait_avg_min": buffer_wait_metrics["avg_wait_min"],
+            "buffer_wait_avg_min_including_open": buffer_wait_metrics["avg_wait_min_including_open"],
+            "buffer_wait_completed_count": buffer_wait_metrics["completed_wait_count"],
+            "buffer_wait_open_count": buffer_wait_metrics["open_wait_count"],
+            "completed_product_lead_time_avg_min": lead_time_metrics["avg_min"],
+            "completed_product_lead_time_p95_min": lead_time_metrics["p95_min"],
+            "downstream_closure_ratio": downstream_closure_ratio,
             "terminated": self.terminated,
             "termination_reason": self.termination_reason,
         }
+
+
+
+
+

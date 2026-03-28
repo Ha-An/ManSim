@@ -8,7 +8,7 @@ seed: 7
 
 horizon:
   # 총 시뮬레이션 일수
-  num_days: 10
+  num_days: 5
   # 하루 길이(분). 240=4시간, 480=8시간, 1440=24시간
   minutes_per_day: 240
 
@@ -39,8 +39,6 @@ movement:
   unload_min: 2
   # BatteryStation 이동 시간
   to_battery_station_min: 4
-  # TownHall 이동 시간
-  to_townhall_min: 4
   # 그 외 기본 이동 시간
   default_min: 6
 

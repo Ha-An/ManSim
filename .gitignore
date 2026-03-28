@@ -8,3 +8,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 _tmp_kor_test.txt
+openclaw/state/
+
+openclaw/workspaces/*/.openclaw/

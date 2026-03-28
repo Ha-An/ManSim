@@ -1,0 +1,134 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.3.13"
+  },
+  "env": {
+    "shellEnv": {
+      "enabled": false
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "ollama/qwen2.5:14b"
+      },
+      "models": {
+        "ollama/qwen2.5:14b": {}
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "skipBootstrap": true,
+      "timeoutSeconds": 120
+    },
+    "list": [
+      {
+        "id": "main"
+      },
+      {
+        "id": "A1",
+        "name": "A1",
+        "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\A1",
+        "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\A1\\agent",
+        "model": "ollama/qwen2.5:14b"
+      },
+      {
+        "id": "A2",
+        "name": "A2",
+        "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\A2",
+        "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\A2\\agent",
+        "model": "ollama/qwen2.5:14b"
+      },
+      {
+        "id": "A3",
+        "name": "A3",
+        "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\A3",
+        "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\A3\\agent",
+        "model": "ollama/qwen2.5:14b"
+      },
+      {
+        "id": "MANAGER",
+        "name": "MANAGER",
+        "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\MANAGER",
+        "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\MANAGER\\agent",
+        "model": "ollama/qwen2.5:14b"
+      }
+    ]
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": false,
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "auth": {
+      "mode": "none"
+    },
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "ollama": {
+        "baseUrl": "http://localhost:11434",
+        "apiKey": "ollama-local",
+        "api": "ollama",
+        "models": [
+          {
+            "id": "qwen2.5:14b",
+            "name": "Qwen 2.5 14B",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 32768,
+            "maxTokens": 32768
+          }
+        ]
+      }
+    }
+  },
+  "tools": {
+    "profile": "minimal"
+  },
+  "skills": {
+    "allowBundled": [],
+    "load": {
+      "extraDirs": []
+    },
+    "entries": {
+      "coding-agent": {
+        "enabled": false
+      },
+      "healthcheck": {
+        "enabled": false
+      },
+      "node-connect": {
+        "enabled": false
+      },
+      "session-logs": {
+        "enabled": false
+      },
+      "skill-creator": {
+        "enabled": false
+      },
+      "weather": {
+        "enabled": false
+      }
+    }
+  }
+}

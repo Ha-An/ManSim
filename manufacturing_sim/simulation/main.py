@@ -15,6 +15,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from manufacturing_sim.simulation.scenarios.manufacturing.run import run
+from manufacturing_sim.simulation.scenarios.manufacturing.viz.orchestration_intelligence_dashboard import export_orchestration_intelligence_dashboard
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.dashboard import export_kpi_dashboard
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.gantt import export_gantt
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.llm_trace import export_llm_trace_dashboard
@@ -123,9 +124,23 @@ def _recover_artifacts_if_possible(output_dir: Path, experiment_cfg: dict[str, o
     except BaseException as exc:
         artifact_status["errors"]["task_priority_dashboard"] = f"{type(exc).__name__}: {exc}"
 
-    llm_trace_path = ""
+    orchestration_intelligence_dashboard_path = None
     llm_exchange_blob = _load_json(output_dir / "llm_exchange.json")
     records = llm_exchange_blob.get("records", []) if isinstance(llm_exchange_blob, dict) and isinstance(llm_exchange_blob.get("records", []), list) else []
+    try:
+        orchestration_intelligence_dashboard_path = export_orchestration_intelligence_dashboard(
+            output_dir=output_dir,
+            daily_summary=daily_summary,
+            llm_records=records,
+        )
+        if orchestration_intelligence_dashboard_path is not None and Path(orchestration_intelligence_dashboard_path).exists():
+            artifact_status["generated"]["orchestration_intelligence_dashboard"] = str(orchestration_intelligence_dashboard_path)
+        else:
+            artifact_status["errors"]["orchestration_intelligence_dashboard"] = "orchestration intelligence dashboard export returned no HTML path"
+    except BaseException as exc:
+        artifact_status["errors"]["orchestration_intelligence_dashboard"] = f"{type(exc).__name__}: {exc}"
+
+    llm_trace_path = ""
     if records:
         try:
             trace_path = export_llm_trace_dashboard(records=records, output_dir=output_dir)
@@ -158,6 +173,7 @@ def _recover_artifacts_if_possible(output_dir: Path, experiment_cfg: dict[str, o
         "gantt_path": str(gantt_path),
         "kpi_dashboard_path": str(dashboard_path) if dashboard_path else "",
         "task_priority_dashboard_path": str(task_priority_dashboard_path) if task_priority_dashboard_path else "",
+        "orchestration_intelligence_dashboard_path": str(orchestration_intelligence_dashboard_path) if orchestration_intelligence_dashboard_path else "",
         "llm_trace_path": llm_trace_path,
         "terminated": bool(kpi.get("terminated", False)),
         "termination_reason": str(kpi.get("termination_reason", "")),

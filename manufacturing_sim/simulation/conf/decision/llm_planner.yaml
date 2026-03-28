@@ -1,37 +1,115 @@
-﻿# LLM planner 모드
-# - LLM이 하루 단위 진단, task-priority weight, quota, norm update를 담당한다.
-# - 실제 runtime task dispatch는 엔진 점수 기반으로 수행한다.
+﻿# OpenClaw 기반 매니저 LLM planner 모드 설정.
+# - 작업자 에이전트(A1/A2/A3)는 로컬 상태를 보고 개인 큐를 우선 수행한다.
+# - MANAGER 계열 에이전트는 병목 진단과 일일 계획 수립을 담당한다.
+# - 실제 작업 실행 순서는 시뮬레이터 안에서 결정론적으로 처리된다.
 mode: llm_planner
 
-# breakdown / discharge 같은 긴급 이벤트 대응 on/off
 urgent_discuss:
+  # 긴급 재계획 경로 사용 여부.
+  # 현재 구조에서는 비활성화 상태가 기본이다.
   enabled: false
 
-# false면 shared norm을 planning에서 숨기고, norm update도 수행하지 않는다.
 norms:
+  # 하루가 끝난 뒤 규범/운영 원칙을 갱신할지 여부.
   enabled: true
 
 llm:
+  # LLM 경로 자체를 사용할지 여부.
   enabled: true
-  provider: openai_compatible
-  server_url: "http://localhost:11434/v1"
-  model: "qwen2.5:14b"
+  # 현재는 OpenClaw gateway를 통해 호출한다.
+  provider: openclaw
+  # OpenClaw gateway의 OpenAI 호환 주소.
+  # OpenClaw provider를 쓸 때는 이 주소가 사실상 주 엔드포인트다.
+  server_url: "http://localhost:18789/v1"
+  # 프롬프트와 응답의 기본 언어 설정.
+  language: KOR
+  # 호출 1회당 최대 대기 시간(초).
   timeout_sec: 120
+  # 샘플링 온도. 현재는 재현성을 위해 0.0으로 둔다.
   temperature: 0.0
+  # 상위 호출에서 허용하는 최대 출력 토큰 수.
   max_tokens: 800
 
-  communication:
-    # GovSim-style townhall 대화 on/off
+  openclaw:
+    # 백엔드 상태 점검 주기(초).
+    # 너무 짧으면 불필요한 probe가 늘고, 너무 길면 장애 감지가 늦어진다.
+    backend_health_probe_interval_sec: 30
+    # health probe HTTP 요청 타임아웃(초).
+    backend_health_probe_timeout_sec: 2.5
+    # probe 실패 시 추가로 다시 확인할 횟수.
+    runtime_recovery_probe_retries: 2
+    # readiness 실패 시 gateway 재기동을 시도할 최대 횟수.
+    runtime_recovery_restarts: 1
+    # recovery 재시도 사이 대기 시간(초).
+    runtime_recovery_backoff_sec: 1.5
+    # 실제 native-local readiness 확인에 허용하는 최대 시간(초).
+    runtime_readiness_timeout_sec: 12.0
+    # 사용할 OpenClaw profile 이름.
+    profile_name: mansim_repo
+    # 위 profile의 설정 파일 경로.
+    profile_config_path: "openclaw/profiles/mansim_repo/openclaw.json"
+    # session id 앞에 붙는 네임스페이스.
+    # 다른 프로젝트와 세션 충돌을 피하려면 프로젝트별로 다르게 둔다.
+    session_namespace: mansim
+    # 기본 매니저 에이전트 id.
+    # 실제 runtime에서는 day-scoped id로 파생되어 사용된다.
+    manager_agent_id: MANAGER
+    # OpenClaw workspace 템플릿 루트 경로.
+    workspace_root: openclaw/workspaces
+    # OpenClaw native thinking 옵션.
+    # 허용값: off, minimal, low, medium, high, adaptive
+    # - off: thinking 옵션을 붙이지 않음
+    # - minimal~high/adaptive: `--thinking <level>`로 native-local 호출에 전달
+    # 일반적으로 thinking을 높이면 더 느려질 수 있다.
+    native_thinking: "off"
+    prompt:
+      # system prompt를 더 짧게 압축할지 여부.
+      # 토큰 절약과 latency 감소에 도움이 될 수 있다.
+      compact_system_prompt: true
+    worker_agent_ids:
+      # 현장 작업자로 취급할 에이전트 목록.
+      - A1
+      - A2
+      - A3
+    backend:
+      # OpenClaw가 실제로 연결할 하위 추론 백엔드.
+      provider: ollama
+      # 하위 백엔드에서 사용할 실제 모델 태그.
+      model: qwen2.5:14b
+      # Ollama 서버 주소.
+      base_url: "http://localhost:11434"
+      # Windows에서 WSL 안 Ollama를 찾을 때 사용할 배포판 이름.
+      wsl_distro: "Ubuntu-24.04"
+      # 백엔드 API 종류.
+      api: ollama
+      # 로컬 Ollama 경로에서는 형식상만 쓰는 값이다.
+      api_key: "ollama-local"
+      # 모델 입력 컨텍스트 창 크기.
+      context_window: 32768
+      # 모델이 낼 수 있는 최대 출력 토큰 수.
+      max_output_tokens: 32768
+      # 하위 모델의 reasoning 모드 사용 여부.
+      reasoning: false
+
+  orchestration:
+    # manager 기반 병목 진단/일일 계획 루프 사용 여부.
     enabled: true
-    # townhall 자연어 발언 언어: KOR 또는 ENG
-    language: KOR
-    rounds: 5
-    # 각 발화에서 transcript context로 유지할 최근 메시지 수
-    max_transcript_messages: 24
+    # 작업자 개인 큐에 하루에 넣을 최대 작업 수.
+    worker_queue_limit: 4
+    # planner가 만들 수 있는 병렬 작업 그룹 최대 수.
+    max_parallel_groups: 3
+    # 하루 중간 incident 재계획 경로 사용 여부.
+    # 기본값이 true라서, 현재처럼 끄려면 명시적으로 false를 유지해야 한다.
+    incident_replan_enabled: false
+    # 작업자 보고나 리뷰에 넣을 항목 수 제한.
+    report_item_limit: 4
+    # 작업자 호출을 병렬로 보낼지 여부.
+    parallel_worker_calls: true
+    # orchestration 단계의 thinking 표시 옵션.
+    thinking: "off"
 
   memory:
-    # discussion memory에 유지할 최근 day 수
+    # 며칠치 이력을 프롬프트/메모리에 포함할지 결정한다.
     history_window_days: 7
-    # per-agent memory snippet을 프롬프트에 포함할지 여부
-    include_agent_memory: true
-
+    # 작업자 개별 memory를 planner 입력에 직접 포함할지 여부.
+    include_agent_memory: false

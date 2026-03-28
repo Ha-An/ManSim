@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import sys
@@ -129,7 +129,7 @@ def _load_battery_period_min(events_path_str: str, default: float = 180.0) -> fl
 
 @st.cache_data(show_spinner=False)
 def _load_run_meta(events_path_str: str) -> dict[str, Any]:
-    out = {"mode": "unknown", "model": "", "server_url": "", "communication_enabled": None, "communication_language": ""}
+    out = {"mode": "unknown", "model": "", "server_url": "", "communication_enabled": None, "coordination_review_enabled": None, "language": "", "communication_language": ""}
     events_path = Path(events_path_str)
 
     run_meta_path = events_path.parent / "run_meta.json"
@@ -147,7 +147,10 @@ def _load_run_meta(events_path_str: str) -> dict[str, Any]:
             out["server_url"] = str(llm.get("server_url", "")).strip()
             if "communication_enabled" in llm:
                 out["communication_enabled"] = bool(llm.get("communication_enabled"))
-            out["communication_language"] = str(llm.get("communication_language", "")).strip().upper()
+            if "coordination_review_enabled" in llm:
+                out["coordination_review_enabled"] = bool(llm.get("coordination_review_enabled"))
+            out["language"] = str(llm.get("language", llm.get("communication_language", ""))).strip().upper()
+            out["communication_language"] = out["language"]
             if out["mode"] != "unknown":
                 return out
 
@@ -169,6 +172,10 @@ def _load_run_meta(events_path_str: str) -> dict[str, Any]:
     m_comm = re.search(r"(?m)^\s{6}enabled\s*:\s*(true|false)\s*$", text)
     if m_comm:
         out["communication_enabled"] = str(m_comm.group(1)).strip().lower() == "true"
+    m_lang = re.search(r'(?m)^\s{4}language\s*:\s*"?([^"\n]+)"?\s*$', text)
+    if m_lang:
+        out["language"] = str(m_lang.group(1)).strip().upper()
+        out["communication_language"] = out["language"]
     return out
 
 
@@ -326,8 +333,6 @@ def _target_zone(task_type: str, payload: dict[str, Any], fallback_zone: str) ->
 def _canonical_zone(zone: str) -> str:
     if zone in ZONE_LAYOUT:
         return zone
-    if zone in {"Home", "TownHall"}:
-        return "Warehouse"
     return "Warehouse"
 
 
@@ -612,7 +617,6 @@ def _decision_source_label(source: str) -> str:
         "single_candidate": "Single Candidate",
         "priority_score": "Priority Score",
         "priority_score_fallback": "Score Fallback",
-        "llm_task_selector": "LLM Selector",
     }
     return labels.get(normalized, "-" if not normalized else normalized.replace("_", " ").title())
 
@@ -1640,69 +1644,43 @@ def _draw_factory_map(
 
 
 
-def _collect_townhall_events(events_df: pd.DataFrame, current_t: float) -> list[dict[str, Any]]:
-    filtered = events_df[(events_df["t"] <= current_t) & (events_df["type"] == "CHAT_TOWNHALL")]
+def _collect_daily_review_events(events_df: pd.DataFrame, current_t: float) -> list[dict[str, Any]]:
+    # ?? ??? ?? ?? ?? ???? ????.
+    filtered = events_df[(events_df["t"] <= current_t) & (events_df["type"] == "CHAT_DAILY_REVIEW")]
     sessions: list[dict[str, Any]] = []
 
     for row in filtered.itertuples(index=False):
         details = row.details if isinstance(row.details, dict) else {}
-        trace = details.get("discussion_trace", [])
-
-        transcript: list[dict[str, Any]] = []
-        moderator_summary = ""
-        rounds = 0
-        memory_update: dict[str, Any] = {}
+        trace = details.get("review_trace", details.get("discussion_trace", []))
+        day_summary = details.get("day_summary", {}) if isinstance(details.get("day_summary", {}), dict) else {}
+        updated_norms = details.get("updated_norms", {}) if isinstance(details.get("updated_norms", {}), dict) else {}
+        communication_enabled = bool(details.get("coordination_review_enabled", details.get("communication_enabled", False)))
+        session: dict[str, Any] = {
+            "t": float(row.t),
+            "day": int(row.day),
+            "event_type": str(row.type),
+            "communication_enabled": communication_enabled,
+            "day_summary": day_summary,
+            "updated_norms": updated_norms,
+            "mode": "daily_review",
+            "worker_reports": {},
+            "manager_review": {},
+        }
 
         if isinstance(trace, list):
             for item in trace:
                 if not isinstance(item, dict):
                     continue
-                if "agent_id" in item:
-                    try:
-                        ridx = int(item.get("round", 0))
-                    except (TypeError, ValueError):
-                        ridx = 0
-                    rounds = max(rounds, ridx)
-                    transcript.append(
-                        {
-                            "round": ridx,
-                            "agent_id": str(item.get("agent_id", "")).strip(),
-                            "utterance": str(item.get("utterance", "")).strip(),
-                            "proposal": item.get("proposal", {}) if isinstance(item.get("proposal", {}), dict) else {},
-                        }
-                    )
-                    continue
+                item_type = str(item.get("type", "")).strip()
+                if item_type == "worker_daily_report" and isinstance(item.get("worker_reports", {}), dict):
+                    session["worker_reports"] = item.get("worker_reports", {})
+                    session["manager_review"] = item.get("manager_review", {}) if isinstance(item.get("manager_review", {}), dict) else {}
+                elif item_type == "deterministic_daily_review" and isinstance(item.get("review", {}), dict):
+                    session["mode"] = "deterministic_daily_review"
+                    session["worker_reports"] = {}
+                    session["manager_review"] = item.get("review", {})
 
-                role = str(item.get("role", "")).strip().lower()
-                summary = str(item.get("summary", "")).strip()
-                if role == "moderator" or summary:
-                    if summary:
-                        moderator_summary = summary
-                    try:
-                        rounds = max(rounds, int(item.get("rounds", rounds)))
-                    except (TypeError, ValueError):
-                        pass
-                    if isinstance(item.get("memory_update", {}), dict):
-                        memory_update = item.get("memory_update", {})
-
-        day_summary = details.get("day_summary", {}) if isinstance(details.get("day_summary", {}), dict) else {}
-        updated_norms = details.get("updated_norms", {}) if isinstance(details.get("updated_norms", {}), dict) else {}
-        communication_enabled = bool(details.get("communication_enabled", False))
-
-        sessions.append(
-            {
-                "t": float(row.t),
-                "day": int(row.day),
-                "communication_enabled": communication_enabled,
-                "rounds": int(rounds),
-                "messages": len(transcript),
-                "transcript": transcript,
-                "moderator_summary": moderator_summary,
-                "day_summary": day_summary,
-                "updated_norms": updated_norms,
-                "memory_update": memory_update,
-            }
-        )
+        sessions.append(session)
 
     return sessions
 
@@ -1724,36 +1702,34 @@ def _phase_details_for_day(events_df: pd.DataFrame, day: int, current_t: float) 
     return strategy, assignment
 
 
-def _render_townhall_conversation_panel(events_df: pd.DataFrame, current_t: float) -> None:
-    st.markdown("### Townhall Conversation")
-    sessions = _collect_townhall_events(events_df, current_t)
+def _render_daily_review_panel(events_df: pd.DataFrame, current_t: float) -> None:
+    st.markdown("### Daily Operations Review")
+    sessions = _collect_daily_review_events(events_df, current_t)
     if not sessions:
-        st.info("No townhall conversation is available at the current replay time.")
+        st.info("No daily coordination review is available at the current replay time.")
         return
 
-    overview_rows = [
-        {
+    overview_rows = []
+    for s in sessions:
+        worker_reports = s.get("worker_reports", {}) if isinstance(s.get("worker_reports", {}), dict) else {}
+        manager_review = s.get("manager_review", {}) if isinstance(s.get("manager_review", {}), dict) else {}
+        overview_rows.append({
             "day": s["day"],
             "time(min)": round(float(s["t"]), 1),
-            "communication": "on" if s["communication_enabled"] else "off",
-            "rounds": int(s["rounds"]),
-            "messages": int(s["messages"]),
-            "has_summary": bool(str(s.get("moderator_summary", "")).strip()),
-        }
-        for s in sessions
-    ]
+            "event": s.get("event_type", "-"),
+            "mode": "daily_review",
+            "worker_reports": len(worker_reports),
+            "has_summary": bool(str(manager_review.get("summary", "")).strip()),
+        })
     st.dataframe(pd.DataFrame(overview_rows), use_container_width=True, hide_index=True)
 
     option_indices = list(range(len(sessions)))
     selected_idx = st.selectbox(
-        "Select townhall session",
+        "Select review session",
         options=option_indices,
         index=len(option_indices) - 1,
-        key="townhall_session_idx",
-        format_func=lambda i: (
-            f"Day {sessions[i]['day']} | t={sessions[i]['t']:.1f} | "
-            f"rounds {sessions[i]['rounds']} | messages {sessions[i]['messages']}"
-        ),
+        key="daily_review_session_idx",
+        format_func=lambda i: f"Day {sessions[i]['day']} | t={sessions[i]['t']:.1f} | {sessions[i].get('mode', '-')}",
     )
     session = sessions[int(selected_idx)]
     strategy, assignment = _phase_details_for_day(events_df, int(session["day"]), current_t)
@@ -1761,52 +1737,31 @@ def _render_townhall_conversation_panel(events_df: pd.DataFrame, current_t: floa
     left_col, right_col = st.columns([2.2, 1.3])
 
     with left_col:
-        transcript = session.get("transcript", [])
-        if not transcript:
-            st.info("This session has no per-agent transcript.")
-        else:
-            transcript_rows = [
-                {
-                    "round": int(msg.get("round", 0)),
-                    "agent": str(msg.get("agent_id", "")).strip(),
-                    "utterance": str(msg.get("utterance", "")).strip(),
-                    "has_proposal": bool(msg.get("proposal", {})),
-                }
-                for msg in transcript
-            ]
-            st.dataframe(pd.DataFrame(transcript_rows), use_container_width=True, hide_index=True)
-
-            round_ids = sorted({int(msg.get("round", 0)) for msg in transcript if int(msg.get("round", 0)) > 0})
-            if round_ids:
-                tabs = st.tabs([f"Round {rid}" for rid in round_ids])
-                for tab, rid in zip(tabs, round_ids):
-                    with tab:
-                        for msg in transcript:
-                            if int(msg.get("round", 0)) != rid:
-                                continue
-                            speaker = str(msg.get("agent_id", "")).strip() or "Agent"
-                            utterance = str(msg.get("utterance", "")).strip() or "-"
-                            st.markdown(f"**{speaker}**")
-                            st.write(utterance)
-                            proposal = msg.get("proposal", {})
-                            if isinstance(proposal, dict) and proposal:
-                                with st.expander(f"{speaker} proposal", expanded=False):
-                                    st.json(proposal)
-            else:
-                for msg in transcript:
-                    speaker = str(msg.get("agent_id", "")).strip() or "Agent"
-                    utterance = str(msg.get("utterance", "")).strip() or "-"
-                    st.markdown(f"**{speaker}**")
-                    st.write(utterance)
-                    proposal = msg.get("proposal", {})
-                    if isinstance(proposal, dict) and proposal:
-                        with st.expander(f"{speaker} proposal", expanded=False):
-                            st.json(proposal)
-
-        moderator_summary = str(session.get("moderator_summary", "")).strip()
-        if moderator_summary:
-            st.markdown("**Moderator Summary**")
-            st.info(moderator_summary)
+        worker_reports = session.get("worker_reports", {}) if isinstance(session.get("worker_reports", {}), dict) else {}
+        manager_review = session.get("manager_review", {}) if isinstance(session.get("manager_review", {}), dict) else {}
+        rows = []
+        for agent_id, report in worker_reports.items():
+            report = report if isinstance(report, dict) else {}
+            rows.append({
+                    "agent": str(agent_id),
+                    "summary": str(report.get("summary", "")).strip(),
+                    "blocked_count": len(report.get("blocked", [])) if isinstance(report.get("blocked", []), list) else 0,
+                    "support_request_count": len(report.get("support_requests", [])) if isinstance(report.get("support_requests", []), list) else 0,
+                    "suggested_focus": ", ".join(report.get("suggested_focus_tasks", [])[:3]) if isinstance(report.get("suggested_focus_tasks", []), list) else "",
+                })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        for agent_id in sorted(worker_reports.keys()):
+            report = worker_reports.get(agent_id, {}) if isinstance(worker_reports.get(agent_id, {}), dict) else {}
+            with st.expander(f"{agent_id} report", expanded=False):
+                st.json(report)
+        summary = str(manager_review.get("summary", "")).strip()
+        if summary:
+            st.markdown("**MANAGER Summary**")
+            st.info(summary)
+        if manager_review:
+            with st.expander("MANAGER Review JSON", expanded=False):
+                st.json(manager_review)
 
     with right_col:
         day_summary = session.get("day_summary", {}) if isinstance(session.get("day_summary", {}), dict) else {}
@@ -1830,16 +1785,15 @@ def _render_townhall_conversation_panel(events_df: pd.DataFrame, current_t: floa
         if assignment:
             with st.expander("Day Start Job Assignment", expanded=False):
                 st.json(assignment)
-
         updated_norms = session.get("updated_norms", {}) if isinstance(session.get("updated_norms", {}), dict) else {}
         if updated_norms:
             with st.expander("Updated Norms", expanded=False):
                 st.json(updated_norms)
-
         memory_update = session.get("memory_update", {}) if isinstance(session.get("memory_update", {}), dict) else {}
         if memory_update:
-            with st.expander("Memory Update", expanded=False):
+            with st.expander("??? ????", expanded=False):
                 st.json(memory_update)
+
 
 def _render_kpi_panel(output_dir: Path) -> None:
     kpi_path = output_dir / "kpi.json"
@@ -1990,10 +1944,10 @@ def main() -> None:
     run_meta = _load_run_meta(str(events_path))
     mode = str(run_meta.get("mode", "unknown")).strip().lower() or "unknown"
     if is_llm_mode(mode):
-        comm = run_meta.get("communication_enabled", None)
-        comm_label = "on" if bool(comm) else "off"
+        review_enabled = run_meta.get("coordination_review_enabled", run_meta.get("communication_enabled", None))
+        review_label = "on" if bool(review_enabled) else "off"
         st.info(
-            f"Run mode: {format_decision_mode_label(mode)} | model={run_meta.get('model', '-') or '-'} | communication={comm_label} | server={run_meta.get('server_url', '-') or '-'}"
+            f"Run mode: {format_decision_mode_label(mode)} | model={run_meta.get('model', '-') or '-'} | review={review_label} | server={run_meta.get('server_url', '-') or '-'}"
         )
     else:
         st.info(f"Run mode: {format_decision_mode_label(mode)}")
@@ -2085,7 +2039,7 @@ def main() -> None:
         ].copy()
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-    _render_townhall_conversation_panel(events_df, current_t)
+    _render_daily_review_panel(events_df, current_t)
 
     st.markdown("### Recent Events")
     recent_df = events_df[events_df["t"] <= current_t].tail(40)
@@ -2105,6 +2059,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
