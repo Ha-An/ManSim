@@ -10,10 +10,10 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "ollama/qwen2.5:14b"
+        "primary": "vllm/mansim-gemma4-e4b"
       },
       "models": {
-        "ollama/qwen2.5:14b": {}
+        "vllm/mansim-gemma4-e4b": {}
       },
       "compaction": {
         "mode": "safeguard"
@@ -30,28 +30,28 @@
         "name": "A1",
         "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\A1",
         "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\A1\\agent",
-        "model": "ollama/qwen2.5:14b"
+        "model": "vllm/mansim-gemma4-e4b"
       },
       {
         "id": "A2",
         "name": "A2",
         "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\A2",
         "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\A2\\agent",
-        "model": "ollama/qwen2.5:14b"
+        "model": "vllm/mansim-gemma4-e4b"
       },
       {
         "id": "A3",
         "name": "A3",
         "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\A3",
         "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\A3\\agent",
-        "model": "ollama/qwen2.5:14b"
+        "model": "vllm/mansim-gemma4-e4b"
       },
       {
         "id": "MANAGER",
         "name": "MANAGER",
         "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\MANAGER",
         "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\MANAGER\\agent",
-        "model": "ollama/qwen2.5:14b"
+        "model": "vllm/mansim-gemma4-e4b"
       }
     ]
   },
@@ -77,14 +77,14 @@
   },
   "models": {
     "providers": {
-      "ollama": {
-        "baseUrl": "http://localhost:11434",
-        "apiKey": "ollama-local",
-        "api": "ollama",
+      "vllm": {
+        "baseUrl": "http://127.0.0.1:8000/v1",
+        "apiKey": "vllm-local",
+        "api": "openai-completions",
         "models": [
           {
-            "id": "qwen2.5:14b",
-            "name": "Qwen 2.5 14B",
+            "id": "mansim-gemma4-e4b",
+            "name": "Gemma 4 E4B IT",
             "reasoning": false,
             "input": [
               "text"
@@ -96,7 +96,7 @@
               "cacheWrite": 0
             },
             "contextWindow": 32768,
-            "maxTokens": 32768
+            "maxTokens": 4096
           }
         ]
       }

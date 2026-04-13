@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import socket
@@ -15,10 +16,15 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from manufacturing_sim.simulation.scenarios.manufacturing.run import run
+from manufacturing_sim.simulation.scenarios.manufacturing.decision.modes import normalize_decision_mode
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.orchestration_intelligence_dashboard import export_orchestration_intelligence_dashboard
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.dashboard import export_kpi_dashboard
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.gantt import export_gantt
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.llm_trace import export_llm_trace_dashboard
+from manufacturing_sim.simulation.scenarios.manufacturing.viz.series_dashboard import (
+    build_series_analysis,
+    export_series_dashboard,
+)
 from manufacturing_sim.simulation.scenarios.manufacturing.viz.task_priority_dashboard import export_task_priority_dashboard
 
 
@@ -65,6 +71,11 @@ def _load_json(path: Path) -> dict | list | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
 def _recover_artifacts_if_possible(output_dir: Path, experiment_cfg: dict[str, object]) -> dict[str, object] | None:
@@ -235,6 +246,70 @@ def _launch_streamlit_dashboard(
     return url
 
 
+def _ensure_knowledge_stub(path: Path) -> None:
+    if path.exists():
+        return
+    stub = "\n".join(
+        [
+            "# Run-Series Knowledge",
+            "",
+            "## Run-Series Scope",
+            "No prior cross-run knowledge has been accumulated yet.",
+            "",
+            "## Carry-Forward Lessons",
+            "- No carry-forward lessons recorded yet.",
+            "",
+            "## Detector Guidance",
+            "- No detector guidance recorded yet.",
+            "",
+            "## Planner Guidance",
+            "- No planner guidance recorded yet.",
+            "",
+            "## Open Watchouts",
+            "- No open watchouts recorded yet.",
+            "",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(stub, encoding="utf-8")
+
+
+def _export_series_artifacts_if_needed(runtime_output_dir: Path, run_count: int, summary_payload: dict[str, object]) -> tuple[str, str]:
+    if run_count <= 1:
+        return ("", "")
+    analysis = build_series_analysis(parent_output_dir=runtime_output_dir, summary_payload=summary_payload)
+    analysis_path = runtime_output_dir / "series_analysis.json"
+    _write_json(analysis_path, analysis)
+    dashboard_path = export_series_dashboard(parent_output_dir=runtime_output_dir, analysis=analysis)
+    return (str(dashboard_path.resolve()) if dashboard_path is not None else "", str(analysis_path.resolve()))
+
+
+def _run_once(experiment_cfg: dict[str, object], output_dir: Path) -> dict[str, object]:
+    result: dict[str, object] | None = None
+    try:
+        try:
+            result = run(experiment_cfg=experiment_cfg, output_dir=output_dir)
+        except BaseException:
+            recovered = _recover_artifacts_if_possible(output_dir, experiment_cfg)
+            if recovered is None:
+                raise
+            print("[run] artifact recovery completed after post-simulation failure", flush=True)
+            result = recovered
+        else:
+            recovered = _recover_artifacts_if_possible(output_dir, experiment_cfg)
+            if recovered is not None:
+                result.update({k: v for k, v in recovered.items() if k.endswith("_path") or k in {"output_dir", "events_path"}})
+        return result
+    except BaseException:
+        recovered = _recover_artifacts_if_possible(output_dir, experiment_cfg)
+        if recovered is None:
+            raise
+        if result is None:
+            print("[run] artifact recovery completed after post-simulation failure", flush=True)
+            print(json.dumps(recovered["kpi"], indent=2))
+        return recovered
+
+
 @hydra.main(config_path="conf", config_name="config", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     # Scenario config + policy-mode config are flattened into one payload
@@ -248,28 +323,89 @@ def main(cfg: DictConfig) -> None:
     runtime_output_dir = Path(HydraConfig.get().runtime.output_dir)
     print(f"[run] output_dir={runtime_output_dir}", flush=True)
     print(f"[run] progress_path={runtime_output_dir / 'progress.json'}", flush=True)
-    result: dict[str, object] | None = None
-    try:
-        try:
-            result = run(experiment_cfg=experiment_cfg, output_dir=runtime_output_dir)
-        except BaseException:
-            recovered = _recover_artifacts_if_possible(runtime_output_dir, experiment_cfg)
-            if recovered is None:
-                raise
-            print("[run] artifact recovery completed after post-simulation failure", flush=True)
-            result = recovered
-        else:
-            recovered = _recover_artifacts_if_possible(runtime_output_dir, experiment_cfg)
-            if recovered is not None:
-                result.update({k: v for k, v in recovered.items() if k.endswith('_path') or k in {'output_dir', 'events_path'}})
+    decision_cfg = experiment_cfg.get("decision", {}) if isinstance(experiment_cfg.get("decision", {}), dict) else {}
+    decision_mode = normalize_decision_mode(str(decision_cfg.get("mode", "adaptive_priority")))
+    llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
+    orchestration_cfg = llm_cfg.get("orchestration", {}) if isinstance(llm_cfg.get("orchestration", {}), dict) else {}
+    orchestration_active = decision_mode == "llm_planner" and bool(orchestration_cfg.get("enabled", True))
+    requested_run_count = int(orchestration_cfg.get("run_count", 3) or 3)
+    run_count = max(1, requested_run_count) if orchestration_active else 1
 
+    knowledge_path = runtime_output_dir / "knowledge.md"
+    knowledge_history_dir = runtime_output_dir / "knowledge_history"
+    if orchestration_active:
+        _ensure_knowledge_stub(knowledge_path)
+
+    series_results: list[dict[str, object]] = []
+    last_result: dict[str, object] | None = None
+    try:
+        for run_index in range(1, run_count + 1):
+            child_output_dir = runtime_output_dir if run_count == 1 else (runtime_output_dir / f"run_{run_index:02d}")
+            child_cfg = copy.deepcopy(experiment_cfg)
+            if orchestration_active:
+                child_cfg["_run_series"] = {
+                    "run_index": run_index,
+                    "total_runs": run_count,
+                    "parent_output_dir": str(runtime_output_dir.resolve()),
+                    "knowledge_path": str(knowledge_path.resolve()),
+                    "knowledge_history_dir": str(knowledge_history_dir.resolve()),
+                }
+            print(f"[run] series_run={run_index}/{run_count} child_output_dir={child_output_dir}", flush=True)
+            result = _run_once(child_cfg, child_output_dir)
+            last_result = result
+            kpi_blob = result.get("kpi", {}) if isinstance(result.get("kpi", {}), dict) else {}
+            run_meta_blob = _load_json(child_output_dir / "run_meta.json")
+            series_entry = {
+                "run_index": run_index,
+                "output_dir": str(child_output_dir.resolve()),
+                "kpi_path": str((child_output_dir / "kpi.json").resolve()),
+                "run_meta_path": str((child_output_dir / "run_meta.json").resolve()),
+                "knowledge_in_path": str(result.get("knowledge_in_path", "")),
+                "knowledge_out_path": str(result.get("knowledge_out_path", "")),
+                "run_reflection_path": str(result.get("run_reflection_path", "")),
+                "total_products": int(kpi_blob.get("total_products", 0) or 0),
+                "downstream_closure_ratio": float(kpi_blob.get("downstream_closure_ratio", 0.0) or 0.0),
+                "wall_clock_sec": float(kpi_blob.get("wall_clock_sec", 0.0) or 0.0),
+                "kpi_dashboard_path": str(result.get("kpi_dashboard_path", "")),
+                "orchestration_intelligence_dashboard_path": str(result.get("orchestration_intelligence_dashboard_path", "")),
+                "run_reflection_markdown_path": str(result.get("run_reflection_markdown_path", "")),
+                "evaluator_enabled": bool(
+                    (
+                        ((run_meta_blob or {}).get("llm", {}))
+                        if isinstance((run_meta_blob or {}).get("llm", {}), dict)
+                        else {}
+                    ).get("evaluator_enabled", False)
+                ),
+            }
+            series_results.append(series_entry)
+            if orchestration_active:
+                summary_payload: dict[str, object] = {
+                    "requested_run_count": requested_run_count,
+                    "completed_run_count": len(series_results),
+                    "knowledge_path": str(knowledge_path.resolve()),
+                    "series_dashboard_path": "",
+                    "series_analysis_path": "",
+                    "runs": series_results,
+                }
+                _write_json(runtime_output_dir / "run_series_summary.json", summary_payload)
+                series_dashboard_path, series_analysis_path = _export_series_artifacts_if_needed(runtime_output_dir, run_count, summary_payload)
+                summary_payload["series_dashboard_path"] = series_dashboard_path
+                summary_payload["series_analysis_path"] = series_analysis_path
+                _write_json(runtime_output_dir / "run_series_summary.json", summary_payload)
+
+        if last_result is None:
+            raise RuntimeError("No run result was produced.")
+
+        result = last_result
         print(json.dumps(result["kpi"], indent=2))
 
         ui_cfg = cfg.get("ui", {})
+        artifact_root = Path(result["output_dir"])
 
         auto_open = bool(ui_cfg.get("auto_open_results", False))
         if auto_open:
             open_all_artifacts = bool(ui_cfg.get("open_all_artifacts", False))
+            artifact_names = [str(item) for item in list(ui_cfg.get("open_artifacts", []))]
             opened_paths: set[Path] = set()
 
             def _open_once(path: Path) -> None:
@@ -280,16 +416,20 @@ def main(cfg: DictConfig) -> None:
                 _open_artifact(path)
 
             if open_all_artifacts:
-                for artifact_path in _iter_output_artifacts(runtime_output_dir):
+                for artifact_path in _iter_output_artifacts(artifact_root):
                     _open_once(artifact_path)
             else:
-                artifact_names = list(ui_cfg.get("open_artifacts", []))
                 for artifact_name in artifact_names:
-                    _open_once(runtime_output_dir / str(artifact_name))
+                    _open_once(artifact_root / str(artifact_name))
+                    if run_count > 1 and artifact_name in {"series_dashboard.html", "series_analysis.json"}:
+                        _open_once(runtime_output_dir / str(artifact_name))
 
             llm_trace_path = str(result.get("llm_trace_path", "")).strip()
-            if llm_trace_path:
+            if llm_trace_path and (open_all_artifacts or "llm_trace.html" in artifact_names):
                 _open_once(Path(llm_trace_path))
+            if run_count > 1 and open_all_artifacts:
+                for series_artifact in ("series_dashboard.html", "series_analysis.json", "knowledge.md", "run_series_summary.json"):
+                    _open_once(runtime_output_dir / series_artifact)
 
         auto_open_streamlit = bool(ui_cfg.get("auto_open_streamlit", False))
         if auto_open_streamlit:
@@ -307,12 +447,13 @@ def main(cfg: DictConfig) -> None:
                 range_end=range_end,
             )
     except BaseException:
+        if last_result is not None:
+            raise
         recovered = _recover_artifacts_if_possible(runtime_output_dir, experiment_cfg)
         if recovered is None:
             raise
-        if result is None:
-            print("[run] artifact recovery completed after post-simulation failure", flush=True)
-            print(json.dumps(recovered["kpi"], indent=2))
+        print("[run] artifact recovery completed after post-simulation failure", flush=True)
+        print(json.dumps(recovered["kpi"], indent=2))
         return
 
 

@@ -1,5 +1,8 @@
-﻿# 부트스트랩
+# Bootstrap
 
-- 이 워크스페이스는 현재 시뮬레이션 run 전용입니다.
-- 런타임은 필요한 사실과 템플릿을 매 턴 갱신합니다.
-- 정적 역할 문서는 유지하고, 현재 턴 지시는 `USER.md`에서만 읽습니다.
+- This workspace is scoped to the current simulation run only.
+- `KNOWLEDGE.md` carries compact cross-run lessons from previous runs in the same experiment series.
+- Runtime code refreshes the active facts and templates every turn.
+- Static role files remain stable; only `USER.md` should drive the current turn.
+- Interpret request-payload keys using `INPUT_KEY_GLOSSARY.md` before ranking bottlenecks.
+- Re-read `KNOWLEDGE.md`, `MEMORY.md`, and `memory/rolling_summary.md` before final ranking when recurrence or chronic constraints may matter.

@@ -4,7 +4,8 @@ defaults:
   # Decision presets:
   # - adaptive_priority: rule-based with adaptive priorities
   # - fixed_priority: rule-based with fixed task weights
-  # - llm_planner: OpenClaw-backed planner with independent worker agents and a moderator
+  # - llm_planner: OpenClaw + Gemma 4 E4B Docker runtime 기반 기본 preset
+  # - llm_planner_qwen_legacy: 기존 WSL Qwen vLLM runtime을 유지하는 legacy preset
   - decision: llm_planner
   - heuristic_rules: default
   - _self_
@@ -17,10 +18,6 @@ ui:
   open_all_artifacts: false
   open_artifacts:
     - kpi_dashboard.html
-    - gantt.html
-    - task_priority_dashboard.html
-    - orchestration_intelligence_dashboard.html
-    - openclaw_workspace_dashboard.html
   auto_open_streamlit: false
   streamlit_preferred_port: 8505
   streamlit_port_range:

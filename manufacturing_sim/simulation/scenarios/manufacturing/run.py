@@ -267,9 +267,17 @@ def run(
     wall_clock_started = perf_counter()
     started_at_utc = _utc_now_iso()
     urgent_cfg = decision_cfg.get("urgent_discuss", {}) if isinstance(decision_cfg.get("urgent_discuss", {}), dict) else {}
+    series_cfg = experiment_cfg.get("_run_series", {}) if isinstance(experiment_cfg.get("_run_series", {}), dict) else {}
+    run_index = max(1, int(series_cfg.get("run_index", 1) or 1))
+    total_runs = max(run_index, int(series_cfg.get("total_runs", 1) or 1))
+    knowledge_in_path = str(series_cfg.get("knowledge_path", str((output_root / "knowledge.md").resolve()))).strip()
 
     run_meta: dict[str, Any] = {
         "decision_mode": decision_mode,
+        "run_index": run_index,
+        "total_runs": total_runs,
+        "knowledge_in_path": knowledge_in_path,
+        "knowledge_out_path": "",
         "started_at_utc": started_at_utc,
         "finished_at_utc": "",
         "wall_clock_sec": 0.0,
@@ -310,8 +318,11 @@ def run(
 
     if is_llm_mode(decision_mode):
         llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
+        provider = str(llm_cfg.get("provider", "")).strip().lower()
         comm_cfg = llm_cfg.get("communication", {}) if isinstance(llm_cfg.get("communication", {}), dict) else {}
         openclaw_cfg = llm_cfg.get("openclaw", {}) if isinstance(llm_cfg.get("openclaw", {}), dict) else {}
+        orchestration_cfg = llm_cfg.get("orchestration", {}) if isinstance(llm_cfg.get("orchestration", {}), dict) else {}
+        evaluator_cfg = orchestration_cfg.get("evaluator", {}) if isinstance(orchestration_cfg.get("evaluator", {}), dict) else {}
         llm_language = str(llm_cfg.get("language", comm_cfg.get("language", "ENG"))).strip().upper() or "ENG"
         run_meta["llm"] = {
             "mode_variant": decision_mode,
@@ -324,6 +335,8 @@ def run(
             "communication_rounds": int(comm_cfg.get("rounds", 0)),
             "communication_language": llm_language,
             "urgent_discuss_enabled": bool(urgent_cfg.get("enabled", True)),
+            "evaluator_enabled": bool(evaluator_cfg.get("enabled", False)) if provider == "openclaw" else False,
+            "evaluator_max_revision_requests": int(evaluator_cfg.get("max_revision_requests", 2) or 2) if provider == "openclaw" else 0,
         }
         if str(llm_cfg.get("provider", "")).strip().lower() == "openclaw":
             backend_cfg = openclaw_cfg.get("backend", {}) if isinstance(openclaw_cfg.get("backend", {}), dict) else {}
@@ -456,6 +469,7 @@ def run(
     orchestration_intelligence_dashboard_path: Path | None = None
     gantt_path = output_root / "gantt.html"
     artifact_status: dict[str, Any] = {"generated": {}, "errors": {}}
+    run_reflection_info: dict[str, Any] = {}
 
     try:
         for day in range(1, total_days + 1):
@@ -564,6 +578,29 @@ def run(
         event_logger.write_json("run_meta.json", run_meta)
         event_logger.write_json("minute_snapshots.json", {"snapshots": world.minute_snapshots})
 
+        if decision_mode == "llm_planner" and hasattr(decision_module, "reflect_run"):
+            reflect_run_fn = getattr(decision_module, "reflect_run")
+            if callable(reflect_run_fn):
+                try:
+                    maybe_reflection = reflect_run_fn(
+                        output_root=output_root,
+                        kpi=kpi,
+                        daily_summaries=world.daily_summaries,
+                        run_meta=run_meta,
+                    )
+                    if isinstance(maybe_reflection, dict):
+                        run_reflection_info = maybe_reflection
+                        run_meta["knowledge_out_path"] = str(maybe_reflection.get("knowledge_out_path", "")).strip()
+                        if str(maybe_reflection.get("run_reflection_path", "")).strip():
+                            artifact_status["generated"]["run_reflection"] = str(maybe_reflection.get("run_reflection_path", "")).strip()
+                        if str(maybe_reflection.get("run_reflection_markdown_path", "")).strip():
+                            artifact_status["generated"]["run_reflection_markdown"] = str(maybe_reflection.get("run_reflection_markdown_path", "")).strip()
+                        if str(maybe_reflection.get("knowledge_archive_path", "")).strip():
+                            artifact_status["generated"]["knowledge_archive"] = str(maybe_reflection.get("knowledge_archive_path", "")).strip()
+                except BaseException as exc:
+                    artifact_status["errors"]["run_reflection"] = f"{type(exc).__name__}: {exc}"
+                    raise
+
         llm_records: list[dict[str, Any]] = []
         transport_metrics: dict[str, Any] = {}
         try:
@@ -653,6 +690,12 @@ def run(
         except BaseException as exc:
             artifact_status["errors"]["artifact_export_fatal"] = f"{type(exc).__name__}: {exc}"
 
+        kpi["run_meta"] = run_meta
+        if run_reflection_info:
+            kpi["run_reflection"] = run_reflection_info.get("run_reflection", {})
+        event_logger.write_json("kpi.json", kpi)
+        event_logger.write_json("run_meta.json", run_meta)
+
         try:
             event_logger.write_json("artifact_status.json", artifact_status)
         except BaseException as exc:
@@ -699,6 +742,10 @@ def run(
         "terminated": world.terminated,
         "termination_reason": world.termination_reason,
         "decision_mode": decision_mode,
+        "run_reflection_path": str(run_reflection_info.get("run_reflection_path", "")).strip(),
+        "run_reflection_markdown_path": str(run_reflection_info.get("run_reflection_markdown_path", "")).strip(),
+        "knowledge_in_path": str(run_meta.get("knowledge_in_path", "")).strip(),
+        "knowledge_out_path": str(run_meta.get("knowledge_out_path", "")).strip(),
     }
 
 

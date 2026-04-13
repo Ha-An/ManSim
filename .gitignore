@@ -9,5 +9,6 @@ __pycache__/
 Thumbs.db
 _tmp_kor_test.txt
 openclaw/state/
+.tooling/
 
 openclaw/workspaces/*/.openclaw/

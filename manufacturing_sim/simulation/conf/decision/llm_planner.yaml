@@ -1,6 +1,6 @@
 ﻿# OpenClaw 기반 매니저 LLM planner 모드 설정.
 # - 작업자 에이전트(A1/A2/A3)는 로컬 상태를 보고 개인 큐를 우선 수행한다.
-# - MANAGER 계열 에이전트는 병목 진단과 일일 계획 수립을 담당한다.
+# - MANAGER 계열 에이전트는 병목 진단(detector), 진단 품질 검토(evaluator), 일일 계획 수립(planner)을 담당한다.
 # - 실제 작업 실행 순서는 시뮬레이터 안에서 결정론적으로 처리된다.
 mode: llm_planner
 
@@ -18,11 +18,17 @@ llm:
   enabled: true
   # 현재는 OpenClaw gateway를 통해 호출한다.
   provider: openclaw
+  # OpenClaw가 사용할 기본 모델 ref.
+  # OpenClaw vLLM provider는 `vllm/<served-model-id>` 형식을 기대한다.
+  # 기본 launcher는 start_vllm_gemma4_docker.ps1 이며, 이 alias를 노출해야 한다.
+  model: "vllm/mansim-gemma4-e4b"
   # OpenClaw gateway의 OpenAI 호환 주소.
   # OpenClaw provider를 쓸 때는 이 주소가 사실상 주 엔드포인트다.
   server_url: "http://localhost:18789/v1"
+  # vLLM이 auth를 강제하지 않아도 OpenClaw는 키 필드를 기대하므로 더미 값을 둔다.
+  api_key: "vllm-local"
   # 프롬프트와 응답의 기본 언어 설정.
-  language: KOR
+  language: ENG
   # 호출 1회당 최대 대기 시간(초).
   timeout_sec: 120
   # 샘플링 온도. 현재는 재현성을 위해 0.0으로 둔다.
@@ -73,27 +79,47 @@ llm:
       - A3
     backend:
       # OpenClaw가 실제로 연결할 하위 추론 백엔드.
-      provider: ollama
-      # 하위 백엔드에서 사용할 실제 모델 태그.
-      model: qwen2.5:14b
-      # Ollama 서버 주소.
-      base_url: "http://localhost:11434"
-      # Windows에서 WSL 안 Ollama를 찾을 때 사용할 배포판 이름.
+      provider: vllm
+      # vLLM 서버를 띄울 때 --served-model-name 으로 노출할 alias.
+      # HF 원본 모델명에 `/`가 들어가면 OpenClaw model ref와 충돌할 수 있으므로 alias를 쓴다.
+      model: mansim-gemma4-e4b
+      model_name: "Gemma 4 E4B IT"
+      # WSL 안 vLLM OpenAI-compatible 서버 주소.
+      # /v1 경로까지 포함해야 OpenClaw vLLM provider 문서와 맞는다.
+      base_url: "http://127.0.0.1:8000/v1"
+      # Windows에서 WSL 안 vLLM을 찾을 때 사용할 배포판 이름.
       wsl_distro: "Ubuntu-24.04"
-      # 백엔드 API 종류.
-      api: ollama
-      # 로컬 Ollama 경로에서는 형식상만 쓰는 값이다.
-      api_key: "ollama-local"
+      # OpenClaw vLLM provider는 openai-completions API를 사용한다.
+      api: "openai-completions"
+      # 로컬 서버라도 OpenClaw vLLM provider opt-in 용 키를 둔다.
+      api_key: "vllm-local"
       # 모델 입력 컨텍스트 창 크기.
+      # Gemma 4 E4B의 긴 컨텍스트 전체를 기본으로 열 필요는 없고,
+      # 현재 OpenClaw JSON planner workload에는 32k가 운영상 안전한 기본값이다.
       context_window: 32768
       # 모델이 낼 수 있는 최대 출력 토큰 수.
-      max_output_tokens: 32768
+      max_output_tokens: 4096
       # 하위 모델의 reasoning 모드 사용 여부.
       reasoning: false
 
   orchestration:
     # manager 기반 병목 진단/일일 계획 루프 사용 여부.
     enabled: true
+    # 같은 설정으로 full simulation run을 연속 몇 번 수행할지 결정한다.
+    # run 간에는 Reflector가 남긴 knowledge.md만 carry-over 된다.
+    run_count: 3
+    detector:
+      # detector가 하루 시작 시 반드시 반환해야 하는 상위 병목 개수.
+      # 프롬프트에는 "정확히 이 개수"를 요구하고, 실제 코드는 1~3 범위로 clamp한다.
+      max_top_bottlenecks: 3
+    evaluator:
+      # detector 결과를 planner로 넘기기 전에 별도 evaluator manager가 품질을 검토할지 여부.
+      # true면 detector -> evaluator -> planner 순으로 day-start manager 체인이 실행된다.
+      enabled: false
+      # evaluator가 detector에게 수정 요청을 보낼 수 있는 최대 횟수.
+      # 2면 초기 detector 초안 이후 최대 두 번의 revision draft까지 허용한다.
+      # 실제 코드는 0 이상의 작은 정수 범위로 clamp한다.
+      max_revision_requests: 2
     # 작업자 개인 큐에 하루에 넣을 최대 작업 수.
     worker_queue_limit: 4
     # planner가 만들 수 있는 병렬 작업 그룹 최대 수.

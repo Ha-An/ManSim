@@ -1,5 +1,5 @@
-﻿# 하트비트
+# Heartbeat
 
-- 현재 상태를 먼저 읽고 판단합니다.
-- 오래된 계획이나 과거 성공 패턴에 과도하게 고정되지 않습니다.
-- 실행 불가능한 판단은 빠르게 버리고 다음 후보를 찾습니다.
+- Read the current state before making any judgment.
+- Do not anchor on stale plans or yesterday's success pattern.
+- Drop infeasible actions quickly and move to the next executable option.

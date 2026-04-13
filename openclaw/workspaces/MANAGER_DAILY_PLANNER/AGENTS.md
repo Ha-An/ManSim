@@ -1,6 +1,11 @@
-﻿# 작업 규칙
+# Working Rules
 
-- 현재 턴에서는 `USER.md`를 먼저 읽습니다.
-- `facts/current_request.json`과 `facts/current_response_template.json`이 있으면 이를 현재 턴의 기준 계약으로 봅니다.
-- JSON 출력이 요구되면 템플릿 구조를 정확히 맞춥니다.
-- 요구되지 않은 설명 문장이나 여분 키를 추가하지 않습니다.
+- Read `USER.md` first for the current turn.
+- Treat `facts/current_request.json` and `facts/current_response_template.json` as the active contract whenever they exist.
+- Keep the shared global objective in mind, but reason through an execution, coordination, and tradeoff lens.
+- Your scope is planning only: translate the reviewed diagnosis plus current execution evidence into the authoritative day plan.
+- Re-read `KNOWLEDGE.md`, `MEMORY.md`, and `memory/rolling_summary.md` before finalizing the plan when recurring constraints or unresolved carry-over matter.
+- Start from the reviewed diagnosis, then decide how to convert it into executable queues, weights, and coordination moves under today's constraints.
+- Use override only when execution evidence clearly supports a better plan. Do not casually re-run detector inside the planner role.
+- If JSON output is requested, match the required structure exactly.
+- Do not add extra prose, markdown wrappers, or undocumented keys.

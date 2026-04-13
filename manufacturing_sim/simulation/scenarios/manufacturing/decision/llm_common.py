@@ -225,14 +225,14 @@ class OptionalLLMDecisionModule(DecisionModule):
         self.worker_queue_limit = max(1, int(orchestration_cfg.get("worker_queue_limit", 4) or 4))
         backend_cfg = openclaw_cfg.get("backend", {}) if isinstance(openclaw_cfg.get("backend", {}), dict) else {}
         self.openclaw_backend = {
-            "provider": str(backend_cfg.get("provider", "ollama")).strip().lower() or "ollama",
-            "model": str(backend_cfg.get("model", "qwen2.5:14b")).strip() or "qwen2.5:14b",
-            "model_name": str(backend_cfg.get("model_name", "Qwen 2.5 14B")).strip() or "Qwen 2.5 14B",
-            "base_url": str(backend_cfg.get("base_url", "http://localhost:11434")).strip() or "http://localhost:11434",
-            "api": str(backend_cfg.get("api", "ollama")).strip() or "ollama",
-            "api_key": str(backend_cfg.get("api_key", "ollama-local")).strip() or "ollama-local",
+            "provider": str(backend_cfg.get("provider", "vllm")).strip().lower() or "vllm",
+            "model": str(backend_cfg.get("model", "mansim-gemma4-e4b")).strip() or "mansim-gemma4-e4b",
+            "model_name": str(backend_cfg.get("model_name", "Gemma 4 E4B IT")).strip() or "Gemma 4 E4B IT",
+            "base_url": str(backend_cfg.get("base_url", "http://127.0.0.1:8000/v1")).strip() or "http://127.0.0.1:8000/v1",
+            "api": str(backend_cfg.get("api", "openai-completions")).strip() or "openai-completions",
+            "api_key": str(backend_cfg.get("api_key", "vllm-local")).strip() or "vllm-local",
             "context_window": max(1024, int(backend_cfg.get("context_window", 32768))),
-            "max_output_tokens": max(256, int(backend_cfg.get("max_output_tokens", 32768))),
+            "max_output_tokens": max(256, int(backend_cfg.get("max_output_tokens", 4096))),
             "reasoning": bool(backend_cfg.get("reasoning", False)),
         }
         self.openclaw_run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -591,6 +591,49 @@ class OptionalLLMDecisionModule(DecisionModule):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self._openclaw_render_markdown(title, sections), encoding="utf-8")
 
+    def _compact_recent_prompt_capsules(self, entries: Any, limit: int = 3) -> list[dict[str, Any]]:
+        if not isinstance(entries, list):
+            return []
+        capsules: list[dict[str, Any]] = []
+        for item in entries[-max(1, int(limit or 3)) :]:
+            if not isinstance(item, dict):
+                continue
+            capsule: dict[str, Any] = {
+                "day": int(item.get("day", 0) or 0),
+            }
+            summary = self._truncate_prompt_text(
+                item.get("summary", item.get("system_focus", item.get("synthesis_summary", ""))),
+                max_len=180,
+            )
+            if summary:
+                capsule["summary"] = summary
+            focus_tasks = item.get("focus_tasks", []) if isinstance(item.get("focus_tasks", []), list) else []
+            if focus_tasks:
+                capsule["focus_tasks"] = self._normalize_memory_text_list(focus_tasks, max_items=3, max_len=80)
+            changed_norm_keys = item.get("changed_norm_keys", []) if isinstance(item.get("changed_norm_keys", []), list) else []
+            if changed_norm_keys:
+                capsule["changed_norm_keys"] = [str(key) for key in changed_norm_keys[:4]]
+            recent_points = item.get("recent_points", []) if isinstance(item.get("recent_points", []), list) else []
+            if recent_points:
+                capsule["recent_points"] = self._normalize_memory_text_list(recent_points, max_items=2, max_len=90)
+            capsules.append(capsule)
+        return capsules
+
+    @staticmethod
+    def _openclaw_prompt_memory_sections(
+        *,
+        run_scope: str,
+        prompt_memory: dict[str, Any],
+        current_commitment: dict[str, Any] | None = None,
+        raw_history_files: dict[str, Any] | None = None,
+    ) -> list[tuple[str, Any]]:
+        sections: list[tuple[str, Any]] = [("Run Scope", run_scope), ("Compressed Prompt Memory", prompt_memory)]
+        if isinstance(current_commitment, dict):
+            sections.append(("Current Commitment", current_commitment))
+        if isinstance(raw_history_files, dict):
+            sections.append(("Raw History Files", raw_history_files))
+        return sections
+
     def _seed_openclaw_run_context(self) -> None:
         if not self._openclaw_enabled():
             return
@@ -621,10 +664,10 @@ class OptionalLLMDecisionModule(DecisionModule):
             )
             self._openclaw_write_markdown(
                 workspace / "memory" / "rolling_summary.md",
-                f"{agent_id} 누적 요약",
+                f"{agent_id} Rolling Summary",
                 [
-                    ("런 범위", "이 파일은 현재 시뮬레이션 run 동안의 메모리만 누적한다."),
-                    ("최신 요약", {"status": "initialized", "run_id": self.openclaw_run_id}),
+                    ("Run Scope", "This file only accumulates memory for the current simulation run."),
+                    ("Latest Summary", {"status": "initialized", "run_id": self.openclaw_run_id}),
                 ],
             )
             self._openclaw_write_json(workspace / "beliefs" / "current_beliefs.json", {"status": "initialized", "agent_id": agent_id, "run_id": self.openclaw_run_id})
@@ -681,6 +724,16 @@ class OptionalLLMDecisionModule(DecisionModule):
             rolling_summary["current_priority_profile"] = self.agent_priority_multipliers.get(aid, {})
             rolling_summary["top_completed_task_families"] = list(latest_experience.get("top_completed_task_families", []))[:3]
             rolling_summary["contribution_signals"] = latest_experience.get("contribution_signals", {})
+            recent_capsules = self._compact_recent_prompt_capsules(self.agent_memories.get(aid, []), limit=3)
+            prompt_memory = {
+                "beliefs": memory_update.get("beliefs", {}),
+                "rolling_summary": rolling_summary,
+                "recent_day_capsules": recent_capsules,
+                "shared_memory_snapshot": {
+                    "recent_norm_changes": list(shared_memory.get("recent_norm_changes", []))[:2],
+                    "recent_issue_summary": list(shared_memory.get("recent_issue_summary", []))[:2],
+                },
+            }
 
             self._openclaw_write_json(workspace / "facts" / "current_day_summary.json", day_view)
             self._openclaw_write_json(workspace / "facts" / "current_norms.json", updated_norms)
@@ -697,40 +750,50 @@ class OptionalLLMDecisionModule(DecisionModule):
             self._openclaw_write_json(workspace / "memory" / "semantic" / "current.json", memory_update.get("semantic_memory", {}))
             self._openclaw_write_markdown(
                 workspace / "memory" / "episodic" / f"day_{day:02d}.md",
-                f"{aid} Day {day} 에피소드 메모리",
-                [("에피소드", memory_update.get("episodic_entry", {})), ("하루 요약", day_view)],
+                f"{aid} Day {day} Episodic Memory",
+                [("Episode", memory_update.get("episodic_entry", {})), ("Day Summary", day_view)],
             )
             self._openclaw_write_markdown(
                 workspace / "memory" / "daily" / f"day_{day:02d}.md",
-                f"{aid} Day {day} 메모리",
+                f"{aid} Day {day} Memory",
                 [
-                    ("하루 요약", day_view),
-                    ("최신 경험", latest_experience),
-                    ("최신 운영 리뷰 메모리", latest_memory),
-                    ("개인 결론", personal_conclusion),
-                    ("신념", memory_update.get("beliefs", {})),
-                    ("약속", memory_update.get("commitment", {})),
-                    ("누적 요약", rolling_summary),
+                    ("Day Summary", day_view),
+                    ("Latest Experience", latest_experience),
+                    ("Latest Operations Review Memory", latest_memory),
+                    ("Personal Conclusion", personal_conclusion),
+                    ("Beliefs", memory_update.get("beliefs", {})),
+                    ("Commitments", memory_update.get("commitment", {})),
+                    ("Rolling Summary", rolling_summary),
                 ],
             )
-            self._openclaw_write_markdown(workspace / "memory" / "semantic" / "specialization.md", f"{aid} 전문화 메모리", [("전문화", memory_update.get("semantic_memory", {}).get("specialization", []))])
-            self._openclaw_write_markdown(workspace / "memory" / "semantic" / "heuristics.md", f"{aid} 휴리스틱 메모리", [("휴리스틱", memory_update.get("semantic_memory", {}).get("heuristics", []))])
-            self._openclaw_write_markdown(workspace / "memory" / "semantic" / "anti_patterns.md", f"{aid} 안티패턴 메모리", [("안티패턴", memory_update.get("semantic_memory", {}).get("anti_patterns", []))])
+            self._openclaw_write_markdown(workspace / "memory" / "semantic" / "specialization.md", f"{aid} Specialization Memory", [("Specialization", memory_update.get("semantic_memory", {}).get("specialization", []))])
+            self._openclaw_write_markdown(workspace / "memory" / "semantic" / "heuristics.md", f"{aid} Heuristics Memory", [("Heuristics", memory_update.get("semantic_memory", {}).get("heuristics", []))])
+            self._openclaw_write_markdown(workspace / "memory" / "semantic" / "anti_patterns.md", f"{aid} Anti-Patterns Memory", [("Anti-Patterns", memory_update.get("semantic_memory", {}).get("anti_patterns", []))])
             self._openclaw_write_markdown(
                 workspace / "memory" / "rolling_summary.md",
-                f"{aid} 누적 요약",
-                [("런 범위", "이 메모리는 현재 시뮬레이션 run 동안에만 유지된다."), ("최신 누적 요약", rolling_summary), ("공유 메모리 스냅샷", shared_memory)],
+                f"{aid} Rolling Summary",
+                [
+                    ("Run Scope", "This file stores compact prompt-facing memory for the current simulation run only."),
+                    ("Latest Rolling Summary", rolling_summary),
+                    ("Recent Day Capsules", recent_capsules),
+                    ("Shared Memory Snapshot", prompt_memory["shared_memory_snapshot"]),
+                ],
             )
             self._openclaw_write_markdown(
                 workspace / "MEMORY.md",
-                f"{aid} 메모리",
-                [
-                    ("런 범위", "이 워크스페이스 메모리는 현재 run 전용이다. 새 시뮬레이션 run이 시작되면 세션과 메모리 파일이 모두 새로 만들어진다."),
-                    ("신념", memory_update.get("beliefs", {})),
-                    ("약속", memory_update.get("commitment", {})),
-                    ("누적 요약", rolling_summary),
-                    ("의미 메모리 파일", {"specialization": "memory/semantic/specialization.md", "heuristics": "memory/semantic/heuristics.md", "anti_patterns": "memory/semantic/anti_patterns.md", "episodic": f"memory/episodic/day_{day:02d}.md"}),
-                ],
+                f"{aid} Memory",
+                self._openclaw_prompt_memory_sections(
+                    run_scope="This workspace memory is scoped to the current run only. When a new simulation run starts, both the session and the memory files are rebuilt from scratch.",
+                    prompt_memory=prompt_memory,
+                    current_commitment=memory_update.get("commitment", {}),
+                    raw_history_files={
+                        "daily": f"memory/daily/day_{day:02d}.md",
+                        "episodic": f"memory/episodic/day_{day:02d}.md",
+                        "semantic_specialization": "memory/semantic/specialization.md",
+                        "semantic_heuristics": "memory/semantic/heuristics.md",
+                        "semantic_anti_patterns": "memory/semantic/anti_patterns.md",
+                    },
+                ),
             )
 
         moderator_workspace = self._openclaw_workspace_path(self.openclaw_manager_agent_id)
@@ -741,6 +804,13 @@ class OptionalLLMDecisionModule(DecisionModule):
             moderator_summary["updated_norms"] = updated_norms
             moderator_summary["highlights"] = highlights
             moderator_summary["shared_memory"] = shared_memory
+            recent_capsules = self._compact_recent_prompt_capsules(self.shared_discussion_memory, limit=3)
+            prompt_memory = {
+                "shared_beliefs": moderator_memory.get("shared_beliefs", {}),
+                "shared_rolling_summary": moderator_summary,
+                "recent_day_capsules": recent_capsules,
+                "norm_memory_snapshot": list(shared_memory.get("recent_norm_changes", []))[:2],
+            }
             self._openclaw_write_json(moderator_workspace / "facts" / "current_day_summary.json", day_view)
             self._openclaw_write_json(moderator_workspace / "facts" / "current_norms.json", updated_norms)
             self._openclaw_write_json(moderator_workspace / "facts" / "current_transcript.json", transcript[-self.comm_max_transcript :])
@@ -753,23 +823,38 @@ class OptionalLLMDecisionModule(DecisionModule):
             self._openclaw_write_json(moderator_workspace / "commitments" / "history" / f"day_{day:02d}.json", moderator_memory.get("shared_commitments", {}))
             self._openclaw_write_json(moderator_workspace / "memory" / "episodic" / f"day_{day:02d}.json", moderator_memory.get("episodic_entry", {}))
             self._openclaw_write_json(moderator_workspace / "memory" / "semantic" / "current.json", moderator_memory.get("shared_semantic_memory", {}))
-            self._openclaw_write_markdown(moderator_workspace / "memory" / "episodic" / f"day_{day:02d}.md", f"{self.openclaw_manager_agent_id} Day {day} 에피소드 메모리", [("에피소드", moderator_memory.get("episodic_entry", {})), ("운영 리뷰 핵심", highlights)])
-            self._openclaw_write_markdown(moderator_workspace / "memory" / "daily" / f"day_{day:02d}.md", f"{self.openclaw_manager_agent_id} Day {day} 메모리", [("하루 요약", day_view), ("공유 신념", moderator_memory.get("shared_beliefs", {})), ("공유 약속", moderator_memory.get("shared_commitments", {})), ("운영 리뷰 종합", moderator_summary), ("개인 결론", conclusions)])
-            self._openclaw_write_markdown(moderator_workspace / "memory" / "semantic" / "coordination_notes.md", f"{self.openclaw_manager_agent_id} 조정 메모", [("조정 메모", moderator_memory.get("shared_semantic_memory", {}).get("coordination_notes", []))])
-            self._openclaw_write_markdown(moderator_workspace / "memory" / "semantic" / "heuristics.md", f"{self.openclaw_manager_agent_id} 휴리스틱", [("휴리스틱", moderator_memory.get("shared_semantic_memory", {}).get("heuristics", []))])
-            self._openclaw_write_markdown(moderator_workspace / "memory" / "semantic" / "anti_patterns.md", f"{self.openclaw_manager_agent_id} 안티패턴", [("안티패턴", moderator_memory.get("shared_semantic_memory", {}).get("anti_patterns", []))])
-            self._openclaw_write_markdown(moderator_workspace / "memory" / "semantic" / "unresolved_disagreements.md", f"{self.openclaw_manager_agent_id} 미해결 이견", [("미해결 이견", moderator_memory.get("shared_semantic_memory", {}).get("unresolved_disagreements", []))])
-            self._openclaw_write_markdown(moderator_workspace / "memory" / "rolling_summary.md", f"{self.openclaw_manager_agent_id} 누적 요약", [("런 범위", "이 메모리는 현재 시뮬레이션 run 동안에만 유지된다."), ("최신 매니저 요약", moderator_summary)])
+            self._openclaw_write_markdown(moderator_workspace / "memory" / "episodic" / f"day_{day:02d}.md", f"{self.openclaw_manager_agent_id} Day {day} Episodic Memory", [("Episode", moderator_memory.get("episodic_entry", {})), ("Operations Review Highlights", highlights)])
+            self._openclaw_write_markdown(moderator_workspace / "memory" / "daily" / f"day_{day:02d}.md", f"{self.openclaw_manager_agent_id} Day {day} Memory", [("Day Summary", day_view), ("Shared Beliefs", moderator_memory.get("shared_beliefs", {})), ("Shared Commitments", moderator_memory.get("shared_commitments", {})), ("Operations Review Summary", moderator_summary), ("Personal Conclusions", conclusions)])
+            self._openclaw_write_markdown(moderator_workspace / "memory" / "semantic" / "coordination_notes.md", f"{self.openclaw_manager_agent_id} Coordination Notes", [("Coordination Notes", moderator_memory.get("shared_semantic_memory", {}).get("coordination_notes", []))])
+            self._openclaw_write_markdown(moderator_workspace / "memory" / "semantic" / "heuristics.md", f"{self.openclaw_manager_agent_id} Heuristics", [("Heuristics", moderator_memory.get("shared_semantic_memory", {}).get("heuristics", []))])
+            self._openclaw_write_markdown(moderator_workspace / "memory" / "semantic" / "anti_patterns.md", f"{self.openclaw_manager_agent_id} Anti-Patterns", [("Anti-Patterns", moderator_memory.get("shared_semantic_memory", {}).get("anti_patterns", []))])
+            self._openclaw_write_markdown(moderator_workspace / "memory" / "semantic" / "unresolved_disagreements.md", f"{self.openclaw_manager_agent_id} Unresolved Disagreements", [("Unresolved Disagreements", moderator_memory.get("shared_semantic_memory", {}).get("unresolved_disagreements", []))])
+            self._openclaw_write_markdown(
+                moderator_workspace / "memory" / "rolling_summary.md",
+                f"{self.openclaw_manager_agent_id} Rolling Summary",
+                [
+                    ("Run Scope", "This file stores compact prompt-facing memory for the current simulation run only."),
+                    ("Latest Manager Summary", moderator_summary),
+                    ("Recent Day Capsules", recent_capsules),
+                    ("Norm Memory Snapshot", prompt_memory.get("norm_memory_snapshot", [])),
+                ],
+            )
             self._openclaw_write_markdown(
                 moderator_workspace / "MEMORY.md",
-                f"{self.openclaw_manager_agent_id} 메모리",
-                [
-                    ("런 범위", "이 워크스페이스 메모리는 현재 run 전용이다. 새 시뮬레이션 run이 시작되면 초기 상태에서 다시 시작한다."),
-                    ("공유 신념", moderator_memory.get("shared_beliefs", {})),
-                    ("공유 약속", moderator_memory.get("shared_commitments", {})),
-                    ("최신 매니저 요약", moderator_summary),
-                    ("의미 메모리 파일", {"coordination_notes": "memory/semantic/coordination_notes.md", "heuristics": "memory/semantic/heuristics.md", "anti_patterns": "memory/semantic/anti_patterns.md", "unresolved_disagreements": "memory/semantic/unresolved_disagreements.md", "episodic": f"memory/episodic/day_{day:02d}.md"}),
-                ],
+                f"{self.openclaw_manager_agent_id} Memory",
+                self._openclaw_prompt_memory_sections(
+                    run_scope="This workspace memory is scoped to the current run only. When a new simulation run starts, it is rebuilt from the initial state.",
+                    prompt_memory=prompt_memory,
+                    current_commitment=moderator_memory.get("shared_commitments", {}),
+                    raw_history_files={
+                        "daily": f"memory/daily/day_{day:02d}.md",
+                        "episodic": f"memory/episodic/day_{day:02d}.md",
+                        "semantic_coordination_notes": "memory/semantic/coordination_notes.md",
+                        "semantic_heuristics": "memory/semantic/heuristics.md",
+                        "semantic_anti_patterns": "memory/semantic/anti_patterns.md",
+                        "semantic_unresolved_disagreements": "memory/semantic/unresolved_disagreements.md",
+                    },
+                ),
             )
 
     def _processing_station_ids(self) -> list[int]:
@@ -1509,14 +1594,9 @@ class OptionalLLMDecisionModule(DecisionModule):
             payload["summary"] = str(strategy.summary).strip()
         diagnosis = dict(getattr(strategy, "diagnosis", {}) or {})
         top_bottlenecks = diagnosis.get("top_bottlenecks", []) if isinstance(diagnosis.get("top_bottlenecks", []), list) else []
-        candidate_actions = diagnosis.get("candidate_actions", []) if isinstance(diagnosis.get("candidate_actions", []), list) else []
-        watchouts = diagnosis.get("watchouts", []) if isinstance(diagnosis.get("watchouts", []), list) else []
+        top_limit = max(1, min(3, int(getattr(self, "detector_max_top_bottlenecks", 3) or 3)))
         if top_bottlenecks:
-            payload["top_bottlenecks"] = top_bottlenecks[:4]
-        if candidate_actions:
-            payload["candidate_actions"] = candidate_actions[:4]
-        if watchouts:
-            payload["watchouts"] = [str(item).strip() for item in watchouts if str(item).strip()][:4]
+            payload["top_bottlenecks"] = top_bottlenecks[:top_limit]
         if not payload and strategy.notes:
             payload["notes"] = list(strategy.notes[:4])
         return payload
@@ -1578,25 +1658,6 @@ class OptionalLLMDecisionModule(DecisionModule):
             if rendered:
                 notes.append("Bottlenecks: " + "; ".join(rendered))
 
-        watchouts = diagnosis.get("watchouts", []) if isinstance(diagnosis.get("watchouts", []), list) else []
-        cleaned_watchouts = [str(item).strip() for item in watchouts if str(item).strip()]
-        if cleaned_watchouts:
-            notes.append("Watchouts: " + "; ".join(cleaned_watchouts[:3]))
-
-        candidate_actions = diagnosis.get("candidate_actions", []) if isinstance(diagnosis.get("candidate_actions", []), list) else []
-        rendered_actions = []
-        for item in candidate_actions[:3]:
-            if isinstance(item, dict):
-                family = str(item.get("task_family", "")).strip()
-                linked = str(item.get("linked_bottleneck", item.get("target_id", ""))).strip()
-                why = str(item.get("why", item.get("reason", ""))).strip()
-                line = " -> ".join(part for part in (family, linked) if part)
-                if why:
-                    line = (line + f" ({why})").strip()
-                if line:
-                    rendered_actions.append(line)
-        if rendered_actions:
-            notes.append("Candidate actions: " + "; ".join(rendered_actions))
         return notes
 
     def _truncate_prompt_text(self, text: Any, max_len: int = 180) -> str:
@@ -2165,13 +2226,29 @@ class OptionalLLMDecisionModule(DecisionModule):
             issue_text = ", ".join(contract_issues or []) or "invalid_json"
             phase_name = str((context or {}).get("phase", call_name or "")).strip().lower()
             if phase_name == "manager_bottleneck_detector":
+                detector_count = max(1, min(3, int(getattr(self, "detector_max_top_bottlenecks", 3) or 3)))
                 return (
                     "Previous reply violated the bottleneck detector JSON contract ("
                     + issue_text
                     + "). Re-read facts/current_request.json and facts/current_response_template.json in your workspace. "
                     + "Return exactly one JSON object only. "
-                    + "For the bottleneck detector phase, emit summary as a short bottleneck diagnosis string, top_bottlenecks as list[object], watchouts as list[string], candidate_actions as list[object], and reason_trace as list[object]. "
-                    + "Focus on the few constraints that currently limit accepted finished product completion the most. Do not output worker_roles or category risk lists. If evidence is missing, use [] or {} with the correct type, never placeholder prose."
+                    + f"For the bottleneck detector phase, emit summary as a short bottleneck diagnosis string and top_bottlenecks as a list containing exactly {detector_count} objects. "
+                    + "Each top_bottlenecks entry must include name, rank, severity, evidence[{metric,value}], and why_it_limits_output. "
+                    + "Do not output watchouts, candidate_actions, reason_trace, worker_roles, or category risk lists. "
+                    + "If evidence is thin, still return the exact number of bottlenecks by including weaker lower-severity constraints instead of returning fewer entries. "
+                    + "If evidence is missing, use [] or {} with the correct type, never placeholder prose."
+                )
+            if phase_name == "manager_diagnosis_evaluator":
+                return (
+                    "Previous reply violated the diagnosis evaluator JSON contract ("
+                    + issue_text
+                    + "). Re-read facts/current_request.json and facts/current_response_template.json in your workspace. "
+                    + "Return exactly one JSON object only. "
+                    + "For manager_diagnosis_evaluator, emit only verdict, summary, and revision_requests. "
+                    + "verdict must be accept or request_revision. "
+                    + "If verdict=accept, revision_requests must be an empty list. "
+                    + "If verdict=request_revision, revision_requests must contain actionable objects with target_rank, issue_type, issue, requested_change, and evidence. "
+                    + "Do not output plans, worker assignments, reason_trace, or generic prose."
                 )
             if phase_name == "manager_daily_planner":
                 return (
@@ -2181,7 +2258,7 @@ class OptionalLLMDecisionModule(DecisionModule):
                     + "Return exactly one JSON object only. "
                     + "For manager_daily_planner, emit only plan_mode, weight_updates, queue_add, reason_trace, and detector_alignment. "
                     + "detector_alignment must be follow, partial_override, or override. "
-                    + "Use execution_state, closure_signals, constraint_signals, candidate_orders, and detector_hypothesis as evidence. "
+                    + "Use execution_state, closure_signals, constraint_signals, and detector_hypothesis as evidence. "
                     + "If a detector bottleneck conflicts with stronger closure evidence, you may override it in reason_trace using detector_relation. "
                     + "Do not output mailbox_add, agent_multiplier_updates, maintain_current_plan, stability_reason, or generic prose reasoning. Use the correct empty type only."
                 )
@@ -3065,8 +3142,27 @@ class OptionalLLMDecisionModule(DecisionModule):
             self._openclaw_write_json(workspace / "commitments" / "history" / f"day_{day:02d}.json", commitment_payload)
             self._openclaw_write_json(workspace / "memory" / "semantic" / "current.json", semantic_payload)
             self._openclaw_write_json(workspace / "memory" / "episodic" / f"day_{day:02d}.json", {"summary": report.get("summary", ""), "completed_work": report.get("completed_work", []), "blocked_work": report.get("blocked_work", [])})
-            self._openclaw_write_markdown(workspace / "memory" / "daily" / f"day_{day:02d}.md", f"{agent_id} Day {day} 보고", [("하루 요약", day_view), ("작업자 보고", report)])
-            self._openclaw_write_markdown(workspace / "MEMORY.md", f"{agent_id} 메모리", [("런 범위", "이 워크스페이스 메모리는 현재 run 전용이다."), ("최신 보고", report), ("신념", belief_payload), ("약속", commitment_payload)])
+            self._openclaw_write_markdown(workspace / "memory" / "daily" / f"day_{day:02d}.md", f"{agent_id} Day {day} Report", [("Day Summary", day_view), ("Worker Report", report)])
+            self._openclaw_write_markdown(
+                workspace / "memory" / "rolling_summary.md",
+                f"{agent_id} Rolling Summary",
+                [
+                    ("Run Scope", "This file stores compact prompt-facing memory for the current simulation run only."),
+                    ("Latest Beliefs", belief_payload),
+                    ("Current Commitment", commitment_payload),
+                    ("Semantic Memory", semantic_payload),
+                ],
+            )
+            self._openclaw_write_markdown(
+                workspace / "MEMORY.md",
+                f"{agent_id} Memory",
+                self._openclaw_prompt_memory_sections(
+                    run_scope="This workspace memory is scoped to the current run only.",
+                    prompt_memory={"beliefs": belief_payload, "semantic_memory": semantic_payload},
+                    current_commitment=commitment_payload,
+                    raw_history_files={"daily": f"memory/daily/day_{day:02d}.md", "episodic": f"memory/episodic/day_{day:02d}.json", "report": f"reports/day_{day:02d}_report.json"},
+                ),
+            )
         manager_workspace = self._openclaw_workspace_path(self.openclaw_manager_agent_id)
         if manager_workspace is None:
             return
@@ -3095,8 +3191,25 @@ class OptionalLLMDecisionModule(DecisionModule):
         self._openclaw_write_json(manager_workspace / "commitments" / "current_commitment.json", shared_commitments)
         self._openclaw_write_json(manager_workspace / "commitments" / "history" / f"day_{day:02d}.json", shared_commitments)
         self._openclaw_write_json(manager_workspace / "memory" / "semantic" / "current.json", shared_semantic)
-        self._openclaw_write_markdown(manager_workspace / "memory" / "daily" / f"day_{day:02d}.md", f"{self.openclaw_manager_agent_id} Day {day} 리뷰", [("작업자 보고", worker_reports), ("일일 리뷰", manager_review)])
-        self._openclaw_write_markdown(manager_workspace / "MEMORY.md", f"{self.openclaw_manager_agent_id} 메모리", [("런 범위", "이 워크스페이스 메모리는 현재 run 전용이다."), ("일일 리뷰", manager_review), ("공유 신념", shared_beliefs), ("공유 약속", shared_commitments)])
+        self._openclaw_write_markdown(manager_workspace / "memory" / "daily" / f"day_{day:02d}.md", f"{self.openclaw_manager_agent_id} Day {day} Review", [("Worker Reports", worker_reports), ("Daily Review", manager_review)])
+        self._openclaw_write_markdown(
+            manager_workspace / "memory" / "rolling_summary.md",
+            f"{self.openclaw_manager_agent_id} Rolling Summary",
+            [
+                ("Run Scope", "This file stores compact prompt-facing memory for the current simulation run only."),
+                ("Latest Manager Summary", {"summary": str(manager_review.get("review_summary", manager_review.get("summary", ""))).strip(), "key_risks": shared_beliefs.get("key_risks", []), "coordination_notes": shared_semantic.get("coordination_notes", [])}),
+            ],
+        )
+        self._openclaw_write_markdown(
+            manager_workspace / "MEMORY.md",
+            f"{self.openclaw_manager_agent_id} Memory",
+            self._openclaw_prompt_memory_sections(
+                run_scope="This workspace memory is scoped to the current run only.",
+                prompt_memory={"shared_beliefs": shared_beliefs, "shared_semantic_memory": shared_semantic},
+                current_commitment=shared_commitments,
+                raw_history_files={"daily": f"memory/daily/day_{day:02d}.md", "daily_review": f"facts/daily_review/day_{day:02d}.json"},
+            ),
+        )
 
     def reflect(self, observation: dict[str, Any]) -> StrategyState:
         plan_day = None

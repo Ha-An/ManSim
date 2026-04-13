@@ -63,6 +63,25 @@ class OpenClawClient:
     def _repo_root() -> Path:
         return Path(__file__).resolve().parents[5]
 
+    def _repo_local_node_dir(self) -> Path:
+        return self._repo_root() / ".tooling" / "node"
+
+    def _augment_env_for_local_openclaw(self, env: dict[str, str]) -> dict[str, str]:
+        node_dir = self._repo_local_node_dir()
+        if node_dir.exists():
+            existing_path = str(env.get("Path", env.get("PATH", "")) or "")
+            env["Path"] = f"{node_dir};{existing_path}" if existing_path else str(node_dir)
+        backend_base_url = self._effective_backend_base_url()
+        backend_api_key = str(self.backend.get("api_key", "")).strip()
+        provider_id = str(self.backend.get("provider", "")).strip().lower()
+        if backend_base_url and provider_id == "ollama":
+            env["OLLAMA_BASE_URL"] = backend_base_url
+        if backend_api_key and provider_id == "ollama":
+            env["OLLAMA_API_KEY"] = backend_api_key
+        if backend_api_key and provider_id == "vllm":
+            env["VLLM_API_KEY"] = backend_api_key
+        return env
+
     def _repo_local_profile_path(self) -> Path:
         return self._repo_root() / "openclaw" / "profiles" / self.profile_name / "openclaw.json"
 
@@ -91,6 +110,31 @@ class OpenClawClient:
                 return int(getattr(response, "status", 0) or 0) == 200
         except Exception:
             return False
+
+    @staticmethod
+    def _backend_probe_path(provider: str) -> str:
+        provider_id = str(provider or "").strip().lower()
+        if provider_id == "ollama":
+            return "/api/tags"
+        if provider_id == "vllm":
+            return "/models"
+        return ""
+
+    @staticmethod
+    def _join_api_probe_url(base_url: str, probe_path: str) -> str:
+        raw_base = str(base_url or "").strip()
+        raw_probe = "/" + str(probe_path or "").lstrip("/")
+        if not raw_base:
+            return raw_probe
+        parts = urlsplit(raw_base)
+        base_path = str(parts.path or "").rstrip("/")
+        if raw_probe.startswith("/v1/") and base_path.endswith("/v1"):
+            final_path = base_path + raw_probe[len("/v1"):]
+        elif raw_probe == "/v1" and base_path.endswith("/v1"):
+            final_path = base_path
+        else:
+            final_path = f"{base_path}{raw_probe}" if base_path else raw_probe
+        return urlunsplit((parts.scheme or "http", parts.netloc, final_path, "", ""))
 
 
     @staticmethod
@@ -146,10 +190,12 @@ class OpenClawClient:
             "last_probe": {"ok": False, "error": "not_checked"},
         }
         base_gateway = self.gateway_url.rstrip("/")
+        gateway_root_parts = urlsplit(base_gateway)
+        gateway_root_url = urlunsplit((gateway_root_parts.scheme or "http", gateway_root_parts.netloc, "", "", ""))
         gateway_candidates = [
-            base_gateway + "/v1/models",
-            base_gateway + "/v1/health",
-            base_gateway + "/health",
+            self._join_api_probe_url(base_gateway, "/models"),
+            self._join_api_probe_url(base_gateway, "/health"),
+            self._join_api_probe_url(gateway_root_url, "/health"),
         ]
         for candidate in gateway_candidates:
             probe = self._probe_http_endpoint(candidate, timeout_sec=timeout_sec)
@@ -171,19 +217,20 @@ class OpenClawClient:
         base_backend = self._effective_backend_base_url().rstrip("/")
         backend_probe: dict[str, Any] = {
             "provider": provider,
-            "ok": provider not in {"ollama"},
+            "ok": provider not in {"ollama", "vllm"},
             "base_url": base_backend,
             "checked_at": time.time(),
             "candidates": [],
             "endpoint": "",
-            "last_probe": {"ok": False, "error": "non_ollama_not_checked"},
+            "last_probe": {"ok": False, "error": "backend_not_checked"},
         }
 
-        if provider == "ollama":
+        probe_path = self._backend_probe_path(provider)
+        if probe_path:
             backend_probe["ok"] = False
             backend_probe["candidates"].append({"reason": "skipped_no_base_url"})
             if base_backend:
-                endpoint = base_backend + "/api/tags"
+                endpoint = self._join_api_probe_url(base_backend, probe_path)
                 probe = self._probe_http_endpoint(endpoint, timeout_sec=timeout_sec)
                 backend_probe["candidates"].append(probe)
                 backend_probe["last_probe"] = probe
@@ -228,10 +275,11 @@ class OpenClawClient:
                 return candidate
         return ""
 
-    def _wsl_http_get_ok(self, *, distro: str, port: int) -> bool:
+    def _wsl_http_get_ok(self, *, distro: str, port: int, path: str) -> bool:
+        target_path = "/" + str(path or "").lstrip("/")
         argv = [
             "wsl", "-d", distro, "--", "bash", "-lc",
-            f"curl -sS -o /dev/null -w '%{{http_code}}' http://localhost:{int(port)}/api/tags",
+            f"curl -sS -o /dev/null -w '%{{http_code}}' http://localhost:{int(port)}{target_path}",
         ]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=20, check=False)
@@ -274,18 +322,19 @@ class OpenClawClient:
 
     def _normalize_backend_connectivity(self) -> None:
         provider_id = str(self.backend.get("provider", "")).strip().lower()
-        if provider_id != "ollama":
+        probe_path = self._backend_probe_path(provider_id)
+        if not probe_path:
             return
         base_url = str(self.backend.get("base_url", "")).strip()
         if not base_url:
             return
         parts = urlsplit(base_url)
-        tags_url = urlunsplit((parts.scheme or "http", parts.netloc, "/api/tags", "", ""))
-        if self._http_get_ok(tags_url, timeout_sec=5.0):
+        probe_url = self._join_api_probe_url(base_url, probe_path)
+        if self._http_get_ok(probe_url, timeout_sec=5.0):
             return
         port = parts.port or 11434
         distro = self._wsl_distro()
-        if self._wsl_http_get_ok(distro=distro, port=port):
+        if provider_id == "ollama" and self._wsl_http_get_ok(distro=distro, port=port, path=probe_path):
             if self._ensure_wsl_ollama_proxy(listen_port=port, target_port=port, distro=distro):
                 self.backend["base_url"] = urlunsplit((parts.scheme or "http", f"127.0.0.1:{port}", parts.path or "", parts.query, parts.fragment))
                 self.backend["resolved_via_local_proxy"] = True
@@ -298,8 +347,8 @@ class OpenClawClient:
             return
         replacement_netloc = f"{wsl_ipv4}:{port}"
         replacement_url = urlunsplit((parts.scheme or "http", replacement_netloc, parts.path or "", parts.query, parts.fragment))
-        replacement_tags_url = urlunsplit((parts.scheme or "http", replacement_netloc, "/api/tags", "", ""))
-        if not self._http_get_ok(replacement_tags_url, timeout_sec=5.0):
+        replacement_probe_url = self._join_api_probe_url(replacement_url, probe_path)
+        if not self._http_get_ok(replacement_probe_url, timeout_sec=5.0):
             return
         self.backend["base_url"] = replacement_url
         self.backend["resolved_from_localhost"] = True
@@ -613,13 +662,14 @@ class OpenClawClient:
     @staticmethod
     def _locate_openclaw_cmd() -> str:
         for candidate in (
+            str((OpenClawClient._repo_root() / ".tooling" / "openclaw-cli" / "node_modules" / ".bin" / "openclaw.cmd").resolve(strict=False)),
             shutil.which("openclaw.cmd"),
             shutil.which("openclaw"),
             os.path.expanduser(r"~\AppData\Roaming\npm\openclaw.cmd"),
         ):
             if candidate and Path(candidate).exists():
                 return str(candidate)
-        raise RuntimeError("OpenClaw executable not found. Expected openclaw.cmd on PATH or under AppData\Roaming\npm.")
+        raise RuntimeError(r"OpenClaw executable not found. Expected openclaw.cmd on PATH or under AppData\Roaming\npm.")
 
     @staticmethod
     def _runtime_agent_key(agent_id: str) -> str:
@@ -733,13 +783,7 @@ class OpenClawClient:
             "Do not output extra keys, prose, markdown, or acknowledgements.",
         ]
         prompt = " ".join(part for part in prompt_parts if part)
-        env = os.environ.copy()
-        backend_base_url = self._effective_backend_base_url()
-        backend_api_key = str(self.backend.get("api_key", "")).strip()
-        if backend_base_url:
-            env["OLLAMA_BASE_URL"] = backend_base_url
-        if backend_api_key:
-            env["OLLAMA_API_KEY"] = backend_api_key
+        env = self._augment_env_for_local_openclaw(os.environ.copy())
         argv = [
             cmd,
             "--profile",
@@ -778,22 +822,43 @@ class OpenClawClient:
         stderr = str(completed.stderr or "").strip()
         if completed.returncode != 0:
             raise RuntimeError(stderr or stdout or f"OpenClaw native agent turn failed with exit code {completed.returncode}.")
-        try:
-            response_payload = json.loads(stdout) if stdout else {}
-        except json.JSONDecodeError:
-            balanced = self._extract_first_json_object_text(stdout)
-            if balanced:
-                try:
-                    response_payload = json.loads(balanced)
-                except json.JSONDecodeError:
-                    response_payload = {"payloads": [{"text": stdout}], "meta": {"stderr": stderr, "fallback": "plain_text_stdout"}}
-            else:
-                response_payload = {"payloads": [{"text": stdout}], "meta": {"stderr": stderr, "fallback": "plain_text_stdout"}}
-        content = self._native_response_text(response_payload) or stdout
+        response_payload: dict[str, Any] = {}
+        raw_response_text = ""
+        parsed_from_stream = ""
+        for stream_name, raw_text in (("stdout", stdout), ("stderr", stderr)):
+            if not raw_text:
+                continue
+            try:
+                response_payload = json.loads(raw_text)
+                raw_response_text = raw_text
+                parsed_from_stream = stream_name
+                break
+            except json.JSONDecodeError:
+                balanced = self._extract_first_json_object_text(raw_text)
+                if balanced:
+                    try:
+                        response_payload = json.loads(balanced)
+                        raw_response_text = raw_text
+                        parsed_from_stream = stream_name
+                        break
+                    except json.JSONDecodeError:
+                        continue
+        if not response_payload:
+            raw_response_text = stdout or stderr
+            parsed_from_stream = "stdout" if stdout else ("stderr" if stderr else "")
+            response_payload = {
+                "payloads": [{"text": raw_response_text}],
+                "meta": {
+                    "stderr": stderr,
+                    "fallback": "plain_text_stdout" if stdout else "plain_text_stderr",
+                },
+            }
+        content = self._native_response_text(response_payload) or raw_response_text
         headers_for_log = {
             "transport": "native_local",
             "agent_id": runtime_agent_id,
             "workspace_alias": workspace_alias,
+            "response_stream": parsed_from_stream,
         }
         request_payload = {
             "command": "openclaw agent --local --json",
@@ -823,13 +888,7 @@ class OpenClawClient:
         port = self._gateway_port()
         log_path = self.gateway_log_path or (self._repo_root() / "openclaw" / "logs" / "gateway.runtime.log")
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        env = os.environ.copy()
-        backend_base_url = self._effective_backend_base_url()
-        backend_api_key = str(self.backend.get("api_key", "")).strip()
-        if backend_base_url:
-            env["OLLAMA_BASE_URL"] = backend_base_url
-        if backend_api_key:
-            env["OLLAMA_API_KEY"] = backend_api_key
+        env = self._augment_env_for_local_openclaw(os.environ.copy())
         argv = [
             cmd,
             "--profile",
@@ -864,14 +923,7 @@ class OpenClawClient:
         }
 
     def _native_agent_environment(self) -> dict[str, str]:
-        env = os.environ.copy()
-        backend_base_url = self._effective_backend_base_url()
-        backend_api_key = str(self.backend.get("api_key", "")).strip()
-        if backend_base_url:
-            env["OLLAMA_BASE_URL"] = backend_base_url
-        if backend_api_key:
-            env["OLLAMA_API_KEY"] = backend_api_key
-        return env
+        return self._augment_env_for_local_openclaw(os.environ.copy())
 
     @staticmethod
     def _extract_first_json_object_text(text: str) -> str:
