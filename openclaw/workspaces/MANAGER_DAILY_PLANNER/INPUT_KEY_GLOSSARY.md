@@ -1,4 +1,4 @@
-# Input Key Glossary
+﻿# Input Key Glossary
 
 This glossary documents the planner request exactly as it appears in `facts/current_request.json`.
 
@@ -32,17 +32,21 @@ This glossary documents the planner request exactly as it appears in `facts/curr
 - Turn-specific runtime instructions.
 - Meaning: these define the active planning contract for the current turn.
 
-### `queue_add_contract`
-- Top-level contract for worker-specific queue assignments.
-- Meaning: planner must follow this nested shape when producing `queue_add`.
-
 ### `reason_trace_contract`
-- Top-level contract for explanation trace entries.
-- Meaning: planner must follow this shape when producing `reason_trace`.
+- Structural contract for each `reason_trace` entry.
+- Meaning: planner must follow this shape when explaining why it changed or maintained the plan.
+
+### `commitment_contract`
+- Structural contract for worker-specific executable commitments.
+- Meaning: planner must reference canonical `opportunities.opportunity_id` values directly.
+
+### `mailbox_contract`
+- Structural contract for worker mailbox entries.
+- Meaning: planner may send handover, dependency, coordination, or watchout messages to specific workers.
 
 ### `decision_contract`
 - Planning decision rules.
-- Meaning: these define when `maintain`, `adjust`, and `queue_add` are valid.
+- Meaning: these define when `maintain` or `adjust` is valid and how commitments must be grounded.
 
 ## Input Packet
 
@@ -58,10 +62,8 @@ This glossary documents the planner request exactly as it appears in `facts/curr
 
 ### `execution_state`
 - `days_remaining`: same horizon reminder for the planner.
-- `current_weights`: active shared task-priority weights.
-- `current_personal_queues`: existing worker-specific queued assignments.
-- `current_agent_multipliers`: current per-worker overlays on top of shared task weights.
-- Interpretation: this is the current operating plan, not binding truth.
+- `current_plan_revision`: active plan revision id.
+- Interpretation: this is the current execution-control state, not a free-form planning template.
 
 ### `closure_signals`
 - `inspection_backlog`: finished products waiting for inspection.
@@ -83,27 +85,53 @@ This glossary documents the planner request exactly as it appears in `facts/curr
 ### `detector_hypothesis`
 - `summary`: reviewed diagnosis summary.
 - `top_bottlenecks`: reviewed ranked bottleneck list.
-- `review_status`: whether the diagnosis was approved normally or passed after revision budget exhaustion.
+- `review_status`: whether the diagnosis was accepted normally or passed after revision budget exhaustion.
 - `review_rounds`: number of evaluator review rounds used.
+- `top_bottlenecks[*].related_opportunity_ids`: planner-facing opportunity ids associated with each detected bottleneck.
 - Interpretation: planner should treat this as the reviewed diagnosis packet for the day, not as binding truth.
 
+### `opportunities`
+- Canonical opportunity board emitted by the simulator.
+- Required fields per item include:
+  - `opportunity_id`
+  - `task_family`
+  - `target_type`
+  - `target_id`
+  - `target_station`
+  - `shareable`
+  - `capacity`
+  - `owners`
+  - `why_available`
+  - `expected_output_impact`
+- Interpretation: planner must build commitments by pointing directly to these opportunities. Do not invent targets outside this board.
+
+### `active_commitments`
+- Current executable commitments already active in the runtime.
+- Interpretation: use this to avoid duplicate assignment, conflicting ownership, or stale rework.
+
+### `incident_context`
+- Mid-run or carry-over coordination state relevant to replanning.
+- Common fields include:
+  - `active_blockers`
+  - `recent_incidents`
+  - `escalation_reason`
+- Interpretation: use this when a delta replan is needed after local worker recovery was insufficient.
+
 ### `guardrails`
-- `allowed_task_priority_keys`: only these task families may appear in planner outputs.
-- `allowed_agent_ids`: only these worker ids may receive queue assignments or agent-specific adjustments.
-- `task_priority_weight_range`: allowed min/max range for shared task weights.
-- `agent_priority_multiplier_range`: allowed min/max range for per-agent multipliers.
-- `allowed_quota_keys`: only these quota keys may appear if quotas are emitted.
-- `quota_range`: allowed quota bounds, including `max_by_key`.
-- `allowed_target_stations`: only these station ids may appear in queued work orders.
-- `allowed_target_types`: only these target object types may appear in queued work orders.
-- `queue_add_entry_contract`: required shape of each queued work-order object.
-- `dispatch_expectation`: indicates whether the current state requires at least one concrete queued work order.
-- `norm_targets`: current norm or rule targets the planner should avoid violating.
-- Interpretation: this section defines the planner output boundary. Never invent ids, target types, task families, or quota keys outside guardrails.
+- `allowed_task_priority_keys`: only these task families may appear in commitments and reason traces.
+- `allowed_agent_ids`: only these worker ids may receive commitments or mailbox messages.
+- `allowed_target_stations`: only these station ids may appear when a station target is referenced.
+- `allowed_target_types`: only executable target object types may appear.
+- `commitment_entry_contract`: required shape of each commitment object.
+- `mailbox_entry_contract`: required shape of each mailbox message.
+- `incident_strategy_contract`: required shape of `incident_strategy`.
+- `norm_targets`: current rule or norm targets that the planner should avoid violating.
+- Interpretation: this section defines the planner output boundary. Never invent ids, target types, task families, or mailbox message types outside guardrails.
 
 ## Workspace Memory
 
+- `KNOWLEDGE.md`
 - `MEMORY.md`
 - `memory/rolling_summary.md`
 
-Meaning: planner may consult these compact run-local summaries when deciding whether a recurring issue or carry-over focus still deserves action today.
+Meaning: planner may consult cross-run knowledge and run-local summaries when deciding whether a recurring issue or carry-over focus still deserves action today.

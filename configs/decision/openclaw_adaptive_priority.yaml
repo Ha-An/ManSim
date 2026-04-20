@@ -1,0 +1,91 @@
+# OpenClaw manager-only LLM 모드.
+# 전략가는 상위 의도만 만들고, deterministic compiler가 이를 실행 가능한 정책으로 바꿉니다.
+# 작업자는 계속 deterministic하게 움직이고, 하루 종료 시 reviewer가 다음 날 교정 신호를 만듭니다.
+mode: openclaw_adaptive_priority
+
+urgent_discuss:
+  # world 레벨 incident escalation을 끕니다.
+  # 현재 모드에는 mid-day LLM 경로가 없습니다.
+  enabled: false
+
+norms:
+  # strategist가 참고할 공통 norm target을 유지합니다.
+  enabled: true
+
+llm:
+  enabled: true
+  provider: openclaw
+  model: "vllm/mansim-gemma4-e4b"
+  server_url: "http://localhost:18789/v1"
+  api_key: "vllm-local"
+  language: ENG
+  timeout_sec: 120
+  temperature: 0.0
+  # backend가 request-level seed를 지원하면 전역 simulation seed를 같이 사용합니다.
+  seed: ${seed}
+  max_tokens: 600
+
+  openclaw:
+    backend_health_probe_interval_sec: 30
+    backend_health_probe_timeout_sec: 2.5
+    runtime_recovery_probe_retries: 2
+    runtime_recovery_restarts: 1
+    runtime_recovery_backoff_sec: 1.5
+    runtime_readiness_timeout_sec: 12.0
+    profile_name: mansim_repo
+    profile_config_path: "openclaw/profiles/mansim_repo/openclaw.json"
+    session_namespace: mansim
+    manager_agent_id: MANAGER
+    workspace_root: openclaw/workspaces
+    # OpenClaw native-local manager turn에서 사용할 thinking 강도입니다.
+    # 허용값: off, minimal, low, medium, high, adaptive
+    # 현재 모드에서는 재현성과 latency를 위해 off가 기본입니다.
+    native_thinking: "off"
+    # OpenClaw runtime workspace/profile에 노출할 worker id 목록입니다.
+    # 비우면 factory.num_agents 기준으로 A1..An을 기본 사용합니다.
+    worker_agent_ids:
+      - A1
+      - A2
+      - A3
+    # 실제 LLM backend 연결 정보입니다.
+    # gateway/runtime health check, profile wiring, backend_direct transport에 사용됩니다.
+    backend:
+      provider: vllm
+      model: mansim-gemma4-e4b
+      model_name: "Gemma 4 E4B IT"
+      base_url: "http://127.0.0.1:8000/v1"
+      wsl_distro: "Ubuntu-24.04"
+      api: "openai-completions"
+      api_key: "vllm-local"
+      context_window: 32768
+      max_output_tokens: 2048
+      reasoning: false
+
+  # 현재 모드의 strategist/reviewer closed loop를 제어하는 설정입니다.
+  orchestration:
+    # manager orchestration 레이어 전체 on/off 스위치입니다.
+    enabled: true
+    # 기본은 single-run입니다.
+    # 2 이상이면 runtime/entrypoint가 run_01, run_02... 형태의 run series로 확장합니다.
+    run_count: 1
+    strategy:
+      # shared task weight를 scripted fallback보다 strategist intent 쪽으로 얼마나 강하게 끌어올릴지 결정합니다.
+      # 값이 클수록 strategist 의도가 전역 정책에 더 강하게 반영됩니다.
+      priority_blend_alpha: 0.45
+      # agent별 multiplier를 scripted fallback보다 strategist intent 쪽으로 얼마나 강하게 끌어올릴지 결정합니다.
+      # 값이 클수록 역할/지원 specialization이 더 강해집니다.
+      agent_blend_alpha: 0.50
+    review:
+      # 하루 종료 시 reviewer manager를 사용할지 결정합니다.
+      # false면 LLM reviewer 대신 deterministic reviewer를 사용합니다.
+      enabled: true
+      # reviewer가 다음 날로 넘길 prevention target 개수 상한입니다.
+      # strategist 입력을 짧게 유지하고 schema drift를 줄입니다.
+      max_prevention_targets: 2
+      # reviewer가 하루에 기록할 failure-mode label 개수 상한입니다.
+      # 진단이 장황한 summary로 퍼지는 것을 막습니다.
+      max_failure_modes: 3
+
+  memory:
+    # run-local closed loop 안에서 보관할 summary/review history 일수입니다.
+    history_window_days: 7

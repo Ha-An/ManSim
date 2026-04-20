@@ -1,0 +1,6 @@
+ui:
+  auto_open_results: true
+  open_all_artifacts: false
+  open_artifacts:
+    - results_dashboard.html
+  streamlit_preferred_port: 8505

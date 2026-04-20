@@ -1,0 +1,86 @@
+﻿# OpenClaw 기반 LLM planner 공통 preset.
+# 기본값은 Gemma 4 E4B runtime이며, 모델 alias만 바꾸는 legacy preset은 이 파일을 상속해서 override한다.
+mode: llm_planner
+
+urgent_discuss:
+  # incident 발생 시 planner replan 이전에 scripted short-term priority 조정을 허용.
+  enabled: true
+
+norms:
+  # detector/planner guardrail과 fallback logic에서 shared norm target을 참조.
+  enabled: true
+
+llm:
+  enabled: true
+  # OpenClaw gateway에 전달되는 상위 provider/model 설정.
+  provider: openclaw
+  model: "vllm/mansim-gemma4-e4b"
+  server_url: "http://localhost:18789/v1"
+  api_key: "vllm-local"
+  # manager prompt 기본 언어. 현재 workspace prompt는 영어 기준으로 작성되어 있다.
+  language: ENG
+  timeout_sec: 120
+  temperature: 0.0
+  max_tokens: 800
+
+  openclaw:
+    # OpenClaw runtime 자체의 health/readiness/recovery 설정.
+    backend_health_probe_interval_sec: 30
+    backend_health_probe_timeout_sec: 2.5
+    runtime_recovery_probe_retries: 2
+    runtime_recovery_restarts: 1
+    runtime_recovery_backoff_sec: 1.5
+    runtime_readiness_timeout_sec: 12.0
+    profile_name: mansim_repo
+    profile_config_path: "openclaw/profiles/mansim_repo/openclaw.json"
+    session_namespace: mansim
+    manager_agent_id: MANAGER
+    workspace_root: openclaw/workspaces
+    native_thinking: "off"
+    # worker id는 시뮬레이터의 worker id와 일치해야 한다.
+    worker_agent_ids:
+      - A1
+      - A2
+      - A3
+    backend:
+      # 실제 LLM backend 설정. OpenClaw gateway가 이 backend에 붙는다.
+      provider: vllm
+      model: mansim-gemma4-e4b
+      model_name: "Gemma 4 E4B IT"
+      base_url: "http://127.0.0.1:8000/v1"
+      wsl_distro: "Ubuntu-24.04"
+      api: "openai-completions"
+      api_key: "vllm-local"
+      context_window: 32768
+      max_output_tokens: 4096
+      reasoning: false
+
+  orchestration:
+    enabled: true
+    # cross-run learning 반복 횟수. 1이면 single run, 3 이상이면 series run.
+    run_count: 1
+    detector:
+      max_top_bottlenecks: 3
+    evaluator:
+      # optional reviewer. detector draft를 한 번 더 검토한다.
+      enabled: false
+      max_revision_requests: 2
+    # planner가 worker당 제안할 수 있는 최대 commitment 수.
+    worker_queue_limit: 4
+    # OpenClaw manager/worker 호출 병렬성 제어.
+    max_parallel_groups: 3
+    incident:
+      enabled: true
+      # worker local response를 먼저 시도하고, 실패 시 manager incident replan으로 올린다.
+      prefer_worker_local_response: true
+      detector_recheck:
+        # incident가 커질 때 detector를 다시 부를 기준.
+        capacity_loss_ratio: 0.5
+        recurring_incident_count: 2
+        backlog_delta: 3
+    parallel_worker_calls: true
+
+  memory:
+    # manager workspace에 주입할 최근 history window.
+    history_window_days: 7
+    include_agent_memory: false

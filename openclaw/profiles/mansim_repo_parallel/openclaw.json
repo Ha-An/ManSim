@@ -1,0 +1,134 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.3.13"
+  },
+  "env": {
+    "shellEnv": {
+      "enabled": false
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "vllm/mansim-gemma4-e4b-parallel"
+      },
+      "models": {
+        "vllm/mansim-gemma4-e4b-parallel": {}
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "skipBootstrap": true,
+      "timeoutSeconds": 120
+    },
+    "list": [
+      {
+        "id": "main"
+      },
+      {
+        "id": "A1",
+        "name": "A1",
+        "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\A1",
+        "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\A1\\agent",
+        "model": "vllm/mansim-gemma4-e4b-parallel"
+      },
+      {
+        "id": "A2",
+        "name": "A2",
+        "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\A2",
+        "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\A2\\agent",
+        "model": "vllm/mansim-gemma4-e4b-parallel"
+      },
+      {
+        "id": "A3",
+        "name": "A3",
+        "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\A3",
+        "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\A3\\agent",
+        "model": "vllm/mansim-gemma4-e4b-parallel"
+      },
+      {
+        "id": "MANAGER",
+        "name": "MANAGER",
+        "workspace": "__REPO_ROOT__\\openclaw\\workspaces\\MANAGER",
+        "agentDir": "__REPO_ROOT__\\openclaw\\state\\agents\\MANAGER\\agent",
+        "model": "vllm/mansim-gemma4-e4b-parallel"
+      }
+    ]
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": false,
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "gateway": {
+    "port": 18790,
+    "mode": "local",
+    "auth": {
+      "mode": "none"
+    },
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "vllm": {
+        "baseUrl": "http://127.0.0.1:8001/v1",
+        "apiKey": "vllm-local",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "mansim-gemma4-e4b-parallel",
+            "name": "Gemma 4 E4B IT Parallel",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 32768,
+            "maxTokens": 2048
+          }
+        ]
+      }
+    }
+  },
+  "tools": {
+    "profile": "minimal"
+  },
+  "skills": {
+    "allowBundled": [],
+    "load": {
+      "extraDirs": []
+    },
+    "entries": {
+      "coding-agent": {
+        "enabled": false
+      },
+      "healthcheck": {
+        "enabled": false
+      },
+      "node-connect": {
+        "enabled": false
+      },
+      "session-logs": {
+        "enabled": false
+      },
+      "skill-creator": {
+        "enabled": false
+      },
+      "weather": {
+        "enabled": false
+      }
+    }
+  }
+}

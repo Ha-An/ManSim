@@ -1,0 +1,16 @@
+﻿defaults:
+  - llm_planner_common
+  - _self_
+
+# Legacy OpenClaw + Qwen preset.
+# 기본 llm_planner 는 Gemma 4 E4B runtime 을 사용하고, 이 preset 은 이전 Qwen runtime 호환용이다.
+
+urgent_discuss:
+  enabled: false
+
+llm:
+  model: "vllm/mansim-qwen3-30b-a3b"
+  openclaw:
+    backend:
+      model: mansim-qwen3-30b-a3b
+      model_name: "Qwen 3 30B A3B Instruct FP8"

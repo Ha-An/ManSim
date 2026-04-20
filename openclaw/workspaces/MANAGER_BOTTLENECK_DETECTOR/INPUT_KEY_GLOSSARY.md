@@ -1,4 +1,4 @@
-# Input Key Glossary
+﻿# Input Key Glossary
 
 This glossary documents the detector request exactly as it appears in `facts/current_request.json`.
 
@@ -111,7 +111,8 @@ This glossary documents the detector request exactly as it appears in `facts/cur
 
 ## Workspace Memory
 
+- `KNOWLEDGE.md`
 - `MEMORY.md`
 - `memory/rolling_summary.md`
 
-Meaning: detector should re-read these prompt-facing summaries to check recurring or chronic issues, but current request facts override stale memory when they conflict.
+Meaning: detector should re-read cross-run knowledge and run-local summaries before finalizing the diagnosis. Current request facts override stale memory when they conflict.

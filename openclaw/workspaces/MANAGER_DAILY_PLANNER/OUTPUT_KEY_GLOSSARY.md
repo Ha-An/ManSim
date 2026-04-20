@@ -1,35 +1,54 @@
-# Output Key Glossary
+﻿# Output Key Glossary
 
 This glossary defines the meaning of the planner output keys.
 
-## LLM Raw Output
+## Planner Raw Output
 
 ### `plan_mode`
 - Allowed values: `maintain`, `adjust`
-- Meaning: High-level statement of whether current request evidence and relevant run-local memory support keeping the active plan or changing it.
-- Interpretation:
-  - `maintain`: Use only when no materially stronger intervention is justified by current request evidence and relevant run-local memory.
-  - `adjust`: Use when current request evidence supports a concrete change in priorities or assignments.
+- Meaning: planner-level decision about whether the active plan can continue as-is or needs a concrete change.
 
-### `weight_updates`
-- Type: `dict[str, float]`
-- Meaning: Temporary task-family weight adjustments proposed for today.
-- Interpretation:
-  - Keys must come from `guardrails.allowed_task_priority_keys`.
-  - Higher values increase the shared priority of that task family.
-  - Use this when planner wants to bias dispatcher behavior broadly, not just assign one specific action.
-
-### `queue_add`
+### `commitments`
 - Type: `dict[str, list]`
-- Meaning: Worker-specific concrete assignments to append to each worker's personal queue.
+- Meaning: worker-specific executable commitments.
+- Required fields per commitment:
+  - `opportunity_id`
+  - `commitment_id`
+  - `alternate_workers`
+  - `dependencies`
+  - `expiry_min`
+  - `success_criteria`
+  - `rationale`
 - Interpretation:
-  - Prefer this when current request evidence supports a specific next action for a specific worker.
-  - Each work-order object should identify the task family, target type, target id, target station when relevant, and a short reason.
-  - This is more concrete than `weight_updates`.
+  - `opportunity_id` must come directly from `input.opportunities`.
+  - This is the authoritative execution output for `llm_planner`.
+  - Do not invent target guesses outside the current opportunity board.
+
+### `mailbox`
+- Type: `dict[str, list]`
+- Meaning: worker-specific coordination messages.
+- Required fields per entry:
+  - `to_agent`
+  - `message_type`
+  - `body`
+- Interpretation:
+  - Use for handover, dependency, coordination, watchout, or assist-request notices.
+  - Mailbox is supplementary; it does not replace commitments.
+
+### `incident_strategy`
+- Type: `dict[str, Any]`
+- Required fields:
+  - `mode`
+  - `focus_opportunity_ids`
+  - `watchouts`
+- Interpretation:
+  - `mode` is typically `delta_replan` or `maintain`.
+  - `focus_opportunity_ids` should identify the opportunities that matter most under the current incident context.
+  - `watchouts` should remain compact and execution-relevant.
 
 ### `reason_trace`
 - Type: `list[dict]`
-- Meaning: Structured explanation of why the planner chose the proposed intervention.
+- Meaning: structured explanation of why the planner chose the final intervention.
 - Required fields per item:
   - `decision`
   - `reason`
@@ -38,57 +57,43 @@ This glossary defines the meaning of the planner output keys.
   - `task_families`
   - `detector_relation`
 - Interpretation:
-  - Use `follow`, `reject`, or `deprioritize` in `detector_relation` to explain how the planner treated the detector hypothesis.
-  - Keep evidence tied to the current request payload and any directly relevant run-local memory references.
+  - Tie evidence to the current request payload.
+  - `detector_relation` must explain whether the planner followed, rejected, or deprioritized the detector hypothesis.
 
 ### `detector_alignment`
 - Allowed values: `follow`, `partial_override`, `override`
-- Meaning: Planner-level summary of how closely the final day plan matches the reviewed diagnosis packet.
-- Interpretation:
-  - `follow`: Detector diagnosis remains the main driver of the day plan.
-  - `partial_override`: Detector is partly accepted, but planner changed the operational emphasis.
-  - `override`: Planner concluded a different intervention is more important than the detector's main diagnosis.
+- Meaning: planner-level summary of how closely the final executable plan matches the reviewed diagnosis packet.
 
 ## Simulator-Normalized Plan
 
 These fields are what the simulator actually executes after sanitizing and normalizing the raw planner output.
 
-### `task_priority_weights`
-- Meaning: Final shared task-family weights after planner updates are applied.
-- Source: Mostly derived from `weight_updates`, then clamped to allowed ranges.
-
-### `personal_queues`
-- Meaning: Final worker-specific work-order queues used by the runtime.
-- Source: Sanitized and normalized form of `queue_add`.
+### `commitments`
+- Meaning: final worker-specific executable commitments used by the runtime.
+- Source: sanitized form of raw `commitments`, or synthesized fallback commitments when the planner output is inert or invalid.
 
 ### `mailbox`
-- Meaning: Final worker handover/dependency messages used during execution.
-- Source: Built by the simulator, not currently a direct planner raw-output field.
+- Meaning: final worker coordination messages used during execution.
+- Source: sanitized form of raw `mailbox`.
 
-### `parallel_groups`
-- Meaning: Optional groups of work intended to run in parallel when dependencies allow it.
-- Source: Optional planner output, then sanitized by the simulator.
-
-### `agent_priority_multipliers`
-- Meaning: Final per-worker overlays on top of shared task weights.
-- Source: Built or blended by the simulator from planner-visible updates and runtime defaults.
+### `incident_strategy`
+- Meaning: final incident replanning guidance attached to the executable plan.
+- Source: sanitized form of raw `incident_strategy`.
 
 ### `manager_summary`
-- Meaning: Short planner-facing natural-language summary of the final day plan.
-- Source: Derived from planner response or synthesized by the simulator when missing.
+- Meaning: short natural-language summary of the final plan.
+- Source: derived from planner response or synthesized by the simulator when missing.
 
 ### `reason_trace`
-- Meaning: Final preserved explanation trace attached to the executable plan.
-- Source: Sanitized form of raw `reason_trace`.
+- Meaning: final preserved explanation trace attached to the executable plan.
+- Source: sanitized form of raw `reason_trace`.
 
 ### `detector_alignment`
-- Meaning: Final preserved detector/planner relationship label attached to the executable plan.
-- Source: Sanitized form of raw `detector_alignment`.
+- Meaning: final preserved detector/planner relationship label attached to the executable plan.
+- Source: sanitized form of raw `detector_alignment`.
 
 ## Practical Rule
 
-- Use `queue_add` when you can justify a specific worker-specific next action from current request evidence.
-- Use `weight_updates` when the right intervention is broader than one immediate queue item.
-- Use both together when the day needs an immediate concrete action plus a broader operating bias.
-
-
+- For `llm_planner`, commitments are the authoritative execution contract.
+- Mailbox supports coordination, not task dispatch on its own.
+- If the planner emits an inert or invalid response, the simulator may synthesize fallback commitments from the canonical opportunity board.

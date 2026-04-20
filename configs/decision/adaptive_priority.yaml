@@ -1,0 +1,12 @@
+﻿# 규칙 기반 priority 조정 모드.
+# LLM/OpenClaw 없이 동작하며, day-level discuss와 incident-level urgent_discuss로
+# task family weight를 조정한다.
+mode: adaptive_priority
+
+urgent_discuss:
+  # 돌발 상황 발생 시 short-term priority boost를 적용할지 여부.
+  enabled: false
+
+norms:
+  # inspection backlog, PM, battery reserve 같은 shared operating policy를 사용할지 여부.
+  enabled: false

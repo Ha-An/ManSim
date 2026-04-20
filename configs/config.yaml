@@ -1,0 +1,19 @@
+﻿# ManSim vNext root config (Hydra)
+# 기본 실행 조합을 정하는 루트 preset.
+# 개별 실행 시에는 `decision=...`, `scenario=...` 식으로 override할 수 있다.
+defaults:
+  - scenario: mfg_basic
+  # decision 모드:
+  # - fixed_priority: 고정 규칙 기반 baseline
+  # - adaptive_priority: 상황 적응형 scripted baseline
+  # - fixed_task_assignment: worker별 task family allowlist를 강제하는 scripted mode
+  # - llm_planner: legacy commitment-driven LLM mode
+  # - openclaw_adaptive_priority: OpenClaw manager-only priority-driven LLM mode
+  - decision: openclaw_adaptive_priority
+  - heuristic_rules: default
+  - runtime: default
+  - worker: default
+  - _self_
+
+# 전역 random seed. scenario 내부 seed보다 이 값이 우선된다.
+seed: 2026

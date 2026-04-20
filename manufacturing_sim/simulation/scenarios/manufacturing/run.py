@@ -8,19 +8,17 @@ from typing import Any
 
 import simpy
 
-from manufacturing_sim.simulation.scenarios.manufacturing.decision.llm_common import OptionalLLMDecisionModule
-from manufacturing_sim.simulation.scenarios.manufacturing.decision.openclaw_orchestrated import OpenClawOrchestratedDecisionModule
-from manufacturing_sim.simulation.scenarios.manufacturing.decision.modes import is_llm_mode, normalize_decision_mode
-from manufacturing_sim.simulation.scenarios.manufacturing.decision.scripted import ScriptedDecisionModule
-from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
-from manufacturing_sim.simulation.scenarios.manufacturing.viz.orchestration_intelligence_dashboard import export_orchestration_intelligence_dashboard
-from manufacturing_sim.simulation.scenarios.manufacturing.viz.dashboard import export_kpi_dashboard
-from manufacturing_sim.simulation.scenarios.manufacturing.viz.gantt import export_gantt
-from manufacturing_sim.simulation.scenarios.manufacturing.viz.llm_trace import export_llm_trace_dashboard
-from manufacturing_sim.simulation.scenarios.manufacturing.viz.openclaw_workspace_dashboard import export_openclaw_workspace_dashboard
-from manufacturing_sim.simulation.scenarios.manufacturing.viz.task_priority_dashboard import (
+from agents import build_decision_module
+from dashboards.legacy import (
+    export_gantt,
+    export_kpi_dashboard,
+    export_llm_trace_dashboard,
+    export_openclaw_workspace_dashboard,
+    export_orchestration_intelligence_dashboard,
     export_task_priority_dashboard,
 )
+from agents.modes import is_llm_mode, normalize_decision_mode
+from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
 from manufacturing_sim.simulation.scenarios.manufacturing.world import ManufacturingWorld
 
 
@@ -29,7 +27,12 @@ def _utc_now_iso() -> str:
 
 
 def _format_duration(seconds: float) -> str:
-    total_seconds = max(0, int(round(float(seconds))))
+    raw_seconds = max(0.0, float(seconds))
+    if raw_seconds < 1.0:
+        return f"{raw_seconds:.3f}s"
+    if raw_seconds < 10.0:
+        return f"{raw_seconds:.2f}s"
+    total_seconds = max(0, int(round(raw_seconds)))
     hours, remainder = divmod(total_seconds, 3600)
     minutes, secs = divmod(remainder, 60)
     if hours:
@@ -97,6 +100,14 @@ def _latency_stats_ms(rows: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
+def _record_has_transport_error(rec: dict[str, Any]) -> bool:
+    status = str(rec.get("status", "")).strip().lower()
+    if status == "error":
+        return True
+    error_text = str(rec.get("error", "")).strip()
+    return bool(error_text)
+
+
 def _summarize_llm_transport_metrics(records: list[dict[str, Any]] | None) -> dict[str, Any]:
     rows = records if isinstance(records, list) else []
     total_calls = len(rows)
@@ -105,6 +116,8 @@ def _summarize_llm_transport_metrics(records: list[dict[str, Any]] | None) -> di
     used_chat = sum(1 for rec in rows if str(rec.get("transport_used", "")).strip() == "chat_compat")
     fallback_count = sum(1 for rec in rows if bool(rec.get("native_fallback_used", False)))
     default_contract_count = sum(1 for rec in rows if bool(rec.get("native_default_contract_used", False)) or "native_default_contract_used" in str(rec.get("error", "")))
+    error_count = sum(1 for rec in rows if _record_has_transport_error(rec))
+    ok_count = max(0, total_calls - error_count)
 
     backend_checked = 0
     backend_healthy = 0
@@ -124,6 +137,7 @@ def _summarize_llm_transport_metrics(records: list[dict[str, Any]] | None) -> di
                 "used_chat": 0,
                 "native_fallback_count": 0,
                 "native_default_contract_count": 0,
+                "error_count": 0,
                 "latencies_ms": [],
                 "attempt_counts": [],
                 "backend_health_ok": 0,
@@ -141,6 +155,8 @@ def _summarize_llm_transport_metrics(records: list[dict[str, Any]] | None) -> di
             phase_entry["native_fallback_count"] += 1
         if bool(rec.get("native_default_contract_used", False)) or "native_default_contract_used" in str(rec.get("error", "")):
             phase_entry["native_default_contract_count"] += 1
+        if _record_has_transport_error(rec):
+            phase_entry["error_count"] += 1
 
         latency_ms = _safe_float_val(rec.get("latency_ms"), -1.0)
         if latency_ms >= 0:
@@ -167,11 +183,14 @@ def _summarize_llm_transport_metrics(records: list[dict[str, Any]] | None) -> di
         denom = int(phase_entry.get("requested_native", 0) or 0)
         phase_entry["native_fallback_ratio"] = round((float(phase_entry.get("native_fallback_count", 0) or 0) / denom), 6) if denom > 0 else 0.0
         phase_entry["native_default_contract_ratio"] = round((float(phase_entry.get("native_default_contract_count", 0) or 0) / denom), 6) if denom > 0 else 0.0
+        phase_entry["ok_count"] = max(0, int(phase_entry.get("calls", 0) or 0) - int(phase_entry.get("error_count", 0) or 0))
+        phase_entry["error_ratio"] = round((float(phase_entry.get("error_count", 0) or 0) / float(phase_entry.get("calls", 0) or 1)), 6) if int(phase_entry.get("calls", 0) or 0) > 0 else 0.0
 
         lat_rows = [{"latency_ms": x} for x in phase_entry.pop("latencies_ms", [])]
         phase_entry["latency_stats_ms"] = _latency_stats_ms(lat_rows)
         attempts = [float(a) for a in phase_entry.pop("attempt_counts", []) if float(a) >= 0]
         phase_entry["avg_attempts"] = round((sum(attempts) / float(len(attempts))), 6) if attempts else 0.0
+        phase_entry["avg_retries"] = phase_entry["avg_attempts"]
         checked = phase_entry.get("backend_health_checked", 0) or 0
         phase_entry["backend_health_ok_ratio"] = round((float(phase_entry.get("backend_health_ok", 0) or 0) / checked), 6) if checked > 0 else 0.0
 
@@ -186,12 +205,16 @@ def _summarize_llm_transport_metrics(records: list[dict[str, Any]] | None) -> di
         "requested_native_local": requested_native,
         "used_native_local": used_native,
         "used_chat_compat": used_chat,
+        "ok_count": ok_count,
+        "error_count": error_count,
+        "error_ratio": round((float(error_count) / float(total_calls)), 6) if total_calls > 0 else 0.0,
         "native_fallback_count": fallback_count,
         "native_fallback_ratio": round((float(fallback_count) / float(requested_native)), 6) if requested_native > 0 else 0.0,
         "native_default_contract_count": default_contract_count,
         "native_default_contract_ratio": round((float(default_contract_count) / float(requested_native)), 6) if requested_native > 0 else 0.0,
         "latency_stats_ms": latency_stats,
         "avg_attempts": avg_attempts,
+        "avg_retries": avg_attempts,
         "backend_health_checked": backend_checked,
         "backend_health_ok": backend_healthy,
         "backend_health_failed": backend_failed,
@@ -276,6 +299,9 @@ def run(
         "decision_mode": decision_mode,
         "run_index": run_index,
         "total_runs": total_runs,
+        "total_days": total_days,
+        "minutes_per_day": float(experiment_cfg["horizon"].get("minutes_per_day", 0)),
+        "sim_total_min": round(sim_total_min, 3),
         "knowledge_in_path": knowledge_in_path,
         "knowledge_out_path": "",
         "started_at_utc": started_at_utc,
@@ -284,37 +310,49 @@ def run(
         "wall_clock_human": "0s",
         "progress_path": str((output_root / "progress.json").resolve()),
         "urgent_discuss_enabled": bool(urgent_cfg.get("enabled", True)),
+        "worker_execution_mode": (
+            str((experiment_cfg.get("worker", {}) if isinstance(experiment_cfg.get("worker", {}), dict) else {}).get("execution_mode", "")).strip()
+            if decision_mode == "llm_planner"
+            else "priority"
+        ),
+        "worker_local_response": dict(
+            (
+                experiment_cfg.get("worker", {}) if isinstance(experiment_cfg.get("worker", {}), dict) else {}
+            ).get("local_response", {})
+            if isinstance((experiment_cfg.get("worker", {}) if isinstance(experiment_cfg.get("worker", {}), dict) else {}).get("local_response", {}), dict)
+            else {}
+        ),
     }
 
     if decision_modules is not None:
         decision_module = decision_modules
     else:
-        if decision_mode in {"adaptive_priority", "fixed_priority"}:
-            decision_module = ScriptedDecisionModule(experiment_cfg)
-        elif decision_mode == "llm_planner":
-            # ?? LLM ??? OpenClaw ??? ??? ????.
-            # OpenClaw? ?? ?? ????? OptionalLLMDecisionModule? fallback?? ????.
-            try:
-                llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
-                provider = str(llm_cfg.get("provider", "")).strip().lower()
-                orchestration_cfg = llm_cfg.get("orchestration", {}) if isinstance(llm_cfg.get("orchestration", {}), dict) else {}
-                if provider == "openclaw" and bool(orchestration_cfg.get("enabled", True)):
-                    decision_module = OpenClawOrchestratedDecisionModule(
-                        cfg=experiment_cfg,
-                        llm_cfg=llm_cfg,
-                    )
-                else:
-                    decision_module = OptionalLLMDecisionModule(
-                        cfg=experiment_cfg,
-                        llm_cfg=llm_cfg,
-                    )
-            except RuntimeError as exc:
-                raise RuntimeError(
-                    "decision.mode=llm_planner is selected, but the configured LLM backend is unavailable. "
-                    "Use decision=adaptive_priority for a local rule-based run or configure the LLM server."
-                ) from exc
-        else:
-            raise ValueError(f"Unsupported decision mode: {decision_mode}")
+        try:
+            decision_module = build_decision_module(experiment_cfg=experiment_cfg, decision_mode=decision_mode)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"decision.mode={decision_mode} is selected, but the configured LLM backend is unavailable. "
+                "Use decision=adaptive_priority for a local rule-based run or configure the LLM server."
+            ) from exc
+
+    if decision_mode == "fixed_task_assignment":
+        run_meta["task_assignment"] = {
+            "validation": str(
+                (decision_cfg.get("task_assignment", {}) if isinstance(decision_cfg.get("task_assignment", {}), dict) else {}).get("validation", "error")
+            ).strip()
+            or "error",
+            "battery_exception_policy": str(
+                getattr(decision_module, "battery_exception_policy", "safety_only")
+            ).strip()
+            or "safety_only",
+            "allowed_task_families": {
+                str(agent_id): list(values)
+                for agent_id, values in (
+                    getattr(decision_module, "agent_task_allowlists", {}) if isinstance(getattr(decision_module, "agent_task_allowlists", {}), dict) else {}
+                ).items()
+                if isinstance(values, list)
+            },
+        }
 
     if is_llm_mode(decision_mode):
         llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
@@ -331,8 +369,7 @@ def run(
             "model": str(llm_cfg.get("model", "")),
             "language": llm_language,
             "communication_enabled": bool(comm_cfg.get("enabled", True)),
-            "coordination_review_enabled": bool(orchestration_cfg.get("daily_review_enabled", True)) if provider == "openclaw" else bool(comm_cfg.get("enabled", True)),
-            "communication_rounds": int(comm_cfg.get("rounds", 0)),
+            "coordination_review_enabled": bool(evaluator_cfg.get("enabled", False)) if provider == "openclaw" else bool(comm_cfg.get("enabled", True)),
             "communication_language": llm_language,
             "urgent_discuss_enabled": bool(urgent_cfg.get("enabled", True)),
             "evaluator_enabled": bool(evaluator_cfg.get("enabled", False)) if provider == "openclaw" else False,
@@ -385,6 +422,8 @@ def run(
     env = simpy.Environment()
     world = ManufacturingWorld(env=env, cfg=experiment_cfg, logger=event_logger, decision_module=decision_module)
     world.bootstrap()
+    run_meta["norms_enabled"] = bool(getattr(world, "norms_enabled", True))
+    run_meta["initial_norms"] = dict(getattr(world, "norms", {})) if isinstance(getattr(world, "norms", {}), dict) else {}
 
     progress_lock = Lock()
     progress_stop = ThreadEvent()
@@ -578,7 +617,7 @@ def run(
         event_logger.write_json("run_meta.json", run_meta)
         event_logger.write_json("minute_snapshots.json", {"snapshots": world.minute_snapshots})
 
-        if decision_mode == "llm_planner" and hasattr(decision_module, "reflect_run"):
+        if is_llm_mode(decision_mode) and hasattr(decision_module, "reflect_run"):
             reflect_run_fn = getattr(decision_module, "reflect_run")
             if callable(reflect_run_fn):
                 try:

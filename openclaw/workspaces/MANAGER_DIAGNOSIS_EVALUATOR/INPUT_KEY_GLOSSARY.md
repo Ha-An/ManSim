@@ -1,4 +1,4 @@
-# Input Key Glossary
+﻿# Input Key Glossary
 
 This glossary documents the evaluator request exactly as it appears in `facts/current_request.json`.
 
@@ -80,12 +80,9 @@ This glossary documents the evaluator request exactly as it appears in `facts/cu
 
 ## Workspace Memory
 
-### `MEMORY.md`
-- Compressed prompt-facing summary of recent diagnosis reviews.
+- `KNOWLEDGE.md`
+- `MEMORY.md`
+- `memory/rolling_summary.md`
+- `machine_recurrence_summary`
 
-### `memory/rolling_summary.md`
-- Compact rolling review summary for the current run.
-
-### `machine_recurrence_summary`
-- Recurring machine issue summary stored inside evaluator memory artifacts.
-- Meaning: use it to check whether repeated machine problems are being ignored or weakly explained.
+Meaning: evaluator should use cross-run knowledge plus run-local review memory when deciding whether recurring issues were ignored, weakly ranked, or poorly explained.

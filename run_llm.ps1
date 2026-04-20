@@ -1,6 +1,4 @@
-﻿# Helper script for local LLM runs through Ollama on WSL.
-# It keeps the WSL distro alive long enough to restart Ollama and then runs
-# the ManSim entry point with the requested decision preset.
+# Helper script for local OpenClaw + vLLM runs.
 param(
     [string]$Decision = "llm_planner",
     [string]$Distro = "Ubuntu-24.04",
@@ -22,9 +20,9 @@ try {
     $keepAliveProc = Start-Process -WindowStyle Hidden -FilePath "wsl.exe" -ArgumentList $keepAliveArgs -PassThru
 
     Start-Sleep -Seconds 2
-    & wsl.exe -d $Distro -u root -- bash -lc "systemctl restart ollama"
+    & wsl.exe -d $Distro -u root -- bash -lc "systemctl restart vllm || true"
 
-    $cmdArgs = @("-m", "manufacturing_sim.simulation.main", "decision=$Decision") + $ExtraArgs
+    $cmdArgs = @("main.py", "decision=$Decision") + $ExtraArgs
     & $PythonPath @cmdArgs
 }
 finally {

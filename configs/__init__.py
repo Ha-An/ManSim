@@ -1,0 +1,1 @@
+# Hydra root config package.

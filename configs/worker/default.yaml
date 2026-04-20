@@ -1,0 +1,10 @@
+execution_mode: commitment
+local_response:
+  enabled: true
+  scope: standard
+  max_local_attempts_per_incident: 2
+  allow_handoff: true
+  allow_self_reorder: true
+  allow_self_recovery: true
+  blocked_duration_escalation_min: 5
+  expiry_margin_escalation_min: 4

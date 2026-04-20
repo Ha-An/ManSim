@@ -1,0 +1,7 @@
+﻿defaults:
+  - llm_planner_common
+  - _self_
+
+# OpenClaw 기반 매니저 LLM planner 기본 preset.
+# Gemma 4 E4B Docker/vLLM runtime을 기준으로 한다.
+# 모델/백엔드만 바꾸고 싶으면 이 파일 대신 `llm_planner_common.yaml`을 상속한 별도 preset을 추가한다.

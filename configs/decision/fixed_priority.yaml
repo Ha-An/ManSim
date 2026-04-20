@@ -1,0 +1,11 @@
+﻿# 고정 priority baseline 모드.
+# priority 자체를 거의 조정하지 않고 정적인 규칙 집합으로 실행한다.
+mode: fixed_priority
+
+urgent_discuss:
+  # 이 모드에서는 incident 발생 시 추가 priority boost를 사용하지 않는다.
+  enabled: false
+
+norms:
+  # 고정 모드여도 shared norm target은 유지한다.
+  enabled: false

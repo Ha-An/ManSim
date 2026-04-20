@@ -129,6 +129,7 @@ def agent_battery_monitor(env: simpy.Environment, world: ManufacturingWorld, age
             continue
 
         remaining = world.battery_remaining(agent)
+        world._emit_low_battery_alert_if_needed(agent)
         if remaining <= eps:
             world.discharge_agent(agent, reason="battery_depleted")
             yield env.timeout(0)

@@ -1,0 +1,24 @@
+﻿# non-LLM scripted mode.
+# 각 worker는 allowlist에 있는 canonical task family만 수행할 수 있고,
+# 그 허용 범위 안에서만 priority를 비교한다.
+mode: fixed_task_assignment
+
+urgent_discuss:
+  # machine breakdown, discharged, battery risk 같은 incident에 즉시 반응할지 여부.
+  enabled: false
+
+norms:
+  # inspection/PM/battery reserve 같은 공통 운영 목표를 사용할지 여부.
+  enabled: false
+
+task_assignment:
+  # `error`: 배정 누락/잘못된 family/잘못된 worker id가 있으면 시작 전에 중단.
+  validation: error
+  # 현재 구현은 battery safety task만 모든 worker 예외 허용.
+  battery_exception_policy: safety_only
+  # canonical task family allowlist.
+  # raw task type(`TRANSFER`, `SETUP_MACHINE` 등)가 아니라 아래 family 이름을 사용한다.
+  allowed_task_families:
+    A1: [material_supply]
+    A2: [inter_station_transfer, unload_machine, inspect_product]
+    A3: [setup_machine, repair_machine, preventive_maintenance]

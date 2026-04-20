@@ -1,0 +1,86 @@
+﻿# 기본 제조 실험 시나리오
+name: mfg_basic
+
+horizon:
+  # 총 시뮬레이션 일수
+  num_days: 10
+  # 하루 길이(분). 240=4시간, 480=8시간, 1440=24시간
+  minutes_per_day: 240
+
+factory:
+  # 이동 작업 에이전트 수
+  num_agents: 3
+  # Station1, Station2의 machine 수
+  machines_per_station: 2
+
+  # station별 processing 시간
+  processing_time_min:
+    station1: 20
+    station2: 30
+
+  # Inspection 시간 모델: base / sqrt(k)
+  # 단, inspection_min_time_min보다 빨라지지는 않는다.
+  inspection_base_time_min: 10
+  inspection_min_time_min: 2
+
+movement:
+  # Warehouse <-> Station 이동 시간
+  warehouse_to_station_min: 8
+  # Station / Inspection 구역 간 기본 이동 시간
+  station_to_station_min: 5
+  # machine setup/load에 드는 시간
+  setup_min: 3
+  # machine unload에 드는 시간
+  unload_min: 2
+  # BatteryStation 이동 시간
+  to_battery_station_min: 4
+  # 그 외 기본 이동 시간
+  default_min: 6
+
+quality:
+  # Inspection에서 scrap으로 판정될 확률(0~1)
+  defect_prob: 0.00
+
+machine_failure:
+  # 평균 고장 간격(분). exponential 분포 기반
+  mean_time_to_fail_min: 300
+  repair_time_min: 20
+  pm_time_min: 30
+  # PM 효과 지속 시간
+  pm_effect_duration_min: 720
+  # PM 효과 중 고장률 multiplier
+  pm_lambda_multiplier: 0.5
+  # PM이 due로 간주되는 목표 간격
+  pm_interval_target_min: 480
+
+agent:
+  # 배터리 교체가 필요한 사용 주기(분)
+  battery_swap_period_min: 200
+  # fresh battery 픽업 시간
+  battery_pickup_time_min: 5
+  # 배터리 전달 작업의 추가 서비스 시간
+  battery_delivery_extra_min: 4
+
+inventory_targets:
+  material:
+    station1: 10
+    station2: 10
+  intermediate:
+    # Station1은 raw material만 사용한다.
+    # intermediate queue는 Station2 입력과 Inspection 입력에서만 의미가 있다.
+    station2: 10
+    station4: 10
+
+# 시뮬레이션 시작 시 초기 queue fill 값
+# 0으로 두면 빈 공장 상태에서 시작하되,
+# inventory_targets는 실행 중 replenishment 목표로 계속 사용된다.
+initial_inventory:
+  material:
+    station1: 0
+    station2: 0
+
+dispatcher:
+  # urgent_discuss 연속 호출 최소 간격
+  urgent_chat_cooldown_min: 5
+  # minute snapshot 기록 간격
+  snapshot_interval_min: 1

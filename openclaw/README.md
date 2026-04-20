@@ -1,41 +1,19 @@
-# OpenClaw 구성
+# OpenClaw Assets
 
-이 디렉터리는 ManSim v0.3이 사용하는 OpenClaw profile과 workspace 템플릿을 저장합니다.
+This directory contains the OpenClaw profile and workspace templates used by ManSim v0.4.
 
-현재 기본 연결 경로는 다음과 같습니다.
-- OpenClaw gateway
-- `gemma4-cu130` Docker runtime
-- `Gemma 4 E4B IT`
-- served model alias `mansim-gemma4-e4b`
+## Purpose
+`openclaw/` is not the simulator core. It is the workspace and profile layer used by the root-level runtime and agent stack.
 
-## 기본 실행 흐름
-```powershell
-.\install_openclaw_cli.ps1
-.\start_vllm_gemma4_docker.ps1
-.\openclaw\start_gateway.ps1
-.\.venv\Scripts\python.exe -m manufacturing_sim.simulation.main
-```
-
-runtime 종료:
-```powershell
-.\stop_vllm_gemma4_docker.ps1
-```
-
-## Legacy 경로
-기존 Qwen runtime은 제거하지 않았고 legacy preset으로 분리되어 있습니다.
-
-```powershell
-.\start_vllm_wsl.ps1
-.\.venv\Scripts\python.exe -m manufacturing_sim.simulation.main decision=llm_planner_qwen_legacy
-```
-
-## 구성
-- `profiles/mansim_repo`
-  - OpenClaw profile 설정
+## Main Contents
+- `profiles/mansim_repo/`
+  - Default Gemma 4 E4B OpenClaw profile for the primary GPU 1 path
+- `profiles/mansim_repo_parallel/`
+  - Optional Gemma 4 E4B OpenClaw profile for the parallel GPU 0 path
 - `workspaces/A1`, `A2`, `A3`
-  - worker template
+  - worker templates
 - `workspaces/MANAGER`
-  - 공통 manager template
+  - shared manager template
 - `workspaces/MANAGER_BOTTLENECK_DETECTOR`
   - detector template
 - `workspaces/MANAGER_DIAGNOSIS_EVALUATOR`
@@ -43,48 +21,54 @@ runtime 종료:
 - `workspaces/MANAGER_DAILY_PLANNER`
   - planner template
 - `workspaces/MANAGER_RUN_REFLECTOR`
-  - run reflector template
+  - reflector template
 
-## Workspace 파일 의미
-- `SOUL.md`
-  - 역할 성향과 판단 스타일
-- `IDENTITY.md`
-  - 책임 경계와 전문성
-- `AGENTS.md`
-  - workspace에서 지켜야 할 규칙
-- `TOOLS.md`
-  - 사용 가능한 도구와 원칙
-- `BOOTSTRAP.md`
-  - 시작 시 다시 읽을 최소 지침
-- `HEARTBEAT.md`
-  - 변하지 않는 운영 원칙
-- `MEMORY.md`
-  - prompt-facing 압축 memory
-- `KNOWLEDGE.md`
-  - run-series root의 `knowledge.md`가 manager group에 주입된 cross-run prior
+## Canonical Run Path
+```powershell
+.\.venv\Scripts\python.exe main.py decision=openclaw_adaptive_priority
+```
+
+## Default Local Stack
+```powershell
+.\install_openclaw_cli.ps1
+.\start_vllm_gemma4_docker.ps1
+.\openclaw\start_gateway.ps1
+.\.venv\Scripts\python.exe main.py decision=openclaw_adaptive_priority
+```
+
+## Optional Parallel Local Stack
+```powershell
+.\start_vllm_gemma4_parallel_docker.ps1
+.\openclaw\start_gateway.ps1 -ProfileName mansim_repo_parallel -BackendModelsUrl http://127.0.0.1:8001/v1/models -ExpectedModelId mansim-gemma4-e4b-parallel -Port 18790
+```
+
+Note
+- `mansim_repo` + E4B on GPU 1 is the current validated healthy baseline.
+- `mansim_repo_parallel` + E4B on GPU 0 is an optional sidecar path for parallel experiments only.
+- current pinned operating profile for the primary path is the `experiment 3` configuration.
+  - stronger strategist authority
+  - stronger strategist role guidance
+  - `llm.max_tokens = 600`
+  - `backend.max_output_tokens = 2048`
+- representative primary-path run: `outputs/2026-04-18/20-18-45`
+  - `23 products / 7m 34s / terminated=false`
+- 3-run summary for the pinned profile: `outputs/2026-04-18/experiment_3_summary.json`
+  - average `21.67 products / 8m 47s`
+  - `10분 이내 3/3`
+- `outputs/2026-04-18/15-47-38` (`26 products / 4m 48s`) remains a best-observed outlier, not the current operating baseline.
+
+## Workspace Runtime Files
+Each runtime workspace typically receives:
 - `USER.md`
-  - 현재 turn 지시와 scratch context
-
-## 현재 LLM orchestration 기준
-- run 내부
-  - `detector -> evaluator(optional) -> planner`
-- run 종료 후
-  - `reflector -> knowledge.md update`
-- 다음 run 시작
-  - manager workspace에 `KNOWLEDGE.md` 주입
-
-## 런타임에 생성되는 대표 파일
+- `MEMORY.md`
+- `KNOWLEDGE.md` for manager roles
 - `facts/current_request.json`
-  - 현재 turn 입력 packet
 - `facts/current_response_template.json`
-  - 해당 agent가 따라야 하는 출력 계약
-- `memory/rolling_summary.md`
-  - run-local 압축 요약
+- `facts/current_native_turn.json`
 - `reports/*`
-  - day별 reflect / evaluation / plan / reflection 산출물
 - `trace/*`
-  - manager call trace와 review history
 
-## 참고
-- OpenClaw 경로가 기대하는 상위 preset은 `manufacturing_sim/simulation/conf/decision/llm_planner.yaml`입니다.
-- 전체 구조와 실행 방법은 [루트 README](../README.md)를 참고하면 됩니다.
+## Notes
+- Canonical config now lives under `configs/`, not under `manufacturing_sim/simulation/conf/`.
+- Cross-run knowledge is injected into manager workspaces as `KNOWLEDGE.md`.
+- Root-level documentation lives in `README.md` and `docs/`.

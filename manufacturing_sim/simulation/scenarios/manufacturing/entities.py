@@ -62,7 +62,12 @@ class Agent:
     carrying_item_id: Optional[str] = None
     carrying_item_type: Optional[str] = None
     battery_swap_critical: bool = False
+    low_battery_alerted: bool = False
     total_task_time_min: dict[str, float] = field(default_factory=dict)
+    current_commitment_id: Optional[str] = None
+    claimed_commitments: list[str] = field(default_factory=list)
+    incident_backlog: list[dict[str, Any]] = field(default_factory=list)
+    local_response_attempts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
