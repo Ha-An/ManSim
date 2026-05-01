@@ -62,6 +62,12 @@ Replay Studio는 두 가지 view를 지원합니다.
 - factory replay: worker, machine, queue, battery, inspection, movement, repair, incident animation.
 - manager replay: input bundle -> Strategist -> compiler -> factory response -> Reviewer -> next-day carry-forward 흐름을 day 단위로 표현합니다.
 
+### Replay Studio 미리보기
+
+아래 화면은 `openclaw_adaptive_priority` run에서 생성된 factory replay 예시입니다. worker 상태, 설비 상태, queue, 이동 경로, worker monitor를 event log 기반으로 재구성합니다.
+
+![Replay Studio factory replay 화면](docs/assets/replay-studio-worker-replay.png)
+
 ## 빠른 시작
 
 Python 환경을 준비하고 dependency를 설치합니다.
