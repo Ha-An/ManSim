@@ -13,7 +13,7 @@ export function toFetchablePath(rawPath: string | null | undefined): string | nu
     return text;
   }
   if (/^[A-Za-z]:[\\/]/.test(text)) {
-    return `/@fs/${text.replace(/\\/g, "/")}`;
+    return `/__mansim_file?path=${encodeURIComponent(text)}`;
   }
   return text;
 }
