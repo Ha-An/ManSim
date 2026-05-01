@@ -1,0 +1,15 @@
+{
+  "source_priority": ["config", "auto"],
+  "viewport": { "width": 1200, "height": 760 },
+  "nodes": [
+    { "entity_id": "queue_q1", "entity_type": "queue", "position": { "x": 220, "y": 250 } },
+    { "entity_id": "storage_s1", "entity_type": "storage", "position": { "x": 220, "y": 520 } },
+    { "entity_id": "machine_m1", "entity_type": "machine", "position": { "x": 520, "y": 220 } },
+    { "entity_id": "machine_m2", "entity_type": "machine", "position": { "x": 760, "y": 220 } },
+    { "entity_id": "charger_c1", "entity_type": "charger", "position": { "x": 960, "y": 520 } },
+    { "entity_id": "robot_r1", "entity_type": "robot", "position": { "x": 360, "y": 620 } },
+    { "entity_id": "robot_r2", "entity_type": "robot", "position": { "x": 620, "y": 620 } },
+    { "entity_id": "order_job_a", "entity_type": "order", "position": { "x": 180, "y": 110 } },
+    { "entity_id": "order_job_b", "entity_type": "order", "position": { "x": 240, "y": 110 } }
+  ]
+}

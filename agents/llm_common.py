@@ -1714,6 +1714,10 @@ class OptionalLLMDecisionModule(DecisionModule):
                 "has_output_waiting_unload": bool(data.get("has_output_waiting_unload", False)),
                 "wait_reasons": wait_reasons,
                 "owners": owners,
+                "repair_team": data.get("repair_team", []),
+                "repair_team_size": data.get("repair_team_size", 0),
+                "repair_slots_remaining": data.get("repair_slots_remaining", 0),
+                "repair_remaining_min": data.get("repair_remaining_min"),
                 "minutes_since_last_pm": data.get("minutes_since_last_pm"),
                 "minutes_since_failure_started": data.get("minutes_since_failure_started"),
             }

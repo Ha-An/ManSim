@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
 import sys
 import webbrowser
 from pathlib import Path
@@ -16,6 +17,8 @@ from omegaconf import DictConfig
 from dashboards import (
     build_series_analysis,
     export_knowledge_dashboard,
+    export_manager_replay,
+    export_operations_replay,
     export_reasoning_dashboard,
     export_replay_dashboard,
     export_results_dashboard,
@@ -123,6 +126,27 @@ def _build_replay_streamlit_url(
     return f"http://localhost:{port}/?{'&'.join(params)}" if params else f"http://localhost:{port}"
 
 
+def _export_replay_studio_assets(output_dir: Path) -> tuple[Path, Path]:
+    script_path = Path(__file__).resolve().parents[1] / "replay_studio" / "examples" / "export_mansim_run.py"
+    output_log = output_dir / "replay_studio_log.json"
+    output_layout = output_dir / "replay_studio_layout.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(script_path),
+            "--run-dir",
+            str(output_dir),
+            "--output-log",
+            str(output_log),
+            "--output-layout",
+            str(output_layout),
+        ],
+        check=True,
+        cwd=str(script_path.parent),
+    )
+    return output_log, output_layout
+
+
 def _export_run_dashboards(
     *,
     output_dir: Path,
@@ -160,6 +184,10 @@ def _export_run_dashboards(
         current_run_id=current_run_id,
     )
     replay_path = export_replay_dashboard(output_dir=output_dir, events=events)
+    operations_replay_path = export_operations_replay(output_dir=output_dir, events=events)
+    manager_replay_path = export_manager_replay(output_dir=output_dir)
+    manager_replay_json_path = output_dir / "manager_replay.json"
+    replay_studio_log_path, replay_studio_layout_path = _export_replay_studio_assets(output_dir)
     knowledge_path = export_knowledge_dashboard(
         output_dir=output_dir,
         graph=knowledge_store.graph,
@@ -191,6 +219,11 @@ def _export_run_dashboards(
     return {
         "results_dashboard_path": str(results_path.resolve()),
         "replay_dashboard_path": str(replay_path.resolve()),
+        "operations_replay_dashboard_path": str(operations_replay_path.resolve()),
+        "manager_replay_dashboard_path": str(manager_replay_path.resolve()) if manager_replay_path is not None else "",
+        "manager_replay_json_path": str(manager_replay_json_path.resolve()) if manager_replay_json_path.exists() else "",
+        "replay_studio_log_path": str(replay_studio_log_path.resolve()),
+        "replay_studio_layout_path": str(replay_studio_layout_path.resolve()),
         "knowledge_dashboard_path": str(knowledge_path.resolve()),
         "reasoning_dashboard_path": str(reasoning_path.resolve()),
     }
@@ -258,12 +291,15 @@ def _refresh_dashboard_suite(
             knowledge_store=knowledge_store,
             cfg=cfg,
             manifest=manifest,
-            manifest_path=Path(str(run_manifest_paths.get(current_run_id, root_manifest_path))),
+            manifest_path=root_manifest_path,
             current_run_id=current_run_id,
             analysis=analysis,
         )
         run_entry["results_dashboard_path"] = exported["results_dashboard_path"]
         run_entry["replay_dashboard_path"] = exported["replay_dashboard_path"]
+        run_entry["operations_replay_dashboard_path"] = exported["operations_replay_dashboard_path"]
+        run_entry["manager_replay_dashboard_path"] = exported.get("manager_replay_dashboard_path", "")
+        run_entry["manager_replay_json_path"] = exported.get("manager_replay_json_path", "")
         run_entry["knowledge_dashboard_path"] = exported["knowledge_dashboard_path"]
         run_entry["reasoning_dashboard_path"] = exported["reasoning_dashboard_path"]
 
@@ -385,6 +421,9 @@ def main(cfg: DictConfig) -> None:
             "orchestration_intelligence_dashboard_path": str(result.get("orchestration_intelligence_dashboard_path", "")),
             "llm_trace_path": str(result.get("llm_trace_path", "")),
             "replay_dashboard_path": exported["replay_dashboard_path"],
+            "operations_replay_dashboard_path": exported["operations_replay_dashboard_path"],
+            "manager_replay_dashboard_path": exported.get("manager_replay_dashboard_path", ""),
+            "manager_replay_json_path": exported.get("manager_replay_json_path", ""),
             "knowledge_dashboard_path": exported["knowledge_dashboard_path"],
             "reasoning_dashboard_path": exported["reasoning_dashboard_path"],
             "results_dashboard_path": exported["results_dashboard_path"],

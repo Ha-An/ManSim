@@ -1463,8 +1463,7 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
                 if agent_id not in opportunity.get("owners", []):
                     continue
                 capacity = max(1, int(opportunity.get("capacity", 1) or 1))
-                shareable = bool(opportunity.get("shareable", False))
-                if assigned_counts.get(opportunity_id, 0) >= capacity and not shareable:
+                if assigned_counts.get(opportunity_id, 0) >= capacity:
                     continue
                 assigned_counts[opportunity_id] = assigned_counts.get(opportunity_id, 0) + 1
                 cleaned.append(
@@ -1759,9 +1758,11 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
         mailbox: dict[str, list[dict[str, Any]]] = {aid: [] for aid in self.agent_ids}
         machines = observation.get("machines", {}) if isinstance(observation.get("machines", {}), dict) else {}
         focus_by_id = machines.get("focus_by_id", {}) if isinstance(machines.get("focus_by_id", {}), dict) else {}
+        opportunities = self._current_opportunity_rows(observation)
         queue_index = {aid: 1 for aid in self.agent_ids}
         mailbox_index = {aid: 1 for aid in self.agent_ids}
         station_orders: dict[int, list[tuple[str, str, str]]] = {}
+        assigned_queue_agents: set[str] = set()
 
         def _station_num(raw: Any) -> int | None:
             text = str(raw or "").strip()
@@ -1793,8 +1794,39 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
                     "reason": reason,
                 }
             )
+            assigned_queue_agents.add(agent_id)
             if target_station is not None:
                 station_orders.setdefault(target_station, []).append((agent_id, task_family, order_id))
+
+        repair_opportunity_index: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for opportunity in opportunities:
+            if not isinstance(opportunity, dict):
+                continue
+            if str(opportunity.get("task_family", "")).strip() != "repair_machine":
+                continue
+            target = opportunity.get("target", {}) if isinstance(opportunity.get("target", {}), dict) else {}
+            machine_id = str(target.get("target_id", "")).strip()
+            if not machine_id:
+                continue
+            repair_opportunity_index[machine_id].append(opportunity)
+
+        signals = self._worker_local_signals(observation)
+        protected_agents: set[str] = set()
+        if int(signals.get("inspection_backlog", 0) or 0) > 0 and "A3" in self.agent_ids:
+            protected_agents.add("A3")
+        if (int(signals.get("low_battery_agents", 0) or 0) > 0 or int(signals.get("discharged_agents", 0) or 0) > 0) and "A2" in self.agent_ids:
+            protected_agents.add("A2")
+
+        def helper_priority(agent_id: str) -> tuple[int, int, str]:
+            protected_penalty = 1 if agent_id in protected_agents else 0
+            role_bias = 2
+            if agent_id == "A2":
+                role_bias = 0
+            elif agent_id == "A1":
+                role_bias = 1
+            elif agent_id == "A3":
+                role_bias = 3
+            return (protected_penalty, role_bias, agent_id)
 
         for machine_id, payload in focus_by_id.items():
             if not isinstance(payload, dict):
@@ -1804,12 +1836,42 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
             station = _station_num(payload.get("station"))
             repair_owner = str(owners.get("repair", "")).strip().upper()
             setup_owner = str(owners.get("setup", "")).strip().upper()
-            if bool(payload.get("broken")) and repair_owner in self.agent_ids:
-                add_queue(repair_owner, "repair_machine", target_type="machine", target_id=str(machine_id), target_station=station, reason=f"Repair {machine_id} because it is broken.")
+            broken = bool(payload.get("broken"))
+            repair_team_size = max(0, int(payload.get("repair_team_size", 0) or 0))
+            repair_slots_remaining = max(0, int(payload.get("repair_slots_remaining", 0) or 0))
+            repair_remaining_min = float(payload.get("repair_remaining_min", 0.0) or 0.0)
+            repair_rows = repair_opportunity_index.get(str(machine_id), [])
+            helper_candidates: list[str] = []
+            for row in repair_rows:
+                for owner in row.get("owners", []):
+                    owner_id = str(owner).strip().upper()
+                    if owner_id in self.agent_ids and owner_id not in helper_candidates:
+                        helper_candidates.append(owner_id)
+            if broken and repair_team_size <= 0 and repair_owner in self.agent_ids and repair_owner not in assigned_queue_agents:
+                add_queue(
+                    repair_owner,
+                    "repair_machine",
+                    target_type="machine",
+                    target_id=str(machine_id),
+                    target_station=station,
+                    reason=f"Repair {machine_id} because it is broken.",
+                )
+            if broken and repair_slots_remaining > 0 and helper_candidates:
+                preferred = [aid for aid in helper_candidates if aid not in assigned_queue_agents]
+                preferred.sort(key=helper_priority)
+                slots_to_fill = min(repair_slots_remaining, len(preferred))
+                for helper_id in preferred[:slots_to_fill]:
+                    add_queue(
+                        helper_id,
+                        "repair_machine",
+                        target_type="machine",
+                        target_id=str(machine_id),
+                        target_station=station,
+                        reason=f"Join repair on {machine_id}; remaining repair work is {round(repair_remaining_min, 2)} min and helper capacity is still open.",
+                    )
             if "ready_for_setup" in wait_reasons and setup_owner in self.agent_ids:
                 add_queue(setup_owner, "setup_machine", target_type="machine", target_id=str(machine_id), target_station=station, reason=f"Setup {machine_id} because it is ready for setup.")
 
-        signals = self._worker_local_signals(observation)
         inspection_backlog = int(signals.get("inspection_backlog", 0) or 0)
         if inspection_backlog > 0:
             add_queue(self.agent_ids[0], "inspect_product", target_type="station", target_id="inspection", target_station=self.inspection_queue_station if hasattr(self, 'inspection_queue_station') else None, reason=f"Pull inspection backlog={inspection_backlog}.")
@@ -2226,7 +2288,7 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
         }
         commitments = {agent_id: [] for agent_id in self.agent_ids}
         reason_trace: list[dict[str, Any]] = []
-        assigned_opportunities: set[str] = set()
+        assigned_counts: dict[str, int] = defaultdict(int)
         per_agent_limit = 1
         if isinstance(fallback, JobPlan) and isinstance(fallback.commitments, dict):
             for agent_id in self.agent_ids:
@@ -2240,7 +2302,8 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
                         continue
                     if agent_id not in opportunity.get("owners", []):
                         continue
-                    if opportunity_id in assigned_opportunities and not bool(opportunity.get("shareable", False)):
+                    capacity = max(1, int(opportunity.get("capacity", 1) or 1))
+                    if assigned_counts.get(opportunity_id, 0) >= capacity:
                         continue
                     commitments[agent_id].append(
                         {
@@ -2256,12 +2319,13 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
                             ],
                         }
                     )
-                    assigned_opportunities.add(opportunity_id)
+                    assigned_counts[opportunity_id] = assigned_counts.get(opportunity_id, 0) + 1
         for opportunity in opportunities:
             if not isinstance(opportunity, dict):
                 continue
             opportunity_id = str(opportunity.get("opportunity_id", "")).strip()
-            if not opportunity_id or opportunity_id in assigned_opportunities:
+            capacity = max(1, int(opportunity.get("capacity", 1) or 1))
+            if not opportunity_id or assigned_counts.get(opportunity_id, 0) >= capacity:
                 continue
             owners = [aid for aid in opportunity.get("owners", []) if aid in self.agent_ids]
             if not owners:
@@ -2284,7 +2348,7 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
                     "success_criteria": [self._truncate_prompt_text(opportunity.get("why_available", ""), max_len=120)] if str(opportunity.get("why_available", "")).strip() else [],
                 }
             )
-            assigned_opportunities.add(opportunity_id)
+            assigned_counts[opportunity_id] = assigned_counts.get(opportunity_id, 0) + 1
             reason_trace.append(
                 {
                     "decision": "adjust",
@@ -2314,6 +2378,22 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
 
         if not any(commitments.values()) and opportunities:
             top = opportunities[0]
+            top_capacity = max(1, int(top.get("capacity", 1) or 1))
+            if assigned_counts.get(str(top.get("opportunity_id", "")).strip(), 0) >= top_capacity:
+                top = {}
+            if not top:
+                return {
+                    "commitments": commitments,
+                    "mailbox": {agent_id: [] for agent_id in self.agent_ids},
+                    "incident_strategy": {
+                        "mode": "delta_replan",
+                        "focus_opportunity_ids": [],
+                        "watchouts": ["planner_inert_or_invalid_response"],
+                    },
+                    "reason_trace": reason_trace,
+                    "manager_summary": "Actionable fallback commitments were synthesized from the canonical opportunity board because the planner response was inert or invalid.",
+                    "rationale": "Use only executable opportunity ids so the simulator can recover without queue/target mismatch.",
+                }
             chosen_agent = next(iter([aid for aid in top.get("owners", []) if aid in self.agent_ids]), self.agent_ids[0])
             commitments[chosen_agent].append(
                 {
@@ -2323,6 +2403,7 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
                     "success_criteria": [self._truncate_prompt_text(top.get("why_available", ""), max_len=120)] if str(top.get("why_available", "")).strip() else [],
                 }
             )
+            assigned_counts[str(top.get("opportunity_id", "")).strip()] = assigned_counts.get(str(top.get("opportunity_id", "")).strip(), 0) + 1
         summary = "Actionable fallback commitments were synthesized from the canonical opportunity board because the planner response was inert or invalid."
         rationale = "Use only executable opportunity ids so the simulator can recover without queue/target mismatch."
         return {
@@ -3405,7 +3486,6 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
             "summary": str(plan.manager_summary or "").strip(),
             "plan_revision": int(getattr(plan, "plan_revision", 0) or 0),
         }
-
 
 
 

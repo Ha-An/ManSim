@@ -10,5 +10,6 @@ Thumbs.db
 _tmp_kor_test.txt
 openclaw/state/
 .tooling/
+backups/
 
 openclaw/workspaces/*/.openclaw/

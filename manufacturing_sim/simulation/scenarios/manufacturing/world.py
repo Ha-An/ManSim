@@ -86,6 +86,7 @@ class ManufacturingWorld:
 
         mean_ttf = float(self.machine_failure_cfg["mean_time_to_fail_min"])
         self.machine_failure_base_lambda = 1.0 / max(1.0, mean_ttf)
+        self.max_repair_agents = max(1, int(self.machine_failure_cfg.get("max_repair_agents", 3) or 3))
         self.pm_lambda_multiplier = float(self.machine_failure_cfg["pm_lambda_multiplier"])
         self.pm_effect_duration_min = float(self.machine_failure_cfg["pm_effect_duration_min"])
         self.pm_interval_target_min = float(self.machine_failure_cfg["pm_interval_target_min"])
@@ -491,6 +492,10 @@ class ManufacturingWorld:
                     "unload": machine.unload_owner,
                     "preventive_maintenance": machine.pm_owner,
                 },
+                "repair_team": list(machine.repair_team),
+                "repair_team_size": self._repair_team_size(machine),
+                "repair_slots_remaining": self._repair_slots_remaining(machine),
+                "repair_remaining_min": round(float(machine.repair_work_remaining_min), 3) if machine.broken else 0.0,
                 "wait_reasons": wait_reasons,
             }
         summary["all"] = overall
@@ -877,7 +882,10 @@ class ManufacturingWorld:
                 if agent.agent_id not in owners:
                     owners.append(agent.agent_id)
                 current["owners"] = owners
-                current["capacity"] = max(int(current.get("capacity", 1) or 1), len(owners) if bool(current.get("shareable", False)) else 1)
+                current["capacity"] = max(
+                    int(current.get("capacity", 1) or 1),
+                    int(opportunity.get("capacity", 1) or 1),
+                )
                 current["expected_output_impact"] = max(
                     float(current.get("expected_output_impact", 0.0) or 0.0),
                     float(opportunity.get("expected_output_impact", 0.0) or 0.0),
@@ -1610,6 +1618,20 @@ class ManufacturingWorld:
                 if start_t is not None and t >= start_t:
                     broken_by_machine[machine_id] += t - start_t
                 active_repair[machine_id] = t
+            elif event_type == "MACHINE_REPAIR_HELPER_JOIN":
+                if machine_id not in active_repair:
+                    start_t = active_broken.pop(machine_id, None)
+                    if start_t is not None and t >= start_t:
+                        broken_by_machine[machine_id] += t - start_t
+                    active_repair[machine_id] = t
+            elif event_type == "MACHINE_REPAIR_HELPER_LEAVE":
+                details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+                team_size = int(details.get("repair_team_size", 0) or 0)
+                if team_size <= 0:
+                    repair_start_t = active_repair.pop(machine_id, None)
+                    if repair_start_t is not None and t >= repair_start_t:
+                        repair_by_machine[machine_id] += t - repair_start_t
+                    active_broken[machine_id] = t
             elif event_type == "MACHINE_REPAIRED":
                 repair_start_t = active_repair.pop(machine_id, None)
                 if repair_start_t is not None and t >= repair_start_t:
@@ -1770,6 +1792,198 @@ class ManufacturingWorld:
         multiplier = self.pm_lambda_multiplier if self.env.now < machine.pm_until else 1.0
         return self.machine_failure_base_lambda * multiplier
 
+    def _repair_total_work_min(self) -> float:
+        return float(self.machine_failure_cfg["repair_time_min"])
+
+    def _repair_team_size(self, machine: Machine) -> int:
+        return len(machine.repair_team)
+
+    def _repair_slots_remaining(self, machine: Machine) -> int:
+        return max(0, self.max_repair_agents - self._repair_team_size(machine))
+
+    def _refresh_repair_progress(self, machine: Machine, *, at_t: float | None = None) -> None:
+        t = float(self.env.now if at_t is None else at_t)
+        if machine.repair_last_progress_at is None:
+            machine.repair_last_progress_at = t
+            return
+        if not machine.broken or machine.repair_work_remaining_min <= 0.0:
+            machine.repair_last_progress_at = t
+            return
+        team_size = self._repair_team_size(machine)
+        elapsed = max(0.0, t - float(machine.repair_last_progress_at))
+        if elapsed > 0.0 and team_size > 0:
+            machine.repair_work_remaining_min = max(0.0, float(machine.repair_work_remaining_min) - elapsed * team_size)
+        machine.repair_last_progress_at = t
+
+    def _interrupt_repair_monitor(self, machine: Machine) -> None:
+        process = machine.repair_monitor_process
+        if process is not None and getattr(process, "is_alive", False):
+            try:
+                process.interrupt("repair_team_changed")
+            except RuntimeError:
+                pass
+        machine.repair_monitor_process = None
+
+    def _sync_repair_owner(self, machine: Machine) -> None:
+        machine.repair_owner = machine.repair_team[0] if machine.repair_team else None
+
+    def _ensure_repair_done_event(self, machine: Machine) -> simpy.Event:
+        event = machine.repair_done_event
+        if event is None or getattr(event, "triggered", False):
+            machine.repair_done_event = self.env.event()
+        return machine.repair_done_event
+
+    def _repair_worker_anchor(self, machine: Machine, agent_id: str) -> dict[str, Any]:
+        team = list(machine.repair_team)
+        try:
+            idx = team.index(agent_id)
+        except ValueError:
+            idx = 0
+        offsets = (
+            (-0.26, -0.16),
+            (-0.26, 0.18),
+            (0.22, 0.02),
+        )
+        ox, oy = offsets[idx % len(offsets)]
+        return {
+            "target_machine_id": machine.machine_id,
+            "anchor_index": idx,
+            "team_size": len(team),
+            "offset_x": ox,
+            "offset_y": oy,
+        }
+
+    def _log_repair_team_event(self, machine: Machine, event_type: str, *, by: str, reason: str = "") -> None:
+        details = {
+            "by": by,
+            "repair_team": list(machine.repair_team),
+            "repair_team_size": self._repair_team_size(machine),
+            "repair_remaining_min": round(float(machine.repair_work_remaining_min), 3),
+            "repair_total_min": round(self._repair_total_work_min(), 3),
+        }
+        if reason:
+            details["reason"] = reason
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type=event_type,
+            entity_id=machine.machine_id,
+            location=f"Station{machine.station}",
+            details=details,
+        )
+
+    def _start_or_resume_repair_monitor(self, machine: Machine) -> None:
+        self._interrupt_repair_monitor(machine)
+        if not machine.broken or self._repair_team_size(machine) <= 0:
+            machine.repair_monitor_process = None
+            machine.state = MachineState.BROKEN if machine.broken else machine.state
+            return
+        self._ensure_repair_done_event(machine)
+        machine.state = MachineState.UNDER_REPAIR
+        machine.repair_last_progress_at = float(self.env.now)
+        machine.repair_monitor_token += 1
+        token = int(machine.repair_monitor_token)
+        process = self.env.process(self._repair_monitor(machine.machine_id, token))
+        machine.repair_monitor_process = process
+
+    def _join_repair_team(self, machine: Machine, agent_id: str) -> bool:
+        if not machine.broken:
+            return False
+        if agent_id in machine.repair_team:
+            return True
+        if self._repair_team_size(machine) >= self.max_repair_agents:
+            return False
+        if machine.repair_work_remaining_min <= 0.0:
+            machine.repair_work_remaining_min = self._repair_total_work_min()
+        self._refresh_repair_progress(machine)
+        machine.repair_team.append(agent_id)
+        self._sync_repair_owner(machine)
+        if self._repair_team_size(machine) == 1:
+            self._log_repair_team_event(machine, "MACHINE_REPAIR_START", by=agent_id)
+        else:
+            self._log_repair_team_event(machine, "MACHINE_REPAIR_HELPER_JOIN", by=agent_id)
+        self._start_or_resume_repair_monitor(machine)
+        return True
+
+    def _leave_repair_team(self, machine: Machine, agent_id: str, *, reason: str = "") -> bool:
+        if agent_id not in machine.repair_team:
+            return False
+        self._refresh_repair_progress(machine)
+        machine.repair_team = [member for member in machine.repair_team if member != agent_id]
+        self._sync_repair_owner(machine)
+        self._log_repair_team_event(machine, "MACHINE_REPAIR_HELPER_LEAVE", by=agent_id, reason=reason)
+        if self._repair_team_size(machine) <= 0:
+            machine.repair_last_progress_at = None
+            machine.repair_monitor_process = None
+            if machine.broken:
+                machine.state = MachineState.BROKEN
+        self._start_or_resume_repair_monitor(machine)
+        return True
+
+    def _complete_repair(self, machine: Machine) -> None:
+        if not machine.broken:
+            return
+        self._refresh_repair_progress(machine)
+        machine.repair_work_remaining_min = 0.0
+        machine.repair_last_progress_at = None
+        machine.repair_monitor_process = None
+        machine.repair_monitor_token += 1
+        team_snapshot = list(machine.repair_team)
+        self._sync_repair_owner(machine)
+        if machine.failed_since is not None:
+            machine.total_broken_min += self.env.now - machine.failed_since
+        machine.broken = False
+        machine.failed_since = None
+        machine.state = MachineState.DONE_WAIT_UNLOAD if machine.output_intermediate is not None else MachineState.WAIT_INPUT
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="MACHINE_REPAIRED",
+            entity_id=machine.machine_id,
+            location=f"Station{machine.station}",
+            details={
+                "by": team_snapshot[0] if team_snapshot else "",
+                "repair_team": team_snapshot,
+                "repair_team_size": len(team_snapshot),
+                "repair_total_min": round(self._repair_total_work_min(), 3),
+            },
+        )
+        done_event = self._ensure_repair_done_event(machine)
+        if not done_event.triggered:
+            done_event.succeed({"machine_id": machine.machine_id, "repair_team": team_snapshot})
+        machine.repair_team = []
+        machine.repair_owner = None
+
+    def _repair_monitor(self, machine_id: str, token: int):
+        machine = self.machines[machine_id]
+        while machine.broken and machine.repair_work_remaining_min > 0.0:
+            if int(machine.repair_monitor_token) != int(token):
+                return
+            team_size = self._repair_team_size(machine)
+            if team_size <= 0:
+                machine.repair_monitor_process = None
+                machine.state = MachineState.BROKEN
+                return
+            machine.repair_last_progress_at = float(self.env.now)
+            remaining = max(0.0, float(machine.repair_work_remaining_min))
+            try:
+                yield self.env.timeout(remaining / team_size)
+                if int(machine.repair_monitor_token) != int(token):
+                    return
+                if machine.repair_monitor_process is not self.env.active_process:
+                    return
+                self._refresh_repair_progress(machine)
+                if not machine.broken or machine.repair_work_remaining_min > 1e-6:
+                    continue
+                self._complete_repair(machine)
+                return
+            except simpy.Interrupt:
+                self._refresh_repair_progress(machine)
+                if not machine.broken:
+                    machine.repair_monitor_process = None
+                    return
+                continue
+
     def break_machine(self, machine: Machine, reason: str) -> None:
         if machine.broken or machine.state in (MachineState.UNDER_REPAIR, MachineState.UNDER_PM):
             return
@@ -1777,6 +1991,13 @@ class ManufacturingWorld:
         machine.broken = True
         machine.failures += 1
         machine.failed_since = self.env.now
+        machine.repair_team = []
+        machine.repair_owner = None
+        machine.repair_work_remaining_min = self._repair_total_work_min()
+        machine.repair_last_progress_at = None
+        machine.repair_done_event = None
+        machine.repair_monitor_process = None
+        machine.repair_monitor_token += 1
         machine.state = MachineState.BROKEN
         self.logger.log(
             t=self.env.now,
@@ -1831,7 +2052,11 @@ class ManufacturingWorld:
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
-            return float(self.travel_time(self.agent_display_location(agent), f"Station{machine.station}")) + float(self.machine_failure_cfg["repair_time_min"])
+            active_helpers = self._repair_team_size(machine)
+            future_team_size = min(self.max_repair_agents, active_helpers + (0 if agent.agent_id in machine.repair_team else 1))
+            future_team_size = max(1, future_team_size)
+            remaining = float(machine.repair_work_remaining_min) if machine.repair_work_remaining_min > 0.0 else self._repair_total_work_min()
+            return float(self.travel_time(self.agent_display_location(agent), f"Station{machine.station}")) + (remaining / future_team_size)
         if task_type == "PREVENTIVE_MAINTENANCE":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
@@ -2330,6 +2555,28 @@ class ManufacturingWorld:
 
     def handle_task_interruption(self, agent: Agent, task: Task, reason: str) -> None:
         if reason in {"battery_depleted", "battery_swap_wait"}:
+            if task.task_type == "REPAIR_MACHINE":
+                machine = self.machines.get(task.payload.get("machine_id"))
+                if machine is not None:
+                    self._leave_repair_team(machine, agent.agent_id, reason=reason)
+                agent.suspended_task = task
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="TASK_SUSPENDED",
+                    entity_id=agent.agent_id,
+                    location=self.agent_display_location(agent),
+                    details={"task_type": task.task_type, "task_id": task.task_id, "reason": reason},
+                )
+                self.emit_incident(
+                    "commitment_blocked",
+                    affected_entities=[agent.agent_id],
+                    blocked_commitments=[agent.current_commitment_id] if agent.current_commitment_id else [],
+                    escalation_level="worker_local",
+                    details={"reason": reason, "task_type": task.task_type},
+                    notify_workers=[agent.agent_id],
+                )
+                return
             if task.task_type == "BATTERY_SWAP" and agent.battery_service_owner == agent.agent_id:
                 # If an agent gets discharged while trying to self-swap,
                 # allow others to deliver a battery for rescue.
@@ -2407,9 +2654,8 @@ class ManufacturingWorld:
         elif task.task_type == "REPAIR_MACHINE":
             machine = self.machines.get(task.payload.get("machine_id"))
             if machine is not None:
-                if machine.repair_owner == agent.agent_id:
-                    machine.repair_owner = None
-                if machine.broken:
+                self._leave_repair_team(machine, agent.agent_id, reason=reason)
+                if machine.broken and self._repair_team_size(machine) <= 0:
                     machine.state = MachineState.BROKEN
 
         elif task.task_type == "PREVENTIVE_MAINTENANCE":
@@ -2733,9 +2979,11 @@ class ManufacturingWorld:
         return "none"
 
     def _task_shareable(self, task: Task) -> bool:
-        return False
+        return str(task.task_type).strip().upper() == "REPAIR_MACHINE"
 
     def _task_capacity(self, task: Task) -> int:
+        if str(task.task_type).strip().upper() == "REPAIR_MACHINE":
+            return self.max_repair_agents
         return 1
 
     def _task_why_available(self, task: Task) -> str:
@@ -3424,7 +3672,7 @@ class ManufacturingWorld:
                 )
 
         for machine in self.machines.values():
-            if machine.broken and machine.repair_owner is None:
+            if machine.broken and agent.agent_id not in machine.repair_team and self._repair_team_size(machine) < self.max_repair_agents:
                 tasks.append(
                     Task(
                         task_id=self._next_task_id("RM"),
@@ -3432,7 +3680,13 @@ class ManufacturingWorld:
                         priority_key="repair_machine",
                         priority=priority_repair_machine,
                         location=f"Station{machine.station}",
-                        payload={"machine_id": machine.machine_id},
+                        payload={
+                            "machine_id": machine.machine_id,
+                            "station": machine.station,
+                            "repair_team_size": self._repair_team_size(machine),
+                            "repair_slots_remaining": self._repair_slots_remaining(machine),
+                            "repair_remaining_min": round(float(machine.repair_work_remaining_min), 3),
+                        },
                     )
                 )
             elif machine.output_intermediate is not None and machine.unload_owner is None:
@@ -3689,40 +3943,22 @@ class ManufacturingWorld:
             machine = self.machines[task.payload["machine_id"]]
             if not machine.broken:
                 return False
-            if machine.repair_owner is not None and machine.repair_owner != agent.agent_id:
-                return False
-            machine.repair_owner = agent.agent_id
             yield from self.move_agent(agent, f"Station{machine.station}", emit_move_events=True)
             try:
                 if not machine.broken:
                     return False
-                machine.state = MachineState.UNDER_REPAIR
-                self.logger.log(
-                    t=self.env.now,
-                    day=self.day_for_time(self.env.now),
-                    event_type="MACHINE_REPAIR_START",
-                    entity_id=machine.machine_id,
-                    location=f"Station{machine.station}",
-                    details={"by": agent.agent_id},
-                )
-                yield self.env.timeout(float(self.machine_failure_cfg["repair_time_min"]))
-                if machine.failed_since is not None:
-                    machine.total_broken_min += self.env.now - machine.failed_since
-                machine.broken = False
-                machine.failed_since = None
-                machine.state = MachineState.DONE_WAIT_UNLOAD if machine.output_intermediate is not None else MachineState.WAIT_INPUT
-                self.logger.log(
-                    t=self.env.now,
-                    day=self.day_for_time(self.env.now),
-                    event_type="MACHINE_REPAIRED",
-                    entity_id=machine.machine_id,
-                    location=f"Station{machine.station}",
-                    details={"by": agent.agent_id},
-                )
+                if not self._join_repair_team(machine, agent.agent_id):
+                    return False
+                task.payload["repair_team_size"] = self._repair_team_size(machine)
+                task.payload["repair_slots_remaining"] = self._repair_slots_remaining(machine)
+                task.payload["repair_remaining_min"] = round(float(machine.repair_work_remaining_min), 3)
+                task.payload["repair_anchor"] = self._repair_worker_anchor(machine, agent.agent_id)
+                done_event = self._ensure_repair_done_event(machine)
+                yield done_event
                 return True
             finally:
-                if machine.repair_owner == agent.agent_id:
-                    machine.repair_owner = None
+                if machine.broken:
+                    self._leave_repair_team(machine, agent.agent_id, reason="task_cancelled")
 
         if task_type == "UNLOAD_MACHINE":
             machine = self.machines[task.payload["machine_id"]]

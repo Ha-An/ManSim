@@ -1,0 +1,8 @@
+﻿node_modules/
+dist/
+.vite/
+.logs/
+.tmp*/
+*.tsbuildinfo
+*.tmp
+.tmp_*

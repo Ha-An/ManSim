@@ -30,6 +30,12 @@ class Machine:
     pm_until: float = 0.0
     last_pm_at: float = 0.0
     repair_owner: Optional[str] = None
+    repair_team: list[str] = field(default_factory=list)
+    repair_work_remaining_min: float = 0.0
+    repair_last_progress_at: Optional[float] = None
+    repair_done_event: Any = None
+    repair_monitor_process: Any = None
+    repair_monitor_token: int = 0
     setup_owner: Optional[str] = None
     unload_owner: Optional[str] = None
     pm_owner: Optional[str] = None

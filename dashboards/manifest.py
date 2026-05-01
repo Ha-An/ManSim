@@ -78,6 +78,13 @@ def _artifact_map(output_dir: Path, row: dict[str, Any]) -> dict[str, str]:
             return str(Path(text).resolve())
         return str((output_dir / fallback_name).resolve())
 
+    def _pick_optional(path_value: Any, fallback_name: str) -> str:
+        text = _normalize_label(path_value)
+        if text:
+            return str(Path(text).resolve())
+        fallback = output_dir / fallback_name
+        return str(fallback.resolve()) if fallback.exists() else ""
+
     return {
         "results_dashboard.html": _pick(row.get("results_dashboard_path", ""), "results_dashboard.html"),
         "kpi_dashboard.html": _pick(row.get("kpi_dashboard_path", ""), "kpi_dashboard.html"),
@@ -86,6 +93,11 @@ def _artifact_map(output_dir: Path, row: dict[str, Any]) -> dict[str, str]:
         "knowledge_dashboard.html": _pick(row.get("knowledge_dashboard_path", ""), "knowledge_dashboard.html"),
         "reasoning_dashboard.html": _pick(row.get("reasoning_dashboard_path", ""), "reasoning_dashboard.html"),
         "replay_dashboard.html": _pick(row.get("replay_dashboard_path", ""), "replay_dashboard.html"),
+        "operations_replay.html": _pick(row.get("operations_replay_dashboard_path", ""), "operations_replay.html"),
+        "manager_replay_dashboard.html": _pick_optional(row.get("manager_replay_dashboard_path", ""), "manager_replay_dashboard.html"),
+        "manager_replay.json": _pick_optional(row.get("manager_replay_json_path", ""), "manager_replay.json"),
+        "replay_studio_log.json": _pick(row.get("replay_studio_log_path", ""), "replay_studio_log.json"),
+        "replay_studio_layout.json": _pick(row.get("replay_studio_layout_path", ""), "replay_studio_layout.json"),
         "events.jsonl": _pick(row.get("events_path", ""), "events.jsonl"),
         "daily_summary.json": _pick(row.get("daily_summary_path", ""), "daily_summary.json"),
         "run_reflection.json": _pick(row.get("run_reflection_path", ""), "run_reflection.json"),
@@ -106,6 +118,7 @@ def build_dashboard_manifest(
     summary_payload: dict[str, Any] | None = None,
     analysis_payload: dict[str, Any] | None = None,
     streamlit_port: int = 8505,
+    replay_studio_port: int = 5173,
 ) -> dict[str, Any]:
     root_output_dir = Path(root_output_dir)
     summary = summary_payload if isinstance(summary_payload, dict) else (_safe_json(root_output_dir / "run_series_summary.json") or {})
@@ -169,6 +182,7 @@ def build_dashboard_manifest(
         "series_root": str(root_output_dir.resolve()),
         "single_run": len(runs) <= 1,
         "streamlit_preferred_port": int(streamlit_port),
+        "replay_studio_preferred_port": int(replay_studio_port),
         "requested_run_count": _safe_int(summary.get("requested_run_count"), len(runs)),
         "completed_run_count": _safe_int(summary.get("completed_run_count"), len(runs)),
         "current_run": runs[-1]["id"] if runs else "",

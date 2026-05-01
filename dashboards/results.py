@@ -4,7 +4,7 @@ import html
 from pathlib import Path
 from typing import Any
 
-from .shell import build_replay_app_url, rel_href, render_page_shell
+from .shell import build_replay_studio_url, rel_href, render_page_shell
 
 
 METRIC_SPECS = [
@@ -285,18 +285,34 @@ def _artifact_cards(*, current_page_path: Path, run: dict[str, Any] | None, mani
     show_reasoning = decision_mode in {"llm_planner", "openclaw_adaptive_priority"}
     show_task_priority = decision_mode in {"adaptive_priority", "fixed_priority", "fixed_task_assignment", "openclaw_adaptive_priority"}
     show_knowledge = decision_mode == "llm_planner" or (decision_mode == "openclaw_adaptive_priority" and total_runs > 1)
-    replay_href = build_replay_app_url(
-        port=int(manifest.get("streamlit_preferred_port", 8505) or 8505) if isinstance(manifest, dict) else 8505,
-        manifest_path=manifest_path,
-        run_id=str(run.get("id", "")).strip(),
-        events_path=Path(str(artifacts.get("events.jsonl", ""))) if str(artifacts.get("events.jsonl", "")).strip() else None,
-        series_root=Path(str(manifest.get("series_root", ""))) if isinstance(manifest, dict) and str(manifest.get("series_root", "")).strip() else None,
-    )
+    manager_payload_path = str(artifacts.get("manager_replay.json", "")).strip()
+    show_manager_replay = decision_mode == "openclaw_adaptive_priority" and bool(manager_payload_path) and Path(manager_payload_path).exists()
     cards = [
         ("KPI Dashboard", rel_href(current_page_path, artifacts.get("kpi_dashboard.html", "")), "Quantitative view with detailed charts and day-level trends."),
-        ("Replay App", replay_href, "Animated factory replay with run selector, entity highlight, and time scrubber."),
+        (
+            "Replay Studio",
+            build_replay_studio_url(
+                port=int(manifest.get("replay_studio_preferred_port", 5173) or 5173) if isinstance(manifest, dict) else 5173,
+                manifest_path=manifest_path,
+                run_id=str(run.get("id", "")).strip(),
+            ),
+            "Independent React replay with pixel-art scene, worker monitor, and richer UI controls.",
+        ),
         ("Gantt", rel_href(current_page_path, artifacts.get("gantt.html", "")), "Task and machine timeline for the selected run."),
     ]
+    if show_manager_replay:
+        cards.append(
+            (
+                "Manager Replay",
+                build_replay_studio_url(
+                    port=int(manifest.get("replay_studio_preferred_port", 5173) or 5173) if isinstance(manifest, dict) else 5173,
+                    manifest_path=manifest_path,
+                    run_id=str(run.get("id", "")).strip(),
+                    view="manager",
+                ),
+                "Per-run manager interaction replay for strategist, compiler, reviewer, and phase-aligned factory effects.",
+            )
+        )
     if show_task_priority:
         cards.append(
             ("Task Priority", rel_href(current_page_path, artifacts.get("task_priority_dashboard.html", "")), "Task-family priority, worker-specific weights, and priority evolution for priority-driven execution.")

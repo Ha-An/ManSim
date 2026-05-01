@@ -17,6 +17,9 @@ ARTIFACT_LABELS = {
     "results_dashboard.html": "Results Hub",
     "kpi_dashboard.html": "KPI",
     "gantt.html": "Gantt",
+    "operations_replay.html": "Operations Replay",
+    "manager_replay_dashboard.html": "Manager Replay",
+    "replay_studio": "Replay Studio",
     "task_priority_dashboard.html": "Task Priority",
     "knowledge_dashboard.html": "Knowledge",
     "reasoning_dashboard.html": "Reasoning",
@@ -49,6 +52,15 @@ def _show_task_priority(run: dict[str, Any] | None) -> bool:
 def _show_reasoning(run: dict[str, Any] | None) -> bool:
     mode = _decision_mode(run)
     return mode in {"llm_planner", "openclaw_adaptive_priority"}
+
+
+def _show_manager_replay(run: dict[str, Any] | None) -> bool:
+    mode = _decision_mode(run)
+    if mode != "openclaw_adaptive_priority":
+        return False
+    artifacts = run.get("artifacts", {}) if isinstance(run.get("artifacts", {}), dict) else {}
+    payload_path = str(artifacts.get("manager_replay.json", "")).strip()
+    return bool(payload_path) and Path(payload_path).exists()
 
 
 def _show_knowledge(run: dict[str, Any] | None) -> bool:
@@ -98,6 +110,27 @@ def build_replay_app_url(*, port: int, manifest_path: Path | None = None, run_id
     return f"{base}/?{'&'.join(params)}" if params else base
 
 
+def build_replay_studio_url(
+    *,
+    port: int = 5173,
+    log_path: str | None = None,
+    manifest_path: Path | None = None,
+    run_id: str | None = None,
+    view: str | None = None,
+) -> str:
+    base = f"http://localhost:{int(port)}"
+    params: list[str] = []
+    if manifest_path is not None:
+        params.append(f"manifest={quote(Path(manifest_path).resolve().as_posix(), safe='')}")
+    if run_id:
+        params.append(f"run={quote(str(run_id), safe='')}")
+    if log_path:
+        params.append(f"log={quote(str(log_path), safe='/')}")
+    if view:
+        params.append(f"view={quote(str(view), safe='')}")
+    return f"{base}/?{'&'.join(params)}" if params else base
+
+
 def _run_selector_options(*, manifest: dict[str, Any] | None, current_page_path: Path, current_artifact: str, current_run_id: str | None) -> tuple[str, str]:
     if not isinstance(manifest, dict):
         return ("", "")
@@ -141,14 +174,20 @@ def _nav_links(*, manifest: dict[str, Any] | None, current_page_path: Path, curr
         target = artifacts.get(artifact, "")
         href = rel_href(current_page_path, target)
         items.append((ARTIFACT_LABELS.get(artifact, artifact), href, artifact == current_artifact))
-    replay_href = build_replay_app_url(
-        port=int(manifest.get("streamlit_preferred_port", 8505) or 8505) if isinstance(manifest, dict) else 8505,
+    replay_studio_href = build_replay_studio_url(
+        port=int(manifest.get("replay_studio_preferred_port", 5173) or 5173) if isinstance(manifest, dict) else 5173,
         manifest_path=manifest_path,
         run_id=str(run.get("id", "")).strip(),
-        events_path=Path(str(artifacts.get("events.jsonl", ""))) if str(artifacts.get("events.jsonl", "")).strip() else None,
-        series_root=Path(str(manifest.get("series_root", ""))) if isinstance(manifest, dict) and str(manifest.get("series_root", "")).strip() else None,
     )
-    items.insert(2, ("Replay", replay_href, current_artifact == "replay_app"))
+    items.insert(2, (ARTIFACT_LABELS["replay_studio"], replay_studio_href, current_artifact == "replay_studio"))
+    if _show_manager_replay(run):
+        href = build_replay_studio_url(
+            port=int(manifest.get("replay_studio_preferred_port", 5173) or 5173) if isinstance(manifest, dict) else 5173,
+            manifest_path=manifest_path,
+            run_id=str(run.get("id", "")).strip(),
+            view="manager",
+        )
+        items.append((ARTIFACT_LABELS.get("manager_replay_dashboard.html", "Manager Replay"), href, current_artifact == "manager_replay_dashboard.html"))
     if _show_task_priority(run):
         target = artifacts.get("task_priority_dashboard.html", "")
         href = rel_href(current_page_path, target)

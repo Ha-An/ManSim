@@ -1,0 +1,828 @@
+{
+  "schema_version": "1.0",
+  "metadata": {
+    "run_id": "manufacturing-demo-001",
+    "title": "Manufacturing Replay Demo",
+    "domain": "manufacturing",
+    "description": "Small event-sourced manufacturing log with collaboration, charging, and bottleneck events.",
+    "created_at": "2026-04-22T03:00:00Z",
+    "total_duration": 52,
+    "time_unit": "minutes"
+  },
+  "layout": {
+    "source_priority": [
+      "config",
+      "auto"
+    ],
+    "viewport": {
+      "width": 1200,
+      "height": 760
+    },
+    "nodes": [
+      {
+        "entity_id": "queue_q1",
+        "entity_type": "queue",
+        "position": {
+          "x": 220,
+          "y": 250
+        }
+      },
+      {
+        "entity_id": "storage_s1",
+        "entity_type": "storage",
+        "position": {
+          "x": 220,
+          "y": 520
+        }
+      },
+      {
+        "entity_id": "machine_m1",
+        "entity_type": "machine",
+        "position": {
+          "x": 520,
+          "y": 220
+        }
+      },
+      {
+        "entity_id": "machine_m2",
+        "entity_type": "machine",
+        "position": {
+          "x": 760,
+          "y": 220
+        }
+      },
+      {
+        "entity_id": "charger_c1",
+        "entity_type": "charger",
+        "position": {
+          "x": 960,
+          "y": 520
+        }
+      },
+      {
+        "entity_id": "robot_r1",
+        "entity_type": "robot",
+        "position": {
+          "x": 360,
+          "y": 620
+        }
+      },
+      {
+        "entity_id": "robot_r2",
+        "entity_type": "robot",
+        "position": {
+          "x": 620,
+          "y": 620
+        }
+      },
+      {
+        "entity_id": "order_job_a",
+        "entity_type": "order",
+        "position": {
+          "x": 180,
+          "y": 110
+        }
+      },
+      {
+        "entity_id": "order_job_b",
+        "entity_type": "order",
+        "position": {
+          "x": 240,
+          "y": 110
+        }
+      }
+    ]
+  },
+  "initial_state": {
+    "timestamp": 0,
+    "entities": {
+      "robot_r1": {
+        "entity_id": "robot_r1",
+        "entity_type": "robot",
+        "state": "idle",
+        "label": "Robot R1",
+        "position": {
+          "x": 360,
+          "y": 620
+        },
+        "attributes": {
+          "battery_pct": 92,
+          "team": "assembly"
+        },
+        "relations": {
+          "linked_ids": [
+            "machine_m1"
+          ]
+        },
+        "updated_at": 0
+      },
+      "robot_r2": {
+        "entity_id": "robot_r2",
+        "entity_type": "robot",
+        "state": "idle",
+        "label": "Robot R2",
+        "position": {
+          "x": 620,
+          "y": 620
+        },
+        "attributes": {
+          "battery_pct": 88,
+          "team": "material"
+        },
+        "relations": {
+          "linked_ids": [
+            "machine_m2"
+          ]
+        },
+        "updated_at": 0
+      },
+      "machine_m1": {
+        "entity_id": "machine_m1",
+        "entity_type": "machine",
+        "state": "idle",
+        "label": "Machine M1",
+        "position": {
+          "x": 520,
+          "y": 220
+        },
+        "attributes": {
+          "utilization": 0,
+          "station": "Cutting"
+        },
+        "relations": {},
+        "updated_at": 0
+      },
+      "machine_m2": {
+        "entity_id": "machine_m2",
+        "entity_type": "machine",
+        "state": "idle",
+        "label": "Machine M2",
+        "position": {
+          "x": 760,
+          "y": 220
+        },
+        "attributes": {
+          "utilization": 0,
+          "station": "Assembly"
+        },
+        "relations": {},
+        "updated_at": 0
+      },
+      "queue_q1": {
+        "entity_id": "queue_q1",
+        "entity_type": "queue",
+        "state": "waiting",
+        "label": "Input Queue",
+        "position": {
+          "x": 220,
+          "y": 250
+        },
+        "attributes": {
+          "capacity": 8
+        },
+        "relations": {},
+        "updated_at": 0
+      },
+      "charger_c1": {
+        "entity_id": "charger_c1",
+        "entity_type": "charger",
+        "state": "idle",
+        "label": "Charger C1",
+        "position": {
+          "x": 960,
+          "y": 520
+        },
+        "attributes": {
+          "ports": 1
+        },
+        "relations": {},
+        "updated_at": 0
+      },
+      "storage_s1": {
+        "entity_id": "storage_s1",
+        "entity_type": "storage",
+        "state": "idle",
+        "label": "Storage",
+        "position": {
+          "x": 220,
+          "y": 520
+        },
+        "attributes": {
+          "jobs_remaining": 2
+        },
+        "relations": {},
+        "updated_at": 0
+      }
+    },
+    "resources": {},
+    "queues": {
+      "queue_q1": {
+        "queue_id": "queue_q1",
+        "item_ids": [],
+        "capacity": 8,
+        "updated_at": 0
+      }
+    },
+    "annotations": []
+  },
+  "events": [
+    {
+      "event_id": "e001",
+      "sequence_index": 1,
+      "timestamp": 0.5,
+      "event_type": "entity_created",
+      "entity_refs": {
+        "primary": "order_job_a"
+      },
+      "payload": {
+        "entity_id": "order_job_a",
+        "entity_type": "order",
+        "state": "waiting",
+        "label": "Order A",
+        "attributes": {
+          "priority": "high"
+        }
+      }
+    },
+    {
+      "event_id": "e002",
+      "sequence_index": 2,
+      "timestamp": 0.7,
+      "event_type": "queue_entered",
+      "entity_refs": {
+        "primary": "order_job_a",
+        "target": "queue_q1"
+      },
+      "payload": {
+        "item_id": "order_job_a",
+        "queue_id": "queue_q1"
+      }
+    },
+    {
+      "event_id": "e003",
+      "sequence_index": 3,
+      "timestamp": 1.1,
+      "event_type": "entity_created",
+      "entity_refs": {
+        "primary": "order_job_b"
+      },
+      "payload": {
+        "entity_id": "order_job_b",
+        "entity_type": "order",
+        "state": "waiting",
+        "label": "Order B",
+        "attributes": {
+          "priority": "medium"
+        }
+      }
+    },
+    {
+      "event_id": "e004",
+      "sequence_index": 4,
+      "timestamp": 1.3,
+      "event_type": "queue_entered",
+      "entity_refs": {
+        "primary": "order_job_b",
+        "target": "queue_q1"
+      },
+      "payload": {
+        "item_id": "order_job_b",
+        "queue_id": "queue_q1"
+      }
+    },
+    {
+      "event_id": "e005",
+      "sequence_index": 5,
+      "timestamp": 2.0,
+      "event_type": "task_assigned",
+      "entity_refs": {
+        "source": "scheduler",
+        "target": "robot_r1",
+        "related": [
+          "order_job_a"
+        ]
+      },
+      "payload": {
+        "task_id": "task_pick_a",
+        "task_label": "Pick Order A"
+      }
+    },
+    {
+      "event_id": "e006",
+      "sequence_index": 6,
+      "timestamp": 2.1,
+      "event_type": "task_started",
+      "entity_refs": {
+        "primary": "robot_r1"
+      },
+      "payload": {
+        "task_id": "task_pick_a",
+        "task_label": "Move Order A to M1"
+      },
+      "durative": {
+        "started_at": 2.1,
+        "ended_at": 6.1,
+        "expected_duration": 4
+      }
+    },
+    {
+      "event_id": "e007",
+      "sequence_index": 7,
+      "timestamp": 2.1,
+      "event_type": "entity_moved",
+      "entity_refs": {
+        "primary": "robot_r1",
+        "source": "storage_s1",
+        "target": "machine_m1"
+      },
+      "payload": {
+        "from": {
+          "x": 360,
+          "y": 620
+        },
+        "to": {
+          "x": 500,
+          "y": 250
+        },
+        "task": "deliver_order_a"
+      },
+      "durative": {
+        "started_at": 2.1,
+        "ended_at": 6.1,
+        "expected_duration": 4
+      }
+    },
+    {
+      "event_id": "e008",
+      "sequence_index": 8,
+      "timestamp": 5.9,
+      "event_type": "queue_exited",
+      "entity_refs": {
+        "primary": "order_job_a",
+        "source": "queue_q1"
+      },
+      "payload": {
+        "item_id": "order_job_a",
+        "queue_id": "queue_q1"
+      }
+    },
+    {
+      "event_id": "e009",
+      "sequence_index": 9,
+      "timestamp": 6.2,
+      "event_type": "message_sent",
+      "entity_refs": {
+        "source": "robot_r1",
+        "target": "machine_m1",
+        "related": [
+          "order_job_a"
+        ]
+      },
+      "payload": {
+        "message": "Input ready at M1"
+      }
+    },
+    {
+      "event_id": "e010",
+      "sequence_index": 10,
+      "timestamp": 6.3,
+      "event_type": "task_finished",
+      "entity_refs": {
+        "primary": "robot_r1"
+      },
+      "payload": {
+        "task_id": "task_pick_a",
+        "next_state": "idle"
+      }
+    },
+    {
+      "event_id": "e011",
+      "sequence_index": 11,
+      "timestamp": 6.4,
+      "event_type": "state_changed",
+      "entity_refs": {
+        "primary": "machine_m1"
+      },
+      "payload": {
+        "state": "working"
+      }
+    },
+    {
+      "event_id": "e012",
+      "sequence_index": 12,
+      "timestamp": 7.0,
+      "event_type": "task_assigned",
+      "entity_refs": {
+        "source": "scheduler",
+        "target": "robot_r2",
+        "related": [
+          "order_job_b"
+        ]
+      },
+      "payload": {
+        "task_id": "task_stage_b",
+        "task_label": "Stage Order B"
+      }
+    },
+    {
+      "event_id": "e013",
+      "sequence_index": 13,
+      "timestamp": 7.2,
+      "event_type": "task_started",
+      "entity_refs": {
+        "primary": "robot_r2"
+      },
+      "payload": {
+        "task_id": "task_stage_b",
+        "task_label": "Stage Order B for M2"
+      },
+      "durative": {
+        "started_at": 7.2,
+        "ended_at": 10.5,
+        "expected_duration": 3.3
+      }
+    },
+    {
+      "event_id": "e014",
+      "sequence_index": 14,
+      "timestamp": 7.2,
+      "event_type": "entity_moved",
+      "entity_refs": {
+        "primary": "robot_r2",
+        "source": "storage_s1",
+        "target": "machine_m2"
+      },
+      "payload": {
+        "from": {
+          "x": 620,
+          "y": 620
+        },
+        "to": {
+          "x": 720,
+          "y": 260
+        },
+        "task": "deliver_order_b"
+      },
+      "durative": {
+        "started_at": 7.2,
+        "ended_at": 10.5,
+        "expected_duration": 3.3
+      }
+    },
+    {
+      "event_id": "e015",
+      "sequence_index": 15,
+      "timestamp": 8.0,
+      "event_type": "collaboration_started",
+      "entity_refs": {
+        "source": "robot_r1",
+        "target": "robot_r2",
+        "related": [
+          "machine_m2",
+          "order_job_b"
+        ]
+      },
+      "payload": {
+        "interaction_id": "collab-stage-b",
+        "label": "Joint staging for M2"
+      }
+    },
+    {
+      "event_id": "e016",
+      "sequence_index": 16,
+      "timestamp": 10.6,
+      "event_type": "task_finished",
+      "entity_refs": {
+        "primary": "robot_r2"
+      },
+      "payload": {
+        "task_id": "task_stage_b",
+        "next_state": "waiting"
+      }
+    },
+    {
+      "event_id": "e017",
+      "sequence_index": 17,
+      "timestamp": 10.7,
+      "event_type": "state_changed",
+      "entity_refs": {
+        "primary": "machine_m2"
+      },
+      "payload": {
+        "state": "blocked"
+      }
+    },
+    {
+      "event_id": "e018",
+      "sequence_index": 18,
+      "timestamp": 11.0,
+      "event_type": "message_sent",
+      "entity_refs": {
+        "source": "robot_r2",
+        "target": "robot_r1",
+        "related": [
+          "machine_m2"
+        ]
+      },
+      "payload": {
+        "message": "M2 needs help. Queue pressure rising."
+      }
+    },
+    {
+      "event_id": "e019",
+      "sequence_index": 19,
+      "timestamp": 12.5,
+      "event_type": "battery_low",
+      "entity_refs": {
+        "primary": "robot_r1"
+      },
+      "payload": {
+        "battery_pct": 18,
+        "label": "R1 battery below safe threshold"
+      }
+    },
+    {
+      "event_id": "e020",
+      "sequence_index": 20,
+      "timestamp": 13.0,
+      "event_type": "charging_started",
+      "entity_refs": {
+        "primary": "robot_r1",
+        "target": "charger_c1"
+      },
+      "payload": {
+        "battery_pct": 18
+      },
+      "durative": {
+        "started_at": 13.0,
+        "ended_at": 19.0,
+        "expected_duration": 6
+      }
+    },
+    {
+      "event_id": "e021",
+      "sequence_index": 21,
+      "timestamp": 13.0,
+      "event_type": "entity_moved",
+      "entity_refs": {
+        "primary": "robot_r1",
+        "source": "machine_m1",
+        "target": "charger_c1"
+      },
+      "payload": {
+        "from": {
+          "x": 500,
+          "y": 250
+        },
+        "to": {
+          "x": 960,
+          "y": 520
+        },
+        "task": "go_charge"
+      },
+      "durative": {
+        "started_at": 13.0,
+        "ended_at": 16.0,
+        "expected_duration": 3
+      }
+    },
+    {
+      "event_id": "e022",
+      "sequence_index": 22,
+      "timestamp": 17.0,
+      "event_type": "bottleneck_detected",
+      "entity_refs": {
+        "primary": "machine_m2",
+        "related": [
+          "queue_q1",
+          "robot_r2"
+        ]
+      },
+      "payload": {
+        "label": "M2 blocked while input queue grows",
+        "queue_depth": 4
+      }
+    },
+    {
+      "event_id": "e023",
+      "sequence_index": 23,
+      "timestamp": 18.0,
+      "event_type": "queue_exited",
+      "entity_refs": {
+        "primary": "order_job_b",
+        "source": "queue_q1"
+      },
+      "payload": {
+        "item_id": "order_job_b",
+        "queue_id": "queue_q1"
+      }
+    },
+    {
+      "event_id": "e024",
+      "sequence_index": 24,
+      "timestamp": 19.0,
+      "event_type": "charging_finished",
+      "entity_refs": {
+        "primary": "robot_r1",
+        "target": "charger_c1"
+      },
+      "payload": {
+        "battery_pct": 96
+      }
+    },
+    {
+      "event_id": "e025",
+      "sequence_index": 25,
+      "timestamp": 20.0,
+      "event_type": "maintenance_started",
+      "entity_refs": {
+        "primary": "machine_m2",
+        "related": [
+          "robot_r2"
+        ]
+      },
+      "payload": {
+        "label": "Quick maintenance check on M2"
+      },
+      "durative": {
+        "started_at": 20.0,
+        "ended_at": 26.0,
+        "expected_duration": 6
+      }
+    },
+    {
+      "event_id": "e026",
+      "sequence_index": 26,
+      "timestamp": 24.0,
+      "event_type": "warning_raised",
+      "entity_refs": {
+        "primary": "machine_m1",
+        "related": [
+          "robot_r1"
+        ]
+      },
+      "payload": {
+        "label": "M1 nearing blocking threshold"
+      }
+    },
+    {
+      "event_id": "e027",
+      "sequence_index": 27,
+      "timestamp": 26.0,
+      "event_type": "maintenance_finished",
+      "entity_refs": {
+        "primary": "machine_m2",
+        "related": [
+          "robot_r2"
+        ]
+      },
+      "payload": {
+        "label": "M2 maintenance completed"
+      }
+    },
+    {
+      "event_id": "e028",
+      "sequence_index": 28,
+      "timestamp": 26.1,
+      "event_type": "collaboration_finished",
+      "entity_refs": {
+        "source": "robot_r1",
+        "target": "robot_r2"
+      },
+      "payload": {
+        "interaction_id": "collab-stage-b"
+      }
+    },
+    {
+      "event_id": "e029",
+      "sequence_index": 29,
+      "timestamp": 27.0,
+      "event_type": "state_changed",
+      "entity_refs": {
+        "primary": "machine_m2"
+      },
+      "payload": {
+        "state": "working"
+      }
+    },
+    {
+      "event_id": "e030",
+      "sequence_index": 30,
+      "timestamp": 30.0,
+      "event_type": "task_assigned",
+      "entity_refs": {
+        "source": "scheduler",
+        "target": "robot_r1",
+        "related": [
+          "machine_m2"
+        ]
+      },
+      "payload": {
+        "task_id": "task_assist_m2",
+        "task_label": "Assist M2 recovery"
+      }
+    },
+    {
+      "event_id": "e031",
+      "sequence_index": 31,
+      "timestamp": 30.2,
+      "event_type": "task_started",
+      "entity_refs": {
+        "primary": "robot_r1"
+      },
+      "payload": {
+        "task_id": "task_assist_m2",
+        "task_label": "Assist M2 recovery"
+      },
+      "durative": {
+        "started_at": 30.2,
+        "ended_at": 35.2,
+        "expected_duration": 5
+      }
+    },
+    {
+      "event_id": "e032",
+      "sequence_index": 32,
+      "timestamp": 30.2,
+      "event_type": "entity_moved",
+      "entity_refs": {
+        "primary": "robot_r1",
+        "source": "charger_c1",
+        "target": "machine_m2"
+      },
+      "payload": {
+        "from": {
+          "x": 960,
+          "y": 520
+        },
+        "to": {
+          "x": 760,
+          "y": 220
+        },
+        "task": "assist_m2"
+      },
+      "durative": {
+        "started_at": 30.2,
+        "ended_at": 35.2,
+        "expected_duration": 5
+      }
+    },
+    {
+      "event_id": "e033",
+      "sequence_index": 33,
+      "timestamp": 35.3,
+      "event_type": "task_finished",
+      "entity_refs": {
+        "primary": "robot_r1"
+      },
+      "payload": {
+        "task_id": "task_assist_m2",
+        "next_state": "idle"
+      }
+    },
+    {
+      "event_id": "e034",
+      "sequence_index": 34,
+      "timestamp": 40.0,
+      "event_type": "state_changed",
+      "entity_refs": {
+        "primary": "machine_m1"
+      },
+      "payload": {
+        "state": "idle"
+      }
+    },
+    {
+      "event_id": "e035",
+      "sequence_index": 35,
+      "timestamp": 46.0,
+      "event_type": "state_changed",
+      "entity_refs": {
+        "primary": "machine_m2"
+      },
+      "payload": {
+        "state": "idle"
+      }
+    },
+    {
+      "event_id": "e036",
+      "sequence_index": 36,
+      "timestamp": 47.0,
+      "event_type": "entity_removed",
+      "entity_refs": {
+        "primary": "order_job_a"
+      },
+      "payload": {}
+    },
+    {
+      "event_id": "e037",
+      "sequence_index": 37,
+      "timestamp": 48.0,
+      "event_type": "entity_removed",
+      "entity_refs": {
+        "primary": "order_job_b"
+      },
+      "payload": {}
+    }
+  ]
+}

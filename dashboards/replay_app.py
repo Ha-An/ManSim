@@ -1828,53 +1828,6 @@ def _render_daily_review_panel(events_df: pd.DataFrame, current_t: float) -> Non
                 st.json(memory_update)
 
 
-def _render_kpi_panel(output_dir: Path) -> None:
-    kpi_path = output_dir / "kpi.json"
-    daily_path = output_dir / "daily_summary.json"
-    kpi = _load_optional_json(str(kpi_path))
-    daily_payload = _load_optional_json(str(daily_path))
-    daily_rows = daily_payload.get("days", []) if isinstance(daily_payload, dict) else []
-
-    if not isinstance(kpi, dict) or not daily_rows:
-        st.info("KPI artifacts were not found for this output directory.")
-        return
-
-    st.subheader("KPI Charts")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Products", int(kpi.get("total_products", 0)))
-    m2.metric("Scrap Count", int(kpi.get("scrap_count", 0)))
-    m3.metric("Scrap Rate", f"{float(kpi.get('scrap_rate', 0.0)):.4f}")
-    m4.metric("Machine Utilization", f"{float(kpi.get('machine_utilization', 0.0)):.4f}")
-
-    daily_df = pd.DataFrame(daily_rows).sort_values("day")
-    daily_fig = go.Figure()
-    daily_fig.add_trace(go.Bar(x=daily_df["day"], y=daily_df["products"], name="products"))
-    daily_fig.add_trace(go.Bar(x=daily_df["day"], y=daily_df["scrap"], name="scrap"))
-    daily_fig.update_layout(barmode="group", title="Daily Products / Scrap", xaxis_title="day", yaxis_title="count")
-    st.plotly_chart(daily_fig, use_container_width=True)
-
-    breakdown_fig = go.Figure()
-    breakdown_fig.add_trace(go.Scatter(x=daily_df["day"], y=daily_df["scrap_rate"], mode="lines+markers", name="scrap_rate"))
-    breakdown_fig.add_trace(go.Scatter(x=daily_df["day"], y=daily_df["machine_breakdowns"], mode="lines+markers", name="breakdowns"))
-    breakdown_fig.update_layout(title="Daily Scrap Rate / Machine Breakdowns", xaxis_title="day", yaxis_title="value")
-    st.plotly_chart(breakdown_fig, use_container_width=True)
-
-    tp = kpi.get("station_throughput", {})
-    if isinstance(tp, dict) and tp:
-        tp_df = pd.DataFrame({"station": [str(k) for k in tp.keys()], "throughput": [float(v) for v in tp.values()]})
-        tp_fig = go.Figure(data=[go.Bar(x=tp_df["station"], y=tp_df["throughput"])])
-        tp_fig.update_layout(title="Station Throughput", xaxis_title="station", yaxis_title="count")
-        st.plotly_chart(tp_fig, use_container_width=True)
-
-    task_minutes = kpi.get("agent_task_minutes", {})
-    if isinstance(task_minutes, dict) and task_minutes:
-        tm_df = pd.DataFrame({"task": list(task_minutes.keys()), "minutes": [float(v) for v in task_minutes.values()]})
-        tm_df = tm_df.sort_values("minutes", ascending=False)
-        tm_fig = go.Figure(data=[go.Bar(x=tm_df["task"], y=tm_df["minutes"])])
-        tm_fig.update_layout(title="Agent Task Minutes", xaxis_title="task", yaxis_title="minutes")
-        st.plotly_chart(tm_fig, use_container_width=True)
-
-
 def _render_map_legend() -> None:
     st.markdown("<div style='font-size:12px;font-weight:700;margin-top:2px;'>Agents</div>", unsafe_allow_html=True)
     for status, color in AGENT_STATUS_COLOR.items():
@@ -2151,9 +2104,6 @@ def main() -> None:
     recent_df = events_df[events_df["t"] <= current_t].tail(40)
     st.dataframe(recent_df, use_container_width=True, hide_index=True)
 
-    output_dir = events_path.parent
-    _render_kpi_panel(output_dir)
-
     if st.session_state.playing:
         next_t = min(max_t, current_t + float(st.session_state.speed))
         st.session_state.replay_t = next_t
@@ -2165,7 +2115,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 

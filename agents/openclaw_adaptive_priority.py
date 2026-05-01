@@ -563,7 +563,6 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         support_intent: str,
     ) -> dict[str, str]:
         stable = {agent_id: self._canonical_role_name(roles.get(agent_id, "")) or self._role_defaults().get(agent_id, "flow_support") for agent_id in self.agent_ids}
-        stable["A3"] = "inspection_closer"
 
         reliability_risk = bool("reliability_instability" in prevention_targets or int(signals.get("broken_machines", 0) or 0) > 0)
         battery_risk = bool(int(signals.get("discharged_agents", 0) or 0) > 0 or int(signals.get("low_battery_agents", 0) or 0) >= 2)
@@ -573,14 +572,44 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             stable["A2"] = "reliability_guard"
         elif battery_risk:
             stable["A2"] = "battery_support"
-        elif stable.get("A2") == "battery_support":
-            stable["A2"] = "reliability_guard"
 
         if support_intent == "closeout_support" or closeout_risk:
             if stable.get("A1") not in {"intake_runner", "flow_support"}:
                 stable["A1"] = "intake_runner"
 
         return self._enforce_role_coverage(stable)
+
+    def _compiled_role_override_reasons(
+        self,
+        requested_roles: dict[str, str],
+        compiled_roles: dict[str, str],
+        *,
+        prevention_targets: list[str],
+        signals: dict[str, Any],
+        support_intent: str,
+    ) -> dict[str, str]:
+        reasons: dict[str, str] = {}
+        reliability_risk = bool("reliability_instability" in prevention_targets or int(signals.get("broken_machines", 0) or 0) > 0)
+        battery_risk = bool(int(signals.get("discharged_agents", 0) or 0) > 0 or int(signals.get("low_battery_agents", 0) or 0) >= 2)
+        closeout_risk = bool("closeout_gap" in prevention_targets or support_intent == "closeout_support")
+        requested_buckets = {agent_id: self._role_bucket(role) for agent_id, role in requested_roles.items()}
+
+        for agent_id in self.agent_ids:
+            requested = self._canonical_role_name(requested_roles.get(agent_id, ""))
+            compiled = self._canonical_role_name(compiled_roles.get(agent_id, ""))
+            if not requested or not compiled or requested == compiled:
+                continue
+            if compiled == "inspection_closer" and "inspection" not in set(requested_buckets.values()):
+                reasons[agent_id] = "ensured one inspection closer because the strategy had no inspection coverage"
+            elif compiled == "reliability_guard" and reliability_risk:
+                reasons[agent_id] = "reliability guardrail applied because breakdown or reliability risk was active"
+            elif compiled == "battery_support" and battery_risk:
+                reasons[agent_id] = "battery guardrail applied because battery risk was active"
+            elif agent_id == "A1" and compiled == "intake_runner" and closeout_risk:
+                reasons[agent_id] = "kept intake flow stable while closeout risk was active"
+            else:
+                reasons[agent_id] = "role coverage guardrail applied"
+        return reasons
 
     def _sanitize_role_change_advice(self, src: Any) -> dict[str, str]:
         blob = src if isinstance(src, dict) else {}
@@ -644,6 +673,18 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         if "inspection" not in set(self._role_bucket(role) for role in final.values()) and "A3" in final:
             final["A3"] = defaults["A3"]
         return final
+
+    def _roles_from_role_plan(self, src: Any) -> dict[str, str]:
+        if not isinstance(src, dict):
+            return {}
+        roles: dict[str, str] = {}
+        for agent_id in self.agent_ids:
+            row = src.get(agent_id)
+            raw_role = row.get("role") if isinstance(row, dict) else row
+            role = self._canonical_role_name(raw_role)
+            if role:
+                roles[agent_id] = role
+        return roles
 
     def _next_plan_revision(self) -> int:
         current = max(
@@ -1300,9 +1341,11 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         closeout = self._closeout_state(observation)
         signals = self._worker_local_signals(observation)
         default_roles = self._role_defaults()
-        roles = self._coalesce_worker_roles(
+        worker_roles = self._coalesce_worker_roles(
             directive.get("worker_roles", previous_review.get("role_change_advice", default_roles))
         )
+        role_plan_roles = self._roles_from_role_plan(directive.get("role_plan", {}))
+        roles = self._coalesce_worker_roles({**worker_roles, **role_plan_roles})
         operating_focus = self._normalize_operating_focus(directive.get("operating_focus", "")) or (
             "closeout"
             if "closeout_gap" in self._sanitize_prevention_targets(previous_review.get("recommended_prevention_targets", []), limit=2)
@@ -1345,6 +1388,13 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
                 else "flow_cover"
             )
         roles = self._stabilize_compiled_roles(
+            roles,
+            prevention_targets=prevention_targets,
+            signals=signals,
+            support_intent=str(support_plan.get("support_intent", "")).strip(),
+        )
+        role_override_reasons = self._compiled_role_override_reasons(
+            role_plan_roles or worker_roles,
             roles,
             prevention_targets=prevention_targets,
             signals=signals,
@@ -1401,6 +1451,47 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             self._apply_agent_floor(agent_targets, "A1", "material_supply", 1.22)
             self._apply_agent_floor(agent_targets, "A1", "inter_station_transfer", 1.2)
             self._apply_agent_floor(agent_targets, "A2", "unload_machine", 1.16)
+
+        machines_by_id = observation.get("machines", {}).get("by_id", {}) if isinstance(observation.get("machines", {}), dict) else {}
+        repair_focus_rows = [
+            row
+            for row in machines_by_id.values()
+            if isinstance(row, dict)
+            and (
+                str(row.get("state", "")).upper() in {"BROKEN", "UNDER_REPAIR"}
+                or int(row.get("repair_slots_remaining", 0) or 0) > 0
+                or int(row.get("repair_team_size", 0) or 0) > 0
+            )
+        ]
+        repair_focus_rows.sort(
+            key=lambda row: (
+                0 if int(row.get("repair_team_size", 0) or 0) <= 0 else 1,
+                -int(row.get("repair_slots_remaining", 0) or 0),
+                -self._safe_float(row.get("repair_remaining_min", 0.0), 0.0),
+                str(row.get("machine_id", "")),
+            )
+        )
+        protected_repair_helpers: set[str] = set()
+        if roles.get("A3") == "inspection_closer" and (backlog > 0 or pass_output > 0):
+            protected_repair_helpers.add("A3")
+        if "battery_instability" in prevention_targets or int(signals.get("discharged_agents", 0) or 0) > 0:
+            protected_repair_helpers.add("A2")
+
+        def repair_helper_priority(agent_id: str) -> tuple[int, int]:
+            role = roles.get(agent_id, "")
+            role_rank = (
+                0
+                if role == "reliability_guard"
+                else 1
+                if role == "flow_support"
+                else 2
+                if role == "battery_support"
+                else 3
+                if role == "intake_runner"
+                else 4
+            )
+            agent_rank = 0 if agent_id == "A2" else 1 if agent_id == "A1" else 2
+            return role_rank, agent_rank
 
         mailbox: dict[str, list[dict[str, Any]]] = {aid: [] for aid in self.agent_ids}
         support_source, support_target = self._parse_support_pair(support_plan.get("primary_support_pair", ""))
@@ -1506,6 +1597,40 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
                 remaining_uses=2 if day >= 4 or discharged_agents > 0 else 1,
             )
 
+        if repair_focus_rows:
+            self._apply_weight_floor(weights, "repair_machine", 1.32)
+            repair_focus = repair_focus_rows[0]
+            repair_machine_id = str(repair_focus.get("machine_id", "")).strip()
+            repair_team = [str(member) for member in repair_focus.get("repair_team", []) if str(member).strip()]
+            repair_slots_remaining = max(0, int(repair_focus.get("repair_slots_remaining", 0) or 0))
+            preferred_helpers = [
+                agent_id
+                for agent_id in sorted(self.agent_ids, key=repair_helper_priority)
+                if agent_id not in repair_team and agent_id not in protected_repair_helpers
+            ]
+            if repair_slots_remaining > 0 and not preferred_helpers:
+                preferred_helpers = [
+                    agent_id
+                    for agent_id in sorted(self.agent_ids, key=repair_helper_priority)
+                    if agent_id not in repair_team
+                ]
+            for helper_index, helper_id in enumerate(preferred_helpers[:repair_slots_remaining]):
+                helper_floor = 1.46 if helper_index == 0 else 1.34
+                self._apply_agent_floor(agent_targets, helper_id, "repair_machine", helper_floor)
+                self._apply_agent_floor(agent_targets, helper_id, "preventive_maintenance", 1.18 if helper_index == 0 else 1.12)
+                self._ensure_mailbox_assist(
+                    mailbox,
+                    agent_id=helper_id,
+                    task_family="repair_machine",
+                    body=(
+                        f"Join shared repair on {repair_machine_id} until machine stability is restored."
+                        if repair_machine_id
+                        else "Join the active shared repair session until machine stability is restored."
+                    ),
+                    message_type="focus_window" if repair_focus.get("repair_team_size", 0) or repair_machine_id else "assist_request",
+                    remaining_uses=2,
+                )
+
         summary = self._truncate_prompt_text(
             directive.get("summary", ""),
             max_len=220,
@@ -1513,6 +1638,7 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         return {
             "summary": summary,
             "worker_roles": roles,
+            "role_override_reasons": role_override_reasons,
             "operating_focus": operating_focus,
             "late_horizon_mode": late_horizon_mode,
             "role_plan": directive.get("role_plan", {}),

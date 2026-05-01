@@ -45,6 +45,7 @@ machine_failure:
   # 평균 고장 간격(분). exponential 분포 기반
   mean_time_to_fail_min: 300
   repair_time_min: 20
+  max_repair_agents: 3
   pm_time_min: 30
   # PM 효과 지속 시간
   pm_effect_duration_min: 720
