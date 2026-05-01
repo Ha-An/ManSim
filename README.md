@@ -2,6 +2,8 @@
 
 ManSim은 제조/생산 시스템 시뮬레이션 연구를 위한 프레임워크입니다. 생산 정책, 작업자 오케스트레이션, 설비 신뢰성, 큐 동역학, 배터리 제약, 이벤트 기반 리플레이 대시보드를 함께 실험할 수 있도록 구성되어 있습니다.
 
+![Replay Studio factory replay 화면](docs/assets/replay-studio-worker-replay.png)
+
 현재 주력 LLM 의사결정 모드는 `openclaw_adaptive_priority`입니다. 이 모드는 전략가가 하루 운영 의도를 만들고, deterministic compiler가 이를 실행 가능한 정책으로 변환하며, 작업자가 시뮬레이터 안에서 실행하고, 리뷰어가 다음 날을 위한 결과를 요약하는 폐루프 구조입니다.
 
 ## 저장소 구조
@@ -61,12 +63,7 @@ Replay Studio는 두 가지 view를 지원합니다.
 
 - factory replay: worker, machine, queue, battery, inspection, movement, repair, incident animation.
 - manager replay: input bundle -> Strategist -> compiler -> factory response -> Reviewer -> next-day carry-forward 흐름을 day 단위로 표현합니다.
-
-### Replay Studio 미리보기
-
-아래 화면은 `openclaw_adaptive_priority` run에서 생성된 factory replay 예시입니다. worker 상태, 설비 상태, queue, 이동 경로, worker monitor를 event log 기반으로 재구성합니다.
-
-![Replay Studio factory replay 화면](docs/assets/replay-studio-worker-replay.png)
+ 
 
 ## 빠른 시작
 
