@@ -42,7 +42,7 @@ llm:
     # 현재 모드에서는 재현성과 latency를 위해 off가 기본입니다.
     native_thinking: "off"
     # OpenClaw runtime workspace/profile에 노출할 worker id 목록입니다.
-    # 비우면 factory.num_agents 기준으로 A1..An을 기본 사용합니다.
+    # 비우면 factory.num_workers 기준으로 A1..An을 기본 사용합니다.
     worker_agent_ids:
       - A1
       - A2

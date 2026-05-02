@@ -14,18 +14,18 @@ def machine_lifecycle(env: simpy.Environment, world: ManufacturingWorld, machine
     machine = world.machines[machine_id]
     while True:
         if machine.broken:
-            machine.state = MachineState.BROKEN
+            world._set_machine_state(machine, MachineState.BROKEN, reason="broken_wait")
             yield env.timeout(1)
             continue
 
         if machine.output_intermediate is not None:
-            machine.state = MachineState.DONE_WAIT_UNLOAD
+            world._set_machine_state(machine, MachineState.DONE_WAIT_UNLOAD, reason="output_waiting_unload")
             yield env.timeout(1)
             continue
 
         needs_intermediate = world._station_requires_intermediate(machine.station)
         if machine.input_material is None or (needs_intermediate and machine.input_intermediate is None):
-            machine.state = MachineState.WAIT_INPUT
+            world._set_machine_state(machine, MachineState.WAIT_INPUT, reason="waiting_input")
             yield env.timeout(1)
             continue
 
@@ -54,7 +54,8 @@ def machine_failure_monitor(env: simpy.Environment, world: ManufacturingWorld, m
         world.break_machine(machine, reason="stochastic")
 
 
-def agent_work_loop(env: simpy.Environment, world: ManufacturingWorld, agent_id: str):
+def worker_work_loop(env: simpy.Environment, world: ManufacturingWorld, worker_id: str):
+    agent_id = worker_id
     agent = world.agents[agent_id]
     while True:
         if world.terminated:
@@ -112,7 +113,13 @@ def agent_work_loop(env: simpy.Environment, world: ManufacturingWorld, agent_id:
             continue
 
 
-def agent_battery_monitor(env: simpy.Environment, world: ManufacturingWorld, agent_id: str):
+def agent_work_loop(env: simpy.Environment, world: ManufacturingWorld, agent_id: str):
+    # Deprecated compatibility wrapper.
+    yield from worker_work_loop(env, world, agent_id)
+
+
+def worker_battery_monitor(env: simpy.Environment, world: ManufacturingWorld, worker_id: str):
+    agent_id = worker_id
     agent = world.agents[agent_id]
     # Guard against floating-point residue (e.g. 2e-13 min) that can cause
     # same-timestamp timeout churn in SimPy.
@@ -138,6 +145,11 @@ def agent_battery_monitor(env: simpy.Environment, world: ManufacturingWorld, age
         yield env.timeout(max(remaining, eps))
         if not agent.discharged and world.battery_remaining(agent) <= eps:
             world.discharge_agent(agent, reason="battery_depleted")
+
+
+def agent_battery_monitor(env: simpy.Environment, world: ManufacturingWorld, agent_id: str):
+    # Deprecated compatibility wrapper.
+    yield from worker_battery_monitor(env, world, agent_id)
 
 
 def snapshot_loop(env: simpy.Environment, world: ManufacturingWorld):

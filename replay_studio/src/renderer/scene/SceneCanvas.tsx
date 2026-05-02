@@ -854,8 +854,13 @@ function drawPlainLeftLabel(
 
 function carryingIconFrame(entity: { attributes: Record<string, unknown> }, sceneIcons: SceneIconSet | null): SceneIconFrame | null {
   if (!sceneIcons) return null;
+  const cargo = entity.attributes.cargo;
   const carryingItemType =
-    typeof entity.attributes.carrying_item_type === "string" ? entity.attributes.carrying_item_type.trim().toLowerCase() : "";
+    cargo && typeof cargo === "object" && typeof (cargo as Record<string, unknown>).item_type === "string"
+      ? String((cargo as Record<string, unknown>).item_type).trim().toLowerCase()
+      : typeof entity.attributes.carrying_item_type === "string"
+        ? entity.attributes.carrying_item_type.trim().toLowerCase()
+        : "";
   if (!carryingItemType) return null;
   if (carryingItemType.includes("battery")) return sceneIcons.battery;
   if (carryingItemType.includes("product")) return sceneIcons.product;
@@ -1046,8 +1051,8 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
           workerVisualState.badgeText,
           workerVisualState.badgeAccent,
           {
-          tailSide: "right",
-          fill: "rgba(255,255,255,0.94)",
+            tailSide: "right",
+            fill: "rgba(255,255,255,0.94)",
           },
         );
         if (taskProgress !== undefined && node.entity.state !== "idle") {

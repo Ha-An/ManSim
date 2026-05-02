@@ -415,6 +415,9 @@ def convert_events(
     }
     output_buffer_counts = {alias: 0 for alias in output_buffer_alias.values()}
     converted: List[Dict[str, Any]] = []
+    has_canonical_worker_events = any(
+        event.get("type") in {"WORKER_STATE_CHANGED", "WORKER_CARGO_CHANGED"} for event in raw_events
+    )
 
     def push(event_type: str, timestamp: float, entity_refs: Dict[str, Any], payload: Dict[str, Any], *, durative: Dict[str, Any] | None = None, suffix: str = "a") -> None:
         converted.append(
@@ -467,6 +470,69 @@ def convert_events(
             "process_window": None,
         }
 
+    def state_for_worker_state(worker_state: str) -> str:
+        normalized = worker_state.strip().upper()
+        if normalized == "MOVING":
+            return "moving"
+        if normalized in {"DISCHARGED"}:
+            return "error"
+        if normalized in {"IDLE"}:
+            return "idle"
+        if normalized in {"WAITING"}:
+            return "waiting"
+        if normalized in {"BATTERY_SWAPPING", "BATTERY_DELIVERING"}:
+            return "charging"
+        if normalized in {"REPAIRING_MACHINE", "PREVENTIVE_MAINTENANCE"}:
+            return "maintenance"
+        return "working"
+
+    def canonical_motion_attributes(details: Dict[str, Any]) -> Dict[str, Any] | None:
+        motion = details.get("motion")
+        if not isinstance(motion, dict):
+            return None
+        from_region = resolve_region_id(str(motion.get("from") or ""))
+        to_region = resolve_region_id(str(motion.get("to") or ""))
+        if not from_region or not to_region:
+            return None
+        from_position = positions.get(from_region)
+        to_position = positions.get(to_region)
+        if not from_position or not to_position:
+            return None
+        started_at = float(motion.get("started_at", 0.0) or 0.0)
+        ended_at = float(motion.get("ended_at", started_at) or started_at)
+        return {
+            "from": from_position,
+            "to": to_position,
+            "started_at": started_at,
+            "ended_at": ended_at,
+        }
+
+    def canonical_worker_attributes(details: Dict[str, Any]) -> Dict[str, Any]:
+        attrs: Dict[str, Any] = {}
+        if "worker_state" in details:
+            attrs["worker_state"] = details.get("worker_state")
+        resolved_motion = canonical_motion_attributes(details)
+        if resolved_motion:
+            attrs["motion"] = resolved_motion
+        if "cargo" in details:
+            attrs["cargo"] = details.get("cargo")
+            cargo = details.get("cargo") if isinstance(details.get("cargo"), dict) else {}
+            attrs["carrying_item_id"] = cargo.get("item_id")
+            attrs["carrying_item_type"] = cargo.get("item_type")
+        if "current_task_id" in details:
+            attrs["active_task"] = details.get("current_task_id")
+        if "current_task_type" in details:
+            attrs["current_task_type"] = details.get("current_task_type")
+        if "task_id" in details:
+            attrs["active_task"] = details.get("task_id")
+        if "task_id" in details or "current_task_id" in details:
+            attrs["task_label"] = details.get("task_id") or details.get("current_task_id")
+        if "battery_remaining_min" in details:
+            remaining = float(details.get("battery_remaining_min") or 0.0)
+            attrs["battery_period_min"] = battery_period_min
+            attrs["battery_pct"] = max(0.0, min(100.0, 100.0 * remaining / max(1.0, battery_period_min)))
+        return attrs
+
     for index, raw in enumerate(raw_events):
         raw_type = raw["type"]
         timestamp = float(raw["t"])
@@ -474,7 +540,79 @@ def convert_events(
         location = raw.get("location")
         details = raw.get("details", {})
 
+        if raw_type == "WORKER_STATE_CHANGED" and entity_id:
+            worker_state = str(details.get("worker_state", "IDLE"))
+            region_id = resolve_region_id(location)
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": entity_id},
+                {
+                    "state": state_for_worker_state(worker_state),
+                    "position": worker_region_slot(region_id, entity_id, layout)
+                    or positions.get(region_id or "", positions.get("warehouse_region")),
+                    "attributes": canonical_worker_attributes(details),
+                },
+            )
+            continue
+
+        if raw_type == "WORKER_CARGO_CHANGED" and entity_id:
+            cargo = details.get("cargo") if isinstance(details.get("cargo"), dict) else {}
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": entity_id},
+                {
+                    "attributes": {
+                        "cargo": cargo,
+                        "carrying_item_id": cargo.get("item_id"),
+                        "carrying_item_type": cargo.get("item_type"),
+                    },
+                },
+            )
+            continue
+
+        if raw_type == "MACHINE_STATE_CHANGED" and entity_id:
+            machine_state = str(details.get("machine_state", "WAIT_INPUT"))
+            state = "idle"
+            if machine_state in {"PROCESSING", "SETUP"}:
+                state = "working"
+            elif machine_state in {"DONE_WAIT_UNLOAD", "WAIT_INPUT"}:
+                state = "waiting"
+            elif machine_state == "BROKEN":
+                state = "error"
+            elif machine_state in {"UNDER_REPAIR", "UNDER_PM"}:
+                state = "maintenance"
+            attrs = {
+                "machine_state": machine_state,
+                "active_worker_ids": details.get("active_worker_ids", []),
+                "repair_team_size": details.get("repair_team_size", 0),
+                "repair_remaining_min": details.get("repair_remaining_min", 0.0),
+                "input_item_id": details.get("input_item_id"),
+                "output_item_id": details.get("output_item_id"),
+            }
+            push("state_changed", timestamp, {"primary": entity_id}, {"state": state, "attributes": attrs})
+            continue
+
+        if raw_type == "ITEM_STATE_CHANGED" and entity_id:
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": entity_id, "target": details.get("ref")},
+                {
+                    "state": str(details.get("item_state", "CREATED")).lower(),
+                    "attributes": {
+                        "item_state": details.get("item_state"),
+                        "item_type": details.get("item_type"),
+                        "ref": details.get("ref"),
+                    },
+                },
+            )
+            continue
+
         if raw_type == "AGENT_MOVE_START":
+            if has_canonical_worker_events:
+                continue
             source = resolve_region_id(details.get("from"))
             target = resolve_region_id(details.get("to"))
             if entity_id and source and target:
@@ -497,6 +635,8 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_MOVE_END" and entity_id:
+            if has_canonical_worker_events:
+                continue
             current_task = active_tasks.get(entity_id)
             region_id = resolve_region_id(location)
             push(
@@ -511,6 +651,8 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_TASK_START" and entity_id:
+            if has_canonical_worker_events:
+                continue
             task_id = details.get("task_id")
             target = task_target(details)
             label = task_label(details)
@@ -539,6 +681,8 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_PICK_ITEM" and entity_id:
+            if has_canonical_worker_events:
+                continue
             item_type = details.get("item_type")
             push(
                 "state_changed",
@@ -555,6 +699,8 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_DROP_ITEM" and entity_id:
+            if has_canonical_worker_events:
+                continue
             push(
                 "state_changed",
                 timestamp,
@@ -570,6 +716,8 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_TASK_END" and entity_id:
+            if has_canonical_worker_events:
+                continue
             task_id = details.get("task_id")
             active = active_tasks.pop(entity_id, None)
             push(
@@ -586,6 +734,8 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_DISCHARGED" and entity_id:
+            if has_canonical_worker_events:
+                continue
             push(
                 "warning_raised",
                 timestamp,
@@ -610,6 +760,8 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_RECHARGED" and entity_id:
+            if has_canonical_worker_events:
+                continue
             push(
                 "state_changed",
                 timestamp,

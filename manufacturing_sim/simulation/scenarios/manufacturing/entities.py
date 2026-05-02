@@ -16,6 +16,37 @@ class MachineState(str, Enum):
     UNDER_PM = "UNDER_PM"
 
 
+class WorkerState(str, Enum):
+    IDLE = "IDLE"
+    MOVING = "MOVING"
+    SUPPLYING_MATERIAL = "SUPPLYING_MATERIAL"
+    TRANSFERRING_INTERMEDIATE = "TRANSFERRING_INTERMEDIATE"
+    SETTING_UP_MACHINE = "SETTING_UP_MACHINE"
+    UNLOADING_MACHINE = "UNLOADING_MACHINE"
+    INSPECTING_PRODUCT = "INSPECTING_PRODUCT"
+    REPAIRING_MACHINE = "REPAIRING_MACHINE"
+    PREVENTIVE_MAINTENANCE = "PREVENTIVE_MAINTENANCE"
+    BATTERY_SWAPPING = "BATTERY_SWAPPING"
+    BATTERY_DELIVERING = "BATTERY_DELIVERING"
+    WAITING = "WAITING"
+    DISCHARGED = "DISCHARGED"
+
+
+class ItemState(str, Enum):
+    CREATED = "CREATED"
+    IN_STORAGE = "IN_STORAGE"
+    IN_QUEUE = "IN_QUEUE"
+    CARRIED_BY_WORKER = "CARRIED_BY_WORKER"
+    LOADED_ON_MACHINE = "LOADED_ON_MACHINE"
+    PROCESSING = "PROCESSING"
+    WAITING_MACHINE_UNLOAD = "WAITING_MACHINE_UNLOAD"
+    WAITING_INSPECTION = "WAITING_INSPECTION"
+    INSPECTING = "INSPECTING"
+    WAITING_INSPECTION_OUTPUT = "WAITING_INSPECTION_OUTPUT"
+    COMPLETED = "COMPLETED"
+    SCRAPPED = "SCRAPPED"
+
+
 @dataclass
 class Machine:
     machine_id: str
@@ -48,9 +79,10 @@ class Machine:
 
 
 @dataclass
-class Agent:
-    agent_id: str
+class Worker:
+    worker_id: str
     location: str = "Home"
+    state: WorkerState = WorkerState.IDLE
     discharged: bool = False
     discharged_since: Optional[float] = None
     current_task_id: Optional[str] = None
@@ -75,6 +107,19 @@ class Agent:
     incident_backlog: list[dict[str, Any]] = field(default_factory=list)
     local_response_attempts: dict[str, int] = field(default_factory=dict)
 
+    @property
+    def agent_id(self) -> str:
+        # Backward compatibility for legacy dashboards/decision code.
+        return self.worker_id
+
+    @agent_id.setter
+    def agent_id(self, value: str) -> None:
+        self.worker_id = value
+
+
+# Deprecated compatibility alias. Manufacturing-domain code should use Worker.
+Agent = Worker
+
 
 @dataclass
 class Task:
@@ -92,5 +137,6 @@ class Item:
     item_id: str
     item_type: str
     created_at: float
+    state: ItemState = ItemState.CREATED
     current_station: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)

@@ -20,7 +20,7 @@ import { SpeedControl } from "../ui/controls/SpeedControl";
 import { StepControls } from "../ui/controls/StepControls";
 import { JumpControls } from "../ui/controls/JumpControls";
 import { Timeline } from "../ui/controls/Timeline";
-import { WorkerMonitorPanel } from "../ui/panels/WorkerMonitorPanel";
+import { EntityMonitorPanel } from "../ui/panels/EntityMonitorPanel";
 import { useUIStore } from "../ui/state/uiStore";
 import { ManagerReplayView, type ManagerReplayPayload } from "./ManagerReplayView";
 
@@ -314,6 +314,22 @@ export default function App() {
     [currentFrame.domainState.entities],
   );
 
+  const machineEntities = useMemo(
+    () =>
+      Object.values(currentFrame.domainState.entities)
+        .filter((entity) => entity.entity_type === "machine" || entity.entity_type === "workstation")
+        .sort((left, right) => left.label.localeCompare(right.label)),
+    [currentFrame.domainState.entities],
+  );
+
+  const itemEntities = useMemo(
+    () =>
+      Object.values(currentFrame.domainState.entities)
+        .filter((entity) => typeof entity.attributes.item_state === "string")
+        .sort((left, right) => left.label.localeCompare(right.label)),
+    [currentFrame.domainState.entities],
+  );
+
   const runSelectionEnabled = availableRuns.length > 1;
 
   async function handleJsonFile(file: File) {
@@ -541,7 +557,13 @@ export default function App() {
         </section>
 
         <aside className="side-panel">
-          <WorkerMonitorPanel workers={workerEntities} regions={renderModel.regions} currentTime={currentFrame.time} />
+          <EntityMonitorPanel
+            workers={workerEntities}
+            machines={machineEntities}
+            items={itemEntities}
+            regions={renderModel.regions}
+            currentTime={currentFrame.time}
+          />
         </aside>
       </main>
     </div>

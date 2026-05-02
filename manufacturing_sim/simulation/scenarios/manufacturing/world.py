@@ -19,7 +19,15 @@ from agents.base import (
     default_task_priority_weights,
 )
 from agents.modes import normalize_decision_mode
-from manufacturing_sim.simulation.scenarios.manufacturing.entities import Agent, Item, Machine, MachineState, Task
+from manufacturing_sim.simulation.scenarios.manufacturing.entities import (
+    Item,
+    ItemState,
+    Machine,
+    MachineState,
+    Task,
+    Worker,
+    WorkerState,
+)
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
 
 
@@ -46,7 +54,9 @@ class ManufacturingWorld:
         self.minutes_per_day = int(horizon_cfg["minutes_per_day"])
 
         factory_cfg = cfg["factory"]
-        self.num_agents = int(factory_cfg["num_agents"])
+        self.num_workers = int(factory_cfg.get("num_workers", factory_cfg.get("num_agents", 3)))
+        # Deprecated alias retained for existing decision modules and dashboards.
+        self.num_agents = self.num_workers
         self.machines_per_station = int(factory_cfg["machines_per_station"])
 
         process_cfg = factory_cfg["processing_time_min"]
@@ -72,7 +82,16 @@ class ManufacturingWorld:
         self.movement_cfg = cfg["movement"]
         self.quality_cfg = cfg["quality"]
         self.machine_failure_cfg = cfg["machine_failure"]
-        self.agent_cfg = cfg["agent"]
+        legacy_agent_cfg = cfg.get("agent", {}) if isinstance(cfg.get("agent", {}), dict) else {}
+        worker_cfg = cfg.get("worker", {}) if isinstance(cfg.get("worker", {}), dict) else {}
+        # Keep legacy scenario keys readable while making `worker` the canonical config surface.
+        self.agent_cfg = {
+            "battery_swap_period_min": 200,
+            "battery_pickup_time_min": 5,
+            "battery_delivery_extra_min": 4,
+            **legacy_agent_cfg,
+            **worker_cfg,
+        }
         self.inventory_targets = cfg["inventory_targets"]
         self.dispatcher_cfg = cfg["dispatcher"]
         self.heuristic_rules = cfg.get("heuristic_rules", {}) if isinstance(cfg.get("heuristic_rules", {}), dict) else {}
@@ -99,9 +118,8 @@ class ManufacturingWorld:
             task_priority_weights=default_task_priority_weights(),
             quotas={},
             rationale="default",
-            agent_priority_multipliers=default_agent_priority_multipliers([f"A{i}" for i in range(1, self.num_agents + 1)]),
+            agent_priority_multipliers=default_agent_priority_multipliers([f"A{i}" for i in range(1, self.num_workers + 1)]),
         )
-        worker_cfg = cfg.get("worker", {}) if isinstance(cfg.get("worker", {}), dict) else {}
         local_response_cfg = worker_cfg.get("local_response", {}) if isinstance(worker_cfg.get("local_response", {}), dict) else {}
         self.worker_execution_mode = str(worker_cfg.get("execution_mode", "commitment")).strip().lower() or "commitment"
         self.worker_local_response_cfg = {
@@ -176,8 +194,10 @@ class ManufacturingWorld:
         self.machines_by_station: dict[int, list[str]] = {station: [] for station in self.stations}
         self._build_machines()
 
-        self.agents: dict[str, Agent] = {}
-        self._build_agents()
+        self.workers: dict[str, Worker] = {}
+        self._build_workers()
+        # Deprecated alias retained for modules that still use "agent" as orchestration vocabulary.
+        self.agents = self.workers
 
         self.product_count = 0
         self.scrap_count = 0
@@ -224,10 +244,10 @@ class ManufacturingWorld:
                 self.machines[machine_id] = machine
                 self.machines_by_station[station].append(machine_id)
 
-    def _build_agents(self) -> None:
-        for idx in range(1, self.num_agents + 1):
-            agent_id = f"A{idx}"
-            self.agents[agent_id] = Agent(agent_id=agent_id, location="Home")
+    def _build_workers(self) -> None:
+        for idx in range(1, self.num_workers + 1):
+            worker_id = f"A{idx}"
+            self.workers[worker_id] = Worker(worker_id=worker_id, location="Home")
 
     def bootstrap(self) -> None:
         from manufacturing_sim.simulation.scenarios.manufacturing import processes
@@ -1009,6 +1029,190 @@ class ManufacturingWorld:
             }
         )
 
+    def _worker_state_for_task(self, worker: Worker, task: Task | None) -> WorkerState:
+        if worker.discharged:
+            return WorkerState.DISCHARGED
+        if task is None:
+            return WorkerState.IDLE
+        task_type = str(task.task_type).strip().upper()
+        if task_type == "SETUP_MACHINE":
+            return WorkerState.SETTING_UP_MACHINE
+        if task_type == "UNLOAD_MACHINE":
+            return WorkerState.UNLOADING_MACHINE
+        if task_type == "REPAIR_MACHINE":
+            return WorkerState.REPAIRING_MACHINE
+        if task_type == "PREVENTIVE_MAINTENANCE":
+            return WorkerState.PREVENTIVE_MAINTENANCE
+        if task_type == "BATTERY_SWAP":
+            return WorkerState.BATTERY_SWAPPING
+        if task_type == "INSPECT_PRODUCT":
+            return WorkerState.INSPECTING_PRODUCT
+        if task_type == "TRANSFER":
+            transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
+            if transfer_kind == "material_supply":
+                return WorkerState.SUPPLYING_MATERIAL
+            if transfer_kind == "inter_station":
+                return WorkerState.TRANSFERRING_INTERMEDIATE
+            if transfer_kind == "battery_delivery":
+                return WorkerState.BATTERY_DELIVERING
+        return WorkerState.WAITING
+
+    def _set_worker_state(
+        self,
+        worker: Worker,
+        state: WorkerState | str,
+        reason: str = "",
+        task_id: str | None = None,
+    ) -> None:
+        next_state = state if isinstance(state, WorkerState) else WorkerState(str(state))
+        if worker.state == next_state and not reason:
+            return
+        worker.state = next_state
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="WORKER_STATE_CHANGED",
+            entity_id=worker.worker_id,
+            location=self.worker_display_location(worker),
+            details={
+                "worker_state": worker.state.value,
+                "reason": reason,
+                "task_id": task_id or worker.current_task_id or "",
+                "current_task_type": worker.current_task_type or "",
+                "cargo": self._worker_cargo_payload(worker),
+                "motion": self._worker_motion_payload(worker),
+                "battery_remaining_min": round(float(self.battery_remaining(worker)), 3),
+            },
+        )
+
+    def _worker_cargo_payload(self, worker: Worker) -> dict[str, Any]:
+        return {
+            "item_id": worker.carrying_item_id,
+            "item_type": worker.carrying_item_type,
+        }
+
+    def _set_worker_motion(
+        self,
+        worker: Worker,
+        from_zone: str,
+        to_zone: str,
+        progress: float,
+        total_min: float,
+    ) -> None:
+        worker.in_transit_from = str(from_zone)
+        worker.in_transit_to = str(to_zone)
+        worker.in_transit_progress = min(1.0, max(0.0, float(progress)))
+        worker.in_transit_total_min = max(0.0, float(total_min))
+        self._set_worker_state(worker, WorkerState.MOVING, reason="motion")
+
+    def _worker_motion_payload(self, worker: Worker) -> dict[str, Any] | None:
+        if not worker.in_transit_from or not worker.in_transit_to:
+            return None
+        total_min = max(0.0, float(worker.in_transit_total_min))
+        progress = min(1.0, max(0.0, float(worker.in_transit_progress)))
+        started_at = float(self.env.now) - (progress * total_min)
+        return {
+            "from": str(worker.in_transit_from),
+            "to": str(worker.in_transit_to),
+            "progress": progress,
+            "total_min": total_min,
+            "started_at": round(started_at, 3),
+            "ended_at": round(started_at + total_min, 3),
+        }
+
+    def _set_worker_cargo(
+        self,
+        worker: Worker,
+        item_id: str | None,
+        item_type: str | None,
+        *,
+        destination: str = "",
+    ) -> None:
+        normalized_id = str(item_id).strip() if item_id is not None else None
+        normalized_type = str(item_type).strip().lower() if item_type is not None else None
+        worker.carrying_item_id = normalized_id or None
+        worker.carrying_item_type = normalized_type or None
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="WORKER_CARGO_CHANGED",
+            entity_id=worker.worker_id,
+            location=self.worker_display_location(worker),
+            details={
+                "worker_state": worker.state.value,
+                "cargo": self._worker_cargo_payload(worker),
+                "destination": destination,
+            },
+        )
+
+    def _set_machine_state(self, machine: Machine, state: MachineState | str, reason: str = "") -> None:
+        next_state = state if isinstance(state, MachineState) else MachineState(str(state))
+        if machine.state == next_state and not reason:
+            return
+        machine.state = next_state
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="MACHINE_STATE_CHANGED",
+            entity_id=machine.machine_id,
+            location=f"Station{machine.station}",
+            details={
+                "machine_state": machine.state.value,
+                "reason": reason,
+                "input_item_id": machine.input_intermediate or machine.input_material,
+                "output_item_id": machine.output_intermediate,
+                "active_worker_ids": [candidate for candidate in (machine.setup_owner, machine.unload_owner, machine.pm_owner) if candidate]
+                + list(machine.repair_team),
+                "repair_team_size": self._repair_team_size(machine),
+                "repair_remaining_min": round(float(machine.repair_work_remaining_min), 3),
+            },
+        )
+
+    def _set_item_state(
+        self,
+        item_id: str,
+        state: ItemState | str,
+        *,
+        location: str = "",
+        ref: str = "",
+        item_type: str | None = None,
+    ) -> None:
+        if not item_id:
+            return
+        next_state = state if isinstance(state, ItemState) else ItemState(str(state))
+        item = self.items.get(item_id)
+        if item is None:
+            self.items[item_id] = Item(
+                item_id=item_id,
+                item_type=str(item_type or "unknown"),
+                created_at=float(self.env.now),
+                state=next_state,
+            )
+            item = self.items[item_id]
+        else:
+            item.state = next_state
+        if location.startswith("Station"):
+            suffix = location.removeprefix("Station")
+            if suffix.isdigit():
+                item.current_station = int(suffix)
+        elif location in {"Warehouse", "BatteryStation"}:
+            item.current_station = None
+        if ref:
+            item.metadata["state_ref"] = ref
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="ITEM_STATE_CHANGED",
+            entity_id=item_id,
+            location=location,
+            details={
+                "item_id": item_id,
+                "item_type": item.item_type,
+                "item_state": item.state.value,
+                "ref": ref,
+            },
+        )
+
     def _next_item_id(self, prefix: str) -> str:
         return f"{prefix}-{next(self.item_counter)}"
 
@@ -1018,7 +1222,7 @@ class ManufacturingWorld:
     def _next_cycle_id(self) -> str:
         return f"CYCLE-{next(self.machine_cycle_counter)}"
 
-    def _set_agent_carrying(self, agent: Agent, item_type: str, item_id: str) -> bool:
+    def _set_agent_carrying(self, agent: Worker, item_type: str, item_id: str) -> bool:
         normalized_type = str(item_type).strip().lower()
         if not normalized_type:
             return False
@@ -1042,8 +1246,14 @@ class ManufacturingWorld:
                 },
             )
             return False
-        agent.carrying_item_id = normalized_item_id
-        agent.carrying_item_type = normalized_type
+        self._set_worker_cargo(agent, normalized_item_id, normalized_type)
+        self._set_item_state(
+            normalized_item_id,
+            ItemState.CARRIED_BY_WORKER,
+            location=self.agent_display_location(agent),
+            ref=agent.agent_id,
+            item_type=normalized_type,
+        )
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1054,7 +1264,7 @@ class ManufacturingWorld:
         )
         return True
 
-    def _clear_agent_carrying(self, agent: Agent, destination: str = "", emit_event: bool = True) -> None:
+    def _clear_agent_carrying(self, agent: Worker, destination: str = "", emit_event: bool = True) -> None:
         item_id = agent.carrying_item_id
         item_type = agent.carrying_item_type
         if item_id is None and item_type is None:
@@ -1068,11 +1278,11 @@ class ManufacturingWorld:
                 location=self.agent_display_location(agent),
                 details={"item_id": item_id or "", "item_type": (item_type or ""), "to": destination},
             )
-        agent.carrying_item_id = None
-        agent.carrying_item_type = None
+        self._set_worker_cargo(agent, None, None, destination=destination)
 
     def _push_material_queue(self, station: int, item_id: str) -> None:
         self.material_queues[station].append(item_id)
+        self._set_item_state(item_id, ItemState.IN_QUEUE, location=f"Station{station}", ref=f"material_queue_{station}", item_type="material")
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1086,6 +1296,7 @@ class ManufacturingWorld:
         if not self.material_queues[station]:
             return None
         item_id = self.material_queues[station].popleft()
+        self._set_item_state(item_id, ItemState.CARRIED_BY_WORKER, location=f"Station{station}", ref=f"material_queue_{station}", item_type="material")
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1102,6 +1313,8 @@ class ManufacturingWorld:
         self.intermediate_queues[station].append(item_id)
         location = "Inspection" if station == self.inspection_queue_station else f"Station{station}"
         queue_name = "product" if station == self.inspection_queue_station else "intermediate"
+        item_state = ItemState.WAITING_INSPECTION if station == self.inspection_queue_station else ItemState.IN_QUEUE
+        self._set_item_state(item_id, item_state, location=location, ref=f"intermediate_queue_{station}", item_type=queue_name)
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1119,6 +1332,8 @@ class ManufacturingWorld:
         item_id = self.intermediate_queues[station].popleft()
         location = "Inspection" if station == self.inspection_queue_station else f"Station{station}"
         queue_name = "product" if station == self.inspection_queue_station else "intermediate"
+        item_state = ItemState.INSPECTING if station == self.inspection_queue_station else ItemState.CARRIED_BY_WORKER
+        self._set_item_state(item_id, item_state, location=location, ref=f"intermediate_queue_{station}", item_type=queue_name)
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1876,10 +2091,11 @@ class ManufacturingWorld:
         self._interrupt_repair_monitor(machine)
         if not machine.broken or self._repair_team_size(machine) <= 0:
             machine.repair_monitor_process = None
-            machine.state = MachineState.BROKEN if machine.broken else machine.state
+            if machine.broken:
+                self._set_machine_state(machine, MachineState.BROKEN, reason="repair_paused")
             return
         self._ensure_repair_done_event(machine)
-        machine.state = MachineState.UNDER_REPAIR
+        self._set_machine_state(machine, MachineState.UNDER_REPAIR, reason="repair_active")
         machine.repair_last_progress_at = float(self.env.now)
         machine.repair_monitor_token += 1
         token = int(machine.repair_monitor_token)
@@ -1916,7 +2132,7 @@ class ManufacturingWorld:
             machine.repair_last_progress_at = None
             machine.repair_monitor_process = None
             if machine.broken:
-                machine.state = MachineState.BROKEN
+                self._set_machine_state(machine, MachineState.BROKEN, reason="repair_team_empty")
         self._start_or_resume_repair_monitor(machine)
         return True
 
@@ -1934,7 +2150,11 @@ class ManufacturingWorld:
             machine.total_broken_min += self.env.now - machine.failed_since
         machine.broken = False
         machine.failed_since = None
-        machine.state = MachineState.DONE_WAIT_UNLOAD if machine.output_intermediate is not None else MachineState.WAIT_INPUT
+        self._set_machine_state(
+            machine,
+            MachineState.DONE_WAIT_UNLOAD if machine.output_intermediate is not None else MachineState.WAIT_INPUT,
+            reason="repair_completed",
+        )
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1962,7 +2182,7 @@ class ManufacturingWorld:
             team_size = self._repair_team_size(machine)
             if team_size <= 0:
                 machine.repair_monitor_process = None
-                machine.state = MachineState.BROKEN
+                self._set_machine_state(machine, MachineState.BROKEN, reason="repair_paused")
                 return
             machine.repair_last_progress_at = float(self.env.now)
             remaining = max(0.0, float(machine.repair_work_remaining_min))
@@ -1998,7 +2218,7 @@ class ManufacturingWorld:
         machine.repair_done_event = None
         machine.repair_monitor_process = None
         machine.repair_monitor_token += 1
-        machine.state = MachineState.BROKEN
+        self._set_machine_state(machine, MachineState.BROKEN, reason=reason)
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -2176,10 +2396,14 @@ class ManufacturingWorld:
         pct = int(round(min(1.0, max(0.0, float(progress))) * 100.0))
         return f"{from_zone}->{to_zone}({pct}%)"
 
-    def agent_display_location(self, agent: Agent) -> str:
-        if self._has_in_transit_position(agent):
-            return self._edge_location_label(str(agent.in_transit_from), str(agent.in_transit_to), float(agent.in_transit_progress))
-        return str(agent.location)
+    def worker_display_location(self, worker: Worker) -> str:
+        if self._has_in_transit_position(worker):
+            return self._edge_location_label(str(worker.in_transit_from), str(worker.in_transit_to), float(worker.in_transit_progress))
+        return str(worker.location)
+
+    def agent_display_location(self, agent: Worker) -> str:
+        # Deprecated alias for orchestration/dashboard compatibility.
+        return self.worker_display_location(agent)
 
     def _move_on_edge(
         self,
@@ -2348,6 +2572,7 @@ class ManufacturingWorld:
             location=self.agent_display_location(agent),
             details=details,
         )
+        self._set_worker_state(agent, WorkerState.DISCHARGED, reason=reason)
         self.emit_incident(
             "worker_discharged",
             affected_entities=[agent.agent_id],
@@ -2455,6 +2680,7 @@ class ManufacturingWorld:
         agent.current_task_id = task.task_id
         agent.current_task_type = task.task_type
         agent.current_task_started_at = start_t
+        self._set_worker_state(agent, WorkerState.WAITING, reason="task_selected", task_id=task.task_id)
         selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
         details: dict[str, Any] = {
             "task_id": task.task_id,
@@ -2506,6 +2732,12 @@ class ManufacturingWorld:
                 "payload": task.payload,
             },
         )
+        if agent.discharged:
+            self._set_worker_state(agent, WorkerState.DISCHARGED, reason=reason or status, task_id=task.task_id)
+        elif status == "completed":
+            self._set_worker_state(agent, WorkerState.IDLE, reason="task_completed", task_id=task.task_id)
+        elif not preserve_carrying:
+            self._set_worker_state(agent, WorkerState.WAITING, reason=reason or status, task_id=task.task_id)
         selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
         self.task_records.append(
             {
@@ -2639,7 +2871,7 @@ class ManufacturingWorld:
                 if machine.setup_owner == agent.agent_id:
                     machine.setup_owner = None
                 if machine.state == MachineState.SETUP:
-                    machine.state = MachineState.WAIT_INPUT
+                    self._set_machine_state(machine, MachineState.WAIT_INPUT, reason=reason)
 
         elif task.task_type == "UNLOAD_MACHINE":
             machine = self.machines.get(task.payload.get("machine_id"))
@@ -2656,7 +2888,7 @@ class ManufacturingWorld:
             if machine is not None:
                 self._leave_repair_team(machine, agent.agent_id, reason=reason)
                 if machine.broken and self._repair_team_size(machine) <= 0:
-                    machine.state = MachineState.BROKEN
+                    self._set_machine_state(machine, MachineState.BROKEN, reason=reason)
 
         elif task.task_type == "PREVENTIVE_MAINTENANCE":
             machine = self.machines.get(task.payload.get("machine_id"))
@@ -2664,11 +2896,11 @@ class ManufacturingWorld:
                 if machine.pm_owner == agent.agent_id:
                     machine.pm_owner = None
                 if machine.broken:
-                    machine.state = MachineState.BROKEN
+                    self._set_machine_state(machine, MachineState.BROKEN, reason=reason)
                 elif machine.output_intermediate is not None:
-                    machine.state = MachineState.DONE_WAIT_UNLOAD
+                    self._set_machine_state(machine, MachineState.DONE_WAIT_UNLOAD, reason=reason)
                 else:
-                    machine.state = MachineState.WAIT_INPUT
+                    self._set_machine_state(machine, MachineState.WAIT_INPUT, reason=reason)
 
         self.logger.log(
             t=self.env.now,
@@ -3622,9 +3854,9 @@ class ManufacturingWorld:
 
     # shared weight는 하루 단위 의도를 나타내고, agent multiplier는 그 의도를 개인별로 미세 조정한다.
     # queue와 mailbox는 이미 상위 선택 tier에서 처리하므로 최종 점수식은 단순하게 유지한다.
-    def _task_score(self, task: Task, agent: Agent | str | None = None) -> float:
+    def _task_score(self, task: Task, agent: Worker | str | None = None) -> float:
         priority_key = self._task_priority_key(task)
-        if isinstance(agent, Agent):
+        if isinstance(agent, Worker):
             effective = self.current_effective_task_priority_weights(agent.agent_id)
             weight = float(effective.get(priority_key, 1.0))
             return float(task.priority) * weight
@@ -3844,12 +4076,14 @@ class ManufacturingWorld:
                 )
             move_start_t = self.env.now
             self._set_in_transit(agent, src, dst, 0.0, move_t)
+            self._set_worker_motion(agent, src, dst, 0.0, move_t)
             try:
                 yield self.env.timeout(move_t)
             except simpy.Interrupt as intr:
                 elapsed = max(0.0, self.env.now - move_start_t)
                 progress = min(1.0, max(0.0, elapsed / max(1e-6, move_t)))
                 self._set_in_transit(agent, src, dst, progress, move_t)
+                self._set_worker_motion(agent, src, dst, progress, move_t)
                 if emit_move_events:
                     self.logger.log(
                         t=self.env.now,
@@ -3895,6 +4129,18 @@ class ManufacturingWorld:
                     location=dst,
                     details={"from": src, "to": dst, "duration": round(move_t, 3)},
                 )
+        if agent.current_task_type:
+            task = Task(
+                task_id=str(agent.current_task_id or ""),
+                task_type=str(agent.current_task_type),
+                priority_key="",
+                priority=0.0,
+                location=dst,
+                payload={},
+            )
+            self._set_worker_state(agent, self._worker_state_for_task(agent, task), reason="arrived_for_task", task_id=agent.current_task_id)
+        elif not agent.discharged:
+            self._set_worker_state(agent, WorkerState.IDLE, reason="move_completed")
 
     def execute_task(self, agent: Agent, task: Task):
         task_type = task.task_type
@@ -3913,6 +4159,7 @@ class ManufacturingWorld:
                 if agent.discharged:
                     return False
                 yield from self.move_agent(agent, "BatteryStation", emit_move_events=True)
+                self._set_worker_state(agent, WorkerState.BATTERY_SWAPPING, reason="battery_swap", task_id=task.task_id)
                 yield self.env.timeout(float(self.agent_cfg["battery_pickup_time_min"]))
                 battery_item_id = str(task.payload.get("battery_item_id", ""))
                 if not battery_item_id:
@@ -3924,6 +4171,7 @@ class ManufacturingWorld:
                 agent.discharged = False
                 agent.discharged_since = None
                 agent.low_battery_alerted = False
+                self._set_worker_state(agent, WorkerState.BATTERY_SWAPPING, reason="battery_recharged", task_id=task.task_id)
                 self._clear_agent_carrying(agent, destination="BatteryStation")
                 self.logger.log(
                     t=self.env.now,
@@ -3944,6 +4192,7 @@ class ManufacturingWorld:
             if not machine.broken:
                 return False
             yield from self.move_agent(agent, f"Station{machine.station}", emit_move_events=True)
+            self._set_worker_state(agent, WorkerState.REPAIRING_MACHINE, reason="repair_machine", task_id=task.task_id)
             try:
                 if not machine.broken:
                     return False
@@ -3969,6 +4218,7 @@ class ManufacturingWorld:
                 if machine.broken or machine.output_intermediate is None:
                     return False
                 yield from self.move_agent(agent, f"Station{machine.station}", emit_move_events=True)
+                self._set_worker_state(agent, WorkerState.UNLOADING_MACHINE, reason="unload_machine", task_id=task.task_id)
                 if machine.broken:
                     return False
                 yield self.env.timeout(float(self.movement_cfg["unload_min"]))
@@ -3980,7 +4230,7 @@ class ManufacturingWorld:
                     if not self._set_agent_carrying(agent, carried_kind, output_id):
                         return False
                 machine.output_intermediate = None
-                machine.state = MachineState.WAIT_INPUT if not machine.broken else MachineState.BROKEN
+                self._set_machine_state(machine, MachineState.WAIT_INPUT if not machine.broken else MachineState.BROKEN, reason="unloaded")
                 if output_id is not None:
                     self.output_buffers[machine.station].append(output_id)
                     self._clear_agent_carrying(agent, destination=f"output_buffer_station_{machine.station}")
@@ -4017,6 +4267,7 @@ class ManufacturingWorld:
                     battery_loaded = bool(task.payload.get("battery_loaded", False))
                     if not battery_loaded:
                         yield from self.move_agent(agent, "BatteryStation", emit_move_events=True)
+                        self._set_worker_state(agent, WorkerState.BATTERY_DELIVERING, reason="battery_delivery_pickup", task_id=task.task_id)
                         yield self.env.timeout(float(self.agent_cfg["battery_pickup_time_min"]))
                         if not battery_item_id:
                             battery_item_id = self._next_item_id("BAT")
@@ -4076,6 +4327,7 @@ class ManufacturingWorld:
                     target_agent.discharged = False
                     target_agent.discharged_since = None
                     target_agent.low_battery_alerted = False
+                    self._set_worker_state(target_agent, WorkerState.IDLE, reason="battery_delivered")
                     self._clear_agent_carrying(agent, destination=handover_location)
                     spent_battery_id = str(task.payload.get("spent_battery_item_id", ""))
                     if not spent_battery_id:
@@ -4139,6 +4391,7 @@ class ManufacturingWorld:
                 if not moved_item_id:
                     from_location = "Inspection" if from_station == self.inspection_queue_station else f"Station{from_station}"
                     yield from self.move_agent(agent, from_location, emit_move_events=True)
+                    self._set_worker_state(agent, WorkerState.TRANSFERRING_INTERMEDIATE, reason="inter_station_pickup", task_id=task.task_id)
                     if not self.output_buffers[from_station]:
                         return False
                     moved_item_id = self.output_buffers[from_station].popleft()
@@ -4158,7 +4411,7 @@ class ManufacturingWorld:
                     yield from self.move_agent(agent, to_location, emit_move_events=True)
                     self.product_count += 1
                     if moved_item_id in self.items:
-                        self.items[moved_item_id].current_station = None
+                        self._set_item_state(moved_item_id, ItemState.COMPLETED, location="Warehouse", ref="warehouse_buffer", item_type="product")
                 else:
                     to_station = from_station + 1
                     to_location = f"Station{to_station}" if to_station <= self.last_processing_station else "Inspection"
@@ -4209,6 +4462,7 @@ class ManufacturingWorld:
                     item_id = str(task.payload.get("transfer_item_id", ""))
                     if not item_id:
                         yield from self.move_agent(agent, "Warehouse", emit_move_events=True)
+                        self._set_worker_state(agent, WorkerState.SUPPLYING_MATERIAL, reason="material_pickup", task_id=task.task_id)
                         item_id = self._next_item_id(f"MAT-S{station}")
                         task.payload["transfer_item_id"] = item_id
                         self.items[item_id] = Item(
@@ -4217,6 +4471,7 @@ class ManufacturingWorld:
                             created_at=self.env.now,
                             current_station=station,
                         )
+                        self._set_item_state(item_id, ItemState.IN_STORAGE, location="Warehouse", ref="warehouse", item_type="material")
                         if not self._set_agent_carrying(agent, "material", item_id):
                             self.items.pop(item_id, None)
                             task.payload.pop("transfer_item_id", None)
@@ -4285,7 +4540,7 @@ class ManufacturingWorld:
                 needs_material = machine.input_material is None
                 needs_intermediate = requires_intermediate and machine.input_intermediate is None
                 if not needs_material and not needs_intermediate:
-                    machine.state = MachineState.IDLE
+                    self._set_machine_state(machine, MachineState.IDLE, reason="setup_not_needed")
                     return False
 
                 has_reserved_material = bool(task.payload.get("material_id"))
@@ -4296,9 +4551,10 @@ class ManufacturingWorld:
                     return False
 
                 yield from self.move_agent(agent, f"Station{station}", emit_move_events=True)
+                self._set_worker_state(agent, WorkerState.SETTING_UP_MACHINE, reason="setup_machine", task_id=task.task_id)
 
                 setup_step = float(self.movement_cfg["setup_min"])
-                machine.state = MachineState.SETUP
+                self._set_machine_state(machine, MachineState.SETUP, reason="setup_started")
                 setup_started = True
                 setup_start_t = float(self.env.now)
                 self.logger.log(
@@ -4315,7 +4571,7 @@ class ManufacturingWorld:
                     if not material_id:
                         popped_material = self._pop_material_queue(station)
                         if popped_material is None:
-                            machine.state = MachineState.WAIT_INPUT
+                            self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="missing_material")
                             _close_setup_event("missing_material")
                             return False
                         material_id = popped_material
@@ -4324,11 +4580,12 @@ class ManufacturingWorld:
                     if not self._set_agent_carrying(agent, "material", material_id):
                         self.material_queues[station].appendleft(material_id)
                         task.payload.pop("material_id", None)
-                        machine.state = MachineState.WAIT_INPUT
+                        self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="carry_failed_material")
                         _close_setup_event("carry_failed_material")
                         return False
                     yield self.env.timeout(setup_step)
                     machine.input_material = material_id
+                    self._set_item_state(material_id, ItemState.LOADED_ON_MACHINE, location=f"Station{station}", ref=machine.machine_id, item_type="material")
                     task.payload.pop("material_id", None)
                     self._clear_agent_carrying(agent, destination=machine.machine_id)
 
@@ -4337,7 +4594,7 @@ class ManufacturingWorld:
                     if not intermediate_id:
                         popped_intermediate = self._pop_intermediate_queue(station)
                         if popped_intermediate is None:
-                            machine.state = MachineState.WAIT_INPUT
+                            self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="missing_intermediate")
                             _close_setup_event("missing_intermediate")
                             return False
                         intermediate_id = popped_intermediate
@@ -4346,20 +4603,21 @@ class ManufacturingWorld:
                     if not self._set_agent_carrying(agent, "intermediate", intermediate_id):
                         self.intermediate_queues[station].appendleft(intermediate_id)
                         task.payload.pop("intermediate_id", None)
-                        machine.state = MachineState.WAIT_INPUT
+                        self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="carry_failed_intermediate")
                         _close_setup_event("carry_failed_intermediate")
                         return False
                     yield self.env.timeout(setup_step)
                     machine.input_intermediate = intermediate_id
+                    self._set_item_state(intermediate_id, ItemState.LOADED_ON_MACHINE, location=f"Station{station}", ref=machine.machine_id, item_type="intermediate")
                     task.payload.pop("intermediate_id", None)
                     self._clear_agent_carrying(agent, destination=machine.machine_id)
 
                 if machine.input_material is None or (requires_intermediate and machine.input_intermediate is None):
-                    machine.state = MachineState.WAIT_INPUT
+                    self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="incomplete_inputs")
                     _close_setup_event("incomplete_inputs")
                     return False
 
-                machine.state = MachineState.IDLE
+                self._set_machine_state(machine, MachineState.IDLE, reason="setup_completed")
                 _close_setup_event("completed")
                 return True
 
@@ -4374,12 +4632,13 @@ class ManufacturingWorld:
                         )
                     ):
                         _close_setup_event("aborted")
-                        machine.state = MachineState.WAIT_INPUT
+                        self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="setup_aborted")
         if task_type == "INSPECT_PRODUCT":
             product_id = str(task.payload.get("inspection_product_id", ""))
             if not product_id and not self.intermediate_queues[self.inspection_queue_station]:
                 return False
             yield from self.move_agent(agent, "Inspection", emit_move_events=True)
+            self._set_worker_state(agent, WorkerState.INSPECTING_PRODUCT, reason="inspect_product", task_id=task.task_id)
             if not product_id:
                 popped = self._pop_intermediate_queue(4)
                 if popped is None:
@@ -4400,6 +4659,7 @@ class ManufacturingWorld:
             defect_prob = float(self.quality_cfg["defect_prob"])
             if self.rng.random() < defect_prob:
                 self.scrap_count += 1
+                self._set_item_state(product_id, ItemState.SCRAPPED, location="Inspection", ref="scrap", item_type="product")
                 self.logger.log(
                     t=self.env.now,
                     day=self.day_for_time(self.env.now),
@@ -4432,6 +4692,13 @@ class ManufacturingWorld:
                     },
                 )
                 self.output_buffers[self.inspection_queue_station].append(product_id)
+                self._set_item_state(
+                    product_id,
+                    ItemState.WAITING_INSPECTION_OUTPUT,
+                    location="Inspection",
+                    ref=f"output_buffer_station_{self.inspection_queue_station}",
+                    item_type="product",
+                )
                 self.logger.log(
                     t=self.env.now,
                     day=self.day_for_time(self.env.now),
@@ -4456,7 +4723,8 @@ class ManufacturingWorld:
                 if machine.broken or machine.state == MachineState.PROCESSING:
                     return False
                 yield from self.move_agent(agent, f"Station{machine.station}", emit_move_events=True)
-                machine.state = MachineState.UNDER_PM
+                self._set_worker_state(agent, WorkerState.PREVENTIVE_MAINTENANCE, reason="preventive_maintenance", task_id=task.task_id)
+                self._set_machine_state(machine, MachineState.UNDER_PM, reason="pm_started")
                 pm_start = self.env.now
                 self.logger.log(
                     t=self.env.now,
@@ -4472,7 +4740,7 @@ class ManufacturingWorld:
                 machine.pm_count += 1
                 machine.last_pm_at = self.env.now
                 machine.pm_until = self.env.now + self.pm_effect_duration_min
-                machine.state = MachineState.WAIT_INPUT
+                self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="pm_completed")
                 self.logger.log(
                     t=self.env.now,
                     day=self.day_for_time(self.env.now),
@@ -4489,7 +4757,11 @@ class ManufacturingWorld:
 
     def start_machine_cycle(self, machine: Machine) -> str:
         cycle_id = self._next_cycle_id()
-        machine.state = MachineState.PROCESSING
+        self._set_machine_state(machine, MachineState.PROCESSING, reason="cycle_started")
+        if machine.input_material:
+            self._set_item_state(machine.input_material, ItemState.PROCESSING, location=f"Station{machine.station}", ref=machine.machine_id, item_type="material")
+        if machine.input_intermediate:
+            self._set_item_state(machine.input_intermediate, ItemState.PROCESSING, location=f"Station{machine.station}", ref=machine.machine_id, item_type="intermediate")
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -4522,7 +4794,8 @@ class ManufacturingWorld:
         machine.input_material = None
         machine.input_intermediate = None
         machine.output_intermediate = output_id
-        machine.state = MachineState.DONE_WAIT_UNLOAD
+        self._set_item_state(output_id, ItemState.WAITING_MACHINE_UNLOAD, location=f"Station{machine.station}", ref=machine.machine_id, item_type=output_type)
+        self._set_machine_state(machine, MachineState.DONE_WAIT_UNLOAD, reason="cycle_completed")
         self.station_throughput[machine.station] += 1
         self.logger.log(
             t=self.env.now,
@@ -4536,7 +4809,7 @@ class ManufacturingWorld:
     def abort_machine_cycle(self, machine: Machine, cycle_id: str, reason: str) -> None:
         machine.input_material = None
         machine.input_intermediate = None
-        machine.state = MachineState.BROKEN if machine.broken else MachineState.WAIT_INPUT
+        self._set_machine_state(machine, MachineState.BROKEN if machine.broken else MachineState.WAIT_INPUT, reason=reason)
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),

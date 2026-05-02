@@ -80,8 +80,19 @@ function workerMachineTaskPosition(
 
   if (entity.state === "moving") return basePosition;
 
-  const taskKind = typeof entity.attributes.task_kind === "string" ? entity.attributes.task_kind.toUpperCase() : "";
-  if (!["SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"].includes(taskKind)) {
+  const workerState = typeof entity.attributes.worker_state === "string" ? entity.attributes.worker_state.toUpperCase() : "";
+  const taskKind = typeof entity.attributes.current_task_type === "string" ? entity.attributes.current_task_type.toUpperCase() : "";
+  const effectiveTaskKind =
+    workerState === "SETTING_UP_MACHINE"
+      ? "SETUP_MACHINE"
+      : workerState === "UNLOADING_MACHINE"
+        ? "UNLOAD_MACHINE"
+        : workerState === "REPAIRING_MACHINE"
+          ? "REPAIR_MACHINE"
+          : workerState === "PREVENTIVE_MAINTENANCE"
+            ? "PREVENTIVE_MAINTENANCE"
+            : taskKind;
+  if (!["SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"].includes(effectiveTaskKind)) {
     return basePosition;
   }
 
@@ -91,13 +102,20 @@ function workerMachineTaskPosition(
   const targetPosition = resolvedPositions[targetId];
   if (!targetPosition) return basePosition;
 
-  const carried = typeof entity.attributes.carrying_item_type === "string" && entity.attributes.carrying_item_type.trim().length > 0;
+  const cargo = entity.attributes.cargo;
+  const cargoType =
+    cargo && typeof cargo === "object" && typeof (cargo as Record<string, unknown>).item_type === "string"
+      ? String((cargo as Record<string, unknown>).item_type)
+      : typeof entity.attributes.carrying_item_type === "string"
+        ? entity.attributes.carrying_item_type
+        : "";
+  const carried = cargoType.trim().length > 0;
   let offset = { x: -54, y: 6 };
-  if (taskKind === "SETUP_MACHINE") {
+  if (effectiveTaskKind === "SETUP_MACHINE") {
     offset = carried ? { x: -46, y: 8 } : { x: -58, y: 4 };
-  } else if (taskKind === "UNLOAD_MACHINE") {
+  } else if (effectiveTaskKind === "UNLOAD_MACHINE") {
     offset = { x: -34, y: 2 };
-  } else if (taskKind === "REPAIR_MACHINE" || taskKind === "PREVENTIVE_MAINTENANCE") {
+  } else if (effectiveTaskKind === "REPAIR_MACHINE" || effectiveTaskKind === "PREVENTIVE_MAINTENANCE") {
     const targetEntity = entities[targetId];
     const repairTeam = Array.isArray(targetEntity?.attributes?.repair_team)
       ? targetEntity.attributes.repair_team.map((member) => String(member))
@@ -108,7 +126,7 @@ function workerMachineTaskPosition(
       { x: -10, y: 26 },
     ];
     const teamIndex = Math.max(0, repairTeam.indexOf(entity.entity_id));
-    if (taskKind === "REPAIR_MACHINE" && repairTeam.length > 0) {
+    if (effectiveTaskKind === "REPAIR_MACHINE" && repairTeam.length > 0) {
       offset = repairOffsets[teamIndex % repairOffsets.length];
     } else {
       offset = { x: -44, y: 12 };
@@ -222,6 +240,7 @@ export function buildRenderModel(
 
   const nodes: RenderNode[] = entities
     .filter((entity) => {
+      if (typeof entity.attributes.item_state === "string") return false;
       if (options.visibleEntityTypes?.length && !options.visibleEntityTypes.includes(entity.entity_type)) return false;
       if (options.entityIdFilter && entity.entity_id !== options.entityIdFilter) return false;
       if (!matchesSearch(entity, options.searchQuery ?? "")) return false;

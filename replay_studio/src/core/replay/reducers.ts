@@ -261,6 +261,7 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       delete entity.attributes.task_window;
       delete entity.attributes.task_label;
       delete entity.attributes.task_kind;
+      delete entity.attributes.current_task_type;
       delete entity.attributes.task_role;
       mergePayloadAttributes(entity, event.payload);
       entity.updated_at = event.timestamp;

@@ -8,8 +8,8 @@ horizon:
   minutes_per_day: 240
 
 factory:
-  # 이동 작업 에이전트 수
-  num_agents: 3
+  # 이동 작업자 수
+  num_workers: 3
   # Station1, Station2의 machine 수
   machines_per_station: 2
 
@@ -54,7 +54,7 @@ machine_failure:
   # PM이 due로 간주되는 목표 간격
   pm_interval_target_min: 480
 
-agent:
+worker:
   # 배터리 교체가 필요한 사용 주기(분)
   battery_swap_period_min: 200
   # fresh battery 픽업 시간
