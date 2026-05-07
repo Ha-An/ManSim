@@ -182,12 +182,13 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       const entity = upsertEntity(next, primaryId);
       const from = asXY(event.payload.from) ?? entity.position;
       const to = asXY(event.payload.to) ?? asXY(event.payload.position) ?? entity.position;
-      if (to) entity.position = { ...to };
+      if (from) entity.position = { ...from };
       entity.state = "moving";
       entity.updated_at = event.timestamp;
       entity.attributes.motion = {
         from,
         to,
+        path: Array.isArray(event.payload.path) ? event.payload.path : undefined,
         started_at: event.durative?.started_at ?? event.timestamp,
         ended_at: event.durative?.ended_at ?? event.timestamp,
       };

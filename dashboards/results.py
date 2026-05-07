@@ -333,12 +333,16 @@ def _artifact_cards(*, current_page_path: Path, run: dict[str, Any] | None, mani
                 "Cross-run comparison across performance, stability, and knowledge drift.",
             )
         )
+    card_html: list[str] = []
+    for label, href, desc in cards:
+        external_attr = ' target="_blank" rel="noopener noreferrer"' if href.startswith(("http://", "https://")) else ""
+        card_html.append(
+            f"<a class='artifact-card' href='{html.escape(href)}'{external_attr}>"
+            f"<strong>{html.escape(label)}</strong><span>{html.escape(desc)}</span></a>"
+        )
     return (
         "<section class='section'><div class='panel'><h2>Primary Views</h2><div class='artifact-grid'>"
-        + "".join(
-            f"<a class='artifact-card' href='{html.escape(href)}'{(' target=\"_blank\" rel=\"noopener noreferrer\"' if href.startswith(('http://', 'https://')) else '')}><strong>{html.escape(label)}</strong><span>{html.escape(desc)}</span></a>"
-            for label, href, desc in cards
-        )
+        + "".join(card_html)
         + "</div></div></section>"
     )
 

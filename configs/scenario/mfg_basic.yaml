@@ -37,6 +37,14 @@ movement:
   # 그 외 기본 이동 시간
   default_min: 6
 
+map:
+  # Tile 기반 공간 모델. false로 두면 기존 zone-name 이동시간 모델로 fallback한다.
+  enabled: true
+  width_tiles: 100
+  height_tiles: 70
+  tile_time_min: 0.1
+  blocked_replan_threshold_min: 5.0
+
 quality:
   # Inspection에서 scrap으로 판정될 확률(0~1)
   defect_prob: 0.00

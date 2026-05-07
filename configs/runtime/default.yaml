@@ -4,3 +4,6 @@ ui:
   open_artifacts:
     - results_dashboard.html
   streamlit_preferred_port: 8505
+  replay_studio_preferred_port: 5173
+  auto_start_replay_studio: true
+  replay_studio_auto_install: true

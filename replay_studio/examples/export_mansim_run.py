@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 import yaml
 
 from python_event_builder import ReplayEventBuilder
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from manufacturing_sim.simulation.scenarios.manufacturing.grid_map import TileGridMap
+except Exception:  # pragma: no cover - keeps standalone demo exporter usable.
+    TileGridMap = None  # type: ignore[assignment]
 
 
 REGION_ID = {
@@ -136,7 +146,32 @@ def parse_machine_ids(raw_events: List[Dict[str, Any]]) -> List[str]:
     return machine_ids
 
 
-def build_layout(worker_ids: List[str]) -> Dict[str, Any]:
+def _stations_from_scenario(scenario_cfg: Dict[str, Any]) -> List[int]:
+    factory_cfg = scenario_cfg.get("factory", {}) if isinstance(scenario_cfg.get("factory", {}), dict) else {}
+    processing = factory_cfg.get("processing_time_min", {}) if isinstance(factory_cfg.get("processing_time_min", {}), dict) else {}
+    stations: List[int] = []
+    for key in processing:
+        text = str(key)
+        if text.startswith("station") and text.replace("station", "", 1).isdigit():
+            stations.append(int(text.replace("station", "", 1)))
+    return sorted(stations) or [1, 2]
+
+
+def build_layout(worker_ids: List[str], scenario_cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    scenario_cfg = scenario_cfg if isinstance(scenario_cfg, dict) else {}
+    map_cfg = scenario_cfg.get("map", {}) if isinstance(scenario_cfg.get("map", {}), dict) else {}
+    if TileGridMap is not None and bool(map_cfg.get("enabled", True)):
+        factory_cfg = scenario_cfg.get("factory", {}) if isinstance(scenario_cfg.get("factory", {}), dict) else {}
+        try:
+            grid = TileGridMap.from_world_config(
+                scenario_cfg,
+                stations=_stations_from_scenario(scenario_cfg),
+                machines_per_station=int(factory_cfg.get("machines_per_station", 2) or 2),
+            )
+            return grid.to_replay_layout(worker_ids)
+        except Exception:
+            pass
+
     layout: Dict[str, Any] = {
         "source_priority": list(LAYOUT_TEMPLATE["source_priority"]),
         "viewport": dict(LAYOUT_TEMPLATE["viewport"]),
@@ -175,6 +210,36 @@ def layout_positions(layout: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
                 "x": region["position"]["x"] + region["size"]["width"] * anchor["x"],
                 "y": region["position"]["y"] + region["size"]["height"] * anchor["y"],
             }
+    return positions
+
+
+def tile_to_position(layout: Dict[str, Any], tile: Dict[str, Any] | None) -> Dict[str, float] | None:
+    if not isinstance(tile, dict):
+        return None
+    grid = layout.get("grid", {}) if isinstance(layout.get("grid", {}), dict) else {}
+    width_tiles = float(grid.get("width_tiles", 0) or 0)
+    height_tiles = float(grid.get("height_tiles", 0) or 0)
+    viewport = layout.get("viewport", {}) if isinstance(layout.get("viewport", {}), dict) else {}
+    viewport_w = float(viewport.get("width", 1600) or 1600)
+    viewport_h = float(viewport.get("height", 960) or 960)
+    if width_tiles <= 0 or height_tiles <= 0:
+        return None
+    try:
+        x = int(tile.get("x"))
+        y = int(tile.get("y"))
+    except Exception:
+        return None
+    return {"x": (x + 0.5) * (viewport_w / width_tiles), "y": (y + 0.5) * (viewport_h / height_tiles)}
+
+
+def path_tiles_to_positions(layout: Dict[str, Any], tiles: Any) -> List[Dict[str, float]]:
+    if not isinstance(tiles, list):
+        return []
+    positions: List[Dict[str, float]] = []
+    for tile in tiles:
+        position = tile_to_position(layout, tile)
+        if position is not None:
+            positions.append(position)
     return positions
 
 
@@ -268,11 +333,22 @@ def resolve_region_id(location: str | None) -> str | None:
 
 
 def find_move_end_time(raw_events: List[Dict[str, Any]], start_index: int, entity_id: str, target_location: str) -> float | None:
+    start_t = float(raw_events[start_index].get("t", 0.0) or 0.0)
     for offset in range(start_index + 1, len(raw_events)):
         candidate = raw_events[offset]
-        if candidate["type"] != "AGENT_MOVE_END":
-            continue
         if candidate["entity_id"] != entity_id:
+            continue
+        if candidate["type"] == "AGENT_MOVE_INTERRUPTED":
+            return float(candidate["t"])
+        if candidate["type"] == "AGENT_MOVE_START":
+            same_start_move = (
+                abs(float(candidate.get("t", 0.0) or 0.0) - start_t) <= 1e-9
+                and candidate.get("details", {}).get("to", candidate.get("location")) == target_location
+            )
+            if same_start_move:
+                continue
+            return None
+        if candidate["type"] != "AGENT_MOVE_END":
             continue
         if candidate["details"].get("to", candidate.get("location")) != target_location:
             continue
@@ -486,32 +562,38 @@ def convert_events(
             return "maintenance"
         return "working"
 
-    def canonical_motion_attributes(details: Dict[str, Any]) -> Dict[str, Any] | None:
+    def canonical_motion_attributes(details: Dict[str, Any], event_index: int, worker_id: str) -> Dict[str, Any] | None:
         motion = details.get("motion")
         if not isinstance(motion, dict):
             return None
+        path_positions = path_tiles_to_positions(layout, motion.get("path_tiles"))
+        from_tile_position = tile_to_position(layout, motion.get("from_tile"))
+        to_tile_position = tile_to_position(layout, motion.get("to_tile"))
         from_region = resolve_region_id(str(motion.get("from") or ""))
         to_region = resolve_region_id(str(motion.get("to") or ""))
-        if not from_region or not to_region:
-            return None
-        from_position = positions.get(from_region)
-        to_position = positions.get(to_region)
+        from_position = from_tile_position or positions.get(from_region or "")
+        to_position = to_tile_position or positions.get(to_region or "")
         if not from_position or not to_position:
             return None
         started_at = float(motion.get("started_at", 0.0) or 0.0)
-        ended_at = float(motion.get("ended_at", started_at) or started_at)
-        return {
+        planned_ended_at = float(motion.get("ended_at", started_at) or started_at)
+        actual_ended_at = find_move_end_time(raw_events, event_index, worker_id, str(motion.get("to") or ""))
+        ended_at = actual_ended_at if actual_ended_at is not None else planned_ended_at
+        payload = {
             "from": from_position,
             "to": to_position,
             "started_at": started_at,
             "ended_at": ended_at,
         }
+        if path_positions:
+            payload["path"] = path_positions
+        return payload
 
-    def canonical_worker_attributes(details: Dict[str, Any]) -> Dict[str, Any]:
+    def canonical_worker_attributes(details: Dict[str, Any], event_index: int, worker_id: str) -> Dict[str, Any]:
         attrs: Dict[str, Any] = {}
         if "worker_state" in details:
             attrs["worker_state"] = details.get("worker_state")
-        resolved_motion = canonical_motion_attributes(details)
+        resolved_motion = canonical_motion_attributes(details, event_index, worker_id)
         if resolved_motion:
             attrs["motion"] = resolved_motion
         if "cargo" in details:
@@ -543,15 +625,17 @@ def convert_events(
         if raw_type == "WORKER_STATE_CHANGED" and entity_id:
             worker_state = str(details.get("worker_state", "IDLE"))
             region_id = resolve_region_id(location)
+            tile_position = tile_to_position(layout, details.get("tile"))
             push(
                 "state_changed",
                 timestamp,
                 {"primary": entity_id},
                 {
                     "state": state_for_worker_state(worker_state),
-                    "position": worker_region_slot(region_id, entity_id, layout)
+                    "position": tile_position
+                    or worker_region_slot(region_id, entity_id, layout)
                     or positions.get(region_id or "", positions.get("warehouse_region")),
-                    "attributes": canonical_worker_attributes(details),
+                    "attributes": canonical_worker_attributes(details, index, entity_id),
                 },
             )
             continue
@@ -615,15 +699,19 @@ def convert_events(
                 continue
             source = resolve_region_id(details.get("from"))
             target = resolve_region_id(details.get("to"))
-            if entity_id and source and target:
+            path_positions = path_tiles_to_positions(layout, details.get("path_tiles"))
+            from_position = tile_to_position(layout, details.get("from_tile")) or (positions.get(source) if source else None)
+            to_position = tile_to_position(layout, details.get("to_tile")) or (positions.get(target) if target else None)
+            if entity_id and source and target and from_position and to_position:
                 end_time = find_move_end_time(raw_events, index, entity_id, details.get("to"))
                 push(
                     "entity_moved",
                     timestamp,
                     {"primary": entity_id, "source": source, "target": target},
                     {
-                        "from": positions[source],
-                        "to": positions[target],
+                        "from": from_position,
+                        "to": to_position,
+                        "path": path_positions,
                         "label": f"{details.get('from', '')} -> {details.get('to', '')}",
                     },
                     durative={
@@ -1126,15 +1214,28 @@ def load_scenario_runtime(run_dir: Path) -> Dict[str, float]:
     return runtime
 
 
+def load_scenario_config(run_dir: Path) -> Dict[str, Any]:
+    config_path = run_dir / ".hydra" / "config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    scenario_cfg = config.get("scenario", {}) if isinstance(config.get("scenario", {}), dict) else {}
+    return scenario_cfg
+
+
 def export_run(run_dir: Path, output_log: Path, output_layout: Path) -> None:
     raw_events = load_jsonl(run_dir / "events.jsonl")
     run_meta = load_json(run_dir / "run_meta.json")
     worker_ids = parse_worker_ids(run_meta, raw_events)
     machine_ids = parse_machine_ids(raw_events)
+    scenario_cfg = load_scenario_config(run_dir)
     runtime_cfg = load_scenario_runtime(run_dir)
     battery_period_min = float(runtime_cfg.get("battery_period_min", 200.0))
     repair_total_min = float(runtime_cfg.get("repair_time_min", 20.0))
-    layout = build_layout(worker_ids)
+    layout = build_layout(worker_ids, scenario_cfg)
     converted_events = convert_events(raw_events, layout, battery_period_min, repair_total_min)
 
     replay_log = {

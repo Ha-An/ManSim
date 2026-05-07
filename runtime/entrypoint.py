@@ -3,8 +3,10 @@ from __future__ import annotations
 import copy
 import json
 import os
+import socket
 import subprocess
 import sys
+import time
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -76,8 +78,80 @@ def _open_artifact(path: Path) -> None:
         pass
 
 
+def _runtime_ui_cfg(cfg: DictConfig) -> dict[str, Any] | DictConfig:
+    runtime_cfg = cfg.get("runtime", {}) if isinstance(cfg.get("runtime", {}), DictConfig) else cfg.get("runtime", {})
+    ui_cfg = runtime_cfg.get("ui", {}) if isinstance(runtime_cfg, (dict, DictConfig)) else {}
+    return ui_cfg if isinstance(ui_cfg, (dict, DictConfig)) else {}
+
+
+def _tcp_port_open(host: str, port: int, timeout_sec: float = 0.3) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout_sec):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_replay_studio_server(cfg: DictConfig) -> None:
+    ui_cfg = _runtime_ui_cfg(cfg)
+    if not bool(ui_cfg.get("auto_start_replay_studio", True)):
+        return
+    if not bool(ui_cfg.get("auto_open_results", False)):
+        return
+
+    port = int(ui_cfg.get("replay_studio_preferred_port", 5173) or 5173)
+    if _tcp_port_open("127.0.0.1", port):
+        return
+
+    repo_root = Path(__file__).resolve().parents[1]
+    app_dir = repo_root / "replay_studio"
+    package_json = app_dir / "package.json"
+    if not package_json.exists():
+        return
+
+    npm = "npm.cmd" if os.name == "nt" else "npm"
+    log_dir = repo_root / ".tooling" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    if not (app_dir / "node_modules").exists() and bool(ui_cfg.get("replay_studio_auto_install", True)):
+        try:
+            with (log_dir / "replay_studio_install.stdout.log").open("a", encoding="utf-8") as stdout, (
+                log_dir / "replay_studio_install.stderr.log"
+            ).open("a", encoding="utf-8") as stderr:
+                subprocess.run(
+                    [npm, "install"],
+                    cwd=str(app_dir),
+                    check=True,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout=180,
+                )
+        except Exception:
+            return
+
+    stdout = (log_dir / "replay_studio.stdout.log").open("a", encoding="utf-8")
+    stderr = (log_dir / "replay_studio.stderr.log").open("a", encoding="utf-8")
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        subprocess.Popen(
+            [npm, "run", "dev", "--", "--host", "127.0.0.1", "--port", str(port)],
+            cwd=str(app_dir),
+            stdout=stdout,
+            stderr=stderr,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+    except Exception:
+        return
+
+    for _ in range(20):
+        if _tcp_port_open("127.0.0.1", port):
+            return
+        time.sleep(0.25)
+
+
 def _open_selected_artifacts(output_root: Path, child_output_dir: Path, cfg: DictConfig) -> None:
-    ui_cfg = cfg.get("runtime", {}).get("ui", {}) if isinstance(cfg.get("runtime", {}).get("ui", {}), DictConfig) else cfg.get("runtime", {}).get("ui", {})
+    ui_cfg = _runtime_ui_cfg(cfg)
     if not isinstance(ui_cfg, (dict, DictConfig)):
         return
     auto_open = bool(ui_cfg.get("auto_open_results", False))
@@ -252,21 +326,13 @@ def _refresh_dashboard_suite(
     analysis = build_series_analysis(parent_output_dir=runtime_output_dir, summary_payload=summary_payload)
     analysis_path = runtime_output_dir / "series_analysis.json"
     _write_json(analysis_path, analysis)
+    ui_cfg = _runtime_ui_cfg(cfg)
     manifest = build_dashboard_manifest(
         root_output_dir=runtime_output_dir,
         summary_payload=summary_payload,
         analysis_payload=analysis,
-        streamlit_port=int(
-            (
-                (
-                    cfg.get("runtime", {}).get("ui", {})
-                    if isinstance(cfg.get("runtime", {}).get("ui", {}), DictConfig)
-                    else cfg.get("runtime", {}).get("ui", {})
-                )
-                or {}
-            ).get("streamlit_preferred_port", 8505)
-            or 8505
-        ),
+        streamlit_port=int(ui_cfg.get("streamlit_preferred_port", 8505) or 8505),
+        replay_studio_port=int(ui_cfg.get("replay_studio_preferred_port", 5173) or 5173),
     )
     manifest_paths = write_dashboard_manifests(root_output_dir=runtime_output_dir, manifest=manifest)
     root_manifest_path = Path(str(manifest_paths.get("root", runtime_output_dir / "dashboard_manifest.json")))
@@ -320,6 +386,7 @@ def _refresh_dashboard_suite(
         summary_payload=summary_payload,
         analysis_payload=analysis,
         streamlit_port=int(manifest.get("streamlit_preferred_port", 8505) or 8505),
+        replay_studio_port=int(manifest.get("replay_studio_preferred_port", 5173) or 5173),
     )
     manifest_paths = write_dashboard_manifests(root_output_dir=runtime_output_dir, manifest=manifest)
     return analysis, manifest
@@ -471,6 +538,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     child_output_dir = Path(str(last_result.get("output_dir", runtime_output_dir)))
+    _ensure_replay_studio_server(cfg)
     _open_selected_artifacts(runtime_output_dir, child_output_dir, cfg)
     print(json.dumps(last_result["kpi"], indent=2, ensure_ascii=False))
 

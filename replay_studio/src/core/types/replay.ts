@@ -1,6 +1,6 @@
 import type { ReplayEvent } from "./event";
 import type { DomainState, BaseEntityState, InteractionState, XY } from "./entity";
-import type { LayoutConfig, LayoutRegionConfig } from "./layout";
+import type { LayoutConfig, LayoutGridConfig, LayoutRegionConfig } from "./layout";
 import type { ReplayCheckpoint, ReplaySnapshot } from "./snapshot";
 
 export interface ReplayMetadata {
@@ -51,6 +51,7 @@ export interface RenderFlow {
 
 export interface ReplayRenderModel {
   regions: RenderRegion[];
+  grid?: LayoutGridConfig;
   nodes: RenderNode[];
   flows: RenderFlow[];
   selectedEntity?: BaseEntityState;

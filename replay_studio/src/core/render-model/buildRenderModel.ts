@@ -8,6 +8,7 @@ import { getActiveInteractions, getFocusedEntityIds } from "../replay/selectors"
 interface MotionMeta {
   from?: { x: number; y: number };
   to?: { x: number; y: number };
+  path?: Array<{ x: number; y: number }>;
   started_at?: number;
   ended_at?: number;
 }
@@ -68,85 +69,28 @@ function createVirtualOutputQueues(domainState: DomainState): BaseEntityState[] 
   return virtualQueues;
 }
 
-function workerMachineTaskPosition(
-  entity: BaseEntityState,
-  basePosition: { x: number; y: number },
-  entities: Record<string, BaseEntityState>,
-  resolvedPositions: Record<string, { x: number; y: number }>,
-): { x: number; y: number } {
-  if (entity.entity_type !== "worker" && entity.entity_type !== "robot" && entity.entity_type !== "transporter") {
-    return basePosition;
-  }
-
-  if (entity.state === "moving") return basePosition;
-
-  const workerState = typeof entity.attributes.worker_state === "string" ? entity.attributes.worker_state.toUpperCase() : "";
-  const taskKind = typeof entity.attributes.current_task_type === "string" ? entity.attributes.current_task_type.toUpperCase() : "";
-  const effectiveTaskKind =
-    workerState === "SETTING_UP_MACHINE"
-      ? "SETUP_MACHINE"
-      : workerState === "UNLOADING_MACHINE"
-        ? "UNLOAD_MACHINE"
-        : workerState === "REPAIRING_MACHINE"
-          ? "REPAIR_MACHINE"
-          : workerState === "PREVENTIVE_MAINTENANCE"
-            ? "PREVENTIVE_MAINTENANCE"
-            : taskKind;
-  if (!["SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"].includes(effectiveTaskKind)) {
-    return basePosition;
-  }
-
-  const targetId = typeof entity.attributes.active_target_id === "string" ? entity.attributes.active_target_id : "";
-  if (!targetId) return basePosition;
-
-  const targetPosition = resolvedPositions[targetId];
-  if (!targetPosition) return basePosition;
-
-  const cargo = entity.attributes.cargo;
-  const cargoType =
-    cargo && typeof cargo === "object" && typeof (cargo as Record<string, unknown>).item_type === "string"
-      ? String((cargo as Record<string, unknown>).item_type)
-      : typeof entity.attributes.carrying_item_type === "string"
-        ? entity.attributes.carrying_item_type
-        : "";
-  const carried = cargoType.trim().length > 0;
-  let offset = { x: -54, y: 6 };
-  if (effectiveTaskKind === "SETUP_MACHINE") {
-    offset = carried ? { x: -46, y: 8 } : { x: -58, y: 4 };
-  } else if (effectiveTaskKind === "UNLOAD_MACHINE") {
-    offset = { x: -34, y: 2 };
-  } else if (effectiveTaskKind === "REPAIR_MACHINE" || effectiveTaskKind === "PREVENTIVE_MAINTENANCE") {
-    const targetEntity = entities[targetId];
-    const repairTeam = Array.isArray(targetEntity?.attributes?.repair_team)
-      ? targetEntity.attributes.repair_team.map((member) => String(member))
-      : [];
-    const repairOffsets = [
-      { x: -56, y: -12 },
-      { x: -58, y: 18 },
-      { x: -10, y: 26 },
-    ];
-    const teamIndex = Math.max(0, repairTeam.indexOf(entity.entity_id));
-    if (effectiveTaskKind === "REPAIR_MACHINE" && repairTeam.length > 0) {
-      offset = repairOffsets[teamIndex % repairOffsets.length];
-    } else {
-      offset = { x: -44, y: 12 };
-    }
-  }
-  return {
-    x: targetPosition.x + offset.x,
-    y: targetPosition.y + offset.y,
-  };
-}
-
 function interpolatePosition(entity: BaseEntityState, basePosition: { x: number; y: number }, currentTime: number) {
   const motion = entity.attributes.motion as MotionMeta | undefined;
   if (!motion?.from || !motion?.to || motion.started_at === undefined || motion.ended_at === undefined) {
     return basePosition;
   }
   if (currentTime <= motion.started_at) return motion.from;
-  if (currentTime >= motion.ended_at || entity.state !== "moving") return basePosition;
+  if (currentTime >= motion.ended_at) return motion.to;
+  if (entity.state !== "moving") return basePosition;
   const span = Math.max(0.0001, motion.ended_at - motion.started_at);
   const ratio = (currentTime - motion.started_at) / span;
+  if (Array.isArray(motion.path) && motion.path.length >= 2) {
+    const clampedRatio = Math.max(0, Math.min(1, ratio));
+    const scaled = clampedRatio * (motion.path.length - 1);
+    const index = Math.min(motion.path.length - 2, Math.floor(scaled));
+    const local = scaled - index;
+    const source = motion.path[index];
+    const target = motion.path[index + 1];
+    return {
+      x: source.x + (target.x - source.x) * local,
+      y: source.y + (target.y - source.y) * local,
+    };
+  }
   return {
     x: motion.from.x + (motion.to.x - motion.from.x) * ratio,
     y: motion.from.y + (motion.to.y - motion.from.y) * ratio,
@@ -264,10 +208,9 @@ export function buildRenderModel(
       if (entity.attributes.virtual && derivedFromQueue) {
         entity.attributes.queue_size = domainState.queues[derivedFromQueue]?.item_ids.length ?? 0;
       }
-      const visualPosition = workerMachineTaskPosition(entity, basePosition, domainState.entities, resolvedLayout.positions);
       return {
         entity,
-        position: interpolatePosition(entity, visualPosition, currentTime),
+        position: interpolatePosition(entity, basePosition, currentTime),
         selected: entity.entity_id === options.selectedEntityId,
         focused: !options.followSelected || focusedEntityIds.size === 0 || focusedEntityIds.has(entity.entity_id),
       };
@@ -299,6 +242,7 @@ export function buildRenderModel(
 
   return {
     regions,
+    grid: options.externalLayout?.grid ?? options.logLayout?.grid,
     nodes,
     flows,
     selectedEntity: options.selectedEntityId ? domainState.entities[options.selectedEntityId] : undefined,

@@ -82,6 +82,10 @@ class Machine:
 class Worker:
     worker_id: str
     location: str = "Home"
+    tile: tuple[int, int] | None = None
+    reserved_tile: tuple[int, int] | None = None
+    movement_path: list[tuple[int, int]] = field(default_factory=list)
+    movement_target_tile: tuple[int, int] | None = None
     state: WorkerState = WorkerState.IDLE
     discharged: bool = False
     discharged_since: Optional[float] = None

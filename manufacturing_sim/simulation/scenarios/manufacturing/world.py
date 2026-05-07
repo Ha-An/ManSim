@@ -28,6 +28,7 @@ from manufacturing_sim.simulation.scenarios.manufacturing.entities import (
     Worker,
     WorkerState,
 )
+from manufacturing_sim.simulation.scenarios.manufacturing.grid_map import Tile, TileGridMap
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
 
 
@@ -190,6 +191,18 @@ class ManufacturingWorld:
         self.task_counter = itertools.count(1)
         self.machine_cycle_counter = itertools.count(1)
 
+        map_cfg = cfg.get("map", {}) if isinstance(cfg.get("map", {}), dict) else {}
+        self.map_enabled = bool(map_cfg.get("enabled", True))
+        self.grid_map: TileGridMap | None = (
+            TileGridMap.from_world_config(
+                cfg,
+                stations=self.stations,
+                machines_per_station=self.machines_per_station,
+            )
+            if self.map_enabled
+            else None
+        )
+
         self.machines: dict[str, Machine] = {}
         self.machines_by_station: dict[int, list[str]] = {station: [] for station in self.stations}
         self._build_machines()
@@ -247,7 +260,10 @@ class ManufacturingWorld:
     def _build_workers(self) -> None:
         for idx in range(1, self.num_workers + 1):
             worker_id = f"A{idx}"
-            self.workers[worker_id] = Worker(worker_id=worker_id, location="Home")
+            worker = Worker(worker_id=worker_id, location="Home")
+            if self.grid_map is not None:
+                worker.tile = self.grid_map.register_worker(worker_id, self.grid_map.initial_worker_tile(worker_id))
+            self.workers[worker_id] = worker
 
     def bootstrap(self) -> None:
         from manufacturing_sim.simulation.scenarios.manufacturing import processes
@@ -1013,6 +1029,67 @@ class ManufacturingWorld:
                 return "inter_station_transfer"
         return str(task.priority_key).strip() or str(task.task_type).strip().lower()
 
+    def _tile_payload(self, tile: Tile | None) -> dict[str, int] | None:
+        if tile is None:
+            return None
+        return {"x": int(tile[0]), "y": int(tile[1])}
+
+    def _object_service_tile_payload(self, agent: Worker, object_id: str) -> dict[str, Any] | None:
+        grid = self.grid_map
+        if grid is None:
+            return None
+        normalized = grid.normalize_location(str(object_id))
+        obj = grid.objects.get(normalized)
+        if obj is None:
+            return None
+        tile = agent.tile
+        service_tiles = set(grid.service_tiles.get(normalized, []))
+        side = ""
+        if tile is not None:
+            if tile[1] == obj.y - 1 and obj.x <= tile[0] < obj.x + obj.width:
+                side = "north"
+            elif tile[1] == obj.y + obj.height and obj.x <= tile[0] < obj.x + obj.width:
+                side = "south"
+            elif tile[0] == obj.x - 1 and obj.y <= tile[1] < obj.y + obj.height:
+                side = "west"
+            elif tile[0] == obj.x + obj.width and obj.y <= tile[1] < obj.y + obj.height:
+                side = "east"
+        return {
+            "service_object_id": normalized,
+            "service_object_type": obj.object_type,
+            "service_tile": self._tile_payload(tile),
+            "service_tile_valid": tile in service_tiles if tile is not None else False,
+            "interaction_side": side,
+            "object_footprint": {
+                "x": int(obj.x),
+                "y": int(obj.y),
+                "width": int(obj.width),
+                "height": int(obj.height),
+            },
+        }
+
+    def _confirm_object_service_tile(self, agent: Worker, object_id: str, task: Task, purpose: str) -> bool:
+        payload = self._object_service_tile_payload(agent, object_id)
+        if payload is None:
+            return True
+        payload.update(
+            {
+                "task_id": task.task_id,
+                "task_type": task.task_type,
+                "purpose": purpose,
+            }
+        )
+        valid = bool(payload.get("service_tile_valid"))
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="AGENT_SERVICE_TILE" if valid else "AGENT_SERVICE_TILE_VIOLATION",
+            entity_id=agent.agent_id,
+            location=self.agent_display_location(agent),
+            details=payload,
+        )
+        return valid
+
     def capture_snapshot(self) -> None:
         t = self.env.now
         self.minute_snapshots.append(
@@ -1023,6 +1100,11 @@ class ManufacturingWorld:
                 "intermediate_queue_lengths": {k: len(v) for k, v in self.intermediate_queues.items()},
                 "output_buffer_lengths": {k: len(v) for k, v in self.output_buffers.items()},
                 "machine_states": {mid: m.state.value for mid, m in self.machines.items()},
+                "worker_tiles": {
+                    worker_id: self._tile_payload(worker.tile)
+                    for worker_id, worker in self.workers.items()
+                    if worker.tile is not None
+                },
                 "inspection_active_agents": self.inspection_active_agents,
                 "incident_count": len(self.incident_events),
                 "commitment_count": sum(len(rows) for rows in self.current_commitments().values()),
@@ -1081,6 +1163,8 @@ class ManufacturingWorld:
                 "current_task_type": worker.current_task_type or "",
                 "cargo": self._worker_cargo_payload(worker),
                 "motion": self._worker_motion_payload(worker),
+                "tile": self._tile_payload(worker.tile),
+                "reserved_tile": self._tile_payload(worker.reserved_tile),
                 "battery_remaining_min": round(float(self.battery_remaining(worker)), 3),
             },
         )
@@ -1098,11 +1182,16 @@ class ManufacturingWorld:
         to_zone: str,
         progress: float,
         total_min: float,
+        *,
+        path_tiles: list[Tile] | None = None,
+        target_tile: Tile | None = None,
     ) -> None:
         worker.in_transit_from = str(from_zone)
         worker.in_transit_to = str(to_zone)
         worker.in_transit_progress = min(1.0, max(0.0, float(progress)))
         worker.in_transit_total_min = max(0.0, float(total_min))
+        worker.movement_path = list(path_tiles or [])
+        worker.movement_target_tile = target_tile
         self._set_worker_state(worker, WorkerState.MOVING, reason="motion")
 
     def _worker_motion_payload(self, worker: Worker) -> dict[str, Any] | None:
@@ -1118,6 +1207,9 @@ class ManufacturingWorld:
             "total_min": total_min,
             "started_at": round(started_at, 3),
             "ended_at": round(started_at + total_min, 3),
+            "from_tile": self._tile_payload(worker.movement_path[0]) if worker.movement_path else self._tile_payload(worker.tile),
+            "to_tile": self._tile_payload(worker.movement_target_tile),
+            "path_tiles": [self._tile_payload(tile) for tile in worker.movement_path],
         }
 
     def _set_worker_cargo(
@@ -2247,7 +2339,7 @@ class ManufacturingWorld:
 
     def _battery_swap_service_min(self, agent: Agent) -> float:
         origin = self.agent_display_location(agent)
-        return float(self.travel_time(origin, "BatteryStation")) + float(self.agent_cfg["battery_pickup_time_min"])
+        return float(self.travel_time(origin, "battery_rack")) + float(self.agent_cfg["battery_pickup_time_min"])
 
     def _battery_mandatory_threshold(self, agent: Agent) -> float:
         configured = float(self._rule("world.battery.mandatory_swap_threshold_min", 15.0))
@@ -2276,31 +2368,31 @@ class ManufacturingWorld:
             future_team_size = min(self.max_repair_agents, active_helpers + (0 if agent.agent_id in machine.repair_team else 1))
             future_team_size = max(1, future_team_size)
             remaining = float(machine.repair_work_remaining_min) if machine.repair_work_remaining_min > 0.0 else self._repair_total_work_min()
-            return float(self.travel_time(self.agent_display_location(agent), f"Station{machine.station}")) + (remaining / future_team_size)
+            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + (remaining / future_team_size)
         if task_type == "PREVENTIVE_MAINTENANCE":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
-            return float(self.travel_time(self.agent_display_location(agent), f"Station{machine.station}")) + float(self.machine_failure_cfg["pm_time_min"])
+            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + float(self.machine_failure_cfg["pm_time_min"])
         if task_type == "UNLOAD_MACHINE":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
-            return float(self.travel_time(self.agent_display_location(agent), f"Station{machine.station}")) + float(self.movement_cfg["unload_min"])
+            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + float(self.movement_cfg["unload_min"])
         if task_type == "SETUP_MACHINE":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
             needs_intermediate = self._station_requires_intermediate(machine.station)
             setup_steps = 2 if needs_intermediate else 1
-            return float(self.travel_time(self.agent_display_location(agent), f"Station{machine.station}")) + float(self.movement_cfg["setup_min"]) * setup_steps
+            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + float(self.movement_cfg["setup_min"]) * setup_steps
         if task_type == "INSPECT_PRODUCT":
-            return float(self.travel_time(self.agent_display_location(agent), "Inspection")) + float(self.inspection_base_time_min)
+            return float(self.travel_time(self.agent_display_location(agent), "intermediate_queue_4")) + float(self.inspection_base_time_min)
         if task_type == "TRANSFER":
             transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
             if transfer_kind == "material_supply":
                 station = int(task.payload.get("station", 1) or 1)
-                return float(self.travel_time(self.agent_display_location(agent), "Warehouse")) + float(self.travel_time("Warehouse", f"Station{station}"))
+                return float(self.travel_time(self.agent_display_location(agent), "Warehouse")) + float(self.travel_time("Warehouse", f"material_queue_{station}"))
             if transfer_kind == "inter_station":
                 from_station = int(task.payload.get("from_station", 1) or 1)
                 from_location = "Inspection" if from_station == self.inspection_queue_station else f"Station{from_station}"
@@ -2309,15 +2401,19 @@ class ManufacturingWorld:
                 else:
                     next_station = from_station + 1
                     to_location = f"Station{next_station}" if next_station <= self.last_processing_station else "Inspection"
-                return float(self.travel_time(self.agent_display_location(agent), from_location)) + float(self.travel_time(from_location, to_location))
+                from_target = f"output_buffer_station_{from_station}"
+                to_target = "warehouse_buffer" if from_station == self.inspection_queue_station else (
+                    f"intermediate_queue_{from_station + 1}" if (from_station + 1) <= self.last_processing_station else "intermediate_queue_4"
+                )
+                return float(self.travel_time(self.agent_display_location(agent), from_target)) + float(self.travel_time(from_location, to_target))
             if transfer_kind == "battery_delivery":
                 target_agent = self.agents.get(str(task.payload.get("target_agent_id", "")))
                 if target_agent is None:
                     return self._battery_swap_service_min(agent)
                 return (
-                    float(self.travel_time(self.agent_display_location(agent), "BatteryStation"))
+                    float(self.travel_time(self.agent_display_location(agent), "battery_rack"))
                     + float(self.agent_cfg["battery_pickup_time_min"])
-                    + float(self.travel_time("BatteryStation", self.agent_display_location(target_agent)))
+                    + float(self.travel_time("battery_rack", self.agent_display_location(target_agent)))
                     + float(self.agent_cfg["battery_delivery_extra_min"])
                 )
         return 0.0
@@ -2377,6 +2473,9 @@ class ManufacturingWorld:
         agent.in_transit_to = None
         agent.in_transit_progress = 0.0
         agent.in_transit_total_min = 0.0
+        agent.reserved_tile = None
+        agent.movement_path = []
+        agent.movement_target_tile = None
 
     def _set_in_transit(self, agent: Agent, from_zone: str, to_zone: str, progress: float, total_min: float) -> None:
         agent.in_transit_from = str(from_zone)
@@ -2503,6 +2602,10 @@ class ManufacturingWorld:
         *,
         emit_move_events: bool = True,
     ) -> str | None:
+        if self.grid_map is not None:
+            yield from self.move_agent(mover, target.agent_id, emit_move_events=emit_move_events)
+            return self.agent_display_location(target)
+
         if not self._has_in_transit_position(target):
             yield from self.move_agent(mover, target.location, emit_move_events=emit_move_events)
             for _ in range(2):
@@ -4023,6 +4126,9 @@ class ManufacturingWorld:
         return tasks
 
     def travel_time(self, src: str, dst: str) -> float:
+        if self.grid_map is not None:
+            return float(self.grid_map.travel_time(src, dst))
+
         def _is_station_zone(zone: str) -> bool:
             return zone.startswith("Station") or zone == "Inspection"
 
@@ -4036,7 +4142,194 @@ class ManufacturingWorld:
             return float(self.movement_cfg["to_battery_station_min"])
         return float(self.movement_cfg["default_min"])
 
+    def _grid_logical_destination(self, dst: str) -> str:
+        if self.grid_map is None:
+            return str(dst)
+        normalized = self.grid_map.normalize_location(dst)
+        target_agent = self.agents.get(normalized)
+        if target_agent is not None:
+            return str(target_agent.location)
+        return self.grid_map.logical_location(normalized)
+
+    def _move_agent_grid(self, agent: Agent, dst: str, emit_move_events: bool = True):
+        grid = self.grid_map
+        if grid is None:
+            return
+
+        eps = 1e-6
+        if agent.tile is None:
+            agent.tile = grid.register_worker(agent.agent_id, grid.initial_worker_tile(agent.agent_id))
+        elif grid.worker_tiles.get(agent.agent_id) != agent.tile:
+            agent.tile = grid.register_worker(agent.agent_id, agent.tile)
+
+        logical_dst = self._grid_logical_destination(dst)
+        start_tile = agent.tile
+        blocked_started_at: float | None = None
+        blocked_event_emitted = False
+        movement_started = False
+        planned_path: list[Tile] = [start_tile]
+        planned_duration = 0.0
+
+        while True:
+            current_tile = agent.tile
+            if current_tile is None:
+                return
+            destination_tiles = grid.destination_tiles(dst, worker_id=agent.agent_id, from_tile=current_tile)
+            if current_tile in destination_tiles:
+                break
+
+            path = grid.find_path(current_tile, destination_tiles, worker_id=agent.agent_id)
+            if not path or len(path) < 2:
+                if blocked_started_at is None:
+                    blocked_started_at = float(self.env.now)
+                blocked_for = float(self.env.now) - blocked_started_at
+                if blocked_for >= grid.blocked_replan_threshold_min and not blocked_event_emitted:
+                    blocked_event_emitted = True
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type="AGENT_TILE_BLOCKED",
+                        entity_id=agent.agent_id,
+                        location=self.agent_display_location(agent),
+                        details={
+                            "destination": str(dst),
+                            "logical_destination": logical_dst,
+                            "from_tile": self._tile_payload(current_tile),
+                            "blocked_for_min": round(blocked_for, 3),
+                        },
+                    )
+                yield self.env.timeout(grid.tile_time_min)
+                continue
+
+            if not movement_started:
+                movement_started = True
+                planned_path = path
+                planned_duration = max(0.0, float(len(path) - 1) * grid.tile_time_min)
+                self._set_in_transit(agent, str(agent.location), logical_dst, 0.0, planned_duration)
+                self._set_worker_motion(
+                    agent,
+                    str(agent.location),
+                    logical_dst,
+                    0.0,
+                    planned_duration,
+                    path_tiles=planned_path,
+                    target_tile=path[-1],
+                )
+                if emit_move_events:
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type="AGENT_MOVE_START",
+                        entity_id=agent.agent_id,
+                        location=str(agent.location),
+                        details={
+                            "from": str(agent.location),
+                            "to": logical_dst,
+                            "duration": round(planned_duration, 3),
+                            "from_tile": self._tile_payload(current_tile),
+                            "to_tile": self._tile_payload(path[-1]),
+                            "path_tiles": [self._tile_payload(tile) for tile in path],
+                            "tile_time_min": round(float(grid.tile_time_min), 6),
+                        },
+                    )
+
+            next_tile = path[1]
+            if not grid.try_reserve(agent.agent_id, next_tile):
+                if blocked_started_at is None:
+                    blocked_started_at = float(self.env.now)
+                yield self.env.timeout(grid.tile_time_min)
+                continue
+
+            blocked_started_at = None
+            agent.reserved_tile = next_tile
+
+            if self._should_interrupt_for_battery(agent, eps):
+                grid.release_reservation(agent.agent_id, next_tile)
+                agent.reserved_tile = None
+                if not agent.discharged:
+                    self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
+                raise simpy.Interrupt("battery_depleted")
+
+            remaining = self.battery_remaining(agent)
+            if not self._battery_interrupt_exempt(agent) and remaining + eps < grid.tile_time_min:
+                try:
+                    yield self.env.timeout(max(eps, remaining))
+                finally:
+                    grid.release_reservation(agent.agent_id, next_tile)
+                    agent.reserved_tile = None
+                if not agent.discharged:
+                    self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
+                raise simpy.Interrupt("battery_depleted")
+
+            try:
+                yield self.env.timeout(grid.tile_time_min)
+            except simpy.Interrupt:
+                grid.release_reservation(agent.agent_id, next_tile)
+                agent.reserved_tile = None
+                raise
+
+            grid.move_worker_to_reserved(agent.agent_id, next_tile)
+            agent.tile = next_tile
+            agent.reserved_tile = None
+            if planned_duration > 1e-9 and planned_path:
+                try:
+                    current_index = max(0, planned_path.index(next_tile))
+                    progress = min(1.0, max(0.0, current_index / max(1, len(planned_path) - 1)))
+                except ValueError:
+                    progress = min(1.0, float(agent.in_transit_progress) + (grid.tile_time_min / planned_duration))
+                self._set_in_transit(agent, str(agent.location), logical_dst, progress, planned_duration)
+
+        old_location = str(agent.location)
+        agent.location = logical_dst
+        self._clear_in_transit(agent)
+        if movement_started:
+            if emit_move_events:
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="AGENT_MOVE_END",
+                    entity_id=agent.agent_id,
+                    location=logical_dst,
+                    details={
+                        "from": old_location,
+                        "to": logical_dst,
+                        "from_tile": self._tile_payload(start_tile),
+                        "to_tile": self._tile_payload(agent.tile),
+                    },
+                )
+            else:
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="AGENT_RELOCATED",
+                    entity_id=agent.agent_id,
+                    location=logical_dst,
+                    details={
+                        "from": old_location,
+                        "to": logical_dst,
+                        "duration": round(planned_duration, 3),
+                        "from_tile": self._tile_payload(start_tile),
+                        "to_tile": self._tile_payload(agent.tile),
+                    },
+                )
+        if agent.current_task_type:
+            task = Task(
+                task_id=str(agent.current_task_id or ""),
+                task_type=str(agent.current_task_type),
+                priority_key="",
+                priority=0.0,
+                location=logical_dst,
+                payload={},
+            )
+            self._set_worker_state(agent, self._worker_state_for_task(agent, task), reason="arrived_for_task", task_id=agent.current_task_id)
+        elif not agent.discharged:
+            self._set_worker_state(agent, WorkerState.IDLE, reason="move_completed")
+
     def move_agent(self, agent: Agent, dst: str, emit_move_events: bool = True):
+        if self.grid_map is not None:
+            yield from self._move_agent_grid(agent, dst, emit_move_events=emit_move_events)
+            return
+
         eps = 1e-6
 
         # If the agent is currently on an edge, first walk to the best endpoint.
@@ -4158,7 +4451,9 @@ class ManufacturingWorld:
             try:
                 if agent.discharged:
                     return False
-                yield from self.move_agent(agent, "BatteryStation", emit_move_events=True)
+                yield from self.move_agent(agent, "battery_rack", emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, "battery_rack", task, "battery_swap"):
+                    return False
                 self._set_worker_state(agent, WorkerState.BATTERY_SWAPPING, reason="battery_swap", task_id=task.task_id)
                 yield self.env.timeout(float(self.agent_cfg["battery_pickup_time_min"]))
                 battery_item_id = str(task.payload.get("battery_item_id", ""))
@@ -4191,7 +4486,9 @@ class ManufacturingWorld:
             machine = self.machines[task.payload["machine_id"]]
             if not machine.broken:
                 return False
-            yield from self.move_agent(agent, f"Station{machine.station}", emit_move_events=True)
+            yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
+            if not self._confirm_object_service_tile(agent, machine.machine_id, task, "repair_machine"):
+                return False
             self._set_worker_state(agent, WorkerState.REPAIRING_MACHINE, reason="repair_machine", task_id=task.task_id)
             try:
                 if not machine.broken:
@@ -4217,7 +4514,9 @@ class ManufacturingWorld:
             try:
                 if machine.broken or machine.output_intermediate is None:
                     return False
-                yield from self.move_agent(agent, f"Station{machine.station}", emit_move_events=True)
+                yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, machine.machine_id, task, "unload_machine"):
+                    return False
                 self._set_worker_state(agent, WorkerState.UNLOADING_MACHINE, reason="unload_machine", task_id=task.task_id)
                 if machine.broken:
                     return False
@@ -4266,7 +4565,9 @@ class ManufacturingWorld:
                     battery_item_id = str(task.payload.get("transfer_item_id", ""))
                     battery_loaded = bool(task.payload.get("battery_loaded", False))
                     if not battery_loaded:
-                        yield from self.move_agent(agent, "BatteryStation", emit_move_events=True)
+                        yield from self.move_agent(agent, "battery_rack", emit_move_events=True)
+                        if not self._confirm_object_service_tile(agent, "battery_rack", task, "battery_delivery_pickup"):
+                            return False
                         self._set_worker_state(agent, WorkerState.BATTERY_DELIVERING, reason="battery_delivery_pickup", task_id=task.task_id)
                         yield self.env.timeout(float(self.agent_cfg["battery_pickup_time_min"]))
                         if not battery_item_id:
@@ -4309,7 +4610,7 @@ class ManufacturingWorld:
 
                     if not self._has_in_transit_position(target_agent):
                         if agent.location != target_agent.location:
-                            yield from self.move_agent(agent, target_agent.location, emit_move_events=True)
+                            yield from self.move_agent(agent, target_agent.agent_id, emit_move_events=True)
                         if agent.location != target_agent.location:
                             return False
                         handover_location = str(target_agent.location)
@@ -4361,7 +4662,9 @@ class ManufacturingWorld:
                     )
                     if target_agent.suspended_task is not None and target_agent.suspended_task.task_type == "BATTERY_SWAP":
                         target_agent.suspended_task = None
-                    yield from self.move_agent(agent, "BatteryStation", emit_move_events=True)
+                    yield from self.move_agent(agent, "battery_rack", emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, "battery_rack", task, "battery_delivery_return"):
+                        return False
                     self._clear_agent_carrying(agent, destination="BatteryStation")
                     task.payload.pop("battery_loaded", None)
                     task.payload.pop("transfer_item_id", None)
@@ -4390,7 +4693,10 @@ class ManufacturingWorld:
                 moved_item_id = str(task.payload.get("transfer_item_id", ""))
                 if not moved_item_id:
                     from_location = "Inspection" if from_station == self.inspection_queue_station else f"Station{from_station}"
-                    yield from self.move_agent(agent, from_location, emit_move_events=True)
+                    output_buffer_id = f"output_buffer_station_{from_station}"
+                    yield from self.move_agent(agent, output_buffer_id, emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, output_buffer_id, task, "inter_station_pickup"):
+                        return False
                     self._set_worker_state(agent, WorkerState.TRANSFERRING_INTERMEDIATE, reason="inter_station_pickup", task_id=task.task_id)
                     if not self.output_buffers[from_station]:
                         return False
@@ -4408,15 +4714,20 @@ class ManufacturingWorld:
                 if from_station == self.inspection_queue_station:
                     # Final logistics leg: inspected product -> Warehouse.
                     to_location = "Warehouse"
-                    yield from self.move_agent(agent, to_location, emit_move_events=True)
+                    yield from self.move_agent(agent, "warehouse_buffer", emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, "warehouse_buffer", task, "completed_product_dropoff"):
+                        return False
                     self.product_count += 1
                     if moved_item_id in self.items:
                         self._set_item_state(moved_item_id, ItemState.COMPLETED, location="Warehouse", ref="warehouse_buffer", item_type="product")
                 else:
                     to_station = from_station + 1
                     to_location = f"Station{to_station}" if to_station <= self.last_processing_station else "Inspection"
-                    yield from self.move_agent(agent, to_location, emit_move_events=True)
                     target_queue_station = to_station if to_station <= self.last_processing_station else self.inspection_queue_station
+                    target_queue_id = f"intermediate_queue_{target_queue_station}"
+                    yield from self.move_agent(agent, target_queue_id, emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, target_queue_id, task, "inter_station_dropoff"):
+                        return False
                     self._push_intermediate_queue(target_queue_station, moved_item_id)
                 task.payload.pop("transfer_item_id", None)
                 moved_item_kind = "product" if from_station >= self.last_processing_station else "intermediate"
@@ -4481,7 +4792,10 @@ class ManufacturingWorld:
                             yield from self.move_agent(agent, "Warehouse", emit_move_events=True)
                         if not self._set_agent_carrying(agent, "material", item_id):
                             return False
-                    yield from self.move_agent(agent, f"Station{station}", emit_move_events=True)
+                    material_queue_id = f"material_queue_{station}"
+                    yield from self.move_agent(agent, material_queue_id, emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, material_queue_id, task, "material_supply_dropoff"):
+                        return False
                     self._push_material_queue(station, item_id)
                     self._clear_agent_carrying(agent, destination=f"Station{station}")
                     self.logger.log(
@@ -4550,7 +4864,9 @@ class ManufacturingWorld:
                 if needs_intermediate and not has_reserved_intermediate and not self.intermediate_queues[station]:
                     return False
 
-                yield from self.move_agent(agent, f"Station{station}", emit_move_events=True)
+                yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, machine.machine_id, task, "setup_machine"):
+                    return False
                 self._set_worker_state(agent, WorkerState.SETTING_UP_MACHINE, reason="setup_machine", task_id=task.task_id)
 
                 setup_step = float(self.movement_cfg["setup_min"])
@@ -4637,7 +4953,9 @@ class ManufacturingWorld:
             product_id = str(task.payload.get("inspection_product_id", ""))
             if not product_id and not self.intermediate_queues[self.inspection_queue_station]:
                 return False
-            yield from self.move_agent(agent, "Inspection", emit_move_events=True)
+            yield from self.move_agent(agent, "intermediate_queue_4", emit_move_events=True)
+            if not self._confirm_object_service_tile(agent, "intermediate_queue_4", task, "inspect_product_pickup"):
+                return False
             self._set_worker_state(agent, WorkerState.INSPECTING_PRODUCT, reason="inspect_product", task_id=task.task_id)
             if not product_id:
                 popped = self._pop_intermediate_queue(4)
@@ -4722,7 +5040,9 @@ class ManufacturingWorld:
             try:
                 if machine.broken or machine.state == MachineState.PROCESSING:
                     return False
-                yield from self.move_agent(agent, f"Station{machine.station}", emit_move_events=True)
+                yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, machine.machine_id, task, "preventive_maintenance"):
+                    return False
                 self._set_worker_state(agent, WorkerState.PREVENTIVE_MAINTENANCE, reason="preventive_maintenance", task_id=task.task_id)
                 self._set_machine_state(machine, MachineState.UNDER_PM, reason="pm_started")
                 pm_start = self.env.now
