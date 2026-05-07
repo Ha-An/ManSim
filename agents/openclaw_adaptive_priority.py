@@ -107,7 +107,7 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             aliases[self._build_day_scoped_runtime_agent_id("manager_daily_reviewer", day)] = "MANAGER_DAILY_REVIEWER"
         if self._knowledge_enabled():
             aliases[self._build_day_scoped_runtime_agent_id("manager_run_reflector")] = "MANAGER_RUN_REFLECTOR"
-        for aid in self.agent_ids:
+        for aid in self.openclaw_worker_agent_ids:
             upper = self._normalize_openclaw_agent_id(aid)
             aliases[upper] = upper
         aliases[self.manager_agent_id] = self.manager_agent_id
@@ -256,7 +256,8 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             (workspace / "facts" / "current_phase.txt").write_text(str(phase), encoding="utf-8")
         system_prompt = "Native-local simulator turn. Use workspace facts only. Return one JSON object only."
         if str(phase) == "manager_shift_strategist":
-            user_prompt = "Execute manager_shift_strategist. Keep output compact and intent-only. Return worker_roles for A1/A2/A3, operating_focus, late_horizon_mode, role_plan, support_plan, prevention_targets, daily_targets, and plan_revision. Do not emit task_priority_weights, agent_priority_multipliers, mailbox_seed, commitments, or personal queues. Keep exactly one clear inspection_closer. Use previous_day_review to decide what should be prevented today. Choose at most two prevention_targets and one primary_support_pair."
+            worker_list = "/".join(self.agent_ids)
+            user_prompt = f"Execute manager_shift_strategist. Keep output compact and intent-only. Return worker_roles for {worker_list}, operating_focus, late_horizon_mode, role_plan, support_plan, prevention_targets, daily_targets, and plan_revision. Do not emit task_priority_weights, agent_priority_multipliers, mailbox_seed, commitments, or personal queues. Keep exactly one clear inspection_closer. Use previous_day_review to decide what should be prevented today. Choose at most two prevention_targets and one primary_support_pair."
         else:
             user_prompt = "Execute manager_daily_reviewer. Keep output compact and diagnosis-only. Do not repeat raw metrics from the request. Return only target_misses, top_failure_modes, recommended_prevention_targets, recommended_support_pair, role_change_advice, and carry_forward_risks. Focus on what tomorrow's strategist should change."
         return system_prompt, user_prompt, dict(required_fields)
@@ -721,17 +722,22 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             if not isinstance(item, dict):
                 continue
             target = item.get("target", {}) if isinstance(item.get("target", {}), dict) else {}
+            task_family = str(item.get("task_family", "")).strip()
+            location = self._truncate_prompt_text(item.get("location", ""), max_len=32)
             entry: dict[str, Any] = {
                 "opportunity_id": str(item.get("opportunity_id", "")).strip(),
-                "task_family": str(item.get("task_family", "")).strip(),
+                "task_family": task_family,
                 "target": {
                     "target_type": str(target.get("target_type", "none")).strip().lower() or "none",
                     "target_id": self._truncate_prompt_text(target.get("target_id", ""), max_len=32),
                     "target_station": target.get("target_station"),
                 },
                 "impact": round(float(item.get("expected_output_impact", 0.0) or 0.0), 1),
-                "location": self._truncate_prompt_text(item.get("location", ""), max_len=32),
+                "location": location,
             }
+            if task_family == "inter_station_transfer" and location == "Inspection":
+                entry["semantic"] = "final_delivery_to_warehouse"
+                entry["goal_effect"] = "increments_completed_products"
             owners = [aid for aid in self._as_str_list(item.get("owners"), []) if aid in self.agent_ids][:2]
             if owners:
                 entry["owners"] = owners
@@ -1056,11 +1062,12 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
                 plan.agent_priority_multipliers.setdefault("A1", {})
                 plan.agent_priority_multipliers["A1"]["inspect_product"] = round(max(float(plan.agent_priority_multipliers["A1"].get("inspect_product", 1.0)), 1.12 if day >= 4 else 1.08), 3)
         if pass_output > 0:
-            unload_floor = 1.12 if pass_output == 1 else 1.2 if pass_output <= 3 else 1.28
-            plan.task_priority_weights["unload_machine"] = round(max(float(plan.task_priority_weights.get("unload_machine", 1.0)), unload_floor), 3)
-            for agent_id, floor in (("A3", 1.32 if day >= 4 else 1.28), ("A1", 1.2 if day >= 4 else 1.15)):
+            transfer_floor = 1.25 if pass_output == 1 else 1.36 if pass_output <= 3 else 1.5
+            plan.task_priority_weights["inter_station_transfer"] = round(max(float(plan.task_priority_weights.get("inter_station_transfer", 1.0)), transfer_floor), 3)
+            plan.task_priority_weights["unload_machine"] = round(max(float(plan.task_priority_weights.get("unload_machine", 1.0)), 1.12), 3)
+            for agent_id, floor in (("A3", 1.45 if day >= 4 else 1.32), ("A1", 1.35 if day >= 4 else 1.22)):
                 plan.agent_priority_multipliers.setdefault(agent_id, {})
-                plan.agent_priority_multipliers[agent_id]["unload_machine"] = round(max(float(plan.agent_priority_multipliers[agent_id].get("unload_machine", 1.0)), floor), 3)
+                plan.agent_priority_multipliers[agent_id]["inter_station_transfer"] = round(max(float(plan.agent_priority_multipliers[agent_id].get("inter_station_transfer", 1.0)), floor), 3)
         return plan
 
     def _mailbox_has_task(self, mailbox: dict[str, list[dict[str, Any]]], agent_id: str, task_family: str) -> bool:
@@ -1143,8 +1150,8 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             self._ensure_mailbox_assist(
                 mailbox,
                 agent_id="A3",
-                task_family="unload_machine",
-                body="Prioritize unload tasks that convert inspection pass output into accepted products.",
+                task_family="inter_station_transfer",
+                body="Deliver inspection pass output to the warehouse; this is the step that increments completed products.",
                 message_type="focus_window",
                 remaining_uses=2,
             )
@@ -1309,7 +1316,7 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
 
     def _prevention_bundle_targets(self, target: str) -> dict[str, float]:
         bundles = {
-            "closeout_gap": {"inspect_product": 1.38, "unload_machine": 1.25, "inter_station_transfer": 1.16},
+            "closeout_gap": {"inter_station_transfer": 1.42, "inspect_product": 1.25, "unload_machine": 1.18},
             "battery_instability": {"battery_swap": 1.6, "battery_delivery_low_battery": 1.28, "battery_delivery_discharged": 1.7},
             "reliability_instability": {"repair_machine": 1.4, "preventive_maintenance": 1.25, "unload_machine": 1.14},
             "flow_blockage": {"material_supply": 1.22, "inter_station_transfer": 1.25, "unload_machine": 1.18},
@@ -1407,7 +1414,7 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             for task_family, floor in self._prevention_bundle_targets(target).items():
                 self._apply_weight_floor(weights, task_family, floor)
         if late_horizon_mode == "closeout_drive":
-            for task_family, floor in {"inspect_product": 1.42, "unload_machine": 1.28, "inter_station_transfer": 1.18}.items():
+            for task_family, floor in {"inter_station_transfer": 1.42, "inspect_product": 1.3, "unload_machine": 1.22}.items():
                 self._apply_weight_floor(weights, task_family, floor)
         elif late_horizon_mode == "reliability_guarded_closeout":
             for task_family, floor in {"inspect_product": 1.35, "unload_machine": 1.22, "repair_machine": 1.25, "preventive_maintenance": 1.18}.items():
@@ -1426,7 +1433,10 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             or int(closeout.get("closure_gap", 0) or 0) >= 2
             or ("closeout_gap" in prevention_targets and day >= 3)
         ):
-            for task_family, floor in {"inspect_product": 1.35, "unload_machine": 1.22}.items():
+            closeout_floors = {"inspect_product": 1.28, "unload_machine": 1.18}
+            if pass_output > 0 or int(closeout.get("closure_gap", 0) or 0) >= 2:
+                closeout_floors["inter_station_transfer"] = 1.48
+            for task_family, floor in closeout_floors.items():
                 self._apply_weight_floor(weights, task_family, floor)
 
         agent_targets = self._apply_role_bias_defaults(
@@ -1436,8 +1446,9 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         if "closeout_gap" in prevention_targets or operating_focus == "closeout":
             self._apply_agent_floor(agent_targets, "A3", "inspect_product", 1.5)
             self._apply_agent_floor(agent_targets, "A3", "unload_machine", 1.28)
+            self._apply_agent_floor(agent_targets, "A3", "inter_station_transfer", 1.42)
             self._apply_agent_floor(agent_targets, "A1", "unload_machine", 1.16)
-            self._apply_agent_floor(agent_targets, "A1", "inter_station_transfer", 1.18)
+            self._apply_agent_floor(agent_targets, "A1", "inter_station_transfer", 1.34)
             self._apply_agent_floor(agent_targets, "A2", "repair_machine", 1.35)
         if "battery_instability" in prevention_targets or operating_focus == "battery":
             self._apply_agent_floor(agent_targets, "A2", "battery_swap", 1.22)
@@ -1503,25 +1514,35 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         reliability_risk = bool("reliability_instability" in prevention_targets or int(signals.get("broken_machines", 0) or 0) > 0)
         battery_risk = bool("battery_instability" in prevention_targets or discharged_agents > 0)
         if support_intent == "closeout_support" and support_source and support_target:
-            for task_family, floor in {"inspect_product": 1.22, "unload_machine": 1.14, "inter_station_transfer": 1.12}.items():
+            for task_family, floor in {"inter_station_transfer": 1.4 if pass_output > 0 else 1.12, "inspect_product": 1.22, "unload_machine": 1.12}.items():
                 self._apply_weight_floor(weights, task_family, floor)
             self._apply_agent_floor(agent_targets, support_target, "inspect_product", 1.5)
             self._apply_agent_floor(agent_targets, support_target, "unload_machine", 1.28)
+            if pass_output > 0:
+                self._apply_agent_floor(agent_targets, support_target, "inter_station_transfer", 1.45)
             self._apply_agent_floor(agent_targets, support_source, "unload_machine", 1.16)
-            self._apply_agent_floor(agent_targets, support_source, "inter_station_transfer", 1.18)
+            self._apply_agent_floor(agent_targets, support_source, "inter_station_transfer", 1.36 if pass_output > 0 else 1.18)
             self._ensure_mailbox_assist(
                 mailbox,
                 agent_id=support_target,
-                task_family="inspect_product",
-                body="Hold inspection close-out until accepted-product conversion is stable.",
+                task_family="inter_station_transfer" if pass_output > 0 and day >= 4 else "inspect_product",
+                body=(
+                    "Deliver inspection pass output to the warehouse; this is the step that increments completed products."
+                    if pass_output > 0 and day >= 4
+                    else "Hold inspection close-out until accepted-product conversion is stable."
+                ),
                 message_type="focus_window" if day >= 2 or backlog > 0 else "assist_request",
                 remaining_uses=2 if day >= 2 or backlog > 0 else 1,
             )
             self._ensure_mailbox_assist(
                 mailbox,
                 agent_id=support_source,
-                task_family="unload_machine" if pass_output > 0 or day >= 3 else "inter_station_transfer",
-                body="Support close-out by clearing downstream conversion work before generic flow tasks.",
+                task_family="inter_station_transfer" if pass_output > 0 or day >= 3 else "unload_machine",
+                body=(
+                    "Support final delivery from inspection output to warehouse before generic flow tasks."
+                    if pass_output > 0
+                    else "Support close-out by clearing downstream conversion work before generic flow tasks."
+                ),
                 message_type="focus_window" if day >= 3 or pass_output > 0 else "assist_request",
                 remaining_uses=2 if day >= 3 or pass_output > 0 else 1,
             )
@@ -1529,8 +1550,12 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
                 self._ensure_mailbox_assist(
                     mailbox,
                     agent_id="A2",
-                    task_family="inspect_product",
-                    body="Assist inspection closure only after reliability-critical actions are covered.",
+                    task_family="inter_station_transfer" if pass_output > 0 else "inspect_product",
+                    body=(
+                        "Assist final delivery to warehouse after reliability-critical actions are covered."
+                        if pass_output > 0
+                        else "Assist inspection closure only after reliability-critical actions are covered."
+                    ),
                     message_type="focus_window",
                     remaining_uses=2,
                 )
@@ -1833,11 +1858,12 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             "daily_targets": "dict[str, int]",
             "plan_revision": "int",
         }
+        worker_list = "/".join(self.agent_ids)
         strategist_instructions = [
             "You own the day-start operating intent only. The deterministic policy compiler will derive low-level weights and mailbox actions.",
             "Do not emit commitments, task_priority_weights, agent_priority_multipliers, or mailbox_seed.",
             "Use canonical worker roles only: intake_runner, reliability_guard, inspection_closer, battery_support, flow_support.",
-            "Use at least two distinct worker roles across A1/A2/A3.",
+            f"Use at least two distinct worker roles across {worker_list}.",
             "Keep exactly one inspection_closer unless inspection backlog is severe enough to justify a second temporary closer.",
             "Prefer A1 as intake_runner or flow_support unless the request packet shows that support pressure is clearly dominant elsewhere.",
             "Use previous_day_review as diagnosis-only feedback. Translate it into prevention_targets and support_plan rather than repeating yesterday's facts.",

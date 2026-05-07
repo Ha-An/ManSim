@@ -1,8 +1,8 @@
-import type { BaseEntityState, DomainState } from "../types/entity";
+import type { BaseEntityState, DomainState, XY } from "../types/entity";
 import type { ReplayEvent } from "../types/event";
 import type { LayoutConfig } from "../types/layout";
 import type { ReplayRenderModel, RenderFlow, RenderNode, RenderRegion } from "../types/replay";
-import { resolveLayout } from "../layout/layoutResolver";
+import { resolveLayout, type ResolvedLayout } from "../layout/layoutResolver";
 import { getActiveInteractions, getFocusedEntityIds } from "../replay/selectors";
 
 interface MotionMeta {
@@ -95,6 +95,52 @@ function interpolatePosition(entity: BaseEntityState, basePosition: { x: number;
     x: motion.from.x + (motion.to.x - motion.from.x) * ratio,
     y: motion.from.y + (motion.to.y - motion.from.y) * ratio,
   };
+}
+
+function stringAttribute(entity: BaseEntityState, key: string): string {
+  const value = entity.attributes[key];
+  return typeof value === "string" ? value.trim().toUpperCase() : "";
+}
+
+function isMobileEntity(entity: BaseEntityState): boolean {
+  return entity.entity_type === "worker" || entity.entity_type === "robot" || entity.entity_type === "transporter";
+}
+
+function isInspectionWorkInProgress(entity: BaseEntityState): boolean {
+  if (!isMobileEntity(entity) || entity.state === "moving") return false;
+  const taskType = stringAttribute(entity, "current_task_type");
+  const workerState = stringAttribute(entity, "worker_state");
+  return workerState === "INSPECTING_PRODUCT" || (entity.state === "working" && taskType === "INSPECT_PRODUCT");
+}
+
+function inspectionWorkbenchPosition(resolvedLayout: ResolvedLayout): XY | undefined {
+  for (const entityId of ["inspection_workbench", "inspection_workstation", "inspection_station", "inspection_table"]) {
+    const position = resolvedLayout.positions[entityId];
+    if (position) return { ...position };
+  }
+
+  const region =
+    Object.values(resolvedLayout.regions).find((candidate) => candidate.region_id === "inspection_region") ??
+    Object.values(resolvedLayout.regions).find((candidate) => candidate.kind === "inspection");
+  if (!region) return undefined;
+
+  return {
+    x: region.position.x + region.size.width * 0.5,
+    y: region.position.y + region.size.height * 0.6,
+  };
+}
+
+function resolveEntityPosition(
+  entity: BaseEntityState,
+  basePosition: XY,
+  currentTime: number,
+  resolvedLayout: ResolvedLayout,
+): XY {
+  const interpolated = interpolatePosition(entity, basePosition, currentTime);
+  if (isInspectionWorkInProgress(entity)) {
+    return inspectionWorkbenchPosition(resolvedLayout) ?? interpolated;
+  }
+  return interpolated;
 }
 
 function matchesSearch(entity: BaseEntityState, query: string): boolean {
@@ -191,10 +237,8 @@ export function buildRenderModel(
       return true;
     })
     .map((entity) => {
-      const isMobileEntity =
-        entity.entity_type === "worker" || entity.entity_type === "robot" || entity.entity_type === "transporter";
       const basePosition =
-        (isMobileEntity && entity.position ? { ...entity.position } : undefined) ??
+        (isMobileEntity(entity) && entity.position ? { ...entity.position } : undefined) ??
         resolvedLayout.positions[entity.entity_id] ??
         { x: 0, y: 0 };
       if (entity.entity_type === "queue" || entity.entity_type === "buffer") {
@@ -210,7 +254,7 @@ export function buildRenderModel(
       }
       return {
         entity,
-        position: interpolatePosition(entity, basePosition, currentTime),
+        position: resolveEntityPosition(entity, basePosition, currentTime, resolvedLayout),
         selected: entity.entity_id === options.selectedEntityId,
         focused: !options.followSelected || focusedEntityIds.size === 0 || focusedEntityIds.has(entity.entity_id),
       };

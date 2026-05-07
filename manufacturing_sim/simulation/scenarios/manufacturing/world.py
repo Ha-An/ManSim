@@ -216,6 +216,7 @@ class ManufacturingWorld:
         self.scrap_count = 0
         self.station_throughput = defaultdict(int)
         self.inspection_active_agents = 0
+        self.inspection_owner: str | None = None
 
         self.minute_snapshots: list[dict[str, Any]] = []
         self.task_records: list[dict[str, Any]] = []
@@ -619,6 +620,7 @@ class ManufacturingWorld:
             "machines_waiting_unload": machines_waiting_unload,
             "broken_machine_count": sum(1 for machine in self.machines.values() if machine.broken),
             "active_inspection_agents": int(self.inspection_active_agents),
+            "inspection_owner": self.inspection_owner,
             "products_completed_total": int(self.product_count),
             "scrap_total": int(self.scrap_count),
         }
@@ -2982,6 +2984,8 @@ class ManufacturingWorld:
                 machine.unload_owner = None
 
         elif task.task_type == "INSPECT_PRODUCT":
+            if self.inspection_owner == agent.agent_id:
+                self.inspection_owner = None
             product_id = task.payload.pop("inspection_product_id", None)
             if product_id is not None:
                 self.intermediate_queues[self.inspection_queue_station].appendleft(product_id)
@@ -3295,6 +3299,11 @@ class ManufacturingWorld:
             if transfer_kind == "material_supply":
                 return f"station{task.payload.get('station', '')}"
             if transfer_kind == "inter_station":
+                try:
+                    if int(task.payload.get("from_station", 0) or 0) == self.inspection_queue_station:
+                        return "warehouse_buffer"
+                except (TypeError, ValueError):
+                    pass
                 return f"station{task.payload.get('from_station', '')}"
         return ""
 
@@ -3339,6 +3348,11 @@ class ManufacturingWorld:
             if transfer_kind == "material_supply":
                 return "A station is below its material target and the warehouse can replenish it."
             if transfer_kind == "inter_station":
+                try:
+                    if int(task.payload.get("from_station", 0) or 0) == self.inspection_queue_station:
+                        return "Inspection pass output can be delivered to the warehouse to increase completed products."
+                except (TypeError, ValueError):
+                    pass
                 return "A downstream transfer can move staged output to the next queue."
             if transfer_kind == "battery_delivery":
                 return "Another worker needs a battery delivery and can be assisted now."
@@ -4087,12 +4101,18 @@ class ManufacturingWorld:
         for station, buffer in self.output_buffers.items():
             if buffer:
                 task_location = "Inspection" if station == self.inspection_queue_station else f"Station{station}"
+                transfer_priority = priority_inter_station_transfer
+                if station == self.inspection_queue_station:
+                    transfer_priority = max(
+                        transfer_priority,
+                        float(self._rule("world.task_priority.completed_product_delivery", 125.0)),
+                    )
                 tasks.append(
                     Task(
                         task_id=self._next_task_id("TR"),
                         task_type="TRANSFER",
                         priority_key="inter_station_transfer",
-                        priority=priority_inter_station_transfer,
+                        priority=transfer_priority,
                         location=task_location,
                         payload={"transfer_kind": "inter_station", "from_station": station},
                     )
@@ -4112,7 +4132,7 @@ class ManufacturingWorld:
                     )
                 )
 
-        if self.intermediate_queues[self.inspection_queue_station]:
+        if self.intermediate_queues[self.inspection_queue_station] and self.inspection_owner is None:
             tasks.append(
                 Task(
                     task_id=self._next_task_id("INS"),
@@ -4950,87 +4970,92 @@ class ManufacturingWorld:
                         _close_setup_event("aborted")
                         self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="setup_aborted")
         if task_type == "INSPECT_PRODUCT":
-            product_id = str(task.payload.get("inspection_product_id", ""))
-            if not product_id and not self.intermediate_queues[self.inspection_queue_station]:
-                return False
-            yield from self.move_agent(agent, "intermediate_queue_4", emit_move_events=True)
-            if not self._confirm_object_service_tile(agent, "intermediate_queue_4", task, "inspect_product_pickup"):
-                return False
-            self._set_worker_state(agent, WorkerState.INSPECTING_PRODUCT, reason="inspect_product", task_id=task.task_id)
-            if not product_id:
-                popped = self._pop_intermediate_queue(4)
-                if popped is None:
-                    return False
-                product_id = popped
-                task.payload["inspection_product_id"] = product_id
-            if not self._set_agent_carrying(agent, "product", product_id):
-                self.intermediate_queues[self.inspection_queue_station].appendleft(product_id)
-                task.payload.pop("inspection_product_id", None)
-                return False
-            self.inspection_active_agents += 1
-            k = max(1, self.inspection_active_agents)
-            inspect_t = max(self.inspection_min_time_min, self.inspection_base_time_min / math.sqrt(k))
             try:
-                yield self.env.timeout(inspect_t)
+                if self.inspection_owner is not None and self.inspection_owner != agent.agent_id:
+                    return False
+                self.inspection_owner = agent.agent_id
+                product_id = str(task.payload.get("inspection_product_id", ""))
+                if not product_id and not self.intermediate_queues[self.inspection_queue_station]:
+                    return False
+                yield from self.move_agent(agent, "intermediate_queue_4", emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, "intermediate_queue_4", task, "inspect_product_pickup"):
+                    return False
+                self._set_worker_state(agent, WorkerState.INSPECTING_PRODUCT, reason="inspect_product", task_id=task.task_id)
+                if not product_id:
+                    popped = self._pop_intermediate_queue(4)
+                    if popped is None:
+                        return False
+                    product_id = popped
+                    task.payload["inspection_product_id"] = product_id
+                if not self._set_agent_carrying(agent, "product", product_id):
+                    self.intermediate_queues[self.inspection_queue_station].appendleft(product_id)
+                    task.payload.pop("inspection_product_id", None)
+                    return False
+                self.inspection_active_agents += 1
+                try:
+                    yield self.env.timeout(max(self.inspection_min_time_min, self.inspection_base_time_min))
+                finally:
+                    self.inspection_active_agents = max(0, self.inspection_active_agents - 1)
+                defect_prob = float(self.quality_cfg["defect_prob"])
+                if self.rng.random() < defect_prob:
+                    self.scrap_count += 1
+                    self._set_item_state(product_id, ItemState.SCRAPPED, location="Inspection", ref="scrap", item_type="product")
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type="INSPECT_FAIL",
+                        entity_id=product_id,
+                        location="Inspection",
+                        details={"inspector": agent.agent_id},
+                    )
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type="SCRAP",
+                        entity_id=product_id,
+                        location="Inspection",
+                        details={},
+                    )
+                    self._clear_agent_carrying(agent, destination="Inspection")
+                else:
+                    # Inspection pass: move product to inspection output buffer.
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type="ITEM_MOVED",
+                        entity_id=product_id,
+                        location="Inspection",
+                        details={
+                            "from": "Inspection",
+                            "to": f"output_buffer_station_{self.inspection_queue_station}",
+                            "item_type": "product",
+                        },
+                    )
+                    self.output_buffers[self.inspection_queue_station].append(product_id)
+                    self._set_item_state(
+                        product_id,
+                        ItemState.WAITING_INSPECTION_OUTPUT,
+                        location="Inspection",
+                        ref=f"output_buffer_station_{self.inspection_queue_station}",
+                        item_type="product",
+                    )
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type="INSPECT_PASS",
+                        entity_id=product_id,
+                        location="Inspection",
+                        details={"inspector": agent.agent_id},
+                    )
+                    self._clear_agent_carrying(
+                        agent,
+                        destination=f"output_buffer_station_{self.inspection_queue_station}",
+                    )
+                task.payload.pop("inspection_product_id", None)
+                return True
             finally:
-                self.inspection_active_agents = max(0, self.inspection_active_agents - 1)
-            defect_prob = float(self.quality_cfg["defect_prob"])
-            if self.rng.random() < defect_prob:
-                self.scrap_count += 1
-                self._set_item_state(product_id, ItemState.SCRAPPED, location="Inspection", ref="scrap", item_type="product")
-                self.logger.log(
-                    t=self.env.now,
-                    day=self.day_for_time(self.env.now),
-                    event_type="INSPECT_FAIL",
-                    entity_id=product_id,
-                    location="Inspection",
-                    details={"inspector": agent.agent_id},
-                )
-                self.logger.log(
-                    t=self.env.now,
-                    day=self.day_for_time(self.env.now),
-                    event_type="SCRAP",
-                    entity_id=product_id,
-                    location="Inspection",
-                    details={},
-                )
-                self._clear_agent_carrying(agent, destination="Inspection")
-            else:
-                # Inspection pass: move product to inspection output buffer.
-                self.logger.log(
-                    t=self.env.now,
-                    day=self.day_for_time(self.env.now),
-                    event_type="ITEM_MOVED",
-                    entity_id=product_id,
-                    location="Inspection",
-                    details={
-                        "from": "Inspection",
-                        "to": f"output_buffer_station_{self.inspection_queue_station}",
-                        "item_type": "product",
-                    },
-                )
-                self.output_buffers[self.inspection_queue_station].append(product_id)
-                self._set_item_state(
-                    product_id,
-                    ItemState.WAITING_INSPECTION_OUTPUT,
-                    location="Inspection",
-                    ref=f"output_buffer_station_{self.inspection_queue_station}",
-                    item_type="product",
-                )
-                self.logger.log(
-                    t=self.env.now,
-                    day=self.day_for_time(self.env.now),
-                    event_type="INSPECT_PASS",
-                    entity_id=product_id,
-                    location="Inspection",
-                    details={"inspector": agent.agent_id},
-                )
-                self._clear_agent_carrying(
-                    agent,
-                    destination=f"output_buffer_station_{self.inspection_queue_station}",
-                )
-            task.payload.pop("inspection_product_id", None)
-            return True
+                if self.inspection_owner == agent.agent_id:
+                    self.inspection_owner = None
 
         if task_type == "PREVENTIVE_MAINTENANCE":
             machine = self.machines[task.payload["machine_id"]]

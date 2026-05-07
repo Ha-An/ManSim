@@ -974,6 +974,7 @@ function drawQueueItemStack(
   ctx: CanvasRenderingContext2D,
   x: number,
   y: number,
+  maxWidth: number,
   count: number,
   kind: string,
   entityId: string,
@@ -983,9 +984,14 @@ function drawQueueItemStack(
   const iconFrame = queueItemFrame(kind, entityId, sceneIcons);
   if (!iconFrame || visibleCount <= 0) return;
   const iconSize = 13.5;
-  const gap = 1;
+  const aspect = iconFrame.width / Math.max(1, iconFrame.height);
+  const iconWidth = iconSize * aspect;
+  const usableWidth = Math.max(iconWidth, maxWidth);
+  const stride = visibleCount > 1 ? Math.min(iconWidth + 0.5, (usableWidth - iconWidth) / (visibleCount - 1)) : 0;
+  const stackWidth = iconWidth + stride * Math.max(0, visibleCount - 1);
+  const startX = x + Math.max(0, (usableWidth - stackWidth) / 2);
   for (let index = 0; index < visibleCount; index += 1) {
-    drawSceneIconFrame(ctx, iconFrame, x + index * (iconSize + gap), y, iconSize);
+    drawSceneIconFrame(ctx, iconFrame, startX + index * stride, y, iconSize);
   }
 }
 
@@ -1405,8 +1411,9 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
           : drawQueueSpriteByKind(ctx, queueX, queueY, spriteScale, kind, sceneIconSet);
         drawQueueItemStack(
           ctx,
-          queueX + Math.max(4, queueSprite.width * 0.18),
+          queueX + Math.max(2, queueSprite.width * 0.08),
           queueY + Math.max(5, queueSprite.height * 0.34),
+          Math.max(28, queueSprite.width * 0.84),
           count,
           kind,
           node.entity.entity_id,

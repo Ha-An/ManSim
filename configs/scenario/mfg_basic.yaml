@@ -18,8 +18,8 @@ factory:
     station1: 20
     station2: 30
 
-  # Inspection 시간 모델: base / sqrt(k)
-  # 단, inspection_min_time_min보다 빨라지지는 않는다.
+  # Inspection은 단일 worker만 점유할 수 있다.
+  # 검사 시간은 base이며, inspection_min_time_min보다 짧아지지 않는다.
   inspection_base_time_min: 10
   inspection_min_time_min: 2
 

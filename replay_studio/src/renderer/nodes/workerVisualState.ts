@@ -116,7 +116,7 @@ export function getWorkerVisualState(entity: Pick<BaseEntityState, "state" | "at
     case "inspect":
       return {
         mode,
-        spriteVariant: "idle",
+        spriteVariant: "setup",
         badgeText: "INSP",
         badgeAccent: "#44b7ff",
         panelText: "Inspection",

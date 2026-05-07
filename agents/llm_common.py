@@ -168,7 +168,8 @@ class OptionalLLMDecisionModule(DecisionModule):
         self.comm_max_transcript = max(1, int(comm_cfg.get("max_transcript_messages", 24)))
         self.communication_language = self.language
 
-        num_agents = int((cfg.get("factory", {}) or {}).get("num_agents", 4))
+        factory_cfg = cfg.get("factory", {}) if isinstance(cfg.get("factory", {}), dict) else {}
+        num_agents = max(1, int(factory_cfg.get("num_agents", factory_cfg.get("num_workers", 4)) or 4))
         self.agent_ids = [f"A{i}" for i in range(1, num_agents + 1)]
 
         openclaw_cfg = self.llm_cfg.get("openclaw", {}) if isinstance(self.llm_cfg.get("openclaw", {}), dict) else {}
@@ -186,7 +187,12 @@ class OptionalLLMDecisionModule(DecisionModule):
             for item in worker_agent_ids
             if str(item).strip()
         ]
-        self.openclaw_worker_agent_ids = parsed_worker_ids if parsed_worker_ids else list(self.agent_ids)
+        if parsed_worker_ids:
+            self.openclaw_worker_agent_ids = [agent_id for agent_id in parsed_worker_ids if agent_id in self.agent_ids]
+            if not self.openclaw_worker_agent_ids:
+                self.openclaw_worker_agent_ids = list(self.agent_ids)
+        else:
+            self.openclaw_worker_agent_ids = list(self.agent_ids)
         self.openclaw_workspace_root = str(openclaw_cfg.get("workspace_root", "openclaw/workspaces")).strip() or "openclaw/workspaces"
         self.openclaw_transport = str(openclaw_cfg.get("transport", "native_local")).strip().lower() or "native_local"
         self.openclaw_backend_health_probe_interval_sec = float(openclaw_cfg.get("backend_health_probe_interval_sec", 30))
