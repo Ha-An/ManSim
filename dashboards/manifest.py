@@ -91,6 +91,10 @@ def _artifact_map(output_dir: Path, row: dict[str, Any]) -> dict[str, str]:
         "gantt.html": _pick(row.get("gantt_path", ""), "gantt.html"),
         "task_priority_dashboard.html": _pick(row.get("task_priority_dashboard_path", ""), "task_priority_dashboard.html"),
         "knowledge_dashboard.html": _pick(row.get("knowledge_dashboard_path", ""), "knowledge_dashboard.html"),
+        "llm_wiki_dashboard.html": _pick_optional(row.get("llm_wiki_dashboard_path", ""), "llm_wiki_dashboard.html"),
+        "knowledge_graph.html": _pick_optional(row.get("knowledge_graph_path", ""), "knowledge_graph.html"),
+        "graphify_graph.html": _pick_optional(row.get("graphify_graph_path", ""), "knowledge_graph_dashboard.html"),
+        "graphify_graph_raw.html": _pick_optional(row.get("graphify_graph_raw_path", ""), "graph.html"),
         "reasoning_dashboard.html": _pick(row.get("reasoning_dashboard_path", ""), "reasoning_dashboard.html"),
         "replay_dashboard.html": _pick(row.get("replay_dashboard_path", ""), "replay_dashboard.html"),
         "operations_replay.html": _pick(row.get("operations_replay_dashboard_path", ""), "operations_replay.html"),
@@ -173,6 +177,11 @@ def build_dashboard_manifest(
                 },
                 "knowledge_in_path": _normalize_label(row.get("knowledge_in_path")),
                 "knowledge_out_path": _normalize_label(row.get("knowledge_out_path")),
+                "llm_knowledge_base_root": _normalize_label(row.get("llm_knowledge_base_root") or run_meta.get("llm_knowledge_base_root")),
+                "llm_knowledge_experiment_id": _normalize_label(row.get("llm_knowledge_experiment_id") or run_meta.get("llm_knowledge_experiment_id")),
+                "llm_knowledge_root": _normalize_label(row.get("llm_knowledge_root") or run_meta.get("llm_knowledge_root")),
+                "llm_wiki_path": _normalize_label(row.get("llm_wiki_path") or run_meta.get("llm_wiki_path")),
+                "llm_graph_path": _normalize_label(row.get("llm_graph_path") or run_meta.get("llm_graph_path")),
                 "evaluator_enabled": bool(row.get("evaluator_enabled", False)),
             }
         )

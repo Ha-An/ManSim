@@ -1,15 +1,14 @@
-# OpenClaw manager-only LLM 모드.
-# 전략가는 상위 의도만 만들고, deterministic compiler가 이를 실행 가능한 정책으로 바꿉니다.
-# 작업자는 계속 deterministic하게 움직이고, 하루 종료 시 reviewer가 다음 날 교정 신호를 만듭니다.
+# OpenClaw manager-only LLM mode.
+# Managers produce high-level operating intent. A deterministic compiler turns that
+# intent into executable policy. Workers remain deterministic shop-floor executors.
 mode: openclaw_adaptive_priority
 
 urgent_discuss:
-  # world 레벨 incident escalation을 끕니다.
-  # 현재 모드에는 mid-day LLM 경로가 없습니다.
+  # Mid-day LLM escalation is not used in the current production path.
   enabled: false
 
 norms:
-  # strategist가 참고할 공통 norm target을 유지합니다.
+  # Shared norm targets are exposed to managers as reference context.
   enabled: true
 
 llm:
@@ -21,7 +20,7 @@ llm:
   language: ENG
   timeout_sec: 120
   temperature: 0.0
-  # backend가 request-level seed를 지원하면 전역 simulation seed를 같이 사용합니다.
+  # If the backend supports request-level seed, reuse the simulation seed.
   seed: ${seed}
   max_tokens: 600
 
@@ -37,18 +36,14 @@ llm:
     session_namespace: mansim
     manager_agent_id: MANAGER
     workspace_root: openclaw/workspaces
-    # OpenClaw native-local manager turn에서 사용할 thinking 강도입니다.
-    # 허용값: off, minimal, low, medium, high, adaptive
-    # 현재 모드에서는 재현성과 latency를 위해 off가 기본입니다.
+    # Native thinking strength for OpenClaw manager turns.
+    # Allowed examples: off, minimal, low, medium, high, adaptive.
     native_thinking: "off"
-    # OpenClaw runtime workspace/profile에 노출할 worker id 목록입니다.
-    # 비우면 factory.num_workers 기준으로 A1..An을 기본 사용합니다.
+    # Worker ids exposed to the OpenClaw runtime. Empty means A1..An from factory.num_workers.
     worker_agent_ids:
       - A1
       - A2
       - A3
-    # 실제 LLM backend 연결 정보입니다.
-    # gateway/runtime health check, profile wiring, backend_direct transport에 사용됩니다.
     backend:
       provider: vllm
       model: mansim-gemma4-e4b
@@ -61,31 +56,51 @@ llm:
       max_output_tokens: 2048
       reasoning: false
 
-  # 현재 모드의 strategist/reviewer closed loop를 제어하는 설정입니다.
   orchestration:
-    # manager orchestration 레이어 전체 on/off 스위치입니다.
+    # Manager orchestration switch.
     enabled: true
-    # 기본은 single-run입니다.
-    # 2 이상이면 runtime/entrypoint가 run_01, run_02... 형태의 run series로 확장합니다.
+    # If run_count >= 2, runtime creates run_01, run_02... under a series directory.
     run_count: 1
     strategy:
-      # shared task weight를 scripted fallback보다 strategist intent 쪽으로 얼마나 강하게 끌어올릴지 결정합니다.
-      # 값이 클수록 strategist 의도가 전역 정책에 더 강하게 반영됩니다.
+      # Blend between scripted fallback weights and strategist intent.
       priority_blend_alpha: 0.45
-      # agent별 multiplier를 scripted fallback보다 strategist intent 쪽으로 얼마나 강하게 끌어올릴지 결정합니다.
-      # 값이 클수록 역할/지원 specialization이 더 강해집니다.
+      # Blend between scripted fallback agent multipliers and strategist role intent.
       agent_blend_alpha: 0.50
     review:
-      # 하루 종료 시 reviewer manager를 사용할지 결정합니다.
-      # false면 LLM reviewer 대신 deterministic reviewer를 사용합니다.
+      # If false, use deterministic reviewer fallback instead of LLM reviewer.
       enabled: true
-      # reviewer가 다음 날로 넘길 prevention target 개수 상한입니다.
-      # strategist 입력을 짧게 유지하고 schema drift를 줄입니다.
+      # Keep reviewer output compact to avoid prompt bloat.
       max_prevention_targets: 2
-      # reviewer가 하루에 기록할 failure-mode label 개수 상한입니다.
-      # 진단이 장황한 summary로 퍼지는 것을 막습니다.
       max_failure_modes: 3
 
   memory:
-    # run-local closed loop 안에서 보관할 summary/review history 일수입니다.
+    # Number of recent days retained in run-local manager memory.
     history_window_days: 7
+
+  knowledge:
+    # LLM Wiki / Curator pipeline. Runtime resolves this path relative to repo root.
+    enabled: true
+    root: knowledge/llm_knowledge
+    # auto creates knowledge/llm_knowledge/experiments/<hydra-run-id>/...
+    # shared keeps all runs directly under root.
+    experiment_scope: auto
+    manager_usage:
+      strategist: true
+      reviewer: true
+      curator: true
+    curator:
+      enabled: true
+      update_frequency: daily
+    graph:
+      enabled: true
+      provider: graphifyy
+      # Use Graphify's OpenAI-compatible ollama backend against the local vLLM server.
+      backend: ollama
+      model: "mansim-gemma4-e4b"
+      base_url: "http://127.0.0.1:8000/v1"
+      api_key: "vllm-local"
+      max_output_tokens: 4096
+      no_cluster: true
+      command: ""
+      update_frequency: run
+      timeout_sec: 900

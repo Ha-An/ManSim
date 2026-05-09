@@ -630,12 +630,20 @@ def run(
                     if isinstance(maybe_reflection, dict):
                         run_reflection_info = maybe_reflection
                         run_meta["knowledge_out_path"] = str(maybe_reflection.get("knowledge_out_path", "")).strip()
+                        for key in ("llm_knowledge_base_root", "llm_knowledge_experiment_id", "llm_knowledge_root", "llm_wiki_path", "llm_graph_path", "llm_wiki_dashboard_path"):
+                            if str(maybe_reflection.get(key, "")).strip():
+                                run_meta[key] = str(maybe_reflection.get(key, "")).strip()
                         if str(maybe_reflection.get("run_reflection_path", "")).strip():
                             artifact_status["generated"]["run_reflection"] = str(maybe_reflection.get("run_reflection_path", "")).strip()
                         if str(maybe_reflection.get("run_reflection_markdown_path", "")).strip():
                             artifact_status["generated"]["run_reflection_markdown"] = str(maybe_reflection.get("run_reflection_markdown_path", "")).strip()
                         if str(maybe_reflection.get("knowledge_archive_path", "")).strip():
                             artifact_status["generated"]["knowledge_archive"] = str(maybe_reflection.get("knowledge_archive_path", "")).strip()
+                        if str(maybe_reflection.get("llm_wiki_dashboard_path", "")).strip():
+                            artifact_status["generated"]["llm_wiki_dashboard"] = str(maybe_reflection.get("llm_wiki_dashboard_path", "")).strip()
+                        graphify_payload = maybe_reflection.get("llm_graphify", {})
+                        if isinstance(graphify_payload, dict) and graphify_payload:
+                            artifact_status["generated"]["llm_graphify"] = graphify_payload
                 except BaseException as exc:
                     artifact_status["errors"]["run_reflection"] = f"{type(exc).__name__}: {exc}"
                     raise
@@ -785,6 +793,12 @@ def run(
         "run_reflection_markdown_path": str(run_reflection_info.get("run_reflection_markdown_path", "")).strip(),
         "knowledge_in_path": str(run_meta.get("knowledge_in_path", "")).strip(),
         "knowledge_out_path": str(run_meta.get("knowledge_out_path", "")).strip(),
+        "llm_knowledge_root": str(run_meta.get("llm_knowledge_root", "")).strip(),
+        "llm_knowledge_base_root": str(run_meta.get("llm_knowledge_base_root", "")).strip(),
+        "llm_knowledge_experiment_id": str(run_meta.get("llm_knowledge_experiment_id", "")).strip(),
+        "llm_wiki_path": str(run_meta.get("llm_wiki_path", "")).strip(),
+        "llm_graph_path": str(run_meta.get("llm_graph_path", "")).strip(),
+        "llm_wiki_dashboard_path": str(run_meta.get("llm_wiki_dashboard_path", "")).strip(),
     }
 
 

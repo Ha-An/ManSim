@@ -9,7 +9,16 @@ __pycache__/
 Thumbs.db
 _tmp_kor_test.txt
 openclaw/state/
+openclaw/logs/
+runtime/logs/
 .tooling/
 backups/
+dist/
+node_modules/
+*.egg-info/
+
+# Generated LLM Wiki / Graphify experiment vaults.
+knowledge/llm_knowledge/
+llm_knowledge/
 
 openclaw/workspaces/*/.openclaw/

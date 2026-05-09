@@ -13,6 +13,9 @@ Hub는 아래 view로 연결됩니다.
 - OpenClaw workspace dashboard
 - factory Replay Studio view
 - manager Replay Studio view
+- LLM Wiki dashboard
+- Graphify knowledge graph dashboard
+- Series dashboard, multi-run일 때
 
 ## Factory Replay Studio
 
@@ -46,6 +49,30 @@ Manager replay는 아래 파일을 사용합니다.
 
 Compiler는 agent가 아니라 deterministic system stage로 표시합니다. Strategist와 Reviewer는 manager decision phase로 유지합니다.
 
+## LLM Wiki Dashboard
+
+`llm_wiki_dashboard.html`은 Curator가 만든 Obsidian-compatible vault의 진입점입니다.
+
+- Obsidian 앱이 설치되어 있고 vault가 등록되어 있으면 `obsidian://open?...` 링크로 앱을 엽니다.
+- 앱 연결이 실패해도 browser preview로 `00_Index.md`와 주요 page link를 확인할 수 있습니다.
+- Wiki 원본은 `knowledge/llm_knowledge/experiments/<id>/wiki/`에 있습니다.
+
+Wiki는 raw JSON viewer가 아닙니다. Raw artifact는 `raw/`에 보관하고, wiki에는 반복 사용 가능한 운영관리 지식만 정리합니다.
+
+## Knowledge Graph Dashboard
+
+`knowledge_graph_dashboard.html`은 Graphify 결과를 hub 내부 dashboard로 보여줍니다.
+
+기본 tab은 Network입니다.
+
+- Network: node-link graph.
+- Tree: hierarchy-oriented view.
+- Communities: cluster/community view.
+- Edges: relation table.
+- Raw JSON: `graph.json` 원본 확인.
+
+Graph 원본은 `knowledge/llm_knowledge/experiments/<id>/graph/` 아래에 저장됩니다.
+
 ## Shared Repair 시각화
 
 협동 수리 event는 아래 형태로 export됩니다.
@@ -56,6 +83,10 @@ Compiler는 agent가 아니라 deterministic system stage로 표시합니다. St
 - `MACHINE_REPAIRED`
 
 Replay Studio는 repair team size, repair progress, machine 주변에 배치된 참여 worker를 표시합니다.
+
+## Series Dashboard
+
+Multi-run 실행이면 parent output directory에 `series_dashboard.html`이 생성됩니다. 이 dashboard는 completed products를 primary metric으로 사용합니다. Closure ratio와 backlog가 개선되어도 completed products가 감소하면 knowledge impact를 positive로 보지 않습니다.
 
 ## Replay Studio Asset 재생성
 

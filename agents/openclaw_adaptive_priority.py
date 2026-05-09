@@ -7,6 +7,7 @@ from typing import Any
 from .base import JobPlan, StrategyState
 from .openclaw_orchestrated import OpenClawOrchestratedDecisionModule
 from .scripted import ScriptedDecisionModule
+from knowledge import LLMWikiStore
 
 class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule):
     """OpenClaw managers tune priority policy while workers stay deterministic."""
@@ -20,10 +21,46 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         orch_cfg = self.llm_cfg.get("orchestration", {}) if isinstance(self.llm_cfg.get("orchestration", {}), dict) else {}
         strategy_cfg = orch_cfg.get("strategy", {}) if isinstance(orch_cfg.get("strategy", {}), dict) else {}
         review_cfg = orch_cfg.get("review", {}) if isinstance(orch_cfg.get("review", {}), dict) else {}
+        knowledge_cfg = self.llm_cfg.get("knowledge", {}) if isinstance(self.llm_cfg.get("knowledge", {}), dict) else {}
+        manager_usage_cfg = knowledge_cfg.get("manager_usage", {}) if isinstance(knowledge_cfg.get("manager_usage", {}), dict) else {}
+        curator_cfg = knowledge_cfg.get("curator", {}) if isinstance(knowledge_cfg.get("curator", {}), dict) else {}
+        graph_cfg = knowledge_cfg.get("graph", {}) if isinstance(knowledge_cfg.get("graph", {}), dict) else {}
+        backend_cfg = (
+            self.llm_cfg.get("openclaw", {}).get("backend", {})
+            if isinstance(self.llm_cfg.get("openclaw", {}), dict) and isinstance(self.llm_cfg.get("openclaw", {}).get("backend", {}), dict)
+            else {}
+        )
         self.refresh_after_patch_count = max(1, int(strategy_cfg.get("refresh_after_patch_count", 2) or 2))
         self.review_enabled = bool(review_cfg.get("enabled", True))
         self.reviewer_max_prevention_targets = max(1, int(review_cfg.get("max_prevention_targets", 2) or 2))
         self.reviewer_max_failure_modes = max(1, int(review_cfg.get("max_failure_modes", 3) or 3))
+        self.llm_wiki_enabled = bool(knowledge_cfg.get("enabled", False))
+        self.llm_wiki_root = Path(str(knowledge_cfg.get("root", "llm_knowledge") or "llm_knowledge")).resolve()
+        self.llm_wiki_base_root = str(knowledge_cfg.get("base_root", "") or "").strip()
+        self.llm_wiki_experiment_id = str(knowledge_cfg.get("experiment_id", "") or "").strip()
+        self.llm_wiki_manager_usage = {
+            "strategist": bool(manager_usage_cfg.get("strategist", True)),
+            "reviewer": bool(manager_usage_cfg.get("reviewer", True)),
+            "curator": bool(manager_usage_cfg.get("curator", True)),
+        }
+        self.llm_wiki_curator_enabled = self.llm_wiki_enabled and bool(curator_cfg.get("enabled", True))
+        self.llm_wiki_graph_enabled = self.llm_wiki_enabled and bool(graph_cfg.get("enabled", True))
+        self.llm_wiki_graph_update_frequency = str(graph_cfg.get("update_frequency", "run") or "run").strip().lower()
+        self.llm_wiki_store = (
+            LLMWikiStore(
+                self.llm_wiki_root,
+                graphify_command=str(graph_cfg.get("command", "") or "").strip() or None,
+                graphify_timeout_sec=int(graph_cfg.get("timeout_sec", 300) or 300),
+                graphify_backend=str(graph_cfg.get("backend", "") or ("ollama" if str(backend_cfg.get("base_url", "") or "").strip() else "")).strip() or None,
+                graphify_model=str(graph_cfg.get("model", "") or backend_cfg.get("model", "") or backend_cfg.get("model_name", "") or "").strip() or None,
+                graphify_base_url=str(graph_cfg.get("base_url", "") or backend_cfg.get("base_url", "") or "").strip() or None,
+                graphify_api_key=str(graph_cfg.get("api_key", "") or backend_cfg.get("api_key", "") or "").strip() or None,
+                graphify_max_output_tokens=int(graph_cfg.get("max_output_tokens", 0) or 0),
+                graphify_no_cluster=bool(graph_cfg.get("no_cluster", False)),
+            )
+            if self.llm_wiki_enabled
+            else None
+        )
         self.allowed_worker_roles = (
             "intake_runner",
             "reliability_guard",
@@ -65,6 +102,31 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
     def _knowledge_enabled(self) -> bool:
         return int(self.run_series_total) > 1
 
+    def _llm_wiki_enabled(self) -> bool:
+        return bool(self.llm_wiki_enabled and self.llm_wiki_store is not None)
+
+    def _llm_wiki_manager_enabled(self, phase: str) -> bool:
+        if not self._llm_wiki_enabled():
+            return False
+        key = str(phase or "").strip().lower()
+        if key == "manager_shift_strategist":
+            return bool(self.llm_wiki_manager_usage.get("strategist", True))
+        if key == "manager_daily_reviewer":
+            return bool(self.llm_wiki_manager_usage.get("reviewer", True))
+        if key == "manager_curator":
+            return bool(self.llm_wiki_manager_usage.get("curator", True))
+        return False
+
+    def _llm_wiki_prompt_blob(self, *, max_len: int = 3000) -> str:
+        if not self._llm_wiki_enabled() or self.llm_wiki_store is None:
+            return ""
+        return self._truncate_prompt_text(self.llm_wiki_store.compact_prompt_digest(max_len=max_len), max_len=max_len)
+
+    def _llm_graph_prompt_blob(self, *, max_len: int = 1200) -> str:
+        if not self._llm_wiki_enabled() or self.llm_wiki_store is None:
+            return ""
+        return self._truncate_prompt_text(self.llm_wiki_store.graph_digest(max_len=max_len), max_len=max_len)
+
     def _reset_run_state(self) -> None:
         super()._reset_run_state()
         self.shift_policy_history = []
@@ -75,9 +137,14 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             self.series_knowledge_text = ""
 
     def _manager_knowledge_workspace_aliases(self) -> list[str]:
-        if not self._knowledge_enabled():
-            return []
-        return ["MANAGER_SHIFT_STRATEGIST", "MANAGER_DAILY_REVIEWER", "MANAGER_RUN_REFLECTOR"]
+        aliases: list[str] = []
+        if self._knowledge_enabled():
+            aliases.extend(["MANAGER_SHIFT_STRATEGIST", "MANAGER_DAILY_REVIEWER", "MANAGER_RUN_REFLECTOR"])
+        if self._llm_wiki_enabled():
+            aliases.extend(["MANAGER_SHIFT_STRATEGIST", "MANAGER_DAILY_REVIEWER"])
+            if self.llm_wiki_curator_enabled:
+                aliases.append("MANAGER_CURATOR")
+        return list(dict.fromkeys(aliases))
 
     def _build_day_scoped_runtime_agent_id(self, phase: str, day: int | None = None) -> str:
         suffix = self._phase_runtime_agent_suffix()
@@ -87,6 +154,8 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             return f"MANAGER_SHIFT_STRATEGIST_{suffix}_D{safe_day}"
         if phase_key == "manager_daily_reviewer":
             return f"MANAGER_DAILY_REVIEWER_{suffix}_D{safe_day}"
+        if phase_key == "manager_curator":
+            return f"MANAGER_CURATOR_{suffix}_D{safe_day}"
         if phase_key == "manager_run_reflector":
             return f"MANAGER_RUN_REFLECTOR_{suffix}"
         return super()._build_day_scoped_runtime_agent_id(phase, day)
@@ -96,6 +165,8 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         for day in range(1, self._simulation_total_days() + 1):
             ids[f"{self.manager_agent_id}:manager_shift_strategist:d{day}"] = self._build_day_scoped_runtime_agent_id("manager_shift_strategist", day)
             ids[f"{self.manager_agent_id}:manager_daily_reviewer:d{day}"] = self._build_day_scoped_runtime_agent_id("manager_daily_reviewer", day)
+            if self.llm_wiki_curator_enabled:
+                ids[f"{self.manager_agent_id}:manager_curator:d{day}"] = self._build_day_scoped_runtime_agent_id("manager_curator", day)
         if self._knowledge_enabled():
             ids[f"{self.manager_agent_id}:manager_run_reflector"] = self._build_day_scoped_runtime_agent_id("manager_run_reflector")
         return ids
@@ -105,6 +176,8 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         for day in range(1, self._simulation_total_days() + 1):
             aliases[self._build_day_scoped_runtime_agent_id("manager_shift_strategist", day)] = "MANAGER_SHIFT_STRATEGIST"
             aliases[self._build_day_scoped_runtime_agent_id("manager_daily_reviewer", day)] = "MANAGER_DAILY_REVIEWER"
+            if self.llm_wiki_curator_enabled:
+                aliases[self._build_day_scoped_runtime_agent_id("manager_curator", day)] = "MANAGER_CURATOR"
         if self._knowledge_enabled():
             aliases[self._build_day_scoped_runtime_agent_id("manager_run_reflector")] = "MANAGER_RUN_REFLECTOR"
         for aid in self.openclaw_worker_agent_ids:
@@ -125,6 +198,11 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             return self.phase_runtime_agent_ids.get(
                 f"{self.manager_agent_id}:manager_daily_reviewer:d{day}",
                 self._build_day_scoped_runtime_agent_id("manager_daily_reviewer", day),
+            )
+        if call_name == "manager_curator":
+            return self.phase_runtime_agent_ids.get(
+                f"{self.manager_agent_id}:manager_curator:d{day}",
+                self._build_day_scoped_runtime_agent_id("manager_curator", day),
             )
         if call_name == "manager_run_reflector":
             return self.phase_runtime_agent_ids.get(
@@ -158,12 +236,21 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         self.openclaw_gateway_log_path = Path(runtime_info["gateway_log_path"])
         self._seed_openclaw_run_context()
         self._seed_cross_run_knowledge()
+        self._sync_llm_wiki_workspace_context()
         gateway_info: dict[str, Any] = self.openclaw_client.restart_gateway()
         merged = dict(runtime_info)
         merged["gateway"] = gateway_info
         merged["run_id"] = self.openclaw_run_id
         merged["transport"] = self.openclaw_transport
         merged["knowledge_in_path"] = str(self.series_knowledge_path.resolve()) if self.series_knowledge_path is not None else ""
+        if self._llm_wiki_enabled() and self.llm_wiki_store is not None:
+            if self.llm_wiki_base_root:
+                merged["llm_knowledge_base_root"] = self.llm_wiki_base_root
+            if self.llm_wiki_experiment_id:
+                merged["llm_knowledge_experiment_id"] = self.llm_wiki_experiment_id
+            merged["llm_knowledge_root"] = str(self.llm_wiki_store.root_dir.resolve())
+            merged["llm_wiki_path"] = str(self.llm_wiki_store.wiki_dir.resolve())
+            merged["llm_graph_path"] = str(self.llm_wiki_store.graph_dir.resolve())
         return merged
 
     def _native_phase_directives(self, phase: str) -> list[str]:
@@ -181,6 +268,11 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
                 "Return only target misses, failure labels, recommended prevention targets, support pair guidance, role-change advice, and carry-forward risks.",
                 "Focus on what tomorrow's strategist should change, not on replaying today's facts.",
             ],
+            "manager_curator": [
+                "Maintain the ManSim LLM wiki as compact reusable operational knowledge.",
+                "Separate managed-object facts from manager-behavior lessons.",
+                "Return only structured wiki update intent; do not write Markdown yourself.",
+            ],
         }
         if str(phase or "").strip() in directives:
             return list(directives[str(phase).strip()])
@@ -197,7 +289,7 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         instructions: list[str],
         history_tag: str,
     ) -> tuple[str, str, dict[str, str]]:
-        if str(phase) not in {"manager_shift_strategist", "manager_daily_reviewer"}:
+        if str(phase) not in {"manager_shift_strategist", "manager_daily_reviewer", "manager_curator"}:
             return super()._native_turn_prompts(
                 agent_id=agent_id,
                 phase=phase,
@@ -239,7 +331,7 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
                 "plan_revision": "int",
                 "limits": {"max_prevention_targets": 2, "max_daily_targets": 3},
             }
-        else:
+        elif str(phase) == "manager_daily_reviewer":
             request_payload["review_contract"] = {
                 "target_misses": ["one_of[min_accepted_products_today,max_closeout_gap_end,max_discharged_workers]"],
                 "top_failure_modes": ["one_of[closeout_gap,battery_instability,reliability_instability,flow_blockage,s2_underfeed]"],
@@ -249,6 +341,26 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
                 "carry_forward_risks": ["short English string"],
                 "limits": {"max_target_misses": 3, "max_failure_modes": 3, "max_prevention_targets": 2, "max_risks": 4},
             }
+        else:
+            request_payload["curation_contract"] = {
+                "summary": "short English synthesis",
+                "daily_updates": ["short reusable fact or lesson"],
+                "managed_object_updates": {
+                    "items": ["item-flow observation"],
+                    "workers": ["worker behavior observation"],
+                    "equipment": ["machine or inspection workbench observation"],
+                    "queues": ["queue or buffer observation"],
+                },
+                "manager_lessons": {
+                    "strategist": ["strategy lesson"],
+                    "reviewer": ["review quality lesson"],
+                    "curator": ["wiki maintenance lesson"],
+                },
+                "links": ["Obsidian-style target such as [[Runs/Run-0001]]"],
+                "graph_hints": ["node-or-edge candidate for Graphify"],
+                "open_questions": ["question to revisit"],
+                "limits": {"max_each_list": 4},
+            }
         if workspace is not None:
             self._openclaw_write_json(workspace / "facts" / "current_request.json", request_payload)
             self._openclaw_write_json(workspace / "facts" / "request_history" / f"{history_tag}.json", request_payload)
@@ -257,9 +369,14 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         system_prompt = "Native-local simulator turn. Use workspace facts only. Return one JSON object only."
         if str(phase) == "manager_shift_strategist":
             worker_list = "/".join(self.agent_ids)
-            user_prompt = f"Execute manager_shift_strategist. Keep output compact and intent-only. Return worker_roles for {worker_list}, operating_focus, late_horizon_mode, role_plan, support_plan, prevention_targets, daily_targets, and plan_revision. Do not emit task_priority_weights, agent_priority_multipliers, mailbox_seed, commitments, or personal queues. Keep exactly one clear inspection_closer. Use previous_day_review to decide what should be prevented today. Choose at most two prevention_targets and one primary_support_pair."
-        else:
+            extra = " Re-read LLM_WIKI.md and KNOWLEDGE_GRAPH.md before deciding whether a recurring lesson applies." if self._llm_wiki_manager_enabled("manager_shift_strategist") else ""
+            user_prompt = f"Execute manager_shift_strategist. Keep output compact and intent-only. Return worker_roles for {worker_list}, operating_focus, late_horizon_mode, role_plan, support_plan, prevention_targets, daily_targets, and plan_revision. Do not emit task_priority_weights, agent_priority_multipliers, mailbox_seed, commitments, or personal queues. Keep exactly one clear inspection_closer. Use previous_day_review to decide what should be prevented today. Choose at most two prevention_targets and one primary_support_pair.{extra}"
+        elif str(phase) == "manager_daily_reviewer":
+            extra = " Re-read LLM_WIKI.md and KNOWLEDGE_GRAPH.md before judging recurring or unresolved risks." if self._llm_wiki_manager_enabled("manager_daily_reviewer") else ""
             user_prompt = "Execute manager_daily_reviewer. Keep output compact and diagnosis-only. Do not repeat raw metrics from the request. Return only target_misses, top_failure_modes, recommended_prevention_targets, recommended_support_pair, role_change_advice, and carry_forward_risks. Focus on what tomorrow's strategist should change."
+            user_prompt += extra
+        else:
+            user_prompt = "Execute manager_curator. Return only summary, daily_updates, managed_object_updates, manager_lessons, links, graph_hints, and open_questions. Distinguish managed-object facts from manager-behavior lessons. Keep every list short and reusable."
         return system_prompt, user_prompt, dict(required_fields)
 
     def _backend_direct_turn_prompts(
@@ -322,6 +439,33 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
                 "role_change_advice values must be canonical role names only.",
                 "Carry-forward risks should be short English strings, not raw metric dumps.",
                 "Keep the whole JSON compact so it fits well within the token budget.",
+            ]
+        elif phase_name == "manager_curator":
+            template = {
+                "summary": "short synthesis",
+                "daily_updates": ["accepted-product closeout improved after explicit support"],
+                "managed_object_updates": {
+                    "items": ["finished products need final warehouse delivery to count"],
+                    "workers": ["A3 acted as inspection_closer"],
+                    "equipment": ["inspection workbench had one active owner"],
+                    "queues": ["inspection output queue remained open"],
+                },
+                "manager_lessons": {
+                    "strategist": ["keep closeout visible when accepted products are queued"],
+                    "reviewer": ["flag inspection output that did not reach warehouse"],
+                    "curator": ["link daily facts to managed objects and manager decisions"],
+                },
+                "links": ["[[Managed/Queues/Inspection Output]]"],
+                "graph_hints": ["Inspection Output Queue affects Completed Products"],
+                "open_questions": [],
+            }
+            extra_rules = [
+                "You maintain wiki update intent only; the deterministic wiki writer will edit Markdown.",
+                "daily_updates should be reusable lessons, not a raw metric dump.",
+                "managed_object_updates must separate items, workers, equipment, and queues.",
+                "manager_lessons must separate strategist, reviewer, and curator perspectives.",
+                "links should use Obsidian-style wikilinks when a useful page target is obvious.",
+                "Keep each list to at most four short strings.",
             ]
         else:
             return super()._backend_direct_turn_prompts(
@@ -1208,6 +1352,9 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         }
         if self._knowledge_enabled():
             packet["knowledge"] = self._knowledge_prompt_blob()
+        if self._llm_wiki_manager_enabled("manager_shift_strategist"):
+            packet["llm_wiki_digest"] = self._llm_wiki_prompt_blob(max_len=2600)
+            packet["knowledge_graph_digest"] = self._llm_graph_prompt_blob(max_len=900)
         return self._prune_prompt_value(packet) or {}
 
     def _reviewer_packet(self, day_summary: dict[str, Any], norms: dict[str, Any]) -> dict[str, Any]:
@@ -1246,6 +1393,9 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             "norm_targets": dict(norms if isinstance(norms, dict) else {}),
             "previous_day_review": self._latest_day_review_memory(),
         }
+        if self._llm_wiki_manager_enabled("manager_daily_reviewer"):
+            packet["llm_wiki_digest"] = self._llm_wiki_prompt_blob(max_len=2200)
+            packet["knowledge_graph_digest"] = self._llm_graph_prompt_blob(max_len=900)
         return self._prune_prompt_value(packet) or {}
 
     def _build_priority_policy_plan(
@@ -1776,6 +1926,14 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             top_failure_modes.append("s2_underfeed")
         return {
             "day": day,
+            "products": products,
+            "inspection_passes": inspection_passes,
+            "inspection_backlog_end": backlog,
+            "machine_breakdowns": breakdowns,
+            "agent_discharged_count": discharged,
+            "station1_output_buffer_end": station1_buffer_end,
+            "station2_output_buffer_end": station2_buffer_end,
+            "station2_completions": station2_completions,
             "what_improved": improved[:3],
             "what_worsened": worsened[:3],
             "carry_forward_risks": risks[:4],
@@ -1789,6 +1947,29 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             "policy_critique_hints": critique_hints[:3],
             "next_day_prevention_hints": critique_hints[:3],
         }
+
+    def _sync_llm_wiki_workspace_context(self) -> None:
+        if not self._llm_wiki_enabled() or self.llm_wiki_store is None:
+            return
+        if not self._openclaw_enabled() or self.openclaw_runtime_workspace_root is None:
+            return
+        wiki_digest = self._llm_wiki_prompt_blob(max_len=3000)
+        graph_digest = self._llm_graph_prompt_blob(max_len=1200)
+        context = {
+            "enabled": True,
+            "base_root": self.llm_wiki_base_root,
+            "experiment_id": self.llm_wiki_experiment_id,
+            "root": str(self.llm_wiki_store.root_dir.resolve()),
+            "wiki_path": str(self.llm_wiki_store.wiki_dir.resolve()),
+            "graph_path": str(self.llm_wiki_store.graph_dir.resolve()),
+            "manager_usage": dict(self.llm_wiki_manager_usage),
+        }
+        for workspace_alias in self._manager_knowledge_workspace_aliases():
+            workspace = self.openclaw_runtime_workspace_root / workspace_alias
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "LLM_WIKI.md").write_text(wiki_digest + ("\n" if not wiki_digest.endswith("\n") else ""), encoding="utf-8")
+            (workspace / "KNOWLEDGE_GRAPH.md").write_text(graph_digest + ("\n" if not graph_digest.endswith("\n") else ""), encoding="utf-8")
+            self._openclaw_write_json(workspace / "facts" / "llm_knowledge_context.json", context)
 
     def _sync_shift_workspace(self, *, observation: dict[str, Any], policy: dict[str, Any], request_packet: dict[str, Any]) -> None:
         day = self._safe_int(observation.get("day", (observation.get("time", {}) if isinstance(observation.get("time", {}), dict) else {}).get("day", 0)), 0)
@@ -2029,6 +2210,209 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         self._sync_reviewer_workspace(day=day, summary=day_summary, review=review, request_packet=request_packet)
         return review
 
+    def _deterministic_curator_report(
+        self,
+        *,
+        day_summary: dict[str, Any],
+        shift_policy: dict[str, Any],
+        reviewer_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        products = self._safe_int(day_summary.get("products", 0), 0)
+        inspection_passes = self._safe_int(day_summary.get("inspection_passes", 0), 0)
+        closeout_gap = max(0, inspection_passes - products)
+        worker_roles = dict(shift_policy.get("worker_roles", {})) if isinstance(shift_policy.get("worker_roles", {}), dict) else {}
+        top_failure_modes = list(reviewer_report.get("top_failure_modes", [])) if isinstance(reviewer_report.get("top_failure_modes", []), list) else []
+        daily_updates = [
+            f"Day {self._safe_int(day_summary.get('day', 0), 0)} completed {products} accepted products with {inspection_passes} inspection passes.",
+        ]
+        if closeout_gap > 0:
+            daily_updates.append("Inspection output must be delivered to warehouse promptly because accepted-but-undelivered items do not raise completed product count.")
+        if top_failure_modes:
+            daily_updates.append("Reviewer recurring risk labels: " + ", ".join(str(item) for item in top_failure_modes[:3]))
+        return {
+            "summary": f"Curated day {self._safe_int(day_summary.get('day', 0), 0)} with products={products}, closeout_gap={closeout_gap}.",
+            "daily_updates": daily_updates[:4],
+            "managed_object_updates": {
+                "items": ["Finished-product count depends on warehouse delivery after inspection pass."],
+                "workers": [f"{agent}:{role}" for agent, role in worker_roles.items() if str(role).strip()][:4],
+                "equipment": [
+                    f"Inspection workbench processed {inspection_passes} passes.",
+                    f"Machine breakdowns today: {self._safe_int(day_summary.get('machine_breakdowns', 0), 0)}.",
+                ],
+                "queues": [
+                    f"Inspection backlog end: {self._safe_int(day_summary.get('inspection_backlog_end', 0), 0)}.",
+                    f"Inspection closeout gap end: {closeout_gap}.",
+                ],
+            },
+            "manager_lessons": {
+                "strategist": list(reviewer_report.get("recommended_prevention_targets", []))[:3] if isinstance(reviewer_report.get("recommended_prevention_targets", []), list) else [],
+                "reviewer": list(reviewer_report.get("carry_forward_risks", []))[:3] if isinstance(reviewer_report.get("carry_forward_risks", []), list) else [],
+                "curator": ["Link daily facts to managed objects and manager decisions."],
+            },
+            "links": ["[[Managed/Queues/Inspection Output]]", "[[Managers/Strategist]]", "[[Managers/Reviewer]]"],
+            "graph_hints": ["Inspection Output Queue affects Completed Products", "Strategist prevention targets influence worker roles"],
+            "open_questions": [],
+        }
+
+    def _curator_packet(
+        self,
+        *,
+        day_summary: dict[str, Any],
+        shift_policy: dict[str, Any],
+        reviewer_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        day = self._safe_int(day_summary.get("day", 0), 0)
+        packet = {
+            "objective": {
+                "global_goal": "Maintain an Obsidian-compatible LLM wiki that compounds operational knowledge for future manager decisions."
+            },
+            "time_context": {
+                "run_index": int(self.run_series_index),
+                "day": day,
+                "days_remaining": max(0, self._simulation_total_days() - day),
+            },
+            "schema_views": {
+                "managed_objects": ["items", "workers", "equipment", "queues"],
+                "manager_perspectives": ["strategist", "reviewer", "curator"],
+            },
+            "day_summary": self._prune_prompt_value(day_summary) or {},
+            "shift_policy": self._prune_prompt_value(shift_policy) or {},
+            "reviewer_report": self._prune_prompt_value(reviewer_report) or {},
+            "existing_wiki_digest": self._llm_wiki_prompt_blob(max_len=2500),
+            "existing_graph_digest": self._llm_graph_prompt_blob(max_len=1000),
+        }
+        return self._prune_prompt_value(packet) or {}
+
+    def _sanitize_curator_output(self, src: Any, *, fallback: dict[str, Any]) -> dict[str, Any]:
+        data = src if isinstance(src, dict) else {}
+
+        def _strings(value: Any, limit: int = 4) -> list[str]:
+            rows: list[str] = []
+            for item in value if isinstance(value, list) else []:
+                text = self._truncate_prompt_text(item, max_len=180).strip()
+                if text:
+                    rows.append(text)
+                if len(rows) >= max(1, limit):
+                    break
+            return rows
+
+        def _grouped(value: Any, allowed: tuple[str, ...]) -> dict[str, list[str]]:
+            src_dict = value if isinstance(value, dict) else {}
+            return {key: _strings(src_dict.get(key, []), limit=4) for key in allowed}
+
+        out = {
+            "summary": self._truncate_prompt_text(data.get("summary", fallback.get("summary", "")), max_len=220).strip(),
+            "daily_updates": _strings(data.get("daily_updates", fallback.get("daily_updates", [])), limit=4),
+            "managed_object_updates": _grouped(
+                data.get("managed_object_updates", fallback.get("managed_object_updates", {})),
+                ("items", "workers", "equipment", "queues"),
+            ),
+            "manager_lessons": _grouped(
+                data.get("manager_lessons", fallback.get("manager_lessons", {})),
+                ("strategist", "reviewer", "curator"),
+            ),
+            "links": _strings(data.get("links", fallback.get("links", [])), limit=6),
+            "graph_hints": _strings(data.get("graph_hints", fallback.get("graph_hints", [])), limit=6),
+            "open_questions": _strings(data.get("open_questions", fallback.get("open_questions", [])), limit=4),
+        }
+        if not out["summary"]:
+            out["summary"] = str(fallback.get("summary", "Curator update recorded."))
+        return out
+
+    def _invoke_curator(
+        self,
+        *,
+        day_summary: dict[str, Any],
+        shift_policy: dict[str, Any],
+        reviewer_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        fallback = self._deterministic_curator_report(day_summary=day_summary, shift_policy=shift_policy, reviewer_report=reviewer_report)
+        if not self.llm_wiki_curator_enabled:
+            return fallback
+        day = self._safe_int(day_summary.get("day", 0), 0)
+        request_packet = self._curator_packet(day_summary=day_summary, shift_policy=shift_policy, reviewer_report=reviewer_report)
+        required_fields = {
+            "summary": "str",
+            "daily_updates": "list[str]",
+            "managed_object_updates": "dict[str, list[str]]",
+            "manager_lessons": "dict[str, list[str]]",
+            "links": "list[str]",
+            "graph_hints": "list[str]",
+            "open_questions": "list[str]",
+        }
+        instructions = [
+            "Produce wiki update intent only; deterministic code writes files.",
+            "Keep updates compact and reusable.",
+            "Separate managed object observations from manager behavior lessons.",
+            "Use current day evidence over stale wiki notes when they conflict.",
+        ]
+        curator_transport = self._openclaw_transport_for_call("manager_curator")
+        runtime_agent_id = self._phase_runtime_agent_id("manager_curator", {"phase": "manager_curator", "day": day})
+        if curator_transport == "native_local":
+            system_prompt, prompt, required_keys = self._native_turn_prompts(
+                agent_id=runtime_agent_id,
+                phase="manager_curator",
+                role_summary="You are MANAGER_CURATOR. Maintain the ManSim LLM wiki and knowledge graph source material.",
+                input_payload=request_packet,
+                required_fields=required_fields,
+                instructions=instructions,
+                history_tag=f"day_{day:02d}_manager_curator",
+            )
+            self._assert_native_workspace_inputs_ready(runtime_agent_id, "manager_curator")
+        else:
+            system_prompt, prompt, required_keys = self._backend_direct_turn_prompts(
+                phase="manager_curator",
+                role_summary="You are MANAGER_CURATOR. Maintain the ManSim LLM wiki and knowledge graph source material.",
+                input_payload=request_packet,
+                required_fields=required_fields,
+                instructions=instructions,
+            )
+        try:
+            payload = self._call_llm_json(prompt, system_prompt, call_name="manager_curator", context={"phase": "manager_curator", "day": day}, required_keys=required_keys)
+        except RuntimeError:
+            payload = fallback
+        report = self._sanitize_curator_output(payload, fallback=fallback)
+        self._sync_curator_workspace(day=day, request_packet=request_packet, curator_report=report)
+        return report
+
+    def _sync_curator_workspace(self, *, day: int, request_packet: dict[str, Any], curator_report: dict[str, Any]) -> None:
+        workspace = self._phase_workspace_for_call("manager_curator", {"phase": "manager_curator", "day": max(1, day)})
+        if workspace is None:
+            return
+        payload = {"request": request_packet, "curator_report": curator_report}
+        self._openclaw_write_json(workspace / "reports" / f"day_{day:02d}_curator_report.json", curator_report)
+        self._openclaw_write_json(workspace / "facts" / "current_curator_report.json", curator_report)
+        self._openclaw_write_json(workspace / "memory" / "episodic" / f"day_{day:02d}_curator_cycle.json", payload)
+        self._openclaw_write_markdown(
+            workspace / "memory" / "rolling_summary.md",
+            "MANAGER_CURATOR Rolling Summary",
+            [
+                ("Run Scope", "This workspace stores day-end LLM wiki maintenance decisions for the current run."),
+                ("Latest Curator Report", curator_report),
+                ("LLM Wiki Root", str(self.llm_wiki_store.root_dir.resolve()) if self.llm_wiki_store is not None else ""),
+            ],
+        )
+
+    def _update_llm_wiki_daily(self, *, day_summary: dict[str, Any], reviewer_report: dict[str, Any]) -> dict[str, Any]:
+        if not self._llm_wiki_enabled() or self.llm_wiki_store is None:
+            return {}
+        day = self._safe_int(day_summary.get("day", 0), 0)
+        shift_policy = dict(self.current_shift_policy) if isinstance(self.current_shift_policy, dict) else {}
+        curator_report = self._invoke_curator(day_summary=day_summary, shift_policy=shift_policy, reviewer_report=reviewer_report)
+        self.llm_wiki_store.write_daily_update(
+            run_index=int(self.run_series_index),
+            day=max(1, day),
+            day_summary=day_summary,
+            shift_policy=shift_policy,
+            reviewer_report=reviewer_report,
+            curator_report=curator_report,
+            source_output_dir=self.run_output_root,
+        )
+        if self.llm_wiki_graph_enabled and self.llm_wiki_graph_update_frequency in {"day", "daily"}:
+            self.llm_wiki_store.run_graphify(run_index=int(self.run_series_index), day=max(1, day), reason="daily")
+        self._sync_llm_wiki_workspace_context()
+        return curator_report
+
     def reflect(self, observation: dict[str, Any]) -> StrategyState:
         shift_policy = self._invoke_shift_strategist(observation, norms=getattr(self, "norms", {}))
         self.current_shift_policy = dict(shift_policy)
@@ -2073,6 +2457,7 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         self.day_review_memory.append(review)
         if len(self.day_review_memory) > max(1, int(self.memory_window_days or 7)):
             del self.day_review_memory[: len(self.day_review_memory) - max(1, int(self.memory_window_days or 7))]
+        curator_report = self._update_llm_wiki_daily(day_summary=compiled, reviewer_report=review)
         day = self._safe_int(compiled.get("day", 0), 0)
         self.shared_discussion_memory.append(
             {
@@ -2086,6 +2471,8 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             }
         )
         self._last_discussion_trace = [{"day": day, "type": "daily_reviewer", "review": review}]
+        if curator_report:
+            self._last_discussion_trace.append({"day": day, "type": "manager_curator", "curator_report": curator_report})
         self._write_operating_artifacts()
         return updated_norms
 
@@ -2093,6 +2480,32 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         return {}
 
     def reflect_run(self, *, output_root: Path, kpi: dict[str, Any], daily_summaries: list[dict[str, Any]], run_meta: dict[str, Any]) -> dict[str, Any]:
-        if not self._knowledge_enabled():
-            return {}
-        return super().reflect_run(output_root=output_root, kpi=kpi, daily_summaries=daily_summaries, run_meta=run_meta)
+        payload: dict[str, Any] = {}
+        if self._knowledge_enabled():
+            payload = super().reflect_run(output_root=output_root, kpi=kpi, daily_summaries=daily_summaries, run_meta=run_meta)
+        if self._llm_wiki_enabled() and self.llm_wiki_store is not None:
+            reflection = payload.get("run_reflection", {}) if isinstance(payload.get("run_reflection", {}), dict) else {}
+            self.llm_wiki_store.write_run_raw(
+                run_index=int(self.run_series_index),
+                run_output_dir=output_root,
+                run_meta=run_meta,
+                kpi=kpi,
+                daily_summaries=daily_summaries,
+                reflection=reflection,
+            )
+            graph_info: dict[str, Any] = {}
+            if self.llm_wiki_graph_enabled and self.llm_wiki_graph_update_frequency in {"run", "end", "run_end"}:
+                graph_info = self.llm_wiki_store.run_graphify(run_index=int(self.run_series_index), reason="run")
+            wiki_dashboard_path = self.llm_wiki_store.export_wiki_dashboard(output_root)
+            payload.update(
+                {
+                    "llm_knowledge_base_root": self.llm_wiki_base_root,
+                    "llm_knowledge_experiment_id": self.llm_wiki_experiment_id,
+                    "llm_knowledge_root": str(self.llm_wiki_store.root_dir.resolve()),
+                    "llm_wiki_path": str(self.llm_wiki_store.wiki_dir.resolve()),
+                    "llm_graph_path": str(self.llm_wiki_store.graph_dir.resolve()),
+                    "llm_wiki_dashboard_path": str(wiki_dashboard_path.resolve()),
+                    "llm_graphify": graph_info,
+                }
+            )
+        return payload

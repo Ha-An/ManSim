@@ -1,61 +1,110 @@
-# OpenClaw Native Loop 검토
+# OpenClaw Native Loop Review
+
+이 문서는 ManSim이 사용하는 local OpenClaw stack과 runtime workspace 구조를 요약합니다.
 
 ## 범위
-이 문서는 ManSim이 현재 사용하는 로컬 OpenClaw native-local 스택을 요약합니다.
 
-대상 경로
-- `llm_planner`
+대상 decision path:
+
 - `openclaw_adaptive_priority`
+- `llm_planner`, legacy 참고용
 
-현재 유지되는 production 경로
-- `openclaw_adaptive_priority`
-- local OpenClaw gateway + local vLLM backend
-- strategist + compiler + reviewer closed loop
+현재 production path는 `openclaw_adaptive_priority`입니다.
 
-## 기본 스택
-- OpenClaw gateway
+## Local Stack
+
+기본 구성:
+
 - local vLLM backend
-- default model alias: `vllm/mansim-gemma4-e4b`
-- workspace templates: `openclaw/workspaces/`
+- OpenClaw gateway
+- ManSim runtime
+- OpenClaw workspace templates
 
-## 런타임 동작
-- runtime이 temp runtime 디렉터리 아래 run별 OpenClaw workspace root를 준비합니다.
-- strategist와 reviewer는 day-scoped runtime alias를 사용합니다.
-- 요청/응답 contract 파일은 turn마다 다시 기록됩니다.
-- run-local prompt-facing memory는 실행 중 갱신됩니다.
+기본 실행 순서:
 
-## 현재 manager set
-### `openclaw_adaptive_priority`
-- shift strategist
-- daily reviewer
-- run reflector는 multi-run일 때만 사용
+```powershell
+.\install_openclaw_cli.ps1
+.\start_vllm_gemma4_docker.ps1
+.\openclaw\start_gateway.ps1
+.\.venv\Scripts\python.exe main.py decision=openclaw_adaptive_priority
+```
 
-### `llm_planner`
+기본 profile:
+
+- `openclaw/profiles/mansim_repo/openclaw.json`
+- model alias: `vllm/mansim-gemma4-e4b`
+- backend model: `mansim-gemma4-e4b`
+- gateway: `http://localhost:18789/v1`
+- backend: `http://127.0.0.1:8000/v1`
+
+## Runtime Workspace
+
+Runtime은 run마다 임시 OpenClaw workspace를 준비합니다. 각 manager workspace에는 보통 아래 파일이 들어갑니다.
+
+- `USER.md`
+- `MEMORY.md`
+- `KNOWLEDGE.md`
+- `LLM_WIKI.md`
+- `KNOWLEDGE_GRAPH.md`
+- `facts/current_request.json`
+- `facts/current_response_template.json`
+- `facts/current_native_turn.json`
+- `reports/*`
+- `trace/*`
+
+`LLM_WIKI.md`와 `KNOWLEDGE_GRAPH.md`는 config에서 manager knowledge usage가 켜져 있을 때 compact digest로 갱신됩니다.
+
+## Manager Set
+
+`openclaw_adaptive_priority`:
+
+- `MANAGER_SHIFT_STRATEGIST`
+- `MANAGER_DAILY_REVIEWER`
+- `MANAGER_CURATOR`
+
+Multi-run에서는 run-level reflection과 knowledge handoff도 함께 사용됩니다.
+
+Legacy `llm_planner`:
+
 - detector
-- evaluator(optional)
+- evaluator
 - planner
-- reflector
+- run reflector
 
-## 운영상 장점
-- workspace 상태를 run 이후 직접 점검할 수 있습니다.
-- native-local 요청은 per-turn artifact를 그대로 남깁니다.
-- strategist reasoning은 유지하면서도 execution policy는 deterministic compiler가 고정합니다.
-- day boundary 중심의 closed loop를 유지합니다.
+## 운영 장점
 
-## 주요 실패 지점
-- gateway는 정상인데 backend가 비정상인 경우
-- strategist/reviewer output schema drift
-- compiler mapping이 너무 약하거나 너무 강한 경우
-- strategist role drift가 run마다 커지는 경우
-- daily reviewer diagnosis가 지나치게 일반적인 경우
-- 여전히 남아 있는 late-horizon variance
+- Strategist reasoning을 보존하면서 execution은 deterministic compiler가 안정화합니다.
+- Manager request/response artifact를 turn 단위로 남깁니다.
+- Workspace 파일을 통해 OpenClaw 입력을 직접 검사할 수 있습니다.
+- LLM Wiki와 knowledge graph를 manager input으로 주입할 수 있습니다.
 
-## 문제 발생 시 확인할 것
-1. `run_meta.json`
-2. `kpi.json`
-3. `daily_summary.json`
-4. `day_summary_memory.json`
-5. `day_review_memory.json`
-6. `shift_policy_history.json`
-7. temp runtime root 아래 OpenClaw workspace 파일
-8. `reasoning_dashboard.html`
+## 자주 보는 실패 지점
+
+- OpenClaw gateway는 떠 있지만 backend model이 응답하지 않는 경우.
+- Strategist/reviewer output schema가 contract에서 벗어나는 경우.
+- Compiler mapping이 너무 약해 manager intent가 실행에 반영되지 않는 경우.
+- Compiler mapping이 너무 강해 current state보다 과거 lesson을 과적용하는 경우.
+- Reviewer가 raw metric을 반복하고 actionable correction을 남기지 않는 경우.
+- Curator가 raw JSON을 wiki로 복사해 reusable knowledge가 되지 않는 경우.
+
+## 디버깅 체크리스트
+
+먼저 아래 artifact를 봅니다.
+
+- `run_meta.json`
+- `kpi.json`
+- `daily_summary.json`
+- `day_summary_memory.json`
+- `day_review_memory.json`
+- `shift_policy_history.json`
+- `manager_replay.json`
+- `reasoning_dashboard.html`
+- runtime OpenClaw workspace의 `facts/current_request.json`
+- runtime OpenClaw workspace의 `reports/*`
+
+Knowledge 관련 문제는 아래를 추가로 봅니다.
+
+- `llm_wiki_dashboard.html`
+- `knowledge_graph_dashboard.html`
+- `knowledge/llm_knowledge/experiments/<id>/wiki/00_Index.md`
+- `knowledge/llm_knowledge/experiments/<id>/graph/graphify_history.jsonl`

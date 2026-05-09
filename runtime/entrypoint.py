@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from omegaconf import DictConfig
 from dashboards import (
     build_series_analysis,
     export_knowledge_dashboard,
+    export_llm_graph_dashboard,
     export_manager_replay,
     export_operations_replay,
     export_reasoning_dashboard,
@@ -164,7 +166,7 @@ def _open_selected_artifacts(output_root: Path, child_output_dir: Path, cfg: Dic
             if path.is_file() and not path.name.startswith("."):
                 _open_artifact(path)
         if output_root != child_output_dir:
-            for name in ("series_dashboard.html", "series_analysis.json", "knowledge/KNOWLEDGE.md", "knowledge/knowledge_graph.json"):
+            for name in ("series_dashboard.html", "series_analysis.json", "knowledge/KNOWLEDGE.md", "knowledge/knowledge_graph.json", "llm_wiki_dashboard.html"):
                 _open_artifact(output_root / name)
         return
     for name in artifact_names:
@@ -262,6 +264,16 @@ def _export_run_dashboards(
     manager_replay_path = export_manager_replay(output_dir=output_dir)
     manager_replay_json_path = output_dir / "manager_replay.json"
     replay_studio_log_path, replay_studio_layout_path = _export_replay_studio_assets(output_dir)
+    llm_wiki_dashboard_raw = str(run_meta.get("llm_wiki_dashboard_path", "")).strip()
+    llm_wiki_dashboard_path = Path(llm_wiki_dashboard_raw) if llm_wiki_dashboard_raw else output_dir / "llm_wiki_dashboard.html"
+    if not llm_wiki_dashboard_path.exists():
+        llm_wiki_dashboard_path = output_dir / "llm_wiki_dashboard.html"
+    llm_graph_raw = str(run_meta.get("llm_graph_path", "")).strip()
+    llm_graph_path = Path(llm_graph_raw) if llm_graph_raw else None
+    graphify_tree_path = (llm_graph_path / "GRAPH_TREE.html") if llm_graph_path is not None else None
+    graphify_graph_html_path = (llm_graph_path / "graph.html") if llm_graph_path is not None else None
+    graphify_graph_raw_path = graphify_tree_path if graphify_tree_path is not None and graphify_tree_path.exists() else graphify_graph_html_path
+    graphify_graph_json_path = (llm_graph_path / "graph.json") if llm_graph_path is not None else None
     knowledge_path = export_knowledge_dashboard(
         output_dir=output_dir,
         graph=knowledge_store.graph,
@@ -279,6 +291,14 @@ def _export_run_dashboards(
         daily_summary=daily_rows,
         reflection=reflection,
         run_meta=run_meta,
+    )
+    graph_dashboard_path = export_llm_graph_dashboard(
+        output_dir=output_dir,
+        graph_html_path=graphify_graph_raw_path if graphify_graph_raw_path is not None and graphify_graph_raw_path.exists() else None,
+        graph_json_path=graphify_graph_json_path if graphify_graph_json_path is not None and graphify_graph_json_path.exists() else None,
+        manifest=manifest,
+        manifest_path=manifest_path,
+        current_run_id=current_run_id,
     )
     results_path = export_results_dashboard(
         output_dir=output_dir,
@@ -299,6 +319,10 @@ def _export_run_dashboards(
         "replay_studio_log_path": str(replay_studio_log_path.resolve()),
         "replay_studio_layout_path": str(replay_studio_layout_path.resolve()),
         "knowledge_dashboard_path": str(knowledge_path.resolve()),
+        "llm_wiki_dashboard_path": str(llm_wiki_dashboard_path.resolve()) if llm_wiki_dashboard_path.exists() else "",
+        "graphify_graph_path": str(graph_dashboard_path.resolve()) if graph_dashboard_path.exists() else "",
+        "graphify_graph_raw_path": str(graphify_graph_raw_path.resolve()) if graphify_graph_raw_path is not None and graphify_graph_raw_path.exists() else "",
+        "knowledge_graph_path": str(graphify_graph_json_path.resolve()) if graphify_graph_json_path is not None and graphify_graph_json_path.exists() else "",
         "reasoning_dashboard_path": str(reasoning_path.resolve()),
     }
 
@@ -367,6 +391,10 @@ def _refresh_dashboard_suite(
         run_entry["manager_replay_dashboard_path"] = exported.get("manager_replay_dashboard_path", "")
         run_entry["manager_replay_json_path"] = exported.get("manager_replay_json_path", "")
         run_entry["knowledge_dashboard_path"] = exported["knowledge_dashboard_path"]
+        run_entry["llm_wiki_dashboard_path"] = exported.get("llm_wiki_dashboard_path", "")
+        run_entry["graphify_graph_path"] = exported.get("graphify_graph_path", "")
+        run_entry["graphify_graph_raw_path"] = exported.get("graphify_graph_raw_path", "")
+        run_entry["knowledge_graph_path"] = exported.get("knowledge_graph_path", "")
         run_entry["reasoning_dashboard_path"] = exported["reasoning_dashboard_path"]
 
     if not bool(manifest.get("single_run", True)):
@@ -408,6 +436,14 @@ def _sync_root_knowledge_artifacts(runtime_output_dir: Path, knowledge_store: Kn
     )
 
 
+def _safe_experiment_id(runtime_output_dir: Path) -> str:
+    resolved = runtime_output_dir.resolve()
+    parts = resolved.parts
+    raw = f"{parts[-2]}_{parts[-1]}" if len(parts) >= 2 else resolved.name
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-._")
+    return safe or "experiment"
+
+
 @hydra.main(config_path="../configs", config_name="config", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     experiment_cfg = build_legacy_experiment_cfg(cfg)
@@ -417,6 +453,21 @@ def main(cfg: DictConfig) -> None:
     decision_cfg = experiment_cfg.get("decision", {}) if isinstance(experiment_cfg.get("decision", {}), dict) else {}
     decision_mode = normalize_decision_mode(str(decision_cfg.get("mode", "adaptive_priority")))
     llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
+    if isinstance(llm_cfg, dict):
+        knowledge_cfg = llm_cfg.get("knowledge", {}) if isinstance(llm_cfg.get("knowledge", {}), dict) else {}
+        if bool(knowledge_cfg.get("enabled", False)):
+            raw_root = str(knowledge_cfg.get("root", "knowledge/llm_knowledge") or "knowledge/llm_knowledge").strip()
+            base_root = Path(raw_root)
+            if not base_root.is_absolute():
+                base_root = Path(str(HydraConfig.get().runtime.cwd)) / base_root
+            base_root = base_root.resolve()
+            scope = str(knowledge_cfg.get("experiment_scope", "auto") or "auto").strip().lower()
+            experiment_id = _safe_experiment_id(runtime_output_dir)
+            root_path = base_root if scope in {"shared", "global"} else base_root / "experiments" / experiment_id
+            knowledge_cfg["base_root"] = str(base_root)
+            knowledge_cfg["experiment_id"] = experiment_id if scope not in {"shared", "global"} else "shared"
+            knowledge_cfg["root"] = str(root_path.resolve())
+            llm_cfg["knowledge"] = knowledge_cfg
     orchestration_cfg = llm_cfg.get("orchestration", {}) if isinstance(llm_cfg.get("orchestration", {}), dict) else {}
     orchestration_active = decision_mode in {"llm_planner", "openclaw_adaptive_priority"} and bool(orchestration_cfg.get("enabled", True))
     requested_run_count = int(orchestration_cfg.get("run_count", 1 if decision_mode == "openclaw_adaptive_priority" else 3) or (1 if decision_mode == "openclaw_adaptive_priority" else 3))
@@ -471,6 +522,14 @@ def main(cfg: DictConfig) -> None:
             "events_path": str((child_output_dir / "events.jsonl").resolve()),
             "knowledge_in_path": str(result.get("knowledge_in_path", "")),
             "knowledge_out_path": str(knowledge_store.markdown_path.resolve()),
+            "llm_knowledge_base_root": str(result.get("llm_knowledge_base_root", "")),
+            "llm_knowledge_experiment_id": str(result.get("llm_knowledge_experiment_id", "")),
+            "llm_knowledge_root": str(result.get("llm_knowledge_root", "")),
+            "llm_wiki_path": str(result.get("llm_wiki_path", "")),
+            "llm_graph_path": str(result.get("llm_graph_path", "")),
+            "llm_wiki_dashboard_path": exported.get("llm_wiki_dashboard_path", str(result.get("llm_wiki_dashboard_path", ""))),
+            "graphify_graph_path": exported.get("graphify_graph_path", ""),
+            "knowledge_graph_path": exported.get("knowledge_graph_path", ""),
             "run_reflection_path": str(result.get("run_reflection_path", "")),
             "run_reflection_markdown_path": str(result.get("run_reflection_markdown_path", "")),
             "total_products": int(kpi.get("total_products", 0) or 0),

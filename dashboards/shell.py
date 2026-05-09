@@ -22,6 +22,8 @@ ARTIFACT_LABELS = {
     "replay_studio": "Replay Studio",
     "task_priority_dashboard.html": "Task Priority",
     "knowledge_dashboard.html": "Knowledge",
+    "llm_wiki_dashboard.html": "LLM Wiki",
+    "graphify_graph.html": "Knowledge Graph",
     "reasoning_dashboard.html": "Reasoning",
     "series_dashboard.html": "Series",
 }
@@ -72,6 +74,17 @@ def _show_knowledge(run: dict[str, Any] | None) -> bool:
     return False
 
 
+def _show_llm_wiki(run: dict[str, Any] | None) -> bool:
+    if not isinstance(run, dict):
+        return False
+    artifacts = run.get("artifacts", {}) if isinstance(run.get("artifacts", {}), dict) else {}
+    for artifact in ("llm_wiki_dashboard.html", "graphify_graph.html"):
+        path = str(artifacts.get(artifact, "")).strip()
+        if path and Path(path).exists():
+            return True
+    return bool(str(run.get("llm_wiki_path", "")).strip() or str(run.get("llm_graph_path", "")).strip())
+
+
 def _find_run(manifest: dict[str, Any] | None, run_id: str | None) -> dict[str, Any] | None:
     if not isinstance(manifest, dict):
         return None
@@ -87,13 +100,35 @@ def rel_href(current_page: Path, target: str | Path | None) -> str:
     raw = str(target or "").strip()
     if not raw:
         return "#"
-    if raw.startswith(("http://", "https://")):
+    if raw.startswith(("http://", "https://", "obsidian://")):
         return raw
     try:
         rel = os.path.relpath(str(Path(raw).resolve()), start=str(current_page.resolve().parent))
     except OSError:
         rel = raw
     return rel.replace("\\", "/")
+
+
+def build_obsidian_uri(path: str | Path | None) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return "#"
+    try:
+        target = Path(raw).resolve().as_posix()
+    except OSError:
+        target = raw.replace("\\", "/")
+    return "obsidian://open?path=" + quote(target, safe="")
+
+
+def build_llm_wiki_obsidian_uri(run: dict[str, Any] | None) -> str:
+    if not isinstance(run, dict):
+        return "#"
+    wiki_path = str(run.get("llm_wiki_path", "")).strip()
+    if not wiki_path:
+        return "#"
+    index_path = Path(wiki_path) / "00_Index.md"
+    target = index_path if index_path.exists() else Path(wiki_path)
+    return build_obsidian_uri(target)
 
 
 def build_replay_app_url(*, port: int, manifest_path: Path | None = None, run_id: str | None = None, events_path: Path | None = None, series_root: Path | None = None) -> str:
@@ -201,6 +236,13 @@ def _nav_links(*, manifest: dict[str, Any] | None, current_page_path: Path, curr
             target = artifacts.get(artifact, "")
             href = rel_href(current_page_path, target)
             items.append((ARTIFACT_LABELS.get(artifact, artifact), href, artifact == current_artifact))
+    if _show_llm_wiki(run):
+        wiki_href = build_llm_wiki_obsidian_uri(run)
+        if wiki_href != "#":
+            items.append((ARTIFACT_LABELS["llm_wiki_dashboard.html"], wiki_href, current_artifact == "llm_wiki_dashboard.html"))
+        graph_target = artifacts.get("graphify_graph.html", "")
+        if graph_target and Path(str(graph_target)).exists():
+            items.append((ARTIFACT_LABELS["graphify_graph.html"], rel_href(current_page_path, graph_target), current_artifact == "graphify_graph.html"))
     if isinstance(manifest, dict) and not bool(manifest.get("single_run", True)):
         series_href = rel_href(current_page_path, Path(str(manifest.get("series_root", ""))) / "series_dashboard.html")
         items.append((ARTIFACT_LABELS["series_dashboard.html"], series_href, current_artifact == "series_dashboard.html"))

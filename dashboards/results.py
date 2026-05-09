@@ -4,7 +4,7 @@ import html
 from pathlib import Path
 from typing import Any
 
-from .shell import build_replay_studio_url, rel_href, render_page_shell
+from .shell import build_llm_wiki_obsidian_uri, build_replay_studio_url, rel_href, render_page_shell
 
 
 METRIC_SPECS = [
@@ -285,6 +285,10 @@ def _artifact_cards(*, current_page_path: Path, run: dict[str, Any] | None, mani
     show_reasoning = decision_mode in {"llm_planner", "openclaw_adaptive_priority"}
     show_task_priority = decision_mode in {"adaptive_priority", "fixed_priority", "fixed_task_assignment", "openclaw_adaptive_priority"}
     show_knowledge = decision_mode == "llm_planner" or (decision_mode == "openclaw_adaptive_priority" and total_runs > 1)
+    wiki_href = build_llm_wiki_obsidian_uri(run)
+    show_llm_wiki = wiki_href != "#"
+    show_llm_wiki_preview = bool(str(artifacts.get("llm_wiki_dashboard.html", "")).strip() and Path(str(artifacts.get("llm_wiki_dashboard.html", ""))).exists())
+    show_graphify_graph = bool(str(artifacts.get("graphify_graph.html", "")).strip() and Path(str(artifacts.get("graphify_graph.html", ""))).exists())
     manager_payload_path = str(artifacts.get("manager_replay.json", "")).strip()
     show_manager_replay = decision_mode == "openclaw_adaptive_priority" and bool(manager_payload_path) and Path(manager_payload_path).exists()
     cards = [
@@ -324,6 +328,18 @@ def _artifact_cards(*, current_page_path: Path, run: dict[str, Any] | None, mani
     if show_knowledge:
         cards.append(
             ("Knowledge", rel_href(current_page_path, artifacts.get("knowledge_dashboard.html", "")), "Ontology view: recurring issues, lessons, and run-to-run diffs.")
+        )
+    if show_llm_wiki:
+        cards.append(
+            ("LLM Wiki", wiki_href, "Open the curated Obsidian vault for run and daily evidence.")
+        )
+    if show_llm_wiki_preview:
+        cards.append(
+            ("Wiki Preview", rel_href(current_page_path, artifacts.get("llm_wiki_dashboard.html", "")), "Browser preview of the Obsidian wiki index.")
+        )
+    if show_graphify_graph:
+        cards.append(
+            ("Knowledge Graph", rel_href(current_page_path, artifacts.get("graphify_graph.html", "")), "Open the Graphify graph app built from the LLM wiki vault.")
         )
     if isinstance(manifest, dict) and not bool(manifest.get("single_run", True)):
         cards.append(

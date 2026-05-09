@@ -52,6 +52,25 @@ def _shared_ratio(left: list[str], right: list[str]) -> float:
     return float(len(left_norm & right_norm)) / float(len(union))
 
 
+def _stability_cost(row: dict[str, Any]) -> int:
+    return (
+        _safe_int(row.get("coordination_incident_total"), 0)
+        + _safe_int(row.get("physical_incident_total"), 0)
+        + _safe_int(row.get("unique_replan_blocker_total"), 0)
+        + _safe_int(row.get("planner_escalation_total"), 0)
+    )
+
+
+def _run_quality_key(row: dict[str, Any]) -> tuple[int, float, int, int, int]:
+    return (
+        _safe_int(row.get("total_products"), 0),
+        _safe_float(row.get("downstream_closure_ratio"), 0.0),
+        -_stability_cost(row),
+        -_safe_int(row.get("inspection_backlog_end"), 0),
+        -_safe_int(row.get("run_index"), 0),
+    )
+
+
 def build_series_analysis(*, parent_output_dir: Path, summary_payload: dict[str, Any] | None = None) -> dict[str, Any]:
     summary_blob: Any = summary_payload
     if not isinstance(summary_blob, dict):
@@ -136,34 +155,37 @@ def build_series_analysis(*, parent_output_dir: Path, summary_payload: dict[str,
 
     baseline = enriched_runs[0]
     final_run = enriched_runs[-1]
-    peak_run = max(enriched_runs, key=lambda row: (float(row["downstream_closure_ratio"]), int(row["total_products"]), -int(row["run_index"])))
-    worst_run = min(enriched_runs, key=lambda row: (float(row["downstream_closure_ratio"]), int(row["total_products"]), -int(row["run_index"])))
+    peak_run = max(enriched_runs, key=_run_quality_key)
+    worst_run = min(enriched_runs, key=_run_quality_key)
 
-    positive_signal = any(
-        (row["downstream_closure_ratio"] >= baseline["downstream_closure_ratio"] + 0.03)
-        or (row["total_products"] >= baseline["total_products"] + 2)
-        for row in enriched_runs[1:]
-    )
-    negative_signal = (
-        final_run["downstream_closure_ratio"] <= peak_run["downstream_closure_ratio"] - 0.08
-        or final_run["total_products"] <= peak_run["total_products"] - 3
-        or final_run["downstream_closure_ratio"] <= baseline["downstream_closure_ratio"] - 0.08
-        or final_run["total_products"] <= baseline["total_products"] - 3
-    )
-    if positive_signal and negative_signal:
-        effect = "mixed"
-    elif positive_signal:
+    baseline_products = _safe_int(baseline.get("total_products"), 0)
+    final_products = _safe_int(final_run.get("total_products"), 0)
+    peak_products = _safe_int(peak_run.get("total_products"), 0)
+    product_delta_final = final_products - baseline_products
+    product_delta_best = peak_products - baseline_products
+    closure_delta_final = _safe_float(final_run.get("downstream_closure_ratio"), 0.0) - _safe_float(baseline.get("downstream_closure_ratio"), 0.0)
+    stability_delta_final = _stability_cost(baseline) - _stability_cost(final_run)
+    backlog_delta_final = _safe_int(baseline.get("inspection_backlog_end"), 0) - _safe_int(final_run.get("inspection_backlog_end"), 0)
+    secondary_improved = closure_delta_final >= 0.03 or stability_delta_final > 0 or backlog_delta_final > 0
+
+    if product_delta_final > 0:
         effect = "positive"
+    elif product_delta_final == 0 and secondary_improved:
+        effect = "positive"
+    elif product_delta_final < 0 and secondary_improved:
+        effect = "mixed"
     else:
         effect = "negative"
 
     best_index = int(peak_run["run_index"])
-    if effect == "positive":
+    if effect == "positive" and best_index == int(final_run["run_index"]):
         performance_pattern = "steady_improvement"
-    elif positive_signal and negative_signal and best_index <= max(2, len(enriched_runs) - 1):
+    elif effect == "positive":
+        performance_pattern = "product_preserved_with_secondary_gain"
+    elif effect == "mixed":
+        performance_pattern = "throughput_tradeoff"
+    elif product_delta_best > 0 and best_index < int(final_run["run_index"]):
         performance_pattern = "early_improvement_then_regression"
-    elif positive_signal and negative_signal:
-        performance_pattern = "volatile"
     else:
         performance_pattern = "regression"
 
@@ -179,12 +201,12 @@ def build_series_analysis(*, parent_output_dir: Path, summary_payload: dict[str,
         persistent_alignment.append({"run_index": int(row["run_index"]), "shared_ratio": round(shared_ratio, 6)})
 
     analysis_summary = (
-        f"Knowledge impact is {effect}: peak performance arrived at run {int(peak_run['run_index'])}, while the final run finished at {int(final_run['total_products'])} products and {float(final_run['downstream_closure_ratio']):.3f} closure."
-        if effect == "mixed"
+        f"Knowledge impact is positive: completed products improved by {product_delta_final:+d} versus baseline; closure changed by {closure_delta_final:+.3f}."
+        if effect == "positive"
         else (
-            "Knowledge impact is positive: the final run preserved stronger performance than baseline."
-            if effect == "positive"
-            else "Knowledge impact is negative: later runs did not preserve or improve baseline performance."
+            f"Knowledge impact is mixed: completed products changed by {product_delta_final:+d}, while secondary signals changed by closure {closure_delta_final:+.3f}, stability {stability_delta_final:+d}, backlog {backlog_delta_final:+d}."
+            if effect == "mixed"
+            else f"Knowledge impact is negative: completed products changed by {product_delta_final:+d} and secondary signals did not offset the throughput loss."
         )
     )
 
@@ -199,6 +221,8 @@ def build_series_analysis(*, parent_output_dir: Path, summary_payload: dict[str,
         "worst_run": {"run_index": int(worst_run["run_index"]), "total_products": int(worst_run["total_products"]), "downstream_closure_ratio": round(float(worst_run["downstream_closure_ratio"]), 6)},
         "baseline_vs_best": {"from_run": int(baseline["run_index"]), "to_run": int(peak_run["run_index"]), "products_delta": int(peak_run["total_products"]) - int(baseline["total_products"]), "closure_delta": round(float(peak_run["downstream_closure_ratio"]) - float(baseline["downstream_closure_ratio"]), 6)},
         "baseline_vs_final": {"from_run": int(baseline["run_index"]), "to_run": int(final_run["run_index"]), "products_delta": int(final_run["total_products"]) - int(baseline["total_products"]), "closure_delta": round(float(final_run["downstream_closure_ratio"]) - float(baseline["downstream_closure_ratio"]), 6)},
+        "primary_metric": "completed_products",
+        "secondary_signals": {"closure_delta": round(closure_delta_final, 6), "stability_delta": int(stability_delta_final), "inspection_backlog_delta": int(backlog_delta_final)},
         "lesson_stability": {"consecutive_overlap": consecutive_overlap, "persistent_alignment": persistent_alignment},
         "knowledge_sections": knowledge_sections,
     }
@@ -210,10 +234,10 @@ def _metric_cards_html(analysis: dict[str, Any]) -> str:
     best_delta = analysis.get("baseline_vs_best", {}) if isinstance(analysis.get("baseline_vs_best", {}), dict) else {}
     final_delta = analysis.get("baseline_vs_final", {}) if isinstance(analysis.get("baseline_vs_final", {}), dict) else {}
     cards = [
-        ("Classification", str(analysis.get("knowledge_effect_classification", "mixed")), "Net reading of cross-run knowledge impact."),
+        ("Classification", str(analysis.get("knowledge_effect_classification", "mixed")), "Product-first reading of cross-run knowledge impact."),
         ("Pattern", str(analysis.get("performance_pattern", "volatile")), "Whether the series improved steadily or regressed after an early gain."),
-        ("Peak Run", f"run_{int(peak.get('run_index', 0) or 0):02d}", "Best closure-focused run in the series."),
-        ("Worst Run", f"run_{int(worst.get('run_index', 0) or 0):02d}", "Lowest closure-focused run in the series."),
+        ("Best Product Run", f"run_{int(peak.get('run_index', 0) or 0):02d}", "Best run by completed products, then closure and stability."),
+        ("Worst Product Run", f"run_{int(worst.get('run_index', 0) or 0):02d}", "Weakest run by completed products, then closure and stability."),
         ("Baseline to Best", f"{int(best_delta.get('products_delta', 0) or 0):+d} products / {float(best_delta.get('closure_delta', 0.0) or 0.0):+.3f} closure", "Best improvement relative to the first run."),
         ("Baseline to Final", f"{int(final_delta.get('products_delta', 0) or 0):+d} products / {float(final_delta.get('closure_delta', 0.0) or 0.0):+.3f} closure", "Net change relative to the first run."),
     ]

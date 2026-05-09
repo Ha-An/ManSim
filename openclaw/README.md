@@ -1,34 +1,25 @@
 # OpenClaw Assets
 
-This directory contains the OpenClaw profile and workspace templates used by ManSim v0.4.
+`openclaw/`에는 ManSim이 local OpenClaw 실행에 사용하는 profile, gateway script, workspace template이 들어 있습니다. 이 디렉터리는 simulator core가 아니라 LLM manager runtime layer입니다.
 
-## Purpose
-`openclaw/` is not the simulator core. It is the workspace and profile layer used by the root-level runtime and agent stack.
+## 주요 구성
 
-## Main Contents
-- `profiles/mansim_repo/`
-  - Default Gemma 4 E4B OpenClaw profile for the primary GPU 1 path
-- `profiles/mansim_repo_parallel/`
-  - Optional Gemma 4 E4B OpenClaw profile for the parallel GPU 0 path
-- `workspaces/A1`, `A2`, `A3`
-  - worker templates
-- `workspaces/MANAGER`
-  - shared manager template
-- `workspaces/MANAGER_BOTTLENECK_DETECTOR`
-  - detector template
-- `workspaces/MANAGER_DIAGNOSIS_EVALUATOR`
-  - evaluator template
-- `workspaces/MANAGER_DAILY_PLANNER`
-  - planner template
-- `workspaces/MANAGER_RUN_REFLECTOR`
-  - reflector template
+- `profiles/mansim_repo/` - primary local profile.
+- `profiles/mansim_repo_parallel/` - optional parallel experiment profile.
+- `workspaces/A1`, `workspaces/A2`, `workspaces/A3` - worker workspace template.
+- `workspaces/MANAGER_SHIFT_STRATEGIST` - day-start strategist template.
+- `workspaces/MANAGER_DAILY_REVIEWER` - day-end reviewer template.
+- `workspaces/MANAGER_CURATOR` - LLM Wiki curator template.
+- `workspaces/MANAGER_*` - legacy planner/evaluator/reflector templates.
 
 ## Canonical Run Path
+
 ```powershell
 .\.venv\Scripts\python.exe main.py decision=openclaw_adaptive_priority
 ```
 
 ## Default Local Stack
+
 ```powershell
 .\install_openclaw_cli.ps1
 .\start_vllm_gemma4_docker.ps1
@@ -36,39 +27,42 @@ This directory contains the OpenClaw profile and workspace templates used by Man
 .\.venv\Scripts\python.exe main.py decision=openclaw_adaptive_priority
 ```
 
-## Optional Parallel Local Stack
+기본 연결:
+
+- OpenClaw gateway: `http://localhost:18789/v1`
+- vLLM backend: `http://127.0.0.1:8000/v1`
+- model alias: `vllm/mansim-gemma4-e4b`
+- backend model: `mansim-gemma4-e4b`
+
+## Optional Parallel Stack
+
 ```powershell
 .\start_vllm_gemma4_parallel_docker.ps1
 .\openclaw\start_gateway.ps1 -ProfileName mansim_repo_parallel -BackendModelsUrl http://127.0.0.1:8001/v1/models -ExpectedModelId mansim-gemma4-e4b-parallel -Port 18790
 ```
 
-Note
-- `mansim_repo` + E4B on GPU 1 is the current validated healthy baseline.
-- `mansim_repo_parallel` + E4B on GPU 0 is an optional sidecar path for parallel experiments only.
-- current pinned operating profile for the primary path is the `experiment 3` configuration.
-  - stronger strategist authority
-  - stronger strategist role guidance
-  - `llm.max_tokens = 600`
-  - `backend.max_output_tokens = 2048`
-- representative primary-path run: `outputs/2026-04-18/20-18-45`
-  - `23 products / 7m 34s / terminated=false`
-- 3-run summary for the pinned profile: `outputs/2026-04-18/experiment_3_summary.json`
-  - average `21.67 products / 8m 47s`
-  - `10분 이내 3/3`
-- `outputs/2026-04-18/15-47-38` (`26 products / 4m 48s`) remains a best-observed outlier, not the current operating baseline.
+Parallel profile은 실험용 sidecar입니다. Primary validation path는 `mansim_repo`입니다.
 
-## Workspace Runtime Files
-Each runtime workspace typically receives:
+## Runtime Workspace Files
+
+각 manager workspace에는 보통 아래 파일이 생성되거나 갱신됩니다.
+
 - `USER.md`
 - `MEMORY.md`
-- `KNOWLEDGE.md` for manager roles
+- `KNOWLEDGE.md`
+- `LLM_WIKI.md`
+- `KNOWLEDGE_GRAPH.md`
 - `facts/current_request.json`
 - `facts/current_response_template.json`
 - `facts/current_native_turn.json`
 - `reports/*`
 - `trace/*`
 
+`LLM_WIKI.md`와 `KNOWLEDGE_GRAPH.md`는 Curator-backed knowledge가 활성화된 경우에만 의미 있는 digest를 담습니다.
+
 ## Notes
-- Canonical config now lives under `configs/`, not under `manufacturing_sim/simulation/conf/`.
-- Cross-run knowledge is injected into manager workspaces as `KNOWLEDGE.md`.
-- Root-level documentation lives in `README.md` and `docs/`.
+
+- Canonical config는 `configs/`에 있습니다.
+- Current production path는 `openclaw_adaptive_priority`입니다.
+- Manager는 high-level intent와 diagnosis를 담당하고, deterministic compiler가 실행 policy를 만듭니다.
+- LLM Wiki/graph는 current state를 대체하지 않습니다. Manager는 최신 simulator facts를 우선해야 합니다.

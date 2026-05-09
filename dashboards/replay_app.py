@@ -13,7 +13,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -1988,16 +1988,25 @@ def main() -> None:
         sidebar.metric("Products", int(kpi.get("total_products", 0) or 0))
         sidebar.metric("Closure", f"{float(kpi.get('downstream_closure_ratio', 0.0) or 0.0):.3f}")
         artifacts = selected_run.get("artifacts", {}) if isinstance(selected_run.get("artifacts", {}), dict) else {}
+        wiki_uri = ""
+        wiki_path = str(selected_run.get("llm_wiki_path", "")).strip()
+        if wiki_path:
+            index_path = Path(wiki_path) / "00_Index.md"
+            wiki_target = index_path if index_path.exists() else Path(wiki_path)
+            wiki_uri = "obsidian://open?path=" + quote(wiki_target.resolve().as_posix(), safe="")
         for label, artifact_name in (
             ("Results Hub", "results_dashboard.html"),
             ("KPI", "kpi_dashboard.html"),
             ("Gantt", "gantt.html"),
             ("Knowledge", "knowledge_dashboard.html"),
+            ("Knowledge Graph", "graphify_graph.html"),
             ("Reasoning", "reasoning_dashboard.html"),
         ):
             target = str(artifacts.get(artifact_name, "")).strip()
             if target:
                 sidebar.markdown(f"- [{label}]({Path(target).resolve().as_uri()})")
+        if wiki_uri:
+            sidebar.markdown(f"- [LLM Wiki]({wiki_uri})")
     try:
         st.query_params["events_path"] = str(events_path.resolve().as_posix())
     except Exception:
