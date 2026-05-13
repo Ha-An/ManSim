@@ -31,6 +31,7 @@ world:
     setup_machine: 90.0
     inter_station_transfer: 85.0
     material_supply: 85.0
+    handover_item: 100.0
     inspect_product: 72.0
     preventive_maintenance: 65.0
 
@@ -51,6 +52,7 @@ decision:
       setup_machine: 1.0
       inter_station_transfer: 1.0
       material_supply: 1.0
+      handover_item: 1.0
       inspect_product: 1.0
       preventive_maintenance: 1.0
 

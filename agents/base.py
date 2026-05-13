@@ -19,6 +19,7 @@ TASK_PRIORITY_KEYS: tuple[str, ...] = (
     "material_supply",
     "inspect_product",
     "preventive_maintenance",
+    "handover_item",
 )
 
 FIXED_TASK_ASSIGNABLE_FAMILIES: tuple[str, ...] = (
@@ -29,6 +30,7 @@ FIXED_TASK_ASSIGNABLE_FAMILIES: tuple[str, ...] = (
     "inspect_product",
     "inter_station_transfer",
     "material_supply",
+    "handover_item",
 )
 
 FIXED_TASK_BATTERY_EXCEPTION_FAMILIES: tuple[str, ...] = (

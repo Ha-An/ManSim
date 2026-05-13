@@ -9,7 +9,7 @@
 - `openclaw_adaptive_priority`
 - `llm_planner`, legacy 참고용
 
-현재 production path는 `openclaw_adaptive_priority`입니다.
+기본 simulation path는 `adaptive_priority`입니다. LLM manager를 포함한 주력 OpenClaw path는 `openclaw_adaptive_priority`입니다.
 
 ## Local Stack
 

@@ -4,7 +4,7 @@ import html
 from pathlib import Path
 from typing import Any
 
-from .shell import build_llm_wiki_obsidian_uri, build_replay_studio_url, rel_href, render_page_shell
+from .shell import build_llm_wiki_obsidian_uri, build_replay_studio_3d_url, build_replay_studio_url, rel_href, render_page_shell
 
 
 METRIC_SPECS = [
@@ -301,6 +301,15 @@ def _artifact_cards(*, current_page_path: Path, run: dict[str, Any] | None, mani
                 run_id=str(run.get("id", "")).strip(),
             ),
             "Independent React replay with pixel-art scene, worker monitor, and richer UI controls.",
+        ),
+        (
+            "Replay Studio 3D",
+            build_replay_studio_3d_url(
+                port=int(manifest.get("replay_studio_3d_preferred_port", 5174) or 5174) if isinstance(manifest, dict) else 5174,
+                manifest_path=manifest_path,
+                run_id=str(run.get("id", "")).strip(),
+            ),
+            "Independent Three.js replay with block-style 3D factory layout and smooth worker motion.",
         ),
         ("Gantt", rel_href(current_page_path, artifacts.get("gantt.html", "")), "Task and machine timeline for the selected run."),
     ]

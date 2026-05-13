@@ -14,9 +14,16 @@ PRIMARY_METRICS = [
     ("Machine Utilization", "machine_utilization", "ratio", True, "Processing minutes divided by total machine-minutes."),
     ("Machine Broken Ratio", "machine_broken_ratio", "ratio", False, "Broken minutes divided by total machine-minutes."),
     ("Machine PM Ratio", "machine_pm_ratio", "ratio", False, "Preventive-maintenance minutes divided by total machine-minutes."),
-    ("Worker Availability", "agent_availability_ratio", "ratio", True, "Share of worker-minutes not spent discharged."),
+    ("Humanoid Executing Ratio", "humanoid_execution_ratio_avg", "ratio", True, "Average share of worker-minutes with availability=EXECUTING."),
+    ("Humanoid Unavailable Ratio", "humanoid_unavailable_ratio_avg", "ratio", False, "Average share of worker-minutes with availability=DISABLED or OFFLINE."),
+    ("Handover Items", "handover_item_count", "count", True, "HANDOVER_ITEM executions where a humanoid joined product transport."),
+    ("Shared Carry Time", "shared_product_carry_time_min", "minutes", True, "Product carry minutes after a second carrier joined."),
     ("Worker Local Responses", "worker_local_response_total", "count", True, "Local recoveries or local reorder attempts taken by workers."),
-    ("Worker Discharged Ratio", "agent_discharged_ratio", "ratio", False, "Share of worker-minutes spent discharged."),
+    ("Worker Discharged Ratio", "agent_discharged_ratio", "ratio", False, "Battery-depletion event time ratio."),
+    ("Traffic Collisions", "collision_count", "count", False, "Tile/edge traffic conflicts with overlapping movement windows."),
+    ("Traffic Near Misses", "near_miss_count", "count", False, "Movement conflicts closer than the configured traffic headway."),
+    ("Edge Conflicts", "edge_conflict_count", "count", False, "Workers crossing the same edge in opposite directions during overlapping windows."),
+    ("Path Overlaps", "path_overlap_count", "count", False, "Planned movement paths sharing tiles or edges."),
     ("Wall Clock", "wall_clock_sec", "duration", False, "Real wall-clock runtime for this run."),
     ("Coordination Incidents", "coordination_incident_total", "count", False, "Planning and execution mismatches."),
     ("Unique Replan Blockers", "unique_replan_blocker_total", "count", False, "Distinct blocker states that forced replanning."),
@@ -28,7 +35,8 @@ PRIMARY_METRIC_LOOKUP = {key: (label, key, kind, higher_is_better, description) 
 METRIC_GROUPS = {
     "item": ["total_products", "downstream_closure_ratio", "throughput_per_sim_hour", "completed_product_lead_time_avg_min"],
     "machine": ["machine_utilization", "machine_broken_ratio", "machine_pm_ratio", "wall_clock_sec"],
-    "worker": ["agent_availability_ratio", "worker_local_response_total", "agent_discharged_ratio", "commitment_dispatch_total"],
+    "worker": ["humanoid_execution_ratio_avg", "humanoid_unavailable_ratio_avg", "handover_item_count", "shared_product_carry_time_min"],
+    "traffic": ["collision_count", "near_miss_count", "edge_conflict_count", "path_overlap_count"],
 }
 
 
@@ -97,6 +105,28 @@ def _format_metric(value: float, kind: str) -> str:
 
 def _format_ratio_percent(value: float) -> str:
     return f"{100.0 * float(value):.1f}%"
+
+
+def _humanoid_state_axis_defs() -> dict[str, dict[str, Any]]:
+    fallback = {
+        "availability": {"name": "Availability State", "states": ["AVAILABLE", "ASSIGNED", "EXECUTING", "WAITING", "BLOCKED", "OFFLINE", "DISABLED"]},
+        "mobility": {"name": "Mobility State", "states": ["STATIONARY", "NAVIGATING", "DOCKING"]},
+        "power": {"name": "Power State", "states": ["POWER_NORMAL", "POWER_LOW", "POWER_CRITICAL", "DEPLETED", "CHARGING"]},
+        "manipulation": {"name": "Manipulation State", "states": ["FREE", "REACHING", "HOLDING", "PLACING"]},
+    }
+    try:
+        from humanoids import load_state_schema
+
+        schema = load_state_schema()
+        return {
+            axis_id: {
+                "name": axis.name,
+                "states": list(axis.states.keys()),
+            }
+            for axis_id, axis in schema.axes.items()
+        }
+    except Exception:
+        return fallback
 
 
 def _sorted_worker_ids(mapping: dict[str, Any]) -> list[str]:
@@ -306,39 +336,38 @@ def _machine_table(kpi: dict[str, Any]) -> str:
 
 
 def _worker_table(kpi: dict[str, Any]) -> str:
-    state_by_worker = kpi.get("worker_state_time_by_worker", {}) if isinstance(kpi.get("worker_state_time_by_worker", {}), dict) else {}
-    util_by_worker = kpi.get("worker_utilization_by_worker", {}) if isinstance(kpi.get("worker_utilization_by_worker", {}), dict) else {}
-    total_working = 0.0
-    total_moving = 0.0
-    for worker_id in state_by_worker:
-        row = state_by_worker.get(worker_id, {}) if isinstance(state_by_worker.get(worker_id, {}), dict) else {}
-        total_working += _safe_float(row.get("working_min"))
-        total_moving += _safe_float(row.get("moving_min"))
-    total_worker_time = sum(
-        _safe_float((state_by_worker.get(worker_id, {}) if isinstance(state_by_worker.get(worker_id, {}), dict) else {}).get("working_min"))
-        + _safe_float((state_by_worker.get(worker_id, {}) if isinstance(state_by_worker.get(worker_id, {}), dict) else {}).get("moving_min"))
-        + _safe_float((state_by_worker.get(worker_id, {}) if isinstance(state_by_worker.get(worker_id, {}), dict) else {}).get("discharged_min"))
-        + _safe_float((state_by_worker.get(worker_id, {}) if isinstance(state_by_worker.get(worker_id, {}), dict) else {}).get("idle_min"))
-        for worker_id in state_by_worker
-    )
-    active_total = total_working + total_moving
-    rows = [("Overall", (active_total / total_worker_time) if total_worker_time > 0.0 else 0.0)]
+    state_by_worker = kpi.get("humanoid_state_time_by_worker", {}) if isinstance(kpi.get("humanoid_state_time_by_worker", {}), dict) else {}
+    execution_by_worker = kpi.get("humanoid_execution_ratio_by_worker", {}) if isinstance(kpi.get("humanoid_execution_ratio_by_worker", {}), dict) else {}
+    unavailable_by_worker = kpi.get("humanoid_unavailable_ratio_by_worker", {}) if isinstance(kpi.get("humanoid_unavailable_ratio_by_worker", {}), dict) else {}
+    rows = [("Overall executing", _safe_float(kpi.get("humanoid_execution_ratio_avg")))]
     body = "".join(
-        f"<tr><td>{html.escape(worker_id)}</td><td>{_format_ratio_percent(util_total)}</td></tr>"
-        for worker_id, util_total in (
-            rows
+        f"<tr><td>{html.escape(worker_id)}</td><td>{_format_ratio_percent(executing)}</td><td>{_format_ratio_percent(unavailable)}</td></tr>"
+        for worker_id, executing, unavailable in (
+            [(rows[0][0], rows[0][1], _safe_float(kpi.get("humanoid_unavailable_ratio_avg")))]
             + [
                 (
                     worker_id,
-                    _safe_float((util_by_worker.get(worker_id, {}) if isinstance(util_by_worker.get(worker_id, {}), dict) else {}).get("util_total")),
+                    _safe_float(execution_by_worker.get(worker_id)),
+                    _safe_float(unavailable_by_worker.get(worker_id)),
                 )
                 for worker_id in _sorted_worker_ids(state_by_worker)
             ]
         )
     )
     if not body:
-        body = "<tr><td colspan='2'>No per-worker utilization data.</td></tr>"
-    return "<div class='panel'><h2>Worker Utilization</h2><p class='muted'>Utilization = (working minutes + moving minutes) / total simulated minutes.</p><table><thead><tr><th>Worker</th><th>Utilization</th></tr></thead><tbody>" + body + "</tbody></table></div>"
+        body = "<tr><td colspan='3'>No per-worker humanoid state data.</td></tr>"
+    return "<div class='panel'><h2>Humanoid Availability Ratios</h2><p class='muted'>Ratios are derived from Humanoid_Tasks Availability State only.</p><table><thead><tr><th>Worker</th><th>EXECUTING</th><th>DISABLED/OFFLINE</th></tr></thead><tbody>" + body + "</tbody></table></div>"
+
+
+def _traffic_table(kpi: dict[str, Any]) -> str:
+    by_pair = kpi.get("traffic_conflicts_by_worker_pair", {}) if isinstance(kpi.get("traffic_conflicts_by_worker_pair", {}), dict) else {}
+    rows = "".join(
+        f"<tr><td>{html.escape(str(pair))}</td><td>{_safe_int(count)}</td></tr>"
+        for pair, count in sorted(by_pair.items(), key=lambda item: (-_safe_int(item[1]), str(item[0])))
+    )
+    if not rows:
+        rows = "<tr><td colspan='2'>No worker-pair traffic conflicts.</td></tr>"
+    return "<div class='panel'><h2>Traffic Conflicts by Worker Pair</h2><p class='muted'>Pairs are recorded directly from AGENT_TRAFFIC_CONFLICT events.</p><table><thead><tr><th>Worker Pair</th><th>Conflicts</th></tr></thead><tbody>" + rows + "</tbody></table></div>"
 
 
 def _figure_html(fig: Any, *, include_plotlyjs: bool) -> str:
@@ -376,10 +405,14 @@ def export_kpi_dashboard(
     stage_labels = list(stage_tp.keys())
     stage_values = [float(stage_tp.get(label, 0.0) or 0.0) for label in stage_labels]
 
-    agent_task_minutes = kpi.get("agent_task_minutes", {}) if isinstance(kpi.get("agent_task_minutes", {}), dict) else {}
-    task_pairs = sorted(((str(task_type), float(minutes)) for task_type, minutes in agent_task_minutes.items()), key=lambda item: item[1], reverse=True)
+    humanoid_task_minutes = kpi.get("humanoid_task_minutes", {}) if isinstance(kpi.get("humanoid_task_minutes", {}), dict) else {}
+    task_pairs = sorted(((str(task_type), float(minutes)) for task_type, minutes in humanoid_task_minutes.items()), key=lambda item: item[1], reverse=True)
     task_types = [task_type for task_type, _minutes in task_pairs]
     task_values = [minutes for _task_type, minutes in task_pairs]
+    task_taxonomy = kpi.get("humanoid_task_taxonomy", {}) if isinstance(kpi.get("humanoid_task_taxonomy", {}), dict) else {}
+    task_by_level = task_taxonomy.get("by_level", {}) if isinstance(task_taxonomy.get("by_level", {}), dict) else {}
+    task_by_category = task_taxonomy.get("by_category", {}) if isinstance(task_taxonomy.get("by_category", {}), dict) else {}
+    primitive_minutes = kpi.get("humanoid_primitive_minutes", {}) if isinstance(kpi.get("humanoid_primitive_minutes", {}), dict) else {}
 
     machine_state_by_machine = kpi.get("machine_state_time_by_machine", {}) if isinstance(kpi.get("machine_state_time_by_machine", {}), dict) else {}
     machine_util_by_machine = kpi.get("machine_utilization_by_machine", {}) if isinstance(kpi.get("machine_utilization_by_machine", {}), dict) else {}
@@ -414,29 +447,14 @@ def export_kpi_dashboard(
     buffer_wait_closed_values = [float(buffer_wait_closed_counts.get(key, 0) or 0.0) for key, _label in buffer_wait_keys]
     buffer_wait_open_values = [float(buffer_wait_open_counts.get(key, 0) or 0.0) for key, _label in buffer_wait_keys]
 
-    worker_state_by_worker = kpi.get("worker_state_time_by_worker", {}) if isinstance(kpi.get("worker_state_time_by_worker", {}), dict) else {}
-    worker_util_by_worker = kpi.get("worker_utilization_by_worker", {}) if isinstance(kpi.get("worker_utilization_by_worker", {}), dict) else {}
-    worker_labels = _sorted_worker_ids(worker_state_by_worker)
-    worker_working_values = [
-        _safe_float((worker_state_by_worker.get(worker_id, {}) if isinstance(worker_state_by_worker.get(worker_id, {}), dict) else {}).get("working_min"))
-        for worker_id in worker_labels
-    ]
-    worker_moving_values = [
-        _safe_float((worker_state_by_worker.get(worker_id, {}) if isinstance(worker_state_by_worker.get(worker_id, {}), dict) else {}).get("moving_min"))
-        for worker_id in worker_labels
-    ]
-    worker_discharged_values = [
-        _safe_float((worker_state_by_worker.get(worker_id, {}) if isinstance(worker_state_by_worker.get(worker_id, {}), dict) else {}).get("discharged_min"))
-        for worker_id in worker_labels
-    ]
-    worker_idle_values = [
-        _safe_float((worker_state_by_worker.get(worker_id, {}) if isinstance(worker_state_by_worker.get(worker_id, {}), dict) else {}).get("idle_min"))
-        for worker_id in worker_labels
-    ]
-    worker_util_total = [
-        _safe_float((worker_util_by_worker.get(worker_id, {}) if isinstance(worker_util_by_worker.get(worker_id, {}), dict) else {}).get("util_total"))
-        for worker_id in worker_labels
-    ]
+    humanoid_state_by_worker = kpi.get("humanoid_state_time_by_worker", {}) if isinstance(kpi.get("humanoid_state_time_by_worker", {}), dict) else {}
+    humanoid_execution_by_worker = kpi.get("humanoid_execution_ratio_by_worker", {}) if isinstance(kpi.get("humanoid_execution_ratio_by_worker", {}), dict) else {}
+    worker_labels = _sorted_worker_ids(humanoid_state_by_worker)
+    worker_execution_values = [_safe_float(humanoid_execution_by_worker.get(worker_id)) for worker_id in worker_labels]
+    axis_defs = _humanoid_state_axis_defs()
+    traffic_by_type = kpi.get("traffic_conflicts_by_type", {}) if isinstance(kpi.get("traffic_conflicts_by_type", {}), dict) else {}
+    traffic_by_pair = kpi.get("traffic_conflicts_by_worker_pair", {}) if isinstance(kpi.get("traffic_conflicts_by_worker_pair", {}), dict) else {}
+    item_transport_time = kpi.get("item_transport_time_by_type", {}) if isinstance(kpi.get("item_transport_time_by_type", {}), dict) else {}
 
     panel_figures: dict[str, str] = {}
     include_plotlyjs = True
@@ -563,33 +581,103 @@ def export_kpi_dashboard(
 
     worker_task_fig = go.Figure()
     worker_task_fig.add_trace(go.Bar(name="Task Minutes", x=task_types, y=task_values, text=[f"{value:.1f}m" for value in task_values], textposition="outside", marker_color="#90be6d"))
-    _common_layout(worker_task_fig, y_title="Minutes", x_title="Task type")
-    _add_panel("worker_task_minutes", "Worker Task Minutes", worker_task_fig, "Completed task minutes aggregated across workers.")
+    _common_layout(worker_task_fig, y_title="Minutes", x_title="Humanoid task code")
+    _add_panel("worker_task_minutes", "Humanoid Task Minutes", worker_task_fig, "Completed task minutes by Humanoid_Tasks task code.")
 
     worker_util_fig = go.Figure()
-    worker_util_fig.add_trace(go.Bar(name="Utilization", x=worker_labels, y=worker_util_total, text=[_format_ratio_percent(value) for value in worker_util_total], textposition="outside", marker_color="#4361ee"))
-    _common_layout(worker_util_fig, y_title="Utilization", x_title="Worker", tickformat=".0%")
-    _add_panel("worker_utilization", "Worker Utilization", worker_util_fig, "Utilization = (working minutes + moving minutes) / total simulated minutes.")
+    worker_util_fig.add_trace(go.Bar(name="EXECUTING", x=worker_labels, y=worker_execution_values, text=[_format_ratio_percent(value) for value in worker_execution_values], textposition="outside", marker_color="#4361ee"))
+    _common_layout(worker_util_fig, y_title="Ratio", x_title="Worker", tickformat=".0%")
+    _add_panel("worker_utilization", "Humanoid Executing Ratio", worker_util_fig, "Execution ratio is availability.EXECUTING / total worker time.")
 
-    worker_state_fig = go.Figure()
-    worker_state_series = [
-        ("Working", worker_working_values, "#264653"),
-        ("Moving", worker_moving_values, "#2a9d8f"),
-        ("Discharged", worker_discharged_values, "#bc4749"),
-        ("Idle", worker_idle_values, "#adb5bd"),
-    ]
-    worker_totals = [0.0 for _ in worker_labels]
-    for label, values, color in worker_state_series:
-        worker_totals = [current + value for current, value in zip(worker_totals, values)]
-        worker_state_fig.add_trace(go.Bar(name=label, x=worker_labels, y=values, marker_color=color))
-    worker_state_fig.add_trace(go.Scatter(name="Total", x=worker_labels, y=worker_totals, mode="text", text=[f"{value:.1f}m" for value in worker_totals], textposition="top center", showlegend=False))
-    _common_layout(worker_state_fig, y_title="Minutes", x_title="Worker", barmode="stack", height=400)
-    _add_panel(
-        "worker_state_minutes",
-        "Worker State Minutes",
-        worker_state_fig,
-        "Moving is counted from move intervals only. Working is task time after subtracting any overlap with move intervals, so transfer travel stays in Moving rather than being double-counted.",
+    task_level_fig = go.Figure()
+    task_level_fig.add_trace(go.Bar(name="Task Level", x=list(task_by_level.keys()), y=[_safe_float(v) for v in task_by_level.values()], marker_color="#4d908e"))
+    _common_layout(task_level_fig, y_title="Minutes", x_title="Humanoid_Tasks level")
+    _add_panel("humanoid_task_level_minutes", "Humanoid Task Minutes by Level", task_level_fig, "Grouped only by Humanoid_Tasks TaskSpec.level.")
+
+    task_category_fig = go.Figure()
+    task_category_fig.add_trace(go.Bar(name="Task Category", x=list(task_by_category.keys()), y=[_safe_float(v) for v in task_by_category.values()], marker_color="#f8961e"))
+    _common_layout(task_category_fig, y_title="Minutes", x_title="Humanoid_Tasks category", height=430)
+    _add_panel("humanoid_task_category_minutes", "Humanoid Task Minutes by Category", task_category_fig, "Grouped only by Humanoid_Tasks catalog category.")
+
+    primitive_fig = go.Figure()
+    primitive_pairs = sorted(((str(key), _safe_float(value)) for key, value in primitive_minutes.items()), key=lambda item: item[1], reverse=True)
+    primitive_fig.add_trace(go.Bar(name="Primitive", x=[key for key, _ in primitive_pairs], y=[value for _, value in primitive_pairs], marker_color="#577590"))
+    _common_layout(primitive_fig, y_title="Minutes", x_title="Primitive call code", height=430)
+    _add_panel("humanoid_primitive_minutes", "Humanoid Primitive Minutes", primitive_fig, "Primitive time is paired from HUMANOID_STEP_START/END events.")
+
+    transport_fig = go.Figure()
+    transport_pairs = sorted(((str(key), _safe_float(value)) for key, value in item_transport_time.items()), key=lambda item: item[0])
+    transport_fig.add_trace(
+        go.Bar(
+            name="Transport minutes",
+            x=[key for key, _ in transport_pairs],
+            y=[value for _, value in transport_pairs],
+            text=[f"{value:.1f}m" for _, value in transport_pairs],
+            textposition="outside",
+            marker_color="#00a896",
+        )
     )
+    _common_layout(transport_fig, y_title="Minutes", x_title="Carried item type", height=360)
+    _add_panel(
+        "item_transport_time_by_type",
+        "Item Transport Time by Type",
+        transport_fig,
+        "Loaded movement time uses ManSim item weight multipliers: material 1.0, intermediate 1.5, product 2.0 divided by active product carriers.",
+    )
+
+    traffic_type_fig = go.Figure()
+    traffic_type_pairs = sorted(((str(key), _safe_float(value)) for key, value in traffic_by_type.items()), key=lambda item: item[0])
+    traffic_type_fig.add_trace(
+        go.Bar(
+            name="Traffic conflicts",
+            x=[key for key, _ in traffic_type_pairs],
+            y=[value for _, value in traffic_type_pairs],
+            text=[f"{value:.0f}" for _, value in traffic_type_pairs],
+            textposition="outside",
+            marker_color="#e76f51",
+        )
+    )
+    _common_layout(traffic_type_fig, y_title="Count", x_title="Conflict type", height=380)
+    _add_panel("traffic_conflicts_by_type", "Traffic Conflicts by Type", traffic_type_fig, "Movement conflicts are observed and logged; v1 does not optimize or suppress movement.")
+
+    traffic_pair_fig = go.Figure()
+    traffic_pair_pairs = sorted(((str(key), _safe_float(value)) for key, value in traffic_by_pair.items()), key=lambda item: item[1], reverse=True)
+    traffic_pair_fig.add_trace(
+        go.Bar(
+            name="Worker pair conflicts",
+            x=[key for key, _ in traffic_pair_pairs],
+            y=[value for _, value in traffic_pair_pairs],
+            text=[f"{value:.0f}" for _, value in traffic_pair_pairs],
+            textposition="outside",
+            marker_color="#f4a261",
+        )
+    )
+    _common_layout(traffic_pair_fig, y_title="Count", x_title="Worker pair", height=360)
+    _add_panel("traffic_conflicts_by_pair", "Traffic Conflicts by Worker Pair", traffic_pair_fig, "Pairs are not grouped beyond the worker ids recorded by the simulator.")
+
+    for axis_id, axis_def in axis_defs.items():
+        state_fig = go.Figure()
+        for state_name in axis_def.get("states", []):
+            values = [
+                _safe_float(
+                    (
+                        (humanoid_state_by_worker.get(worker_id, {}) if isinstance(humanoid_state_by_worker.get(worker_id, {}), dict) else {})
+                        .get(axis_id, {})
+                        if isinstance((humanoid_state_by_worker.get(worker_id, {}) if isinstance(humanoid_state_by_worker.get(worker_id, {}), dict) else {}).get(axis_id, {}), dict)
+                        else {}
+                    ).get(state_name)
+                )
+                for worker_id in worker_labels
+            ]
+            if any(value > 0 for value in values):
+                state_fig.add_trace(go.Bar(name=state_name, x=worker_labels, y=values))
+        _common_layout(state_fig, y_title="Minutes", x_title="Worker", barmode="stack", height=390)
+        _add_panel(
+            f"humanoid_state_{axis_id}",
+            str(axis_def.get("name", axis_id)),
+            state_fig,
+            "State order and grouping follow Humanoid_Tasks state_schema_core.json.",
+        )
 
     current_run = _find_run(manifest, current_run_id)
     subtitle = "Quantitative run view with stable KPI cards, machine/worker utilization, and detailed charts."
@@ -620,12 +708,29 @@ def export_kpi_dashboard(
     )
     worker_section = _group_section(
         "Worker Metrics",
-        "Worker availability, local response activity, task execution mix, and utilization.",
+        "Humanoid_Tasks state axes, task taxonomy, primitive execution, and local response activity.",
         _summary_cards(kpi, METRIC_GROUPS["worker"]),
         "<div class='grid cards-2'>"
         + panel_figures["worker_task_minutes"]
         + panel_figures["worker_utilization"]
-        + panel_figures["worker_state_minutes"]
+        + panel_figures["humanoid_task_level_minutes"]
+        + panel_figures["humanoid_task_category_minutes"]
+        + panel_figures["humanoid_primitive_minutes"]
+        + panel_figures["item_transport_time_by_type"]
+        + panel_figures["humanoid_state_availability"]
+        + panel_figures["humanoid_state_mobility"]
+        + panel_figures["humanoid_state_power"]
+        + panel_figures["humanoid_state_manipulation"]
+        + "</div>",
+    )
+    traffic_section = _group_section(
+        "Movement / Traffic Safety",
+        "Observed route overlap, near-miss, tile conflict, and edge conflict events. These are reproduced for inspection, not minimized by policy in this version.",
+        _summary_cards(kpi, METRIC_GROUPS["traffic"]),
+        "<div class='grid cards-2'>"
+        + panel_figures["traffic_conflicts_by_type"]
+        + panel_figures["traffic_conflicts_by_pair"]
+        + _traffic_table(kpi)
         + "</div>",
     )
     body_html = (
@@ -634,6 +739,7 @@ def export_kpi_dashboard(
         + item_section
         + machine_section
         + worker_section
+        + traffic_section
     )
     html_text = render_page_shell(
         title="ManSim KPI Dashboard",

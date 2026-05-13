@@ -271,13 +271,13 @@ def build_initial_state(
             attributes = {"completed_count": 0}
         add_entity(queue_id, entity_type, label, "waiting", attributes=attributes)
 
-    for queue_id, (entity_type, label, derived_from_queue) in OUTPUT_QUEUE_META.items():
+    for queue_id, (entity_type, label, source_ref) in OUTPUT_QUEUE_META.items():
         add_entity(
             queue_id,
             entity_type,
             label,
             "waiting",
-            attributes={"queue_size": 0, "queue_kind": "output", "derived_from_queue": derived_from_queue},
+            attributes={"queue_size": 0, "queue_kind": "output", "source_ref": source_ref},
         )
 
     for machine_id in machine_ids:
@@ -297,12 +297,28 @@ def build_initial_state(
         )
 
     for worker_id in worker_ids:
+        humanoid_state = {
+            "humanoid_id": worker_id,
+            "availability": "AVAILABLE",
+            "mobility": "STATIONARY",
+            "power": "POWER_NORMAL",
+            "manipulation": "FREE",
+            "task_context": None,
+            "reason": None,
+            "timestamp_s": 0,
+            "metadata": {},
+        }
         add_entity(
             worker_id,
             "worker",
             f"Worker {worker_id}",
             "idle",
-            attributes={"battery_pct": 100, "battery_period_min": battery_period_min, "last_swap_at": 0},
+            attributes={
+                "battery_pct": 100,
+                "battery_period_min": battery_period_min,
+                "last_swap_at": 0,
+                "humanoid_state": humanoid_state,
+            },
         )
 
     queues = {
@@ -332,30 +348,6 @@ def resolve_region_id(location: str | None) -> str | None:
     return REGION_ID.get(location)
 
 
-def find_move_end_time(raw_events: List[Dict[str, Any]], start_index: int, entity_id: str, target_location: str) -> float | None:
-    start_t = float(raw_events[start_index].get("t", 0.0) or 0.0)
-    for offset in range(start_index + 1, len(raw_events)):
-        candidate = raw_events[offset]
-        if candidate["entity_id"] != entity_id:
-            continue
-        if candidate["type"] == "AGENT_MOVE_INTERRUPTED":
-            return float(candidate["t"])
-        if candidate["type"] == "AGENT_MOVE_START":
-            same_start_move = (
-                abs(float(candidate.get("t", 0.0) or 0.0) - start_t) <= 1e-9
-                and candidate.get("details", {}).get("to", candidate.get("location")) == target_location
-            )
-            if same_start_move:
-                continue
-            return None
-        if candidate["type"] != "AGENT_MOVE_END":
-            continue
-        if candidate["details"].get("to", candidate.get("location")) != target_location:
-            continue
-        return float(candidate["t"])
-    return None
-
-
 def find_machine_phase_end_time(raw_events: List[Dict[str, Any]], start_index: int, machine_id: str, start_type: str) -> float | None:
     end_type_map = {
         "MACHINE_START": {"MACHINE_END", "MACHINE_ABORTED", "MACHINE_BROKEN"},
@@ -373,6 +365,59 @@ def find_machine_phase_end_time(raw_events: List[Dict[str, Any]], start_index: i
         if candidate.get("type") in expected_end_types:
             return float(candidate["t"])
     return None
+
+
+MIN_VISIBLE_TASK_WINDOW_MIN = 0.1
+
+
+def humanoid_task_key(worker_id: str, details: Dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        worker_id,
+        details.get("task_id"),
+        details.get("instance_id"),
+    )
+
+
+def build_humanoid_task_end_index(raw_events: List[Dict[str, Any]]) -> Dict[tuple[Any, ...], List[float]]:
+    end_index: Dict[tuple[Any, ...], List[float]] = {}
+    for event in raw_events:
+        if event.get("type") != "HUMANOID_TASK_END":
+            continue
+        worker_id = event.get("entity_id")
+        details = event.get("details", {})
+        if not isinstance(worker_id, str) or not isinstance(details, dict):
+            continue
+        end_index.setdefault(humanoid_task_key(worker_id, details), []).append(float(event["t"]))
+    return end_index
+
+
+def find_humanoid_task_end_time(
+    task_end_by_key: Dict[tuple[Any, ...], List[float]],
+    worker_id: str,
+    timestamp: float,
+    details: Dict[str, Any],
+) -> float | None:
+    for ended_at in task_end_by_key.get(humanoid_task_key(worker_id, details), []):
+        if ended_at >= timestamp:
+            return ended_at
+    return None
+
+
+def humanoid_task_window(
+    task_end_by_key: Dict[tuple[Any, ...], List[float]],
+    worker_id: str,
+    timestamp: float,
+    details: Dict[str, Any],
+) -> Dict[str, Any]:
+    ended_at = find_humanoid_task_end_time(task_end_by_key, worker_id, timestamp, details)
+    if ended_at is None or ended_at <= timestamp:
+        ended_at = timestamp + MIN_VISIBLE_TASK_WINDOW_MIN
+    return {
+        "started_at": timestamp,
+        "ended_at": ended_at,
+        "task_id": details.get("task_id"),
+        "task_code": details.get("task_code"),
+    }
 
 
 def task_target(details: Dict[str, Any]) -> str | None:
@@ -455,24 +500,6 @@ def machine_prep_item_kind(machine_id: str | None) -> str:
     return "material"
 
 
-def worker_region_slot(region_id: str | None, entity_id: str, layout: Dict[str, Any]) -> Dict[str, float] | None:
-    if not region_id:
-        return None
-    regions = {region["region_id"]: region for region in layout.get("regions", [])}
-    region = regions.get(region_id)
-    if not region:
-        return None
-    try:
-        index = max(0, int(entity_id[1:]) - 1)
-    except Exception:
-        index = 0
-    offsets = [0.30, 0.50, 0.70]
-    return {
-        "x": region["position"]["x"] + region["size"]["width"] * offsets[index % len(offsets)],
-        "y": region["position"]["y"] + region["size"]["height"] * 0.58,
-    }
-
-
 def convert_events(
     raw_events: List[Dict[str, Any]],
     layout: Dict[str, Any],
@@ -481,6 +508,7 @@ def convert_events(
 ) -> List[Dict[str, Any]]:
     builder = ReplayEventBuilder()
     task_end_by_id = build_task_end_index(raw_events)
+    task_end_by_key = build_humanoid_task_end_index(raw_events)
     positions = layout_positions(layout)
     active_tasks: Dict[str, Dict[str, Any]] = {}
     completed_count = 0
@@ -546,22 +574,6 @@ def convert_events(
             "process_window": None,
         }
 
-    def state_for_worker_state(worker_state: str) -> str:
-        normalized = worker_state.strip().upper()
-        if normalized == "MOVING":
-            return "moving"
-        if normalized in {"DISCHARGED"}:
-            return "error"
-        if normalized in {"IDLE"}:
-            return "idle"
-        if normalized in {"WAITING"}:
-            return "waiting"
-        if normalized in {"BATTERY_SWAPPING", "BATTERY_DELIVERING"}:
-            return "charging"
-        if normalized in {"REPAIRING_MACHINE", "PREVENTIVE_MAINTENANCE"}:
-            return "maintenance"
-        return "working"
-
     def canonical_motion_attributes(details: Dict[str, Any], event_index: int, worker_id: str) -> Dict[str, Any] | None:
         motion = details.get("motion")
         if not isinstance(motion, dict):
@@ -569,16 +581,12 @@ def convert_events(
         path_positions = path_tiles_to_positions(layout, motion.get("path_tiles"))
         from_tile_position = tile_to_position(layout, motion.get("from_tile"))
         to_tile_position = tile_to_position(layout, motion.get("to_tile"))
-        from_region = resolve_region_id(str(motion.get("from") or ""))
-        to_region = resolve_region_id(str(motion.get("to") or ""))
-        from_position = from_tile_position or positions.get(from_region or "")
-        to_position = to_tile_position or positions.get(to_region or "")
+        from_position = from_tile_position
+        to_position = to_tile_position
         if not from_position or not to_position:
             return None
         started_at = float(motion.get("started_at", 0.0) or 0.0)
-        planned_ended_at = float(motion.get("ended_at", started_at) or started_at)
-        actual_ended_at = find_move_end_time(raw_events, event_index, worker_id, str(motion.get("to") or ""))
-        ended_at = actual_ended_at if actual_ended_at is not None else planned_ended_at
+        ended_at = float(motion.get("ended_at", started_at) or started_at)
         payload = {
             "from": from_position,
             "to": to_position,
@@ -591,8 +599,22 @@ def convert_events(
 
     def canonical_worker_attributes(details: Dict[str, Any], event_index: int, worker_id: str) -> Dict[str, Any]:
         attrs: Dict[str, Any] = {}
-        if "worker_state" in details:
-            attrs["worker_state"] = details.get("worker_state")
+        humanoid_state = details.get("humanoid_state")
+        has_active_task_context = False
+        if isinstance(humanoid_state, dict):
+            attrs["humanoid_state"] = humanoid_state
+            task_context = humanoid_state.get("task_context")
+            if isinstance(task_context, dict):
+                has_active_task_context = bool(str(task_context.get("task_code") or "").strip())
+                attrs["current_task_code"] = task_context.get("task_code") or attrs.get("current_task_code")
+                attrs["current_task_instance_id"] = task_context.get("task_instance_id") or attrs.get("current_task_instance_id")
+                attrs["current_step_id"] = task_context.get("step_id") or attrs.get("current_step_id")
+                attrs["current_primitive_call_code"] = task_context.get("primitive_call_code") or attrs.get("current_primitive_call_code")
+                attrs["current_execution_status"] = task_context.get("execution_status")
+            reason = humanoid_state.get("reason")
+            if isinstance(reason, dict):
+                attrs["state_reason_code"] = reason.get("code")
+                attrs["state_reason_message"] = reason.get("message")
         resolved_motion = canonical_motion_attributes(details, event_index, worker_id)
         if resolved_motion:
             attrs["motion"] = resolved_motion
@@ -601,19 +623,56 @@ def convert_events(
             cargo = details.get("cargo") if isinstance(details.get("cargo"), dict) else {}
             attrs["carrying_item_id"] = cargo.get("item_id")
             attrs["carrying_item_type"] = cargo.get("item_type")
-        if "current_task_id" in details:
+        if "current_task_id" in details and has_active_task_context:
             attrs["active_task"] = details.get("current_task_id")
-        if "current_task_type" in details:
+        if "current_task_type" in details and has_active_task_context:
             attrs["current_task_type"] = details.get("current_task_type")
-        if "task_id" in details:
+        if "current_task_code" in details and has_active_task_context:
+            attrs["current_task_code"] = details.get("current_task_code")
+        if "current_task_instance_id" in details and has_active_task_context:
+            attrs["current_task_instance_id"] = details.get("current_task_instance_id")
+        if "current_step_id" in details and has_active_task_context:
+            attrs["current_step_id"] = details.get("current_step_id")
+        if "current_primitive_call_code" in details and has_active_task_context:
+            attrs["current_primitive_call_code"] = details.get("current_primitive_call_code")
+        if "task_code" in details and has_active_task_context:
+            attrs["current_task_code"] = details.get("task_code")
+        if "task_name" in details and has_active_task_context:
+            attrs["current_task_name"] = details.get("task_name")
+        if "instance_id" in details and has_active_task_context:
+            attrs["current_task_instance_id"] = details.get("instance_id")
+        if "step_id" in details and has_active_task_context:
+            attrs["current_step_id"] = details.get("step_id")
+        if "primitive_call_code" in details and has_active_task_context:
+            attrs["current_primitive_call_code"] = details.get("primitive_call_code")
+        if "task_id" in details and has_active_task_context:
             attrs["active_task"] = details.get("task_id")
-        if "task_id" in details or "current_task_id" in details:
+        if ("task_id" in details or "current_task_id" in details) and has_active_task_context:
             attrs["task_label"] = details.get("task_id") or details.get("current_task_id")
         if "battery_remaining_min" in details:
             remaining = float(details.get("battery_remaining_min") or 0.0)
             attrs["battery_period_min"] = battery_period_min
             attrs["battery_pct"] = max(0.0, min(100.0, 100.0 * remaining / max(1.0, battery_period_min)))
         return attrs
+
+    def conflict_position_payload(details: Dict[str, Any]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        tile_position = tile_to_position(layout, details.get("tile"))
+        if tile_position is not None:
+            payload["tile_position"] = tile_position
+        edge = details.get("edge") if isinstance(details.get("edge"), dict) else {}
+        edge_from = tile_to_position(layout, edge.get("from") if isinstance(edge, dict) else None)
+        edge_to = tile_to_position(layout, edge.get("to") if isinstance(edge, dict) else None)
+        if edge_from is not None and edge_to is not None:
+            payload["edge_from_position"] = edge_from
+            payload["edge_to_position"] = edge_to
+        other_edge = details.get("other_edge") if isinstance(details.get("other_edge"), dict) else {}
+        other_edge_from = tile_to_position(layout, other_edge.get("from") if isinstance(other_edge, dict) else None)
+        other_edge_to = tile_to_position(layout, other_edge.get("to") if isinstance(other_edge, dict) else None)
+        if other_edge_from is not None and other_edge_to is not None:
+            payload["other_edge_from_position"] = other_edge_from
+            payload["other_edge_to_position"] = other_edge_to
+        return payload
 
     for index, raw in enumerate(raw_events):
         raw_type = raw["type"]
@@ -623,37 +682,95 @@ def convert_events(
         details = raw.get("details", {})
 
         if raw_type == "WORKER_STATE_CHANGED" and entity_id:
-            worker_state = str(details.get("worker_state", "IDLE"))
-            region_id = resolve_region_id(location)
             tile_position = tile_to_position(layout, details.get("tile"))
+            payload: Dict[str, Any] = {
+                "attributes": canonical_worker_attributes(details, index, entity_id),
+            }
+            if tile_position is not None:
+                payload["position"] = tile_position
+                payload["attributes"]["position_source"] = "simulation_tile"
+            else:
+                payload["attributes"]["position_source"] = "missing"
             push(
                 "state_changed",
                 timestamp,
                 {"primary": entity_id},
-                {
-                    "state": state_for_worker_state(worker_state),
-                    "position": tile_position
-                    or worker_region_slot(region_id, entity_id, layout)
-                    or positions.get(region_id or "", positions.get("warehouse_region")),
-                    "attributes": canonical_worker_attributes(details, index, entity_id),
-                },
+                payload,
             )
             continue
 
         if raw_type == "WORKER_CARGO_CHANGED" and entity_id:
             cargo = details.get("cargo") if isinstance(details.get("cargo"), dict) else {}
+            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs.update(
+                {
+                    "cargo": cargo,
+                    "carrying_item_id": cargo.get("item_id"),
+                    "carrying_item_type": cargo.get("item_type"),
+                }
+            )
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": entity_id},
+                {"attributes": attrs},
+            )
+            continue
+
+        if raw_type == "HUMANOID_TASK_START" and entity_id:
+            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs["task_window"] = humanoid_task_window(task_end_by_key, entity_id, timestamp, details)
+            push("state_changed", timestamp, {"primary": entity_id}, {"attributes": attrs})
+            continue
+
+        if raw_type == "HUMANOID_TASK_END" and entity_id:
+            attrs = canonical_worker_attributes(details, index, entity_id)
+            task_context = (attrs.get("humanoid_state") or {}).get("task_context") if isinstance(attrs.get("humanoid_state"), dict) else None
+            if not isinstance(task_context, dict) or not str(task_context.get("task_code") or "").strip():
+                attrs.update(
+                    {
+                        "active_task": None,
+                        "task_label": None,
+                        "current_task_type": None,
+                        "current_task_code": None,
+                        "current_task_name": None,
+                        "current_task_instance_id": None,
+                    }
+                )
+            attrs.update(
+                {
+                    "current_step_id": "",
+                    "current_primitive_call_code": "",
+                    "task_window": None,
+                }
+            )
+            push("state_changed", timestamp, {"primary": entity_id}, {"attributes": attrs})
+            continue
+
+        if raw_type == "HUMANOID_STEP_START" and entity_id:
+            attrs = canonical_worker_attributes(details, index, entity_id)
             push(
                 "state_changed",
                 timestamp,
                 {"primary": entity_id},
                 {
-                    "attributes": {
-                        "cargo": cargo,
-                        "carrying_item_id": cargo.get("item_id"),
-                        "carrying_item_type": cargo.get("item_type"),
-                    },
+                    "attributes": attrs,
                 },
             )
+            continue
+
+        if raw_type == "HUMANOID_STEP_END" and entity_id:
+            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs.update(
+                {
+                    "current_step_id": "",
+                    "current_primitive_call_code": "",
+                    "last_step_status": details.get("status", ""),
+                    "last_step_id": details.get("step_id", ""),
+                    "last_primitive_call_code": details.get("primitive_call_code", ""),
+                }
+            )
+            push("state_changed", timestamp, {"primary": entity_id}, {"attributes": attrs})
             continue
 
         if raw_type == "MACHINE_STATE_CHANGED" and entity_id:
@@ -694,16 +811,43 @@ def convert_events(
             )
             continue
 
+        if raw_type == "AGENT_TRAFFIC_CONFLICT" and entity_id:
+            worker_ids = details.get("worker_ids", [])
+            related = [str(worker_id) for worker_id in worker_ids if str(worker_id).strip() and str(worker_id) != str(entity_id)]
+            conflict_payload = {
+                "conflict_id": details.get("conflict_id"),
+                "conflict_type": details.get("conflict_type"),
+                "severity": details.get("severity", "warning"),
+                "collision": bool(details.get("collision", False)),
+                "primary_worker_id": details.get("primary_worker_id", entity_id),
+                "other_worker_id": details.get("other_worker_id"),
+                "worker_ids": worker_ids,
+                "move_id": details.get("move_id"),
+                "other_move_id": details.get("other_move_id"),
+                "time_window": details.get("time_window"),
+                "tile": details.get("tile"),
+                "edge": details.get("edge"),
+                "other_edge": details.get("other_edge"),
+                "gap_min": details.get("gap_min"),
+                "label": f"{details.get('conflict_type', 'TRAFFIC')} {entity_id} {details.get('other_worker_id', '')}",
+            }
+            conflict_payload.update(conflict_position_payload(details))
+            push(
+                "traffic_conflict_detected",
+                timestamp,
+                {"primary": entity_id, "related": related, "source": entity_id, "target": related[0] if related else None},
+                conflict_payload,
+                suffix="t",
+            )
+            continue
+
         if raw_type == "AGENT_MOVE_START":
-            if has_canonical_worker_events:
-                continue
             source = resolve_region_id(details.get("from"))
             target = resolve_region_id(details.get("to"))
             path_positions = path_tiles_to_positions(layout, details.get("path_tiles"))
             from_position = tile_to_position(layout, details.get("from_tile")) or (positions.get(source) if source else None)
             to_position = tile_to_position(layout, details.get("to_tile")) or (positions.get(target) if target else None)
             if entity_id and source and target and from_position and to_position:
-                end_time = find_move_end_time(raw_events, index, entity_id, details.get("to"))
                 push(
                     "entity_moved",
                     timestamp,
@@ -713,10 +857,11 @@ def convert_events(
                         "to": to_position,
                         "path": path_positions,
                         "label": f"{details.get('from', '')} -> {details.get('to', '')}",
+                        "move_id": details.get("move_id"),
                     },
                     durative={
                         "started_at": timestamp,
-                        "ended_at": end_time or (timestamp + float(details.get("duration", 0))),
+                        "ended_at": timestamp + float(details.get("duration", 0)),
                         "expected_duration": float(details.get("duration", 0)),
                     },
                 )
@@ -726,15 +871,15 @@ def convert_events(
             if has_canonical_worker_events:
                 continue
             current_task = active_tasks.get(entity_id)
-            region_id = resolve_region_id(location)
+            tile_position = tile_to_position(layout, details.get("tile"))
+            payload = {"state": "working" if current_task else "idle"}
+            if tile_position is not None:
+                payload["position"] = tile_position
             push(
                 "state_changed",
                 timestamp,
                 {"primary": entity_id},
-                {
-                    "state": "working" if current_task else "idle",
-                    "position": worker_region_slot(region_id, entity_id, layout) or positions.get(region_id or "", positions.get("warehouse_region")),
-                },
+                payload,
             )
             continue
 
@@ -757,6 +902,9 @@ def convert_events(
                     "task_label": label,
                     "attributes": {
                         "task_kind": details.get("task_type", ""),
+                        "current_task_code": details.get("task_code", ""),
+                        "current_task_name": details.get("task_name", ""),
+                        "current_task_instance_id": details.get("instance_id", ""),
                         "task_role": details.get("agent_role", ""),
                     },
                 },
@@ -816,7 +964,11 @@ def convert_events(
                     "task_id": task_id,
                     "task_label": (active or {}).get("label", task_label(details)),
                     "next_state": "idle",
-                    "attributes": {"last_task_status": details.get("status", "completed")},
+                    "attributes": {
+                        "last_task_status": details.get("status", "completed"),
+                        "last_task_code": details.get("task_code", ""),
+                        "last_task_name": details.get("task_name", ""),
+                    },
                 },
             )
             continue
@@ -1248,6 +1400,9 @@ def export_run(run_dir: Path, output_log: Path, output_layout: Path) -> None:
             "created_at": run_meta.get("started_at_utc"),
             "total_duration": float(run_meta.get("sim_total_min", run_meta.get("total_days", 0) * run_meta.get("minutes_per_day", 0))),
             "time_unit": "minutes",
+            "replay_mode": "strict",
+            "position_policy": "simulation_tile_or_motion_only",
+            "visual_corrections": False,
         },
         "layout": layout,
         "initial_state": build_initial_state(worker_ids, machine_ids, layout, battery_period_min, repair_total_min),

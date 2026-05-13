@@ -42,6 +42,7 @@ class ObjectFootprint:
     y: int
     width: int
     height: int
+    blocking: bool = True
 
     @property
     def tiles(self) -> tuple[Tile, ...]:
@@ -70,6 +71,9 @@ class TileGridMap:
         "product_queue_4": "intermediate_queue_4",
         "warehouse_buffer": "warehouse_buffer",
         "battery_rack": "battery_rack",
+        "inspection_table": "inspection_table",
+        "inspection_desk": "inspection_table",
+        "inspection_workbench": "inspection_table",
     }
 
     REGION_ID = {
@@ -128,12 +132,15 @@ class TileGridMap:
         self.objects = objects
         self.object_tiles: dict[Tile, str] = {}
         for obj in objects.values():
+            if not obj.blocking:
+                continue
             for tile in obj.tiles:
                 self.object_tiles[tile] = obj.object_id
         self.blocked_static = set(self.walls) | set(self.object_tiles.keys())
         self.service_tiles = {key: list(value) for key, value in service_tiles.items()}
         self.zone_service_tiles = {key: list(value) for key, value in zone_service_tiles.items()}
         self.worker_tiles: dict[str, Tile] = {}
+        self.tile_workers: dict[Tile, set[str]] = {}
         self.occupied_tiles: dict[Tile, str] = {}
         self.reserved_tiles: dict[Tile, str] = {}
 
@@ -233,7 +240,17 @@ class TileGridMap:
     ) -> dict[str, ObjectFootprint]:
         objects: dict[str, ObjectFootprint] = {}
 
-        def add(object_id: str, object_type: str, zone_name: str, rel_x: int, rel_y: int, width: int, height: int) -> None:
+        def add(
+            object_id: str,
+            object_type: str,
+            zone_name: str,
+            rel_x: int,
+            rel_y: int,
+            width: int,
+            height: int,
+            *,
+            blocking: bool = True,
+        ) -> None:
             zone = zones[zone_name]
             objects[object_id] = ObjectFootprint(
                 object_id=object_id,
@@ -243,6 +260,7 @@ class TileGridMap:
                 y=zone.y + rel_y,
                 width=width,
                 height=height,
+                blocking=blocking,
             )
 
         queue_width, queue_height = cls.QUEUE_FOOTPRINT
@@ -269,6 +287,7 @@ class TileGridMap:
                 add(f"S{station}M{idx}", "machine", zone_name, rel_x, 14, machine_width, machine_height)
         add("intermediate_queue_4", "queue", "Inspection", 3, 6, queue_width, queue_height)
         add("inspection_output_queue", "buffer", "Inspection", 15, 6, queue_width, queue_height)
+        add("inspection_table", "inspection_table", "Inspection", 10, 12, 6, 4, blocking=False)
         return objects
 
     @classmethod
@@ -279,10 +298,14 @@ class TileGridMap:
         walls: set[Tile],
         objects: dict[str, ObjectFootprint],
     ) -> dict[str, list[Tile]]:
-        object_tiles = {tile for obj in objects.values() for tile in obj.tiles}
+        object_tiles = {tile for obj in objects.values() if obj.blocking for tile in obj.tiles}
         blocked = walls | object_tiles
         out: dict[str, list[Tile]] = {}
         for obj in objects.values():
+            if obj.object_type == "inspection_table":
+                center = obj.center()
+                out[obj.object_id] = [center] if 0 <= center[0] < width and 0 <= center[1] < height and center not in walls else []
+                continue
             candidates: set[Tile] = set()
             for x in range(obj.x, obj.x + obj.width):
                 candidates.add((x, obj.y - 1))
@@ -306,7 +329,7 @@ class TileGridMap:
         walls: set[Tile],
         objects: dict[str, ObjectFootprint],
     ) -> dict[str, list[Tile]]:
-        object_tiles = {tile for obj in objects.values() for tile in obj.tiles}
+        object_tiles = {tile for obj in objects.values() if obj.blocking for tile in obj.tiles}
         blocked = walls | object_tiles
         out: dict[str, list[Tile]] = {}
         for zone_name, zone in zones.items():
@@ -353,10 +376,37 @@ class TileGridMap:
         return slots[index % len(slots)]
 
     def register_worker(self, worker_id: str, tile: Tile) -> Tile:
+        previous = self.worker_tiles.get(worker_id)
+        if previous is not None:
+            self._remove_worker_occupancy(worker_id, previous)
         chosen = self.nearest_free_tile(tile, worker_id=worker_id) or tile
         self.worker_tiles[worker_id] = chosen
-        self.occupied_tiles[chosen] = worker_id
+        self._add_worker_occupancy(worker_id, chosen)
         return chosen
+
+    def workers_at(self, tile: Tile) -> set[str]:
+        return set(self.tile_workers.get(tile, set()))
+
+    def _sync_occupied_tile(self, tile: Tile) -> None:
+        workers = self.tile_workers.get(tile, set())
+        if workers:
+            self.occupied_tiles[tile] = sorted(workers)[0]
+        else:
+            self.tile_workers.pop(tile, None)
+            self.occupied_tiles.pop(tile, None)
+
+    def _add_worker_occupancy(self, worker_id: str, tile: Tile) -> None:
+        self.tile_workers.setdefault(tile, set()).add(worker_id)
+        self._sync_occupied_tile(tile)
+
+    def _remove_worker_occupancy(self, worker_id: str, tile: Tile) -> None:
+        workers = self.tile_workers.get(tile)
+        if workers is None:
+            if self.occupied_tiles.get(tile) == worker_id:
+                self.occupied_tiles.pop(tile, None)
+            return
+        workers.discard(worker_id)
+        self._sync_occupied_tile(tile)
 
     def nearest_free_tile(self, preferred: Tile, *, worker_id: str) -> Tile | None:
         if self.is_enterable(preferred, worker_id=worker_id):
@@ -383,15 +433,23 @@ class TileGridMap:
     def is_passable_static(self, tile: Tile) -> bool:
         return self.is_in_bounds(tile) and tile not in self.blocked_static
 
-    def is_enterable(self, tile: Tile, *, worker_id: str, allow_reserved_by_self: bool = True) -> bool:
+    def is_enterable(
+        self,
+        tile: Tile,
+        *,
+        worker_id: str,
+        allow_reserved_by_self: bool = True,
+        ignore_dynamic: bool = False,
+    ) -> bool:
         if not self.is_passable_static(tile):
             return False
-        occupant = self.occupied_tiles.get(tile)
-        if occupant is not None and occupant != worker_id:
-            return False
-        reserved_by = self.reserved_tiles.get(tile)
-        if reserved_by is not None and (reserved_by != worker_id or not allow_reserved_by_self):
-            return False
+        if not ignore_dynamic:
+            occupants = self.tile_workers.get(tile)
+            if occupants and any(occupant != worker_id for occupant in occupants):
+                return False
+            reserved_by = self.reserved_tiles.get(tile)
+            if reserved_by is not None and (reserved_by != worker_id or not allow_reserved_by_self):
+                return False
         return True
 
     def neighbors(self, tile: Tile) -> list[Tile]:
@@ -410,11 +468,22 @@ class TileGridMap:
             return 10**9
         return builtins.abs(ax - bx) + builtins.abs(ay - by)
 
-    def destination_tiles(self, location: str, *, worker_id: str, from_tile: Tile | None = None) -> list[Tile]:
+    def destination_tiles(
+        self,
+        location: str,
+        *,
+        worker_id: str,
+        from_tile: Tile | None = None,
+        ignore_dynamic: bool = False,
+    ) -> list[Tile]:
         normalized = self.normalize_location(location)
         if normalized in self.worker_tiles:
             target = self.worker_tiles[normalized]
-            tiles = [tile for tile in self.neighbors(target) if self.is_enterable(tile, worker_id=worker_id)]
+            tiles = [
+                tile
+                for tile in self.neighbors(target)
+                if self.is_enterable(tile, worker_id=worker_id, ignore_dynamic=ignore_dynamic)
+            ]
             return sorted(tiles, key=lambda tile: (self.manhattan(from_tile or target, tile), tile[1], tile[0]))
         if normalized in self.service_tiles:
             tiles = self.service_tiles[normalized]
@@ -424,14 +493,21 @@ class TileGridMap:
             tiles = self.zone_service_tiles.get("Warehouse", [])
         return sorted(tiles, key=lambda tile: (self.manhattan(from_tile or tile, tile), tile[1], tile[0]))
 
-    def select_destination_tile(self, location: str, *, worker_id: str, from_tile: Tile) -> Tile | None:
-        candidates = self.destination_tiles(location, worker_id=worker_id, from_tile=from_tile)
+    def select_destination_tile(self, location: str, *, worker_id: str, from_tile: Tile, ignore_dynamic: bool = False) -> Tile | None:
+        candidates = self.destination_tiles(location, worker_id=worker_id, from_tile=from_tile, ignore_dynamic=ignore_dynamic)
         for tile in candidates:
-            if self.is_enterable(tile, worker_id=worker_id):
+            if self.is_enterable(tile, worker_id=worker_id, ignore_dynamic=ignore_dynamic):
                 return tile
         return candidates[0] if candidates else None
 
-    def find_path(self, start: Tile, goals: Tile | Iterable[Tile], *, worker_id: str) -> list[Tile] | None:
+    def find_path(
+        self,
+        start: Tile,
+        goals: Tile | Iterable[Tile],
+        *,
+        worker_id: str,
+        ignore_dynamic: bool = False,
+    ) -> list[Tile] | None:
         if not self.is_passable_static(start):
             return None
         raw_goals = [goals] if isinstance(goals, tuple) and len(goals) == 2 and isinstance(goals[0], int) else list(goals)
@@ -466,7 +542,7 @@ class TileGridMap:
                     node = came_from[node]
                 return list(reversed(path))
             for neighbor in self.neighbors(current):
-                if neighbor != start and not self.is_enterable(neighbor, worker_id=worker_id):
+                if neighbor != start and not self.is_enterable(neighbor, worker_id=worker_id, ignore_dynamic=ignore_dynamic):
                     continue
                 new_cost = current_cost + 1
                 if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
@@ -487,12 +563,15 @@ class TileGridMap:
                 self.reserved_tiles.pop(reserved_tile, None)
 
     def move_worker_to_reserved(self, worker_id: str, tile: Tile) -> None:
-        old = self.worker_tiles.get(worker_id)
-        if old is not None and self.occupied_tiles.get(old) == worker_id:
-            self.occupied_tiles.pop(old, None)
+        self.move_worker(worker_id, tile)
         self.release_reservation(worker_id, tile)
+
+    def move_worker(self, worker_id: str, tile: Tile) -> None:
+        old = self.worker_tiles.get(worker_id)
+        if old is not None:
+            self._remove_worker_occupancy(worker_id, old)
         self.worker_tiles[worker_id] = tile
-        self.occupied_tiles[tile] = worker_id
+        self._add_worker_occupancy(worker_id, tile)
 
     def travel_time(self, src: str, dst: str) -> float:
         src_norm = self.normalize_location(src)
@@ -601,6 +680,7 @@ class TileGridMap:
                         "y": obj.y,
                         "width": obj.width,
                         "height": obj.height,
+                        "blocking": obj.blocking,
                     }
                     for obj in self.objects.values()
                 ],

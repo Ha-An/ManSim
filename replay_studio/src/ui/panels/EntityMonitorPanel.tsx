@@ -44,24 +44,14 @@ function progressPercent(value: number | undefined): string {
   return `${Math.round(value * 100)}%`;
 }
 
-function workerBatteryProgress(entity: BaseEntityState, currentTime: number): number | undefined {
-  const batteryPeriodMin = Number(entity.attributes.battery_period_min);
-  const lastSwapAt = Number(entity.attributes.last_swap_at);
+function workerBatteryProgress(entity: BaseEntityState): number | undefined {
   const batteryPct = Number(entity.attributes.battery_pct);
-  if (Number.isFinite(batteryPeriodMin) && batteryPeriodMin > 0 && Number.isFinite(lastSwapAt)) {
-    if (Number.isFinite(batteryPct) && batteryPct <= 0) return 0;
-    return clamp(1 - (currentTime - lastSwapAt) / batteryPeriodMin, 0, 1);
-  }
   if (!Number.isFinite(batteryPct)) return undefined;
   return clamp(batteryPct / 100, 0, 1);
 }
 
 function workerTaskProgress(entity: BaseEntityState, currentTime: number): number | undefined {
-  const taskWindowProgress = progressFromWindow(entity.attributes.task_window, currentTime);
-  if (taskWindowProgress !== undefined) return taskWindowProgress;
-  const motionProgress = progressFromWindow(entity.attributes.motion, currentTime);
-  if (entity.state === "moving" && motionProgress !== undefined) return motionProgress;
-  return undefined;
+  return progressFromWindow(entity.attributes.task_window, currentTime);
 }
 
 function machineProcessProgress(entity: BaseEntityState, currentTime: number): number | undefined {
@@ -78,6 +68,49 @@ function cargoItemType(entity: BaseEntityState): string {
     if (typeof itemType === "string" && itemType.trim()) return itemType.trim();
   }
   return typeof entity.attributes.carrying_item_type === "string" ? entity.attributes.carrying_item_type.trim() : "";
+}
+
+function cargoItemId(entity: BaseEntityState): string {
+  const cargo = entity.attributes.cargo;
+  if (cargo && typeof cargo === "object") {
+    const itemId = (cargo as Record<string, unknown>).item_id;
+    if (typeof itemId === "string" && itemId.trim()) return itemId.trim();
+  }
+  return typeof entity.attributes.carrying_item_id === "string" ? entity.attributes.carrying_item_id.trim() : "";
+}
+
+function cargoSharedCarry(entity: BaseEntityState): string {
+  const cargo = entity.attributes.cargo;
+  if (!cargo || typeof cargo !== "object") return "-";
+  const row = cargo as Record<string, unknown>;
+  const carrierCount = Number(row.carrier_count);
+  const carrierIds = Array.isArray(row.carrier_ids) ? row.carrier_ids.map(String).filter(Boolean) : [];
+  const multiplier = Number(row.effective_time_multiplier);
+  if (!row.shared_carry && carrierIds.length <= 1) return "-";
+  const carrierLabel = carrierIds.length ? carrierIds.join(" + ") : `${carrierCount || 1} carriers`;
+  const multiplierLabel = Number.isFinite(multiplier) ? `, x${multiplier.toFixed(2)}` : "";
+  return `${carrierLabel}${multiplierLabel}`;
+}
+
+function humanoidState(entity: BaseEntityState): Record<string, unknown> {
+  const value = entity.attributes.humanoid_state;
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function humanoidTaskContext(entity: BaseEntityState): Record<string, unknown> {
+  const context = humanoidState(entity).task_context;
+  return context && typeof context === "object" ? (context as Record<string, unknown>) : {};
+}
+
+function humanoidStateValue(entity: BaseEntityState, nestedKey: string): string {
+  const nested = humanoidState(entity)[nestedKey];
+  return typeof nested === "string" && nested.trim() ? nested.trim() : "-";
+}
+
+function hasActiveHumanoidTask(entity: BaseEntityState): boolean {
+  const availability = humanoidStateValue(entity, "availability").toUpperCase();
+  const taskCode = humanoidTaskContext(entity).task_code;
+  return availability !== "AVAILABLE" && typeof taskCode === "string" && taskCode.trim().length > 0;
 }
 
 function itemType(entity: BaseEntityState): string {
@@ -128,16 +161,67 @@ function progressClass(value: number | undefined, kind: "battery" | "task" | "ma
 }
 
 function statusLabel(entity: BaseEntityState): string {
-  if (typeof entity.attributes.worker_state === "string") return entity.attributes.worker_state;
   if (typeof entity.attributes.machine_state === "string") return entity.attributes.machine_state;
   if (typeof entity.attributes.item_state === "string") return entity.attributes.item_state;
   return entity.state.toUpperCase();
 }
 
 function workerTaskLabel(entity: BaseEntityState): string {
-  if (typeof entity.attributes.task_label === "string" && entity.attributes.task_label.trim()) return entity.attributes.task_label;
-  if (typeof entity.attributes.current_task_type === "string" && entity.attributes.current_task_type.trim()) return entity.attributes.current_task_type;
+  const taskCode = humanoidTaskContext(entity).task_code;
+  if (typeof taskCode === "string" && taskCode.trim()) return taskCode.trim();
+  if (hasActiveHumanoidTask(entity) && typeof entity.attributes.task_label === "string" && entity.attributes.task_label.trim()) return entity.attributes.task_label;
+  if (hasActiveHumanoidTask(entity) && typeof entity.attributes.current_task_type === "string" && entity.attributes.current_task_type.trim()) return entity.attributes.current_task_type;
   return "No active task";
+}
+
+function workerTaskCode(entity: BaseEntityState): string {
+  const taskCode = humanoidTaskContext(entity).task_code;
+  if (typeof taskCode === "string" && taskCode.trim()) return taskCode.trim();
+  if (hasActiveHumanoidTask(entity) && typeof entity.attributes.current_task_code === "string" && entity.attributes.current_task_code.trim()) {
+    return entity.attributes.current_task_code.trim();
+  }
+  return "-";
+}
+
+function workerPrimitive(entity: BaseEntityState): string {
+  const primitive = humanoidTaskContext(entity).primitive_call_code;
+  if (typeof primitive === "string" && primitive.trim()) return primitive.trim();
+  if (hasActiveHumanoidTask(entity) && typeof entity.attributes.current_primitive_call_code === "string" && entity.attributes.current_primitive_call_code.trim()) {
+    return entity.attributes.current_primitive_call_code.trim();
+  }
+  return "-";
+}
+
+function workerMotionPath(entity: BaseEntityState, currentTime: number): string {
+  const motion = entity.attributes.motion;
+  if (!motion || typeof motion !== "object") return "0 tiles";
+  const payload = motion as Record<string, unknown>;
+  const startedAt = Number(payload.started_at);
+  const endedAt = Number(payload.ended_at);
+  const isMoving =
+    Number.isFinite(startedAt) &&
+    Number.isFinite(endedAt) &&
+    endedAt > startedAt &&
+    currentTime >= startedAt &&
+    currentTime < endedAt;
+  if (!isMoving) return "0 tiles";
+  const path = payload.path;
+  if (Array.isArray(path) && path.length >= 2) return `${path.length} tiles`;
+  const from = payload.from;
+  const to = payload.to;
+  return from && to ? "2 tiles" : "0 tiles";
+}
+
+function workerTrafficConflict(entity: BaseEntityState): string {
+  const conflict = entity.attributes.last_traffic_conflict;
+  if (!conflict || typeof conflict !== "object") return "-";
+  const payload = conflict as Record<string, unknown>;
+  const type = typeof payload.conflict_type === "string" ? payload.conflict_type : "TRAFFIC";
+  const primary = typeof payload.primary_worker_id === "string" ? payload.primary_worker_id : "";
+  let other = typeof payload.other_worker_id === "string" ? payload.other_worker_id : "";
+  if (other === entity.entity_id) other = primary && primary !== entity.entity_id ? primary : "";
+  const suffix = other ? ` with ${other}` : "";
+  return `${type}${suffix}`;
 }
 
 function machineActiveWorkers(entity: BaseEntityState): string {
@@ -156,24 +240,7 @@ function isCompletedProduct(entity: BaseEntityState): boolean {
 }
 
 function shouldDisplayItem(entity: BaseEntityState): boolean {
-  const kind = itemType(entity).toLowerCase();
-  const state = itemState(entity);
-
-  if (!kind || !state) return false;
-
-  if (kind.includes("product")) {
-    return state !== "SCRAPPED";
-  }
-
-  if (kind.includes("battery")) {
-    return ["CREATED", "IN_STORAGE", "IN_QUEUE", "CARRIED_BY_WORKER"].includes(state);
-  }
-
-  if (kind.includes("material") || kind.includes("intermediate")) {
-    return ["CREATED", "IN_STORAGE", "IN_QUEUE", "CARRIED_BY_WORKER"].includes(state);
-  }
-
-  return !["COMPLETED", "SCRAPPED"].includes(state);
+  return Boolean(itemType(entity) || itemState(entity));
 }
 
 function itemStageGroup(entity: BaseEntityState): "queue" | "carried" | "loaded" | "completed" {
@@ -284,11 +351,17 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
         <div className="worker-monitor-list">
           {workers.map((worker) => {
             const visualState = getWorkerVisualState(worker);
-            const batteryProgress = workerBatteryProgress(worker, currentTime);
+            const batteryProgress = workerBatteryProgress(worker);
             const taskProgress = workerTaskProgress(worker, currentTime);
             const carryingItemType = cargoItemType(worker) || "-";
-            const carryingIcon = itemIconSrc(carryingItemType);
-            const lastSwapAt = Number(worker.attributes.last_swap_at);
+            const carryingId = cargoItemId(worker) || "-";
+            const availability = humanoidStateValue(worker, "availability");
+            const mobility = humanoidStateValue(worker, "mobility");
+            const power = humanoidStateValue(worker, "power");
+            const manipulation = humanoidStateValue(worker, "manipulation");
+            const motionPath = workerMotionPath(worker, currentTime);
+            const trafficConflict = workerTrafficConflict(worker);
+            const sharedCarry = cargoSharedCarry(worker);
             return (
               <article className="worker-monitor-card" key={worker.entity_id}>
                 <div className="worker-monitor-header">
@@ -301,7 +374,7 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                       <div className="worker-monitor-location">{regionLabel(worker, regions)}</div>
                     </div>
                   </div>
-                  <div className={`worker-monitor-state state-${worker.state}`}>{visualState.panelText}</div>
+                  <div className={`worker-monitor-state state-${visualState.mode}`}>{visualState.panelText}</div>
                 </div>
 
                 <div className="worker-monitor-meter">
@@ -332,27 +405,47 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
 
                 <div className="worker-monitor-grid">
                   <div>
-                    <span className="worker-monitor-key">Task</span>
-                    <span className="worker-monitor-value">{workerTaskLabel(worker)}</span>
+                    <span className="worker-monitor-key">Availability</span>
+                    <span className="worker-monitor-value">{availability}</span>
+                  </div>
+                  <div>
+                    <span className="worker-monitor-key">Mobility</span>
+                    <span className="worker-monitor-value">{mobility}</span>
+                  </div>
+                  <div>
+                    <span className="worker-monitor-key">Power</span>
+                    <span className="worker-monitor-value">{power}</span>
+                  </div>
+                  <div>
+                    <span className="worker-monitor-key">Manipulation</span>
+                    <span className="worker-monitor-value">{manipulation}</span>
+                  </div>
+                  <div>
+                    <span className="worker-monitor-key">Task / Code</span>
+                    <span className="worker-monitor-value">{workerTaskLabel(worker)} / {workerTaskCode(worker)}</span>
+                  </div>
+                  <div>
+                    <span className="worker-monitor-key">Primitive</span>
+                    <span className="worker-monitor-value">{workerPrimitive(worker)}</span>
+                  </div>
+                  <div>
+                    <span className="worker-monitor-key">Motion Path</span>
+                    <span className="worker-monitor-value">{motionPath}</span>
+                  </div>
+                  <div>
+                    <span className="worker-monitor-key">Traffic</span>
+                    <span className="worker-monitor-value">{trafficConflict}</span>
                   </div>
                   <div>
                     <span className="worker-monitor-key">Carry</span>
                     <span className="worker-monitor-value carry-value">
-                      {carryingIcon ? (
-                        <span className="worker-monitor-carry-chip">
-                          <img className="worker-monitor-carry-icon" src={carryingIcon} alt={carryingItemType} />
-                        </span>
-                      ) : null}
-                      <span>{carryingItemType}</span>
+                      <span>{carryingId}</span>
+                      <span>{carryingItemType !== "-" ? `(${carryingItemType})` : ""}</span>
                     </span>
                   </div>
                   <div>
-                    <span className="worker-monitor-key">State</span>
-                    <span className="worker-monitor-value">{statusLabel(worker)}</span>
-                  </div>
-                  <div>
-                    <span className="worker-monitor-key">Last Swap</span>
-                    <span className="worker-monitor-value">{Number.isFinite(lastSwapAt) ? `${lastSwapAt.toFixed(1)} min` : "-"}</span>
+                    <span className="worker-monitor-key">Shared Carry</span>
+                    <span className="worker-monitor-value">{sharedCarry}</span>
                   </div>
                   <div>
                     <span className="worker-monitor-key">Updated</span>

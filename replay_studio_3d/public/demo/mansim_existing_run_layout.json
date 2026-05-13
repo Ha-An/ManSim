@@ -1,0 +1,210 @@
+{
+  "source_priority": [
+    "config",
+    "auto"
+  ],
+  "viewport": {
+    "width": 1600,
+    "height": 960
+  },
+  "regions": [
+    {
+      "region_id": "warehouse_region",
+      "label": "Warehouse",
+      "kind": "storage",
+      "position": {
+        "x": 590,
+        "y": 100
+      },
+      "size": {
+        "width": 420,
+        "height": 170
+      },
+      "accent": "#86b6ff"
+    },
+    {
+      "region_id": "station_1_region",
+      "label": "Station 1",
+      "kind": "station",
+      "position": {
+        "x": 70,
+        "y": 340
+      },
+      "size": {
+        "width": 450,
+        "height": 290
+      },
+      "accent": "#8fb6ff"
+    },
+    {
+      "region_id": "station_2_region",
+      "label": "Station 2",
+      "kind": "station",
+      "position": {
+        "x": 560,
+        "y": 340
+      },
+      "size": {
+        "width": 450,
+        "height": 290
+      },
+      "accent": "#8fb6ff"
+    },
+    {
+      "region_id": "inspection_region",
+      "label": "Inspection",
+      "kind": "inspection",
+      "position": {
+        "x": 1090,
+        "y": 340
+      },
+      "size": {
+        "width": 450,
+        "height": 290
+      },
+      "accent": "#adc0eb"
+    },
+    {
+      "region_id": "battery_station_region",
+      "label": "Battery Station",
+      "kind": "battery",
+      "position": {
+        "x": 590,
+        "y": 680
+      },
+      "size": {
+        "width": 420,
+        "height": 140
+      },
+      "accent": "#96c3f7"
+    }
+  ],
+  "nodes": [
+    {
+      "entity_id": "material_queue_1",
+      "entity_type": "queue",
+      "region_id": "station_1_region",
+      "anchor": {
+        "x": 0.18,
+        "y": 0.46
+      }
+    },
+    {
+      "entity_id": "station_1_output_queue",
+      "entity_type": "buffer",
+      "region_id": "station_1_region",
+      "anchor": {
+        "x": 0.84,
+        "y": 0.46
+      }
+    },
+    {
+      "entity_id": "S1M1",
+      "entity_type": "machine",
+      "region_id": "station_1_region",
+      "anchor": {
+        "x": 0.6,
+        "y": 0.36
+      }
+    },
+    {
+      "entity_id": "S1M2",
+      "entity_type": "machine",
+      "region_id": "station_1_region",
+      "anchor": {
+        "x": 0.6,
+        "y": 0.72
+      }
+    },
+    {
+      "entity_id": "material_queue_2",
+      "entity_type": "queue",
+      "region_id": "station_2_region",
+      "anchor": {
+        "x": 0.18,
+        "y": 0.3
+      }
+    },
+    {
+      "entity_id": "intermediate_queue_2",
+      "entity_type": "buffer",
+      "region_id": "station_2_region",
+      "anchor": {
+        "x": 0.18,
+        "y": 0.6
+      }
+    },
+    {
+      "entity_id": "station_2_output_queue",
+      "entity_type": "buffer",
+      "region_id": "station_2_region",
+      "anchor": {
+        "x": 0.84,
+        "y": 0.46
+      }
+    },
+    {
+      "entity_id": "S2M1",
+      "entity_type": "machine",
+      "region_id": "station_2_region",
+      "anchor": {
+        "x": 0.6,
+        "y": 0.36
+      }
+    },
+    {
+      "entity_id": "S2M2",
+      "entity_type": "machine",
+      "region_id": "station_2_region",
+      "anchor": {
+        "x": 0.6,
+        "y": 0.72
+      }
+    },
+    {
+      "entity_id": "intermediate_queue_4",
+      "entity_type": "queue",
+      "region_id": "inspection_region",
+      "anchor": {
+        "x": 0.2,
+        "y": 0.46
+      }
+    },
+    {
+      "entity_id": "inspection_output_queue",
+      "entity_type": "buffer",
+      "region_id": "inspection_region",
+      "anchor": {
+        "x": 0.82,
+        "y": 0.46
+      }
+    },
+    {
+      "entity_id": "A1",
+      "entity_type": "worker",
+      "region_id": "warehouse_region",
+      "anchor": {
+        "x": 0.3,
+        "y": 0.58
+      }
+    },
+    {
+      "entity_id": "A2",
+      "entity_type": "worker",
+      "region_id": "warehouse_region",
+      "anchor": {
+        "x": 0.5,
+        "y": 0.58
+      }
+    },
+    {
+      "entity_id": "A3",
+      "entity_type": "worker",
+      "region_id": "warehouse_region",
+      "anchor": {
+        "x": 0.7,
+        "y": 0.58
+      }
+    }
+  ]
+}

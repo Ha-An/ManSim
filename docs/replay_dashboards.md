@@ -24,13 +24,24 @@ Factory replay는 아래 파일을 사용합니다.
 - `replay_studio_log.json`
 - `replay_studio_layout.json`
 
-로그는 event-sourced 방식이며 deterministic replay를 목표로 합니다. Replay Studio는 아래 순서로 상태를 복원합니다.
+로그는 event-sourced 방식이며 deterministic replay를 목표로 합니다. Factory replay는 기본적으로 strict mode로 export됩니다. 이 모드에서는 Replay Studio가 worker 위치를 임의 보정하거나 inspection workbench로 강제 이동시키지 않고, simulator가 남긴 tile/motion/event payload를 기준으로만 상태를 복원합니다.
 
 1. initial state
 2. `timestamp`, `sequence_index`, `event_id` 기준으로 stable sort된 event stream
 3. 선택적 checkpoint
 
-Renderer는 worker, machine, queue, battery station, inspection, material flow, movement, incident, shared repair를 시각화합니다.
+Renderer는 worker, machine, queue, battery station, inspection, material flow, movement, traffic conflict, incident, shared repair를 시각화합니다. 부드러운 이동 animation은 `AGENT_MOVE_START`에서 export된 `entity_moved.payload.path`와 `durative` window를 따른 표현이며, 위치 fallback이나 inspection 전용 강제 배치는 사용하지 않습니다.
+
+Traffic conflict는 simulator의 `AGENT_TRAFFIC_CONFLICT` event에서 생성됩니다. Replay Studio에서는 `traffic_conflict_detected` event로 변환되며, 현재 conflict tile 또는 edge를 overlay로 표시합니다. 이 표시는 정책 보정이 아니라 simulator가 기록한 이동 사건을 그대로 관찰하기 위한 것입니다.
+
+Worker monitor는 compact 운영 패널입니다.
+
+- `Task / Code`: 기존 task label과 Humanoid task code를 한 줄에 표시합니다.
+- `Primitive`: 현재 `HUMANOID_STEP_START`/`HUMANOID_STEP_END` 또는 `WORKER_STATE_CHANGED`에 기록된 primitive를 표시합니다. Simulation-side presentation hint는 더 이상 생성하지 않습니다.
+- `Motion Path`: 현재 motion payload의 path point 수를 표시합니다.
+- `Traffic`: 최근 traffic conflict type과 상대 worker를 표시합니다.
+- `Carry`: item image 대신 현재 들고 있는 item ID와 type을 표시합니다.
+- `Updated`: 해당 worker entity의 마지막 replay update time입니다.
 
 ## Manager Replay
 
@@ -107,3 +118,5 @@ npm run build
 ```
 
 Replay log validator는 잘못된 entity reference를 거부합니다. Exporter는 빈 ref를 `null`로 쓰지 말고 필드 자체를 생략해야 합니다.
+
+`replay_studio_log.json.metadata`에는 `replay_mode: strict`, `position_policy: simulation_tile_or_motion_only`, `visual_corrections: false`가 기록됩니다.

@@ -5,6 +5,20 @@ from enum import Enum
 from typing import Any, Optional
 
 
+def default_humanoid_state_payload(humanoid_id: str = "") -> dict[str, Any]:
+    return {
+        "humanoid_id": humanoid_id or "",
+        "availability": "AVAILABLE",
+        "mobility": "STATIONARY",
+        "power": "POWER_NORMAL",
+        "manipulation": "FREE",
+        "task_context": None,
+        "reason": None,
+        "timestamp_s": None,
+        "metadata": {},
+    }
+
+
 class MachineState(str, Enum):
     IDLE = "IDLE"
     WAIT_INPUT = "WAIT_INPUT"
@@ -14,22 +28,6 @@ class MachineState(str, Enum):
     BROKEN = "BROKEN"
     UNDER_REPAIR = "UNDER_REPAIR"
     UNDER_PM = "UNDER_PM"
-
-
-class WorkerState(str, Enum):
-    IDLE = "IDLE"
-    MOVING = "MOVING"
-    SUPPLYING_MATERIAL = "SUPPLYING_MATERIAL"
-    TRANSFERRING_INTERMEDIATE = "TRANSFERRING_INTERMEDIATE"
-    SETTING_UP_MACHINE = "SETTING_UP_MACHINE"
-    UNLOADING_MACHINE = "UNLOADING_MACHINE"
-    INSPECTING_PRODUCT = "INSPECTING_PRODUCT"
-    REPAIRING_MACHINE = "REPAIRING_MACHINE"
-    PREVENTIVE_MAINTENANCE = "PREVENTIVE_MAINTENANCE"
-    BATTERY_SWAPPING = "BATTERY_SWAPPING"
-    BATTERY_DELIVERING = "BATTERY_DELIVERING"
-    WAITING = "WAITING"
-    DISCHARGED = "DISCHARGED"
 
 
 class ItemState(str, Enum):
@@ -86,12 +84,22 @@ class Worker:
     reserved_tile: tuple[int, int] | None = None
     movement_path: list[tuple[int, int]] = field(default_factory=list)
     movement_target_tile: tuple[int, int] | None = None
-    state: WorkerState = WorkerState.IDLE
+    current_move_id: Optional[str] = None
+    current_move_segment_index: int = 0
+    current_move_segment_from_tile: tuple[int, int] | None = None
+    current_move_segment_to_tile: tuple[int, int] | None = None
+    current_move_logical_destination: Optional[str] = None
+    current_move_started_at: Optional[float] = None
     discharged: bool = False
     discharged_since: Optional[float] = None
     current_task_id: Optional[str] = None
     current_task_type: Optional[str] = None
+    current_task_code: Optional[str] = None
+    current_task_instance_id: Optional[str] = None
+    current_step_id: Optional[str] = None
+    current_primitive_call_code: Optional[str] = None
     current_task_started_at: Optional[float] = None
+    humanoid_state: dict[str, Any] = field(default_factory=default_humanoid_state_payload)
     process_ref: Any = None
     last_battery_swap: float = 0.0
     suspended_task: Any = None
@@ -103,6 +111,8 @@ class Worker:
     in_transit_total_min: float = 0.0
     carrying_item_id: Optional[str] = None
     carrying_item_type: Optional[str] = None
+    transport_session_id: Optional[str] = None
+    shared_carry_role: Optional[str] = None
     battery_swap_critical: bool = False
     low_battery_alerted: bool = False
     total_task_time_min: dict[str, float] = field(default_factory=dict)
@@ -134,6 +144,13 @@ class Task:
     location: str
     payload: dict[str, Any] = field(default_factory=dict)
     selection_meta: dict[str, Any] = field(default_factory=dict)
+    task_code: str = ""
+    instance_id: str = ""
+    assigned_robot_id: str = ""
+    args: dict[str, Any] = field(default_factory=dict)
+    task_spec_name: str = ""
+    step_plan: list[dict[str, Any]] = field(default_factory=list)
+    humanoid: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

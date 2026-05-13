@@ -9,8 +9,9 @@ defaults:
   # - fixed_task_assignment: worker별 task family allowlist를 강제하는 scripted mode
   # - llm_planner: legacy commitment-driven LLM mode
   # - openclaw_adaptive_priority: OpenClaw manager-only priority-driven LLM mode
-  - decision: openclaw_adaptive_priority
+  - decision: adaptive_priority
   - heuristic_rules: default
+  - humanoids: default
   - runtime: default
   - worker: default
   - _self_

@@ -123,6 +123,7 @@ def build_dashboard_manifest(
     analysis_payload: dict[str, Any] | None = None,
     streamlit_port: int = 8505,
     replay_studio_port: int = 5173,
+    replay_studio_3d_port: int = 5174,
 ) -> dict[str, Any]:
     root_output_dir = Path(root_output_dir)
     summary = summary_payload if isinstance(summary_payload, dict) else (_safe_json(root_output_dir / "run_series_summary.json") or {})
@@ -192,6 +193,7 @@ def build_dashboard_manifest(
         "single_run": len(runs) <= 1,
         "streamlit_preferred_port": int(streamlit_port),
         "replay_studio_preferred_port": int(replay_studio_port),
+        "replay_studio_3d_preferred_port": int(replay_studio_3d_port),
         "requested_run_count": _safe_int(summary.get("requested_run_count"), len(runs)),
         "completed_run_count": _safe_int(summary.get("completed_run_count"), len(runs)),
         "current_run": runs[-1]["id"] if runs else "",

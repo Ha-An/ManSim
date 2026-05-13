@@ -12,11 +12,13 @@
 - `workspaces/MANAGER_CURATOR` - LLM Wiki curator template.
 - `workspaces/MANAGER_*` - legacy planner/evaluator/reflector templates.
 
-## Canonical Run Path
+## LLM Manager Run Path
 
 ```powershell
 .\.venv\Scripts\python.exe main.py decision=openclaw_adaptive_priority
 ```
+
+Repository 기본 simulation path는 OpenClaw 없는 `adaptive_priority`입니다. 이 디렉터리는 LLM manager path를 사용할 때 필요한 profile과 workspace asset만 관리합니다.
 
 ## Default Local Stack
 
@@ -63,6 +65,6 @@ Parallel profile은 실험용 sidecar입니다. Primary validation path는 `mans
 ## Notes
 
 - Canonical config는 `configs/`에 있습니다.
-- Current production path는 `openclaw_adaptive_priority`입니다.
+- 기본 simulation path는 `adaptive_priority`이고, LLM manager path는 `openclaw_adaptive_priority`입니다.
 - Manager는 high-level intent와 diagnosis를 담당하고, deterministic compiler가 실행 policy를 만듭니다.
 - LLM Wiki/graph는 current state를 대체하지 않습니다. Manager는 최신 simulator facts를 우선해야 합니다.

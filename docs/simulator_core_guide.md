@@ -1,16 +1,18 @@
 # Simulator Core Guide
 
-이 문서는 `manufacturing_sim/` 아래의 제조 시뮬레이터 코어를 설명합니다. LLM manager, dashboard, OpenClaw runtime은 코어 바깥 layer입니다.
+이 문서는 `manufacturing_sim/` 아래의 제조 simulator core를 설명합니다. Humanoid State/Task/Primitive 상세는 [humanoid_worker_model.md](humanoid_worker_model.md), 이동 경로계획과 traffic 상세는 [humanoid_movement_model.md](humanoid_movement_model.md)에 분리되어 있습니다.
 
 ## Core Responsibility
 
 Simulator core가 담당하는 것:
 
-- factory state 보관
+- factory state 보관과 transition
 - SimPy 기반 discrete-event time progression
-- worker, machine, item state transition
-- feasible task 후보 생성
+- worker, machine, item entity 관리
+- 현재 상태에서 실행 가능한 task 후보 생성
 - 선택된 task 실행
+- tile map 기반 worker 이동
+- traffic reservation, conflict 관찰, event 기록
 - battery, setup, breakdown, repair, inspection 처리
 - event log와 KPI source 생성
 
@@ -22,18 +24,24 @@ Simulator core가 담당하지 않는 것:
 - run-series knowledge synthesis
 - LLM Wiki/Graphify update
 
-## 주요 파일
+## Key Files
 
 - `manufacturing_sim/simulation/scenarios/manufacturing/world.py`
-  - Factory world state, task enumeration, task execution, KPI aggregation.
-- `manufacturing_sim/simulation/scenarios/manufacturing/processes.py`
-  - SimPy process loop.
+  - Factory world state, task enumeration, execution, KPI aggregation.
+- `manufacturing_sim/simulation/scenarios/manufacturing/humanoid_runtime.py`
+  - `Humanoid_Tasks` catalog/profile validation, TaskSpec step flattening, primitive execution bridge.
+- `manufacturing_sim/simulation/scenarios/manufacturing/grid_map.py`
+  - Tile map, pathfinding, worker tile occupancy.
+- `manufacturing_sim/simulation/scenarios/manufacturing/traffic.py`
+  - Path overlap, tile conflict, edge conflict, near miss detection.
 - `manufacturing_sim/simulation/scenarios/manufacturing/entities.py`
-  - `Machine`, `Worker`, `Task`, `Item`과 state enum.
+  - `Worker`, `Machine`, `Task`, `Item` dataclasses and machine/item domain states.
+- `manufacturing_sim/simulation/scenarios/manufacturing/processes.py`
+  - SimPy process orchestration.
 - `manufacturing_sim/simulation/scenarios/manufacturing/logging.py`
-  - `events.jsonl` event logging.
+  - `events.jsonl` event writer.
 - `manufacturing_sim/simulation/scenarios/manufacturing/run.py`
-  - Scenario execution entry와 artifact export.
+  - Scenario execution entrypoint.
 
 ## Time Model
 
@@ -63,137 +71,187 @@ Warehouse material
   -> Warehouse completed product or scrap
 ```
 
-주요 buffer/queue:
+주요 queue/buffer:
 
 - `material_queues` - station별 raw material 대기.
-- `intermediate_queues` - station 사이의 item 대기.
+- `intermediate_queues` - station 사이 item 대기.
 - `output_buffers` - stage 처리 후 다음 이동 전 대기.
-- `inspection_queue` - inspection 대상 item 대기.
-- `inspection_output` - inspection 통과 후 warehouse transfer 대기.
+- inspection input queue - inspection 대상 item 대기.
+- inspection output queue - inspection 통과 후 warehouse transfer 대기.
 - completed warehouse buffer - 최종 accepted product count source.
 
-`completed products`는 inspection output에 쌓인 item이 아니라 warehouse까지 도착한 accepted product입니다.
+`completed products`는 inspection output에 쌓인 item이 아닙니다. Inspection을 통과한 accepted product가 warehouse까지 운반되어야 최종 count가 증가합니다.
 
 ## Entity Model
 
 ### Worker
 
-Worker는 현재 위치, battery, task 상태, 이동/작업 여부를 가집니다. Decision layer가 task를 선택하면 simulator가 이동과 작업 시간을 반영합니다.
+Worker는 ManSim 내부 entity이지만 상태와 task 의미는 `Humanoid_Tasks`에서 가져온 정의를 사용합니다. `Worker.humanoid_state`는 `HumanoidStateSnapshot` dictionary이며, `availability`, `mobility`, `power`, `manipulation`, `task_context`, `reason`을 담습니다.
 
-대표 상태:
-
-- idle
-- moving
-- processing
-- recharging
-- repairing
-- blocked
+자세한 상태 축과 task 목록은 [humanoid_worker_model.md](humanoid_worker_model.md)를 보세요.
 
 ### Machine
 
-Machine은 processing station의 상태를 나타냅니다.
+Machine은 ManSim domain state를 그대로 사용합니다.
 
-대표 상태:
+- `WAIT_INPUT`
+- `SETUP`
+- `IDLE`
+- `PROCESSING`
+- `DONE_WAIT_UNLOAD`
+- `BROKEN`
+- `UNDER_REPAIR`
+- `UNDER_PM`
 
-- idle
-- processing
-- broken
-- repair_in_progress
-- setup_required
+Machine state는 Humanoid state와 별개입니다. Machine dashboard와 KPI는 machine state를 기준으로 집계합니다.
 
 ### Item
 
-Item은 factory flow를 따라 이동합니다.
+Item은 material, intermediate, product, battery 등으로 구분됩니다. 주요 state:
 
-대표 상태:
+- `CREATED`
+- `IN_STORAGE`
+- `IN_QUEUE`
+- `CARRIED_BY_WORKER`
+- `LOADED_ON_MACHINE`
+- `PROCESSING`
+- `WAITING_MACHINE_UNLOAD`
+- `WAITING_INSPECTION`
+- `INSPECTING`
+- `WAITING_INSPECTION_OUTPUT`
+- `COMPLETED`
+- `SCRAPPED`
 
-- raw material
-- in process
-- waiting transfer
-- waiting inspection
-- inspected accepted
-- inspected rejected
-- completed
+Item state도 Humanoid state와 별개입니다. Worker가 item을 들면 worker의 `manipulation`은 보통 `HOLDING`이 되고, item state는 `CARRIED_BY_WORKER`가 됩니다.
 
-## Task Model
+## Task Runtime Boundary
 
-Simulator는 현재 상태에서 실행 가능한 task 후보를 생성합니다. Decision mode는 이 후보 중 하나를 선택합니다.
+Simulator는 현재 factory state에서 실행 가능한 task 후보를 만듭니다. Decision mode는 후보 중 하나를 선택합니다. 선택된 task는 `HumanoidTaskRuntime`을 통해 `Humanoid_Tasks`의 task catalog와 worker profile validation을 거친 뒤 실행됩니다.
 
-대표 task family:
+`task_type`과 priority key는 기존 decision layer 호환용 label입니다. 실제 실행 단위는 `task_code`입니다.
 
-- `load_material`
-- `process_stage_1`
-- `process_stage_2`
-- `transfer_to_next_stage`
-- `inspect`
-- `transfer_inspection_output`
-- `recharge`
-- `repair_machine`
-- `setup_machine`
+현재 ManSim에서 사용하는 task code:
 
-Task 후보에는 보통 target entity, expected duration, route, priority 관련 context가 포함됩니다.
+- `REPLENISH_MATERIAL`
+- `TRANSFER`
+- `MANAGE_ROBOT_POWER`
+- `SETUP_MACHINE`
+- `UNLOAD_MACHINE`
+- `INSPECT_PRODUCT`
+- `REPAIR_MACHINE`
+- `PREVENTIVE_MAINTENANCE`
+- `HANDOVER_ITEM`
 
-## Inspection Constraint
+Task별 primitive sequence, state 축 변화, ManSim domain side effect는 [humanoid_worker_model.md](humanoid_worker_model.md)에 정리되어 있습니다.
 
-Inspection workbench는 한 번에 하나의 worker만 점유할 수 있어야 합니다. Inspection queue 위의 item이 많더라도 동시에 여러 worker가 같은 inspection 작업을 수행하면 안 됩니다.
+## Domain Rules
 
-정상 동작:
+### Inspection
 
-- 한 worker가 inspection task를 시작하면 workbench가 busy가 됩니다.
-- 다른 worker는 inspection이 끝날 때까지 같은 workbench inspection을 시작하지 않습니다.
-- Inspection 완료 후 accepted item은 inspection output으로 이동하고, 이후 warehouse transfer가 완료되어야 completed count가 증가합니다.
+Inspection workbench는 한 번에 하나의 worker만 점유할 수 있습니다.
 
-## Repair Model
+- Worker는 inspection input queue에서 product를 집습니다.
+- Worker는 `inspection_table` service tile까지 이동합니다.
+- Worker가 table 위치에 도착한 뒤에만 `EXECUTE_QUALITY_ACTION`이 진행됩니다.
+- Pass item은 inspection output queue까지 worker가 직접 운반합니다.
+- Warehouse transfer가 끝나야 `completed products`가 증가합니다.
 
-Machine repair는 협동 수리를 지원합니다.
+### Setup / Unload
 
-- `scenario.machine_failure.max_repair_agents`가 동시 repair 참여 worker 수를 제한합니다.
-- 한 worker가 수리를 시작하고 helper가 합류할 수 있습니다.
-- Repair progress는 active repair worker 수에 따라 빨라집니다.
-- 모든 repair worker가 이탈하면 남은 repair work는 보존됩니다.
+Setup과 unload는 queue와 machine 사이의 실제 carry 이동을 포함합니다.
 
-Replay event에는 helper join/leave, team size, remaining work가 기록됩니다.
+- `SETUP_MACHINE`: 필요한 input queue로 이동해 item을 집고 machine service tile로 돌아와 load/setup을 수행합니다.
+- `UNLOAD_MACHINE`: machine output을 집고 station output buffer까지 운반합니다.
 
-## Battery Model
+### Repair / Preventive Maintenance
 
-Worker는 이동과 작업 중 battery를 소모합니다. Battery가 낮으면 recharge task가 feasible candidate로 올라오며, safety guard가 low-battery worker를 보호합니다.
+Repair는 여러 worker가 한 machine에 합류할 수 있습니다. 동시 repair worker 수는 `scenario.machine_failure.max_repair_agents`가 제한합니다. Preventive maintenance는 idle machine에 대해 수행되며, breakdown probability를 낮추는 효과를 갖습니다.
 
-Manager가 battery prevention target을 선택하면 compiler는 recharge 관련 floor와 role multiplier를 강화할 수 있습니다.
+### Battery
+
+Battery swap은 `MANAGE_ROBOT_POWER`로 표현합니다. Battery delivery는 `TRANSFER` task code를 사용하며, payload args에 target worker와 battery rack 정보가 들어갑니다.
+
+### Product Handover
+
+Product transport session이 active이고 carrier가 1명일 때, 다른 available worker는 `HANDOVER_ITEM` 후보를 받을 수 있습니다. Helper가 source carrier를 따라잡을 수 있을 만큼 남은 경로가 있을 때만 후보가 생성됩니다. 합류 후 다음 tile segment부터 product 이동 multiplier가 carrier 수로 나뉩니다.
+
+## Movement And Traffic
+
+Worker 이동은 tile map 기반입니다. Core는 `move_agent(agent, dst)`를 통해 logical destination을 service tile 후보로 바꾸고, A* path를 따라 한 tile씩 이동합니다.
+
+기본 traffic mode는 `strict_reservation`입니다. Worker가 다음 tile을 예약하지 못하면 이동하지 않고 대기하며 `AGENT_TRAFFIC_CONFLICT` / `TRAFFIC_WAIT`을 기록합니다. `observe_conflicts` 모드는 충돌 가능 상황을 막지 않고 관찰하기 위한 실험 모드입니다.
+
+자세한 pathfinding, reservation, traffic conflict 정의는 [humanoid_movement_model.md](humanoid_movement_model.md)를 보세요.
 
 ## Event Logging
 
 Core는 event-sourced replay를 위해 주요 상태 변화를 기록합니다.
 
-대표 event:
+Worker 관련 event details에는 `humanoid_state` snapshot 원본이 들어갑니다.
 
-- worker movement start/end
-- task start/end
-- item transfer
-- processing complete
-- inspection start/end
-- machine breakdown/repaired
-- repair helper join/leave
-- battery recharge
-- incident/blocker
+주요 event:
 
-Export된 event는 `replay_studio_log.json`으로 변환되어 Replay Studio가 소비합니다.
+- `WORKER_STATE_CHANGED`
+- `WORKER_CARGO_CHANGED`
+- `HUMANOID_TASK_START`, `HUMANOID_TASK_END`
+- `HUMANOID_STEP_START`, `HUMANOID_STEP_END`
+- `AGENT_MOVE_START`, `AGENT_MOVE_TILE_START`, `AGENT_MOVE_TILE_END`, `AGENT_MOVE_END`
+- `AGENT_TRAFFIC_CONFLICT`
+- `PRODUCT_CARRY_STARTED`, `PRODUCT_CARRY_JOINED`, `PRODUCT_CARRY_COMPLETED`
+- `ITEM_MOVED`
+- `MACHINE_STATE_CHANGED`
+- `MACHINE_REPAIR_*`
+
+`HUMANOID_STEP_START`와 `HUMANOID_STEP_END`에는 `task_code`, `instance_id`, `step_id`, `primitive_call_code`, `humanoid_state`가 포함됩니다.
+
+## Replay Export
+
+`events.jsonl`은 `replay_studio_log.json`으로 변환됩니다. Replay Studio는 worker 위치를 임의 보정하지 않고, `AGENT_MOVE_START`에서 export된 `entity_moved.payload.path`와 `durative` window를 기준으로 이동을 보간합니다.
+
+Worker panel은 `humanoid_state` 원본에서 네 state 축, task context, primitive, cargo item id, traffic reason을 읽습니다. Task가 종료되어 `task_context=null`이면 stale task label을 표시하지 않습니다.
 
 ## KPI Source
 
-`kpi.json`과 dashboard KPI는 simulator core artifact에서 집계됩니다.
+`kpi.json`과 dashboard KPI는 simulator core artifact에서 집계합니다.
 
-핵심 KPI:
+Humanoid/worker KPI:
+
+- `humanoid_state_time_by_worker`
+- `humanoid_state_time_by_axis`
+- `humanoid_state_ratio_by_worker`
+- `humanoid_execution_ratio_by_worker`
+- `humanoid_unavailable_ratio_by_worker`
+- `humanoid_task_minutes`
+- `humanoid_primitive_minutes`
+- `humanoid_task_taxonomy`
+
+Traffic KPI:
+
+- `traffic_conflicts_by_type`
+- `traffic_conflicts_by_worker_pair`
+- `collision_count`
+- `near_miss_count`
+- `edge_conflict_count`
+- `path_overlap_count`
+
+Transport/handover KPI:
+
+- `handover_item_count`
+- `shared_product_carry_completed_count`
+- `product_carry_time_min`
+- `shared_product_carry_time_min`
+- `item_transport_time_by_type`
+
+Production and flow KPI:
 
 - `total_products`
 - `downstream_closure_ratio`
 - `completed_product_lead_time_avg_min`
 - buffer wait time
-- physical incident total
-- coordination incident total
-- machine breakdown count
-- inspection backlog end
+- machine utilization and breakdown time
+- inspection throughput
 
-해석상 가장 중요한 지표는 `total_products`입니다.
+가장 중요한 해석 기준은 `total_products`입니다.
 
 ## Runtime Boundary
 
@@ -207,17 +265,16 @@ Export된 event는 `replay_studio_log.json`으로 변환되어 Replay Studio가 
 - `replay_studio_layout.json`
 - `results_dashboard.html`
 
-LLM Wiki, Graphify graph, manager replay는 core 밖의 orchestration/dashboard layer에서 생성됩니다.
+LLM Wiki, Graphify graph, manager replay는 core 바깥의 orchestration/dashboard layer에서 생성됩니다.
 
-## 디버깅 순서
+## Debugging Order
 
-Factory behavior가 이상하면 먼저 아래를 봅니다.
+Factory behavior가 이상하면 아래 순서로 확인합니다.
 
-1. `daily_summary.json`
-2. `kpi.json`
-3. `events.jsonl`
-4. `minute_snapshots.json`
+1. `events.jsonl`
+2. `minute_snapshots.json`
+3. `kpi.json`
+4. `daily_summary.json`
 5. `replay_studio_log.json`
-6. factory Replay Studio
 
-Manager 판단이 이상하면 core보다 `manager_replay.json`, `shift_policy_history.json`, `day_review_memory.json`, OpenClaw workspace trace를 먼저 봅니다.
+Replay Studio에서 이상해 보이면 먼저 `events.jsonl`의 core event가 같은 내용을 말하는지 확인합니다. Core event가 정상이고 Replay만 다르면 exporter/reducer/UI 문제일 가능성이 큽니다.

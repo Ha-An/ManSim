@@ -1,6 +1,6 @@
 # OpenClaw Adaptive Priority Call Flow
 
-`openclaw_adaptive_priority`는 ManSim의 현재 production LLM path입니다. 핵심 아이디어는 manager가 운영 의도를 만들고, deterministic compiler가 그 의도를 안전하게 실행 가능한 정책으로 바꾸는 것입니다.
+`openclaw_adaptive_priority`는 ManSim의 OpenClaw 기반 LLM manager path입니다. 기본 simulation path는 OpenClaw 없는 `adaptive_priority`이며, 이 문서는 LLM manager loop를 명시적으로 켰을 때의 흐름을 설명합니다. 핵심 아이디어는 manager가 운영 의도를 만들고, deterministic compiler가 그 의도를 안전하게 실행 가능한 정책으로 바꾸는 것입니다.
 
 ## 전체 흐름
 
@@ -97,6 +97,8 @@ Compiler는 LLM agent가 아니라 system stage입니다. Strategist intent, pre
 ## Worker Execution
 
 Worker는 shop-floor executor입니다.
+
+실제 물리 실행은 simulator core와 `Humanoid_Tasks` hierarchy runtime이 담당합니다. Manager/Compiler는 priority, role, safety floor 같은 실행 policy를 조정할 뿐 task primitive를 직접 실행하지 않습니다.
 
 선택 순서:
 

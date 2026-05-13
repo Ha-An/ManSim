@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import copy
 import math
 import random
 from collections import defaultdict, deque
@@ -26,10 +27,17 @@ from manufacturing_sim.simulation.scenarios.manufacturing.entities import (
     MachineState,
     Task,
     Worker,
-    WorkerState,
+    default_humanoid_state_payload,
 )
 from manufacturing_sim.simulation.scenarios.manufacturing.grid_map import Tile, TileGridMap
+from manufacturing_sim.simulation.scenarios.manufacturing.humanoid_runtime import HumanoidTaskRuntime
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
+from manufacturing_sim.simulation.scenarios.manufacturing.traffic import (
+    TrafficConflict,
+    TrafficMonitor,
+    TrafficPlan,
+    TrafficSegment,
+)
 
 
 class ManufacturingWorld:
@@ -81,6 +89,41 @@ class ManufacturingWorld:
         self.inspection_min_time_min = float(factory_cfg["inspection_min_time_min"])
 
         self.movement_cfg = cfg["movement"]
+        self.traffic_cfg = self.movement_cfg.get("traffic", {}) if isinstance(self.movement_cfg.get("traffic", {}), dict) else {}
+        self.traffic_enabled = bool(self.traffic_cfg.get("enabled", True))
+        self.traffic_mode = str(self.traffic_cfg.get("mode", "observe_conflicts")).strip().lower() or "observe_conflicts"
+        self.traffic_fidelity = str(self.traffic_cfg.get("fidelity", "tile_edge")).strip().lower() or "tile_edge"
+        self.traffic_collision_effect = str(self.traffic_cfg.get("collision_effect", "log_only")).strip().lower() or "log_only"
+        self.traffic_emit_tile_step_events = bool(self.traffic_cfg.get("emit_tile_step_events", True))
+        self.traffic_monitor = (
+            TrafficMonitor(near_miss_headway_min=float(self.traffic_cfg.get("near_miss_headway_min", 0.05) or 0.05))
+            if self.traffic_enabled
+            else None
+        )
+        self.traffic_conflicts: list[dict[str, Any]] = []
+        self.traffic_move_counter = itertools.count(1)
+        transport_cfg = self.movement_cfg.get("item_transport", {}) if isinstance(self.movement_cfg.get("item_transport", {}), dict) else {}
+        weight_cfg = transport_cfg.get("weight_time_multiplier", {}) if isinstance(transport_cfg.get("weight_time_multiplier", {}), dict) else {}
+        self.item_transport_weight_multiplier = {
+            "material": float(weight_cfg.get("material", 1.0) or 1.0),
+            "intermediate": float(weight_cfg.get("intermediate", 1.5) or 1.5),
+            "product": float(weight_cfg.get("product", 2.0) or 2.0),
+            "battery": float(weight_cfg.get("battery", 1.0) or 1.0),
+            "battery_fresh": float(weight_cfg.get("battery_fresh", weight_cfg.get("battery", 1.0)) or 1.0),
+            "battery_spent": float(weight_cfg.get("battery_spent", weight_cfg.get("battery", 1.0)) or 1.0),
+        }
+        collaboration_cfg = (
+            transport_cfg.get("product_collaboration", {})
+            if isinstance(transport_cfg.get("product_collaboration", {}), dict)
+            else {}
+        )
+        self.product_collaboration_enabled = bool(collaboration_cfg.get("enabled", True))
+        self.product_collaboration_max_carriers = max(1, int(collaboration_cfg.get("max_carriers", 2) or 2))
+        self.product_collaboration_divide_time = bool(collaboration_cfg.get("divide_time_by_carrier_count", True))
+        self.transport_session_counter = itertools.count(1)
+        self.product_transport_sessions: dict[str, dict[str, Any]] = {}
+        self.product_transport_session_by_item: dict[str, str] = {}
+        self.product_transport_session_by_worker: dict[str, str] = {}
         self.quality_cfg = cfg["quality"]
         self.machine_failure_cfg = cfg["machine_failure"]
         legacy_agent_cfg = cfg.get("agent", {}) if isinstance(cfg.get("agent", {}), dict) else {}
@@ -211,6 +254,7 @@ class ManufacturingWorld:
         self._build_workers()
         # Deprecated alias retained for modules that still use "agent" as orchestration vocabulary.
         self.agents = self.workers
+        self.humanoid_runtime = HumanoidTaskRuntime(self, cfg)
 
         self.product_count = 0
         self.scrap_count = 0
@@ -262,6 +306,7 @@ class ManufacturingWorld:
         for idx in range(1, self.num_workers + 1):
             worker_id = f"A{idx}"
             worker = Worker(worker_id=worker_id, location="Home")
+            worker.humanoid_state = default_humanoid_state_payload(worker_id)
             if self.grid_map is not None:
                 worker.tile = self.grid_map.register_worker(worker_id, self.grid_map.initial_worker_tile(worker_id))
             self.workers[worker_id] = worker
@@ -1021,6 +1066,8 @@ class ManufacturingWorld:
             return "preventive_maintenance"
         if task.task_type == "INSPECT_PRODUCT":
             return "inspect_product"
+        if task.task_type == "HANDOVER_ITEM":
+            return "handover_item"
         if task.task_type == "TRANSFER":
             transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
             if transfer_kind == "battery_delivery":
@@ -1035,6 +1082,149 @@ class ManufacturingWorld:
         if tile is None:
             return None
         return {"x": int(tile[0]), "y": int(tile[1])}
+
+    def _tile_from_payload(self, payload: Any) -> Tile | None:
+        if isinstance(payload, tuple) and len(payload) == 2:
+            return (int(payload[0]), int(payload[1]))
+        if isinstance(payload, dict) and "x" in payload and "y" in payload:
+            return (int(payload["x"]), int(payload["y"]))
+        return None
+
+    def _traffic_observe_conflicts(self) -> bool:
+        return bool(self.traffic_enabled and self.traffic_mode == "observe_conflicts" and self.traffic_fidelity in {"tile_edge", "tile"})
+
+    def _traffic_strict_reservation(self) -> bool:
+        return not self._traffic_observe_conflicts()
+
+    def _traffic_reason_code(self, conflict_type: str, *, collision: bool = False) -> str:
+        if collision:
+            return "collision"
+        normalized = str(conflict_type or "").strip().lower()
+        return normalized or "traffic_conflict"
+
+    def _traffic_humanoid_state_payload(self, worker: Worker, conflict: TrafficConflict) -> dict[str, Any]:
+        payload = self._humanoid_state_payload(worker)
+        payload["reason"] = {
+            "code": self._traffic_reason_code(conflict.conflict_type, collision=conflict.collision),
+            "message": f"{conflict.conflict_type} with {conflict.other_worker_id}",
+            "source": "mansim.traffic",
+            "metadata": {
+                "conflict_id": conflict.conflict_id,
+                "other_worker_id": conflict.other_worker_id,
+                "collision": bool(conflict.collision),
+            },
+        }
+        return payload
+
+    def _log_traffic_conflicts(self, agent: Worker, conflicts: list[TrafficConflict]) -> None:
+        for conflict in conflicts:
+            details = conflict.to_dict()
+            details["humanoid_state"] = self._traffic_humanoid_state_payload(agent, conflict)
+            details["traffic_mode"] = self.traffic_mode
+            details["collision_effect"] = self.traffic_collision_effect
+            details["location"] = self.agent_display_location(agent)
+            self.traffic_conflicts.append(copy.deepcopy(details))
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="AGENT_TRAFFIC_CONFLICT",
+                entity_id=agent.agent_id,
+                location=self.agent_display_location(agent),
+                details=details,
+            )
+
+    def _traffic_register_plan(self, agent: Worker, move_id: str, path: list[Tile], *, started_at: float, ended_at: float) -> None:
+        if self.traffic_monitor is None or not self.traffic_enabled or len(path) < 2:
+            return
+        conflicts = self.traffic_monitor.register_plan(
+            TrafficPlan(
+                move_id=move_id,
+                worker_id=agent.agent_id,
+                path_tiles=tuple(path),
+                started_at=float(started_at),
+                ended_at=float(ended_at),
+            )
+        )
+        self._log_traffic_conflicts(agent, conflicts)
+
+    def _traffic_complete_plan(self, move_id: str) -> None:
+        if self.traffic_monitor is not None:
+            self.traffic_monitor.complete_plan(move_id)
+
+    def _traffic_begin_segment(
+        self,
+        agent: Worker,
+        *,
+        move_id: str,
+        segment_index: int,
+        from_tile: Tile,
+        to_tile: Tile,
+        started_at: float,
+        ended_at: float,
+        logical_destination: str,
+    ) -> None:
+        if self.traffic_monitor is None or not self.traffic_enabled:
+            return
+        segment = TrafficSegment(
+            move_id=move_id,
+            worker_id=agent.agent_id,
+            segment_index=segment_index,
+            from_tile=from_tile,
+            to_tile=to_tile,
+            started_at=float(started_at),
+            ended_at=float(ended_at),
+        )
+        conflicts = self.traffic_monitor.begin_segment(segment)
+        self._log_traffic_conflicts(agent, conflicts)
+        if self.traffic_emit_tile_step_events:
+            self.logger.log(
+                t=started_at,
+                day=self.day_for_time(started_at),
+                event_type="AGENT_MOVE_TILE_START",
+                entity_id=agent.agent_id,
+                location=self.agent_display_location(agent),
+                details={
+                    "move_id": move_id,
+                    "segment_index": segment_index,
+                    "from_tile": self._tile_payload(from_tile),
+                    "to_tile": self._tile_payload(to_tile),
+                    "logical_destination": logical_destination,
+                    "started_at": round(float(started_at), 3),
+                    "ended_at": round(float(ended_at), 3),
+                    "humanoid_state": self._humanoid_state_payload(agent),
+                },
+            )
+
+    def _traffic_end_segment(
+        self,
+        agent: Worker,
+        *,
+        move_id: str,
+        segment_index: int,
+        from_tile: Tile,
+        to_tile: Tile,
+        ended_at: float,
+        logical_destination: str,
+    ) -> None:
+        if self.traffic_monitor is not None:
+            self.traffic_monitor.end_segment(agent.agent_id, move_id, segment_index, ended_at=float(ended_at))
+        if self.traffic_emit_tile_step_events:
+            self.logger.log(
+                t=ended_at,
+                day=self.day_for_time(ended_at),
+                event_type="AGENT_MOVE_TILE_END",
+                entity_id=agent.agent_id,
+                location=self.agent_display_location(agent),
+                details={
+                    "move_id": move_id,
+                    "segment_index": segment_index,
+                    "from_tile": self._tile_payload(from_tile),
+                    "to_tile": self._tile_payload(to_tile),
+                    "logical_destination": logical_destination,
+                    "ended_at": round(float(ended_at), 3),
+                    "humanoid_state": self._humanoid_state_payload(agent),
+                },
+            )
 
     def _object_service_tile_payload(self, agent: Worker, object_id: str) -> dict[str, Any] | None:
         grid = self.grid_map
@@ -1107,51 +1297,58 @@ class ManufacturingWorld:
                     for worker_id, worker in self.workers.items()
                     if worker.tile is not None
                 },
+                "humanoid_states": {
+                    worker_id: self._humanoid_state_payload(worker)
+                    for worker_id, worker in self.workers.items()
+                },
                 "inspection_active_agents": self.inspection_active_agents,
                 "incident_count": len(self.incident_events),
                 "commitment_count": sum(len(rows) for rows in self.current_commitments().values()),
             }
         )
 
-    def _worker_state_for_task(self, worker: Worker, task: Task | None) -> WorkerState:
-        if worker.discharged:
-            return WorkerState.DISCHARGED
-        if task is None:
-            return WorkerState.IDLE
-        task_type = str(task.task_type).strip().upper()
-        if task_type == "SETUP_MACHINE":
-            return WorkerState.SETTING_UP_MACHINE
-        if task_type == "UNLOAD_MACHINE":
-            return WorkerState.UNLOADING_MACHINE
-        if task_type == "REPAIR_MACHINE":
-            return WorkerState.REPAIRING_MACHINE
-        if task_type == "PREVENTIVE_MAINTENANCE":
-            return WorkerState.PREVENTIVE_MAINTENANCE
-        if task_type == "BATTERY_SWAP":
-            return WorkerState.BATTERY_SWAPPING
-        if task_type == "INSPECT_PRODUCT":
-            return WorkerState.INSPECTING_PRODUCT
-        if task_type == "TRANSFER":
-            transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
-            if transfer_kind == "material_supply":
-                return WorkerState.SUPPLYING_MATERIAL
-            if transfer_kind == "inter_station":
-                return WorkerState.TRANSFERRING_INTERMEDIATE
-            if transfer_kind == "battery_delivery":
-                return WorkerState.BATTERY_DELIVERING
-        return WorkerState.WAITING
-
-    def _set_worker_state(
+    def _set_humanoid_axes(
         self,
         worker: Worker,
-        state: WorkerState | str,
+        *,
+        availability: str | None = None,
+        mobility: str | None = None,
+        power: str | None = None,
+        manipulation: str | None = None,
         reason: str = "",
+        reason_message: str = "",
+        source: str = "mansim.world",
         task_id: str | None = None,
+        clear_task_context: bool = False,
     ) -> None:
-        next_state = state if isinstance(state, WorkerState) else WorkerState(str(state))
-        if worker.state == next_state and not reason:
-            return
-        worker.state = next_state
+        runtime = getattr(self, "humanoid_runtime", None)
+        if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "set_axes"):
+            runtime.set_axes(
+                worker,
+                availability=availability,
+                mobility=mobility,
+                power=power,
+                manipulation=manipulation,
+                reason_code=reason,
+                reason_message=reason_message,
+                source=source,
+                task_id=task_id,
+                clear_task_context=clear_task_context,
+            )
+        else:
+            payload = self._humanoid_state_payload(worker)
+            if availability:
+                payload["availability"] = availability
+            if mobility:
+                payload["mobility"] = mobility
+            if power:
+                payload["power"] = power
+            if manipulation:
+                payload["manipulation"] = manipulation
+            if clear_task_context:
+                payload["task_context"] = None
+            payload["timestamp_s"] = round(float(self.env.now), 3)
+            worker.humanoid_state = payload
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1159,23 +1356,488 @@ class ManufacturingWorld:
             entity_id=worker.worker_id,
             location=self.worker_display_location(worker),
             details={
-                "worker_state": worker.state.value,
-                "reason": reason,
-                "task_id": task_id or worker.current_task_id or "",
-                "current_task_type": worker.current_task_type or "",
+                "humanoid_state": self._humanoid_state_payload(worker),
                 "cargo": self._worker_cargo_payload(worker),
                 "motion": self._worker_motion_payload(worker),
                 "tile": self._tile_payload(worker.tile),
-                "reserved_tile": self._tile_payload(worker.reserved_tile),
                 "battery_remaining_min": round(float(self.battery_remaining(worker)), 3),
             },
         )
 
+    def _set_humanoid_for_task(self, worker: Worker, task: Task | None, *, reason: str, task_id: str | None = None) -> None:
+        if worker.discharged:
+            self._set_humanoid_axes(
+                worker,
+                availability="DISABLED",
+                mobility="STATIONARY",
+                power="DEPLETED",
+                reason=reason or "battery_depleted",
+                source="mansim.discharge",
+                task_id=task_id,
+            )
+            return
+        if task is None:
+            self._set_humanoid_axes(
+                worker,
+                availability="AVAILABLE",
+                mobility="STATIONARY",
+                power="POWER_NORMAL",
+                manipulation="HOLDING" if worker.carrying_item_id else "FREE",
+                reason=reason,
+                source="mansim.task",
+                task_id=task_id,
+                clear_task_context=True,
+            )
+            return
+        self._set_humanoid_axes(
+            worker,
+            availability="EXECUTING",
+            mobility="STATIONARY",
+            power="CHARGING" if str(task.task_code).strip().upper() == "MANAGE_ROBOT_POWER" else None,
+            manipulation="HOLDING" if worker.carrying_item_id else None,
+            reason=reason,
+            source="mansim.task",
+            task_id=task_id or task.task_id,
+        )
+
+    def _set_humanoid_primitive_hint(self, agent: Agent, primitive_call_code: str, *, reason: str = "primitive_hint") -> None:
+        """Update the Humanoid_Tasks state snapshot for domain-internal primitives."""
+        runtime = getattr(self, "humanoid_runtime", None)
+        if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "set_step_state"):
+            task = self._current_task_stub(agent)
+            step = {"step_id": agent.current_step_id or "", "call_code": primitive_call_code}
+            runtime.set_step_state(agent, task, step, event_type="HUMANOID_STEP_START", status="running")
+        return
+
+    def _current_task_stub(self, worker: Worker) -> Task:
+        return Task(
+            task_id=str(worker.current_task_id or ""),
+            task_type=str(worker.current_task_type or ""),
+            priority_key="",
+            priority=0.0,
+            location=str(worker.location),
+            payload={},
+            task_code=str(worker.current_task_code or ""),
+            instance_id=str(worker.current_task_instance_id or ""),
+            assigned_robot_id=worker.worker_id,
+        )
+
+    def _sync_humanoid_cargo_state(self, worker: Worker, *, destination: str = "") -> None:
+        runtime = getattr(self, "humanoid_runtime", None)
+        if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "sync_worker_cargo_state"):
+            runtime.sync_worker_cargo_state(worker, destination=destination)
+
+    def _set_humanoid_disabled_state(self, worker: Worker, *, reason: str) -> None:
+        runtime = getattr(self, "humanoid_runtime", None)
+        if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "set_disabled_state"):
+            runtime.set_disabled_state(worker, reason=reason)
+
+    def _humanoid_state_payload(self, worker: Worker) -> dict[str, Any]:
+        runtime = getattr(self, "humanoid_runtime", None)
+        if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "state_payload"):
+            return runtime.state_payload(worker)
+        if not isinstance(worker.humanoid_state, dict) or not worker.humanoid_state:
+            worker.humanoid_state = default_humanoid_state_payload(worker.worker_id)
+        worker.humanoid_state["humanoid_id"] = worker.worker_id
+        return copy.deepcopy(worker.humanoid_state)
+
     def _worker_cargo_payload(self, worker: Worker) -> dict[str, Any]:
-        return {
+        session = self._transport_session_for_worker(worker)
+        payload: dict[str, Any] = {
             "item_id": worker.carrying_item_id,
             "item_type": worker.carrying_item_type,
         }
+        if session is not None:
+            carrier_ids = [str(worker_id) for worker_id in session.get("carrier_ids", [])]
+            payload.update(
+                {
+                    "transport_session_id": str(session.get("session_id", "")),
+                    "shared_carry": len(carrier_ids) > 1,
+                    "carrier_ids": carrier_ids,
+                    "carrier_count": len(carrier_ids),
+                    "shared_carry_role": worker.shared_carry_role or "",
+                    "item_time_multiplier": round(self._item_transport_multiplier(worker.carrying_item_type), 3),
+                    "effective_time_multiplier": round(self._current_transport_time_multiplier(worker), 3),
+                }
+            )
+        return payload
+
+    def _item_transport_multiplier(self, item_type: str | None) -> float:
+        normalized = str(item_type or "").strip().lower()
+        if not normalized:
+            return 1.0
+        return max(0.01, float(self.item_transport_weight_multiplier.get(normalized, 1.0) or 1.0))
+
+    def _transport_session_for_worker(self, worker: Worker) -> dict[str, Any] | None:
+        session_id = str(worker.transport_session_id or self.product_transport_session_by_worker.get(worker.worker_id, "") or "")
+        session = self.product_transport_sessions.get(session_id)
+        if isinstance(session, dict) and str(session.get("status", "active")) == "active":
+            return session
+        return None
+
+    def _transport_session_for_item(self, item_id: str | None) -> dict[str, Any] | None:
+        session_id = self.product_transport_session_by_item.get(str(item_id or ""))
+        session = self.product_transport_sessions.get(str(session_id or ""))
+        if isinstance(session, dict) and str(session.get("status", "active")) == "active":
+            return session
+        return None
+
+    def _transport_carrier_count(self, worker: Worker) -> int:
+        session = self._transport_session_for_worker(worker)
+        if session is None:
+            return 1
+        return max(1, len([worker_id for worker_id in session.get("carrier_ids", []) if str(worker_id) in self.workers]))
+
+    def _current_transport_time_multiplier(self, worker: Worker) -> float:
+        base = self._item_transport_multiplier(worker.carrying_item_type)
+        session = self._transport_session_for_worker(worker)
+        if (
+            session is not None
+            and str(worker.carrying_item_type or "").strip().lower() == "product"
+            and self.product_collaboration_divide_time
+        ):
+            return max(0.01, base / float(self._transport_carrier_count(worker)))
+        return base
+
+    def _ensure_product_transport_session(self, worker: Worker, *, destination: str) -> dict[str, Any] | None:
+        if not self.product_collaboration_enabled:
+            return None
+        if str(worker.carrying_item_type or "").strip().lower() != "product" or not worker.carrying_item_id:
+            return None
+        existing = self._transport_session_for_item(worker.carrying_item_id)
+        if existing is not None:
+            existing["destination"] = str(destination)
+            if worker.worker_id not in existing.get("carrier_ids", []):
+                existing.setdefault("carrier_ids", []).append(worker.worker_id)
+            worker.transport_session_id = str(existing.get("session_id", ""))
+            worker.shared_carry_role = worker.shared_carry_role or "primary"
+            self.product_transport_session_by_worker[worker.worker_id] = worker.transport_session_id
+            return existing
+        session_id = f"PTX-{next(self.transport_session_counter):06d}"
+        done_event = self.env.event()
+        session: dict[str, Any] = {
+            "session_id": session_id,
+            "status": "active",
+            "item_id": worker.carrying_item_id,
+            "item_type": "product",
+            "primary_worker_id": worker.worker_id,
+            "carrier_ids": [worker.worker_id],
+            "destination": str(destination),
+            "started_at": float(self.env.now),
+            "joined_at": {},
+            "handover_task_id": "",
+            "max_carriers": int(self.product_collaboration_max_carriers),
+            "done_event": done_event,
+        }
+        self.product_transport_sessions[session_id] = session
+        self.product_transport_session_by_item[worker.carrying_item_id] = session_id
+        self.product_transport_session_by_worker[worker.worker_id] = session_id
+        worker.transport_session_id = session_id
+        worker.shared_carry_role = "primary"
+        self._set_worker_cargo(worker, worker.carrying_item_id, "product", destination=str(destination))
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="PRODUCT_CARRY_STARTED",
+            entity_id=worker.carrying_item_id,
+            location=self.agent_display_location(worker),
+            details=self._transport_session_event_details(session, primary_worker=worker.worker_id),
+        )
+        return session
+
+    def _transport_session_event_details(self, session: dict[str, Any], **extra: Any) -> dict[str, Any]:
+        carrier_ids = [str(worker_id) for worker_id in session.get("carrier_ids", []) if str(worker_id)]
+        item_type = str(session.get("item_type", "product") or "product")
+        base_multiplier = self._item_transport_multiplier(item_type)
+        effective_multiplier = base_multiplier / max(1, len(carrier_ids)) if self.product_collaboration_divide_time else base_multiplier
+        details = {
+            "transport_session_id": str(session.get("session_id", "")),
+            "item_id": str(session.get("item_id", "")),
+            "item_type": item_type,
+            "primary_worker_id": str(session.get("primary_worker_id", "")),
+            "carrier_ids": carrier_ids,
+            "carrier_count": len(carrier_ids),
+            "max_carriers": int(session.get("max_carriers", self.product_collaboration_max_carriers) or self.product_collaboration_max_carriers),
+            "destination": str(session.get("destination", "")),
+            "started_at": round(float(session.get("started_at", self.env.now) or self.env.now), 3),
+            "item_time_multiplier": round(base_multiplier, 3),
+            "effective_time_multiplier": round(effective_multiplier, 3),
+        }
+        details.update({key: value for key, value in extra.items() if value not in {None, ""}})
+        return details
+
+    def _join_product_transport_session(self, helper: Worker, session_id: str, *, task: Task) -> bool:
+        session = self.product_transport_sessions.get(str(session_id))
+        if not isinstance(session, dict) or str(session.get("status", "active")) != "active":
+            return False
+        if helper.worker_id in session.get("carrier_ids", []):
+            return True
+        if len(session.get("carrier_ids", [])) >= int(session.get("max_carriers", self.product_collaboration_max_carriers) or self.product_collaboration_max_carriers):
+            return False
+        item_id = str(session.get("item_id", ""))
+        if not item_id:
+            return False
+        if helper.carrying_item_id not in {None, item_id}:
+            return False
+        if helper.carrying_item_id is None and not self._set_agent_carrying(helper, "product", item_id):
+            return False
+        session.setdefault("carrier_ids", []).append(helper.worker_id)
+        session.setdefault("joined_at", {})[helper.worker_id] = float(self.env.now)
+        session["handover_task_id"] = task.task_id
+        helper.transport_session_id = str(session.get("session_id", ""))
+        helper.shared_carry_role = "helper"
+        self.product_transport_session_by_worker[helper.worker_id] = helper.transport_session_id
+        primary = self.workers.get(str(session.get("primary_worker_id", "")))
+        if self.grid_map is not None and primary is not None and primary.tile is not None:
+            self.grid_map.move_worker(helper.worker_id, primary.tile)
+            helper.tile = primary.tile
+        for carrier_id in session.get("carrier_ids", []):
+            carrier = self.workers.get(str(carrier_id))
+            if carrier is not None and carrier.carrying_item_id == item_id:
+                self._set_worker_cargo(carrier, item_id, "product", destination=str(session.get("destination", "")))
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="PRODUCT_CARRY_JOINED",
+            entity_id=item_id,
+            location=self.agent_display_location(helper),
+            details={
+                **self._transport_session_event_details(session, helper_worker_id=helper.worker_id, handover_task_id=task.task_id),
+                "humanoid_state": self._humanoid_state_payload(helper),
+            },
+        )
+        self._set_humanoid_axes(
+            helper,
+            availability="EXECUTING",
+            mobility="STATIONARY",
+            manipulation="HOLDING",
+            reason="product_carry_joined",
+            source="mansim.handover",
+            task_id=task.task_id,
+        )
+        return True
+
+    def _leave_product_transport_session(self, worker: Worker, *, reason: str = "left_session") -> None:
+        session = self._transport_session_for_worker(worker)
+        if session is not None:
+            carrier_ids = [str(worker_id) for worker_id in session.get("carrier_ids", []) if str(worker_id) != worker.worker_id]
+            session["carrier_ids"] = carrier_ids
+            if str(session.get("status", "active")) == "active":
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="PRODUCT_CARRY_LEFT",
+                    entity_id=str(session.get("item_id", "")),
+                    location=self.agent_display_location(worker),
+                    details=self._transport_session_event_details(session, worker_id=worker.worker_id, reason=reason),
+                )
+        self.product_transport_session_by_worker.pop(worker.worker_id, None)
+        worker.transport_session_id = None
+        worker.shared_carry_role = None
+
+    def _complete_product_transport_session(self, session: dict[str, Any], *, destination: str, outcome: str = "completed") -> None:
+        if not isinstance(session, dict) or str(session.get("status", "active")) != "active":
+            return
+        session["status"] = str(outcome or "completed")
+        session["completed_at"] = float(self.env.now)
+        item_id = str(session.get("item_id", ""))
+        carrier_ids = [str(worker_id) for worker_id in session.get("carrier_ids", []) if str(worker_id)]
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="PRODUCT_CARRY_COMPLETED",
+            entity_id=item_id,
+            location=str(destination),
+            details={
+                **self._transport_session_event_details(session, destination=destination, outcome=outcome),
+                "duration": round(max(0.0, float(self.env.now) - float(session.get("started_at", self.env.now) or self.env.now)), 3),
+                "shared_duration": round(
+                    max(
+                        0.0,
+                        float(self.env.now)
+                        - min(
+                            [float(value) for value in (session.get("joined_at", {}) if isinstance(session.get("joined_at", {}), dict) else {}).values()]
+                            or [float(self.env.now)]
+                        ),
+                    ),
+                    3,
+                ),
+            },
+        )
+        done_event = session.get("done_event")
+        if done_event is not None and hasattr(done_event, "triggered") and not done_event.triggered:
+            done_event.succeed(str(outcome or "completed"))
+        for worker_id in carrier_ids:
+            worker = self.workers.get(worker_id)
+            if worker is None:
+                continue
+            self.product_transport_session_by_worker.pop(worker_id, None)
+            worker.transport_session_id = None
+            worker.shared_carry_role = None
+            if worker.carrying_item_id == item_id:
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="AGENT_DROP_ITEM",
+                    entity_id=worker.worker_id,
+                    location=self.agent_display_location(worker),
+                    details={
+                        "item_id": item_id,
+                        "item_type": "product",
+                        "to": destination,
+                        "transport_session_id": str(session.get("session_id", "")),
+                        "shared_carry": len(carrier_ids) > 1,
+                        "humanoid_state": self._humanoid_state_payload(worker),
+                    },
+                )
+                self._set_worker_cargo(worker, None, None, destination=destination)
+        if item_id:
+            self.product_transport_session_by_item.pop(item_id, None)
+
+    def _product_session_has_remaining_path(self, session: dict[str, Any]) -> bool:
+        primary = self.workers.get(str(session.get("primary_worker_id", "")))
+        destination = str(session.get("destination", ""))
+        if primary is None or not destination:
+            return False
+        if self.grid_map is None:
+            return str(primary.location) != destination or self._has_in_transit_position(primary)
+        if primary.tile is None:
+            return False
+        destinations = self.grid_map.destination_tiles(destination, worker_id=primary.worker_id, from_tile=primary.tile, ignore_dynamic=True)
+        if primary.tile in destinations:
+            return False
+        path = self.grid_map.find_path(primary.tile, destinations, worker_id=primary.worker_id, ignore_dynamic=True)
+        return bool(path and len(path) > 1)
+
+    def _product_session_remaining_travel_min(self, session: dict[str, Any], *, future_extra_carriers: int = 0) -> float:
+        primary = self.workers.get(str(session.get("primary_worker_id", "")))
+        destination = str(session.get("destination", ""))
+        if primary is None or not destination:
+            return 0.0
+        carrier_count = len([str(worker_id) for worker_id in session.get("carrier_ids", []) if str(worker_id)])
+        future_carriers = max(1, min(self.product_collaboration_max_carriers, carrier_count + max(0, int(future_extra_carriers))))
+        multiplier = self._item_transport_multiplier("product")
+        if self.product_collaboration_divide_time:
+            multiplier = multiplier / future_carriers
+        if self.grid_map is None:
+            return float(self.travel_time(self.agent_display_location(primary), destination)) * multiplier
+        if primary.tile is None:
+            return 0.0
+        destinations = self.grid_map.destination_tiles(destination, worker_id=primary.worker_id, from_tile=primary.tile, ignore_dynamic=True)
+        if primary.tile in destinations:
+            return 0.0
+        path = self.grid_map.find_path(primary.tile, destinations, worker_id=primary.worker_id, ignore_dynamic=True)
+        if not path:
+            return 0.0
+        return max(0, len(path) - 1) * float(self.grid_map.tile_time_min) * multiplier
+
+    def _helper_join_travel_min(self, helper: Agent, source_agent: Agent) -> float:
+        if self.grid_map is None:
+            return float(self.travel_time(self.agent_display_location(helper), self.agent_display_location(source_agent)))
+        if helper.tile is None or source_agent.tile is None:
+            return 0.0
+        destinations = self.grid_map.destination_tiles(source_agent.agent_id, worker_id=helper.agent_id, from_tile=helper.tile, ignore_dynamic=True)
+        if helper.tile in destinations:
+            return 0.0
+        path = self.grid_map.find_path(helper.tile, destinations, worker_id=helper.agent_id, ignore_dynamic=True)
+        if not path:
+            return float("inf")
+        return max(0, len(path) - 1) * float(self.grid_map.tile_time_min) * self._current_transport_time_multiplier(helper)
+
+    def _helper_join_catch_min(self, helper: Agent, source_agent: Agent) -> float:
+        travel_to_current_source = self._helper_join_travel_min(helper, source_agent)
+        if not math.isfinite(travel_to_current_source) or travel_to_current_source <= 0.0:
+            return travel_to_current_source
+        if not self._has_in_transit_position(source_agent):
+            return travel_to_current_source
+        helper_multiplier = self._current_transport_time_multiplier(helper)
+        source_multiplier = self._current_transport_time_multiplier(source_agent)
+        if source_multiplier <= helper_multiplier:
+            return float("inf")
+        speed_advantage = 1.0 - (helper_multiplier / max(1e-9, source_multiplier))
+        return travel_to_current_source / max(0.05, speed_advantage)
+
+    def _product_session_join_feasible(self, helper: Agent, session: dict[str, Any]) -> bool:
+        if not isinstance(session, dict) or str(session.get("status", "active")) != "active":
+            return False
+        source_agent = self.agents.get(str(session.get("primary_worker_id", "")))
+        if source_agent is None or source_agent.worker_id == helper.worker_id:
+            return False
+        if source_agent.carrying_item_id != str(session.get("item_id", "")):
+            return False
+        remaining_current = self._product_session_remaining_travel_min(session, future_extra_carriers=0)
+        if remaining_current <= 0.0:
+            return False
+        helper_travel = self._helper_join_catch_min(helper, source_agent)
+        if not math.isfinite(helper_travel):
+            return False
+        tile_time = float(getattr(self.grid_map, "tile_time_min", 0.0) or 0.0)
+        primitive_time = float(getattr(self.humanoid_runtime, "default_primitive_min_duration", 0.0) or 0.0)
+        min_join_margin = max(0.5, 5.0 * tile_time, 3.0 * primitive_time)
+        return (helper_travel * 1.25) + min_join_margin < remaining_current
+
+    def _shared_transport_followers(self, primary: Worker) -> list[Worker]:
+        session = self._transport_session_for_worker(primary)
+        if session is None:
+            return []
+        return [
+            worker
+            for worker_id in session.get("carrier_ids", [])
+            if (worker := self.workers.get(str(worker_id))) is not None and worker.worker_id != primary.worker_id
+        ]
+
+    def _start_shared_transport_segment(
+        self,
+        primary: Worker,
+        *,
+        from_tile: Tile,
+        to_tile: Tile,
+        logical_destination: str,
+        segment_duration: float,
+        segment_index: int,
+    ) -> None:
+        for helper in self._shared_transport_followers(primary):
+            helper.current_move_segment_index = segment_index
+            helper.current_move_segment_from_tile = from_tile
+            helper.current_move_segment_to_tile = to_tile
+            helper.current_move_logical_destination = logical_destination
+            self._set_worker_motion(
+                helper,
+                str(helper.location),
+                logical_destination,
+                0.0,
+                segment_duration,
+                path_tiles=[from_tile, to_tile],
+                target_tile=to_tile,
+            )
+
+    def _finish_shared_transport_segment(
+        self,
+        primary: Worker,
+        *,
+        to_tile: Tile,
+        logical_destination: str,
+        segment_duration: float,
+    ) -> None:
+        grid = self.grid_map
+        for helper in self._shared_transport_followers(primary):
+            if grid is not None:
+                grid.release_reservation(helper.worker_id)
+                grid.move_worker(helper.worker_id, to_tile)
+            helper.tile = to_tile
+            helper.current_move_segment_index = 0
+            helper.current_move_segment_from_tile = None
+            helper.current_move_segment_to_tile = None
+            self._set_in_transit(helper, str(helper.location), logical_destination, 1.0, segment_duration)
+            self._clear_in_transit(helper)
+            self._set_humanoid_axes(
+                helper,
+                availability="EXECUTING",
+                mobility="STATIONARY",
+                manipulation="HOLDING",
+                reason="shared_product_carry",
+                source="mansim.transport",
+            )
 
     def _set_worker_motion(
         self,
@@ -1194,7 +1856,13 @@ class ManufacturingWorld:
         worker.in_transit_total_min = max(0.0, float(total_min))
         worker.movement_path = list(path_tiles or [])
         worker.movement_target_tile = target_tile
-        self._set_worker_state(worker, WorkerState.MOVING, reason="motion")
+        self._set_humanoid_axes(
+            worker,
+            availability="EXECUTING" if worker.current_task_id else "AVAILABLE",
+            mobility="NAVIGATING",
+            reason="motion",
+            source="mansim.motion",
+        )
 
     def _worker_motion_payload(self, worker: Worker) -> dict[str, Any] | None:
         if not worker.in_transit_from or not worker.in_transit_to:
@@ -1212,6 +1880,8 @@ class ManufacturingWorld:
             "from_tile": self._tile_payload(worker.movement_path[0]) if worker.movement_path else self._tile_payload(worker.tile),
             "to_tile": self._tile_payload(worker.movement_target_tile),
             "path_tiles": [self._tile_payload(tile) for tile in worker.movement_path],
+            "move_id": worker.current_move_id,
+            "segment_index": int(worker.current_move_segment_index or 0),
         }
 
     def _set_worker_cargo(
@@ -1226,6 +1896,7 @@ class ManufacturingWorld:
         normalized_type = str(item_type).strip().lower() if item_type is not None else None
         worker.carrying_item_id = normalized_id or None
         worker.carrying_item_type = normalized_type or None
+        self._sync_humanoid_cargo_state(worker, destination=destination)
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1233,9 +1904,8 @@ class ManufacturingWorld:
             entity_id=worker.worker_id,
             location=self.worker_display_location(worker),
             details={
-                "worker_state": worker.state.value,
                 "cargo": self._worker_cargo_payload(worker),
-                "destination": destination,
+                "humanoid_state": self._humanoid_state_payload(worker),
             },
         )
 
@@ -1354,7 +2024,11 @@ class ManufacturingWorld:
             event_type="AGENT_PICK_ITEM",
             entity_id=agent.agent_id,
             location=self.agent_display_location(agent),
-            details={"item_id": agent.carrying_item_id, "item_type": agent.carrying_item_type},
+            details={
+                "item_id": agent.carrying_item_id,
+                "item_type": agent.carrying_item_type,
+                "humanoid_state": self._humanoid_state_payload(agent),
+            },
         )
         return True
 
@@ -1363,6 +2037,10 @@ class ManufacturingWorld:
         item_type = agent.carrying_item_type
         if item_id is None and item_type is None:
             return
+        session = self._transport_session_for_worker(agent)
+        if session is not None and str(item_id or "") == str(session.get("item_id", "")):
+            self._complete_product_transport_session(session, destination=destination, outcome="completed")
+            return
         if emit_event:
             self.logger.log(
                 t=self.env.now,
@@ -1370,7 +2048,12 @@ class ManufacturingWorld:
                 event_type="AGENT_DROP_ITEM",
                 entity_id=agent.agent_id,
                 location=self.agent_display_location(agent),
-                details={"item_id": item_id or "", "item_type": (item_type or ""), "to": destination},
+                details={
+                    "item_id": item_id or "",
+                    "item_type": (item_type or ""),
+                    "to": destination,
+                    "humanoid_state": self._humanoid_state_payload(agent),
+                },
             )
         self._set_worker_cargo(agent, None, None, destination=destination)
 
@@ -1545,52 +2228,232 @@ class ManufacturingWorld:
                 intervals.setdefault(agent_id, []).append((start, sim_end))
         return {agent_id: self._merge_intervals(rows) for agent_id, rows in intervals.items()}
 
-    def _worker_state_time_metrics(self) -> dict[str, Any]:
-        total_time = max(1.0, float(self.env.now))
-        task_intervals = self._agent_event_intervals(start_events={"AGENT_TASK_START"}, end_events={"AGENT_TASK_END"})
-        move_intervals = self._agent_event_intervals(
-            start_events={"AGENT_MOVE_START"},
-            end_events={"AGENT_MOVE_END", "AGENT_MOVE_INTERRUPTED"},
-        )
-        discharged_intervals_by_agent: dict[str, list[tuple[float, float]]] = {agent_id: [] for agent_id in sorted(self.agents.keys())}
-        for agent_id, start, end in self._agent_discharged_intervals():
-            discharged_intervals_by_agent.setdefault(agent_id, []).append((float(start), float(end)))
-        discharged_intervals_by_agent = {
-            agent_id: self._merge_intervals(rows) for agent_id, rows in discharged_intervals_by_agent.items()
+    def _humanoid_state_time_metrics(self) -> dict[str, Any]:
+        axes = ("availability", "mobility", "power", "manipulation")
+        sim_end = max(0.0, float(self.env.now))
+        current: dict[str, dict[str, Any]] = {
+            agent_id: default_humanoid_state_payload(agent_id)
+            for agent_id in sorted(self.agents.keys())
+        }
+        last_t: dict[str, float] = {agent_id: 0.0 for agent_id in current}
+        totals: dict[str, dict[str, dict[str, float]]] = {
+            agent_id: {axis: defaultdict(float) for axis in axes}
+            for agent_id in current
         }
 
-        by_worker: dict[str, dict[str, float]] = {}
-        util_by_worker: dict[str, dict[str, float]] = {}
-        for agent_id in sorted(self.agents.keys()):
-            agent_task_intervals = task_intervals.get(agent_id, [])
-            agent_move_intervals = move_intervals.get(agent_id, [])
-            agent_discharged_intervals = discharged_intervals_by_agent.get(agent_id, [])
-            task_total = self._interval_total(agent_task_intervals)
-            move_total = self._interval_total(agent_move_intervals)
-            move_overlap = self._interval_overlap_total(agent_task_intervals, agent_move_intervals)
-            working_total = max(0.0, task_total - move_overlap)
-            discharged_total = self._interval_total(agent_discharged_intervals)
-            idle_total = max(0.0, total_time - working_total - move_total - discharged_total)
-            active_total = working_total + move_total
-            available_total = max(0.0, total_time - discharged_total)
-            no_idle_discharged_total = max(0.0, total_time - idle_total - discharged_total)
-            by_worker[agent_id] = {
-                "working_min": round(working_total, 3),
-                "moving_min": round(move_total, 3),
-                "discharged_min": round(discharged_total, 3),
-                "idle_min": round(idle_total, 3),
+        def add_duration(agent_id: str, end_t: float) -> None:
+            start_t = last_t.get(agent_id, 0.0)
+            duration = max(0.0, float(end_t) - float(start_t))
+            if duration <= 0.0:
+                return
+            state = current.get(agent_id, {})
+            for axis in axes:
+                value = str(state.get(axis, "") or "").strip() or "UNKNOWN"
+                totals[agent_id][axis][value] += duration
+
+        for event in self.logger.events:
+            agent_id = str(event.get("entity_id", "")).strip()
+            if agent_id not in current:
+                continue
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            humanoid_state = details.get("humanoid_state")
+            if not isinstance(humanoid_state, dict):
+                continue
+            event_t = float(event.get("t", 0.0) or 0.0)
+            add_duration(agent_id, event_t)
+            current[agent_id] = dict(humanoid_state)
+            last_t[agent_id] = event_t
+
+        for agent_id in current:
+            add_duration(agent_id, sim_end)
+
+        return {
+            agent_id: {
+                axis: {state: round(duration, 3) for state, duration in sorted(axis_totals.items())}
+                for axis, axis_totals in axis_map.items()
             }
-            util_by_worker[agent_id] = {
-                "util_total": round(active_total / total_time, 6),
-                "util_available": round((active_total / available_total) if available_total > 0.0 else 0.0, 6),
-                "util_no_idle_discharged": round(
-                    (active_total / no_idle_discharged_total) if no_idle_discharged_total > 0.0 else 0.0,
-                    6,
-                ),
+            for agent_id, axis_map in totals.items()
+        }
+
+    def _humanoid_state_axis_totals(self, by_worker: dict[str, Any]) -> dict[str, dict[str, float]]:
+        axis_totals: dict[str, dict[str, float]] = {
+            axis: defaultdict(float)
+            for axis in ("availability", "mobility", "power", "manipulation")
+        }
+        for worker_rows in by_worker.values():
+            if not isinstance(worker_rows, dict):
+                continue
+            for axis, state_rows in worker_rows.items():
+                if axis not in axis_totals or not isinstance(state_rows, dict):
+                    continue
+                for state, minutes in state_rows.items():
+                    axis_totals[axis][str(state)] += float(minutes or 0.0)
+        return {
+            axis: {state: round(minutes, 3) for state, minutes in sorted(rows.items())}
+            for axis, rows in axis_totals.items()
+        }
+
+    def _humanoid_state_ratios(self, by_worker: dict[str, Any]) -> dict[str, dict[str, dict[str, float]]]:
+        ratios: dict[str, dict[str, dict[str, float]]] = {}
+        for worker_id, worker_rows in by_worker.items():
+            if not isinstance(worker_rows, dict):
+                continue
+            ratios[str(worker_id)] = {}
+            for axis, state_rows in worker_rows.items():
+                if not isinstance(state_rows, dict):
+                    continue
+                total = sum(float(value or 0.0) for value in state_rows.values())
+                ratios[str(worker_id)][str(axis)] = {
+                    str(state): round((float(minutes or 0.0) / total) if total > 0 else 0.0, 6)
+                    for state, minutes in sorted(state_rows.items())
+                }
+        return ratios
+
+    def _humanoid_execution_ratios(self, by_worker: dict[str, Any]) -> dict[str, float]:
+        ratios: dict[str, float] = {}
+        for worker_id, worker_rows in by_worker.items():
+            availability = worker_rows.get("availability", {}) if isinstance(worker_rows, dict) else {}
+            if not isinstance(availability, dict):
+                ratios[str(worker_id)] = 0.0
+                continue
+            total = sum(float(value or 0.0) for value in availability.values())
+            ratios[str(worker_id)] = round((float(availability.get("EXECUTING", 0.0) or 0.0) / total) if total > 0 else 0.0, 6)
+        return ratios
+
+    def _humanoid_unavailable_ratios(self, by_worker: dict[str, Any]) -> dict[str, float]:
+        ratios: dict[str, float] = {}
+        for worker_id, worker_rows in by_worker.items():
+            availability = worker_rows.get("availability", {}) if isinstance(worker_rows, dict) else {}
+            if not isinstance(availability, dict):
+                ratios[str(worker_id)] = 0.0
+                continue
+            total = sum(float(value or 0.0) for value in availability.values())
+            unavailable = float(availability.get("DISABLED", 0.0) or 0.0) + float(availability.get("OFFLINE", 0.0) or 0.0)
+            ratios[str(worker_id)] = round((unavailable / total) if total > 0 else 0.0, 6)
+        return ratios
+
+    def _humanoid_primitive_minutes(self) -> dict[str, float]:
+        active: dict[tuple[str, str, str], tuple[float, str]] = {}
+        totals: dict[str, float] = defaultdict(float)
+        for event in self.logger.events:
+            event_type = str(event.get("type", "")).strip()
+            if event_type not in {"HUMANOID_STEP_START", "HUMANOID_STEP_END"}:
+                continue
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            agent_id = str(event.get("entity_id", "") or "")
+            instance_id = str(details.get("instance_id", "") or "")
+            step_id = str(details.get("step_id", "") or "")
+            call_code = str(details.get("primitive_call_code", "") or "")
+            if not agent_id or not instance_id or not step_id or not call_code:
+                continue
+            key = (agent_id, instance_id, step_id)
+            event_t = float(event.get("t", 0.0) or 0.0)
+            if event_type == "HUMANOID_STEP_START":
+                active[key] = (event_t, call_code)
+            else:
+                start = active.pop(key, None)
+                if start is not None and event_t > start[0]:
+                    totals[start[1]] += event_t - start[0]
+        sim_end = float(self.env.now)
+        for start_t, call_code in active.values():
+            if sim_end > start_t:
+                totals[call_code] += sim_end - start_t
+        return {call_code: round(minutes, 3) for call_code, minutes in sorted(totals.items())}
+
+    def _humanoid_task_taxonomy_metrics(self, humanoid_task_minutes: dict[str, float]) -> dict[str, Any]:
+        by_level: dict[str, float] = defaultdict(float)
+        by_category: dict[str, float] = defaultdict(float)
+        by_category_id: dict[str, float] = defaultdict(float)
+        task_details: dict[str, dict[str, Any]] = {}
+        catalog = getattr(getattr(self, "humanoid_runtime", None), "catalog", None)
+        for task_code, minutes in sorted(humanoid_task_minutes.items()):
+            spec = catalog.get(task_code) if catalog is not None else None
+            level = str(getattr(spec, "level", "") or "UNKNOWN")
+            if "." in level:
+                level = level.rsplit(".", 1)[-1]
+            metadata = getattr(spec, "metadata", {}) if spec is not None else {}
+            catalog_meta = metadata.get("catalog", {}) if isinstance(metadata, dict) and isinstance(metadata.get("catalog", {}), dict) else {}
+            category_id = str(catalog_meta.get("category_id", "UNKNOWN") or "UNKNOWN")
+            category = str(catalog_meta.get("category", "UNKNOWN") or "UNKNOWN").strip()
+            value = float(minutes or 0.0)
+            by_level[level] += value
+            by_category_id[category_id] += value
+            by_category[f"{category_id} - {category}" if category_id != "UNKNOWN" else category] += value
+            task_details[str(task_code)] = {
+                "minutes": round(value, 3),
+                "level": level,
+                "category_id": category_id,
+                "category": category,
             }
         return {
-            "state_time_by_worker": by_worker,
-            "utilization_by_worker": util_by_worker,
+            "by_level": {key: round(value, 3) for key, value in sorted(by_level.items())},
+            "by_category_id": {key: round(value, 3) for key, value in sorted(by_category_id.items())},
+            "by_category": {key: round(value, 3) for key, value in sorted(by_category.items())},
+            "by_task": task_details,
+        }
+
+    def _traffic_metrics(self) -> dict[str, Any]:
+        by_type: dict[str, int] = defaultdict(int)
+        by_pair: dict[str, int] = defaultdict(int)
+        by_severity: dict[str, int] = defaultdict(int)
+        for row in self.traffic_conflicts:
+            if not isinstance(row, dict):
+                continue
+            conflict_type = str(row.get("conflict_type", "UNKNOWN") or "UNKNOWN")
+            severity = str(row.get("severity", "info") or "info")
+            by_type[conflict_type] += 1
+            by_severity[severity] += 1
+            worker_ids = row.get("worker_ids", [])
+            if isinstance(worker_ids, list) and len(worker_ids) >= 2:
+                pair = " / ".join(sorted(str(worker_id) for worker_id in worker_ids[:2]))
+                by_pair[pair] += 1
+        return {
+            "traffic_conflicts_by_type": dict(sorted(by_type.items())),
+            "traffic_conflicts_by_worker_pair": dict(sorted(by_pair.items())),
+            "traffic_conflicts_by_severity": dict(sorted(by_severity.items())),
+            "collision_count": sum(1 for row in self.traffic_conflicts if isinstance(row, dict) and bool(row.get("collision", False))),
+            "near_miss_count": int(by_type.get("NEAR_MISS", 0)),
+            "edge_conflict_count": int(by_type.get("EDGE_CONFLICT", 0)),
+            "tile_conflict_count": int(by_type.get("TILE_CONFLICT", 0)),
+            "path_overlap_count": int(by_type.get("PATH_OVERLAP", 0)),
+        }
+
+    def _transport_metrics(self) -> dict[str, Any]:
+        handover_count = 0
+        shared_product_carry_completed = 0
+        product_carry_time = 0.0
+        shared_product_carry_time = 0.0
+        item_transport_time_by_type: dict[str, float] = defaultdict(float)
+        active_moves: dict[tuple[str, str], tuple[float, str]] = {}
+        for event in self.logger.events:
+            event_type = str(event.get("type", "")).strip()
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            event_t = float(event.get("t", 0.0) or 0.0)
+            if event_type == "PRODUCT_CARRY_JOINED":
+                handover_count += 1
+            if event_type == "PRODUCT_CARRY_COMPLETED":
+                shared_duration = float(details.get("shared_duration", 0.0) or 0.0)
+                if int(details.get("carrier_count", 0) or 0) > 1 or shared_duration > 0.0:
+                    shared_product_carry_completed += 1
+                product_carry_time += float(details.get("duration", 0.0) or 0.0)
+                shared_product_carry_time += shared_duration
+            if event_type == "AGENT_MOVE_START":
+                item_type = str(details.get("carrying_item_type", "") or "").strip().lower()
+                if item_type:
+                    active_moves[(str(event.get("entity_id", "")), str(details.get("move_id", "")))] = (event_t, item_type)
+            elif event_type == "AGENT_MOVE_END":
+                key = (str(event.get("entity_id", "")), str(details.get("move_id", "")))
+                start = active_moves.pop(key, None)
+                if start is not None and event_t > start[0]:
+                    item_transport_time_by_type[start[1]] += event_t - start[0]
+        return {
+            "handover_item_count": int(handover_count),
+            "shared_product_carry_completed_count": int(shared_product_carry_completed),
+            "product_carry_time_min": round(product_carry_time, 3),
+            "shared_product_carry_time_min": round(shared_product_carry_time, 3),
+            "item_transport_time_by_type": {
+                key: round(value, 3) for key, value in sorted(item_transport_time_by_type.items())
+            },
         }
 
     def _buffer_wait_metrics(self) -> dict[str, Any]:
@@ -2380,16 +3243,46 @@ class ManufacturingWorld:
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
-            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + float(self.movement_cfg["unload_min"])
+            output_buffer_id = f"output_buffer_station_{machine.station}"
+            return (
+                float(self.travel_time(self.agent_display_location(agent), machine.machine_id))
+                + float(self.movement_cfg["unload_min"])
+                + float(self.travel_time(machine.machine_id, output_buffer_id))
+            )
         if task_type == "SETUP_MACHINE":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
-            needs_intermediate = self._station_requires_intermediate(machine.station)
-            setup_steps = 2 if needs_intermediate else 1
-            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + float(self.movement_cfg["setup_min"]) * setup_steps
+            station = machine.station
+            needs_material = machine.input_material is None
+            needs_intermediate = self._station_requires_intermediate(station) and machine.input_intermediate is None
+            estimate = float(self.travel_time(self.agent_display_location(agent), machine.machine_id))
+            if needs_material:
+                estimate += float(self.travel_time(machine.machine_id, f"material_queue_{station}"))
+                estimate += float(self.travel_time(f"material_queue_{station}", machine.machine_id))
+                estimate += float(self.movement_cfg["setup_min"])
+            if needs_intermediate:
+                estimate += float(self.travel_time(machine.machine_id, f"intermediate_queue_{station}"))
+                estimate += float(self.travel_time(f"intermediate_queue_{station}", machine.machine_id))
+                estimate += float(self.movement_cfg["setup_min"])
+            return estimate
         if task_type == "INSPECT_PRODUCT":
-            return float(self.travel_time(self.agent_display_location(agent), "intermediate_queue_4")) + float(self.inspection_base_time_min)
+            return (
+                float(self.travel_time(self.agent_display_location(agent), "intermediate_queue_4"))
+                + float(self.travel_time("intermediate_queue_4", "inspection_table"))
+                + float(self.inspection_base_time_min)
+                + float(self.travel_time("inspection_table", "inspection_output_queue"))
+            )
+        if task_type == "HANDOVER_ITEM":
+            source_agent = self.agents.get(str(task.payload.get("source_agent_id", "")))
+            session = self.product_transport_sessions.get(str(task.payload.get("transport_session_id", "")))
+            if source_agent is None or not isinstance(session, dict):
+                return 0.0
+            travel = self._helper_join_catch_min(agent, source_agent)
+            if not math.isfinite(travel):
+                return 0.0
+            remaining = self._product_session_remaining_travel_min(session, future_extra_carriers=1)
+            return travel + remaining
         if task_type == "TRANSFER":
             transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
             if transfer_kind == "material_supply":
@@ -2478,6 +3371,56 @@ class ManufacturingWorld:
         agent.reserved_tile = None
         agent.movement_path = []
         agent.movement_target_tile = None
+
+    def _clear_current_move(self, agent: Agent) -> None:
+        agent.current_move_id = None
+        agent.current_move_segment_index = 0
+        agent.current_move_segment_from_tile = None
+        agent.current_move_segment_to_tile = None
+        agent.current_move_logical_destination = None
+        agent.current_move_started_at = None
+
+    def _close_current_move_segment(self, agent: Agent, *, logical_destination: str | None = None) -> None:
+        move_id = str(agent.current_move_id or "")
+        segment_index = int(agent.current_move_segment_index or 0)
+        from_tile = agent.current_move_segment_from_tile
+        to_tile = agent.current_move_segment_to_tile
+        if not move_id or segment_index <= 0 or from_tile is None or to_tile is None:
+            return
+        self._traffic_end_segment(
+            agent,
+            move_id=move_id,
+            segment_index=segment_index,
+            from_tile=from_tile,
+            to_tile=to_tile,
+            ended_at=float(self.env.now),
+            logical_destination=str(logical_destination or agent.current_move_logical_destination or agent.in_transit_to or ""),
+        )
+        agent.current_move_segment_index = 0
+        agent.current_move_segment_from_tile = None
+        agent.current_move_segment_to_tile = None
+
+    def _log_interrupted_move(self, agent: Agent, *, reason: str, logical_destination: str | None = None) -> None:
+        move_id = str(agent.current_move_id or "")
+        if not move_id:
+            return
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="AGENT_MOVE_END",
+            entity_id=agent.agent_id,
+            location=self.agent_display_location(agent),
+            details={
+                "from": str(agent.in_transit_from or agent.location),
+                "to": str(logical_destination or agent.current_move_logical_destination or agent.in_transit_to or ""),
+                "from_tile": self._tile_payload(agent.movement_path[0]) if agent.movement_path else self._tile_payload(agent.tile),
+                "to_tile": self._tile_payload(agent.tile),
+                "move_id": move_id,
+                "status": "interrupted",
+                "reason": reason,
+                "humanoid_state": self._humanoid_state_payload(agent),
+            },
+        )
 
     def _set_in_transit(self, agent: Agent, from_zone: str, to_zone: str, progress: float, total_min: float) -> None:
         agent.in_transit_from = str(from_zone)
@@ -2669,6 +3612,8 @@ class ManufacturingWorld:
                     "in_transit_progress": round(float(agent.in_transit_progress), 4),
                 }
             )
+        self._set_humanoid_disabled_state(agent, reason=reason)
+        details["humanoid_state"] = self._humanoid_state_payload(agent)
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -2677,7 +3622,14 @@ class ManufacturingWorld:
             location=self.agent_display_location(agent),
             details=details,
         )
-        self._set_worker_state(agent, WorkerState.DISCHARGED, reason=reason)
+        self._set_humanoid_axes(
+            agent,
+            availability="DISABLED",
+            mobility="STATIONARY",
+            power="DEPLETED",
+            reason=reason,
+            source="mansim.discharge",
+        )
         self.emit_incident(
             "worker_discharged",
             affected_entities=[agent.agent_id],
@@ -2784,14 +3736,32 @@ class ManufacturingWorld:
     def start_agent_task(self, agent: Agent, task: Task, start_t: float) -> None:
         agent.current_task_id = task.task_id
         agent.current_task_type = task.task_type
+        agent.current_task_code = task.task_code or ""
+        agent.current_task_instance_id = task.instance_id or ""
         agent.current_task_started_at = start_t
-        self._set_worker_state(agent, WorkerState.WAITING, reason="task_selected", task_id=task.task_id)
+        self._set_humanoid_axes(
+            agent,
+            availability="ASSIGNED",
+            mobility="STATIONARY",
+            reason="task_selected",
+            source="mansim.task_selection",
+            task_id=task.task_id,
+        )
         selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
         details: dict[str, Any] = {
             "task_id": task.task_id,
             "task_type": task.task_type,
             "priority_key": self._task_priority_key(task),
+            "task_code": task.task_code,
+            "task_name": task.task_spec_name,
+            "instance_id": task.instance_id,
+            "assigned_robot_id": task.assigned_robot_id,
+            "current_step_id": agent.current_step_id or "",
+            "primitive_call_code": agent.current_primitive_call_code or "",
             "payload": task.payload,
+            "args": task.args,
+            "humanoid": task.humanoid,
+            "humanoid_state": self._humanoid_state_payload(agent),
             "selection": selection,
             "agent_role": self.current_agent_role(agent.agent_id),
             "commitment_id": agent.current_commitment_id,
@@ -2819,7 +3789,7 @@ class ManufacturingWorld:
     def finish_agent_task(self, agent: Agent, task: Task, start_t: float, status: str, reason: str = "") -> None:
         end_t = self.env.now
         duration = max(0.0, end_t - start_t)
-        preserve_carrying = status == "interrupted" and reason in {"battery_depleted", "battery_swap_wait"}
+        preserve_carrying = status == "interrupted" and reason in {"battery_depleted", "battery_swap_wait", "horizon_reached"}
         if (not preserve_carrying) and (agent.carrying_item_id is not None or agent.carrying_item_type is not None):
             self._clear_agent_carrying(agent, destination=agent.location, emit_event=True)
         self.logger.log(
@@ -2831,18 +3801,59 @@ class ManufacturingWorld:
             details={
                 "task_id": task.task_id,
                 "task_type": task.task_type,
+                "task_code": task.task_code,
+                "task_name": task.task_spec_name,
+                "instance_id": task.instance_id,
                 "status": status,
                 "duration": round(duration, 3),
                 "reason": reason,
                 "payload": task.payload,
+                "args": task.args,
+                "humanoid": task.humanoid,
+                "humanoid_state": self._humanoid_state_payload(agent),
             },
         )
         if agent.discharged:
-            self._set_worker_state(agent, WorkerState.DISCHARGED, reason=reason or status, task_id=task.task_id)
+            self._set_humanoid_axes(
+                agent,
+                availability="DISABLED",
+                mobility="STATIONARY",
+                power="DEPLETED",
+                reason=reason or status,
+                source="mansim.task_end",
+                task_id=task.task_id,
+            )
         elif status == "completed":
-            self._set_worker_state(agent, WorkerState.IDLE, reason="task_completed", task_id=task.task_id)
+            self._set_humanoid_axes(
+                agent,
+                availability="AVAILABLE",
+                mobility="STATIONARY",
+                power="POWER_NORMAL",
+                manipulation="HOLDING" if agent.carrying_item_id else "FREE",
+                reason="task_completed",
+                source="mansim.task_end",
+                task_id=task.task_id,
+                clear_task_context=True,
+            )
         elif not preserve_carrying:
-            self._set_worker_state(agent, WorkerState.WAITING, reason=reason or status, task_id=task.task_id)
+            self._set_humanoid_axes(
+                agent,
+                availability="WAITING",
+                mobility="STATIONARY",
+                reason=reason or status,
+                source="mansim.task_end",
+                task_id=task.task_id,
+            )
+        else:
+            self._set_humanoid_axes(
+                agent,
+                availability="WAITING",
+                mobility="STATIONARY",
+                manipulation="HOLDING" if agent.carrying_item_id else "FREE",
+                reason=reason or status,
+                source="mansim.task_end",
+                task_id=task.task_id,
+            )
         selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
         self.task_records.append(
             {
@@ -2850,6 +3861,9 @@ class ManufacturingWorld:
                 "agent_id": agent.agent_id,
                 "task_id": task.task_id,
                 "task_type": task.task_type,
+                "humanoid_task_code": task.task_code,
+                "humanoid_task_name": task.task_spec_name,
+                "humanoid_instance_id": task.instance_id,
                 "priority_key": self._task_priority_key(task),
                 "status": status,
                 "start_t": start_t,
@@ -2887,6 +3901,10 @@ class ManufacturingWorld:
                 )
         agent.current_task_id = None
         agent.current_task_type = None
+        agent.current_task_code = None
+        agent.current_task_instance_id = None
+        agent.current_step_id = None
+        agent.current_primitive_call_code = None
         agent.current_task_started_at = None
         agent.current_commitment_id = None
 
@@ -3235,6 +4253,22 @@ class ManufacturingWorld:
                 scoped.append(task)
         return scoped
 
+    def _bind_humanoid_candidate_for_agent(self, agent: Agent, task: Task | None) -> Task | None:
+        if task is None:
+            return None
+        runtime = getattr(self, "humanoid_runtime", None)
+        if runtime is None or not getattr(runtime, "enabled", False):
+            return task
+        return runtime.bind_candidate(agent, task)
+
+    def _bind_humanoid_candidates_for_agent(self, agent: Agent, candidates: list[Task]) -> list[Task]:
+        bound: list[Task] = []
+        for task in candidates:
+            candidate = self._bind_humanoid_candidate_for_agent(agent, task)
+            if candidate is not None:
+                bound.append(candidate)
+        return bound
+
     def _select_battery_safety_task(self, candidates: list[Task], agent: Agent) -> Task | None:
         if self.battery_remaining(agent) > self._battery_proactive_swap_threshold(agent):
             return None
@@ -3283,6 +4317,8 @@ class ManufacturingWorld:
                 return int(machine.station) if machine is not None else None
         if task.task_type == "INSPECT_PRODUCT":
             return self.inspection_queue_station
+        if task.task_type == "HANDOVER_ITEM":
+            return None
         return None
 
     def _task_target_id(self, task: Task) -> str:
@@ -3292,6 +4328,8 @@ class ManufacturingWorld:
             return str(task.payload.get("machine_id", ""))
         if task.task_type == "INSPECT_PRODUCT":
             return "inspection"
+        if task.task_type == "HANDOVER_ITEM":
+            return str(task.payload.get("source_agent_id", ""))
         if task.task_type == "TRANSFER":
             transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
             if transfer_kind == "battery_delivery":
@@ -3314,6 +4352,8 @@ class ManufacturingWorld:
             return "machine"
         if task.task_type == "INSPECT_PRODUCT":
             return "station"
+        if task.task_type == "HANDOVER_ITEM":
+            return "agent"
         if task.task_type == "TRANSFER":
             transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
             if transfer_kind == "battery_delivery":
@@ -3331,6 +4371,8 @@ class ManufacturingWorld:
         return 1
 
     def _task_why_available(self, task: Task) -> str:
+        if task.task_type == "HANDOVER_ITEM":
+            return "A product is already in transit and another humanoid can join the shared carry."
         if task.task_type == "REPAIR_MACHINE":
             return "A broken machine is idle and can be repaired immediately."
         if task.task_type == "UNLOAD_MACHINE":
@@ -3810,25 +4852,28 @@ class ManufacturingWorld:
         if agent.awaiting_battery_from is not None:
             return None
         if agent.suspended_task is not None:
-            return self._annotate_task_selection(
+            return self._bind_humanoid_candidate_for_agent(agent, self._annotate_task_selection(
                 agent.suspended_task,
                 decision_source="hard_constraint",
                 decision_rule="resume_suspended_task",
                 rationale="Resume the interrupted task before taking a new one.",
-            )
+            ))
 
         mandatory = self.mandatory_task_for_agent(agent)
         if mandatory is not None:
             self._resolve_selection_blocker(agent.agent_id, reason="mandatory_task_selected")
-            return self._annotate_task_selection(
+            return self._bind_humanoid_candidate_for_agent(agent, self._annotate_task_selection(
                 mandatory,
                 decision_source="hard_constraint",
                 decision_rule="mandatory_battery_swap",
                 rationale="Battery remaining reached the mandatory swap threshold.",
                 score_hint=self._task_score(mandatory, agent),
-            )
+            ))
 
-        candidates = self._filter_candidates_for_agent(agent, self._candidate_tasks(agent))
+        candidates = self._bind_humanoid_candidates_for_agent(
+            agent,
+            self._filter_candidates_for_agent(agent, self._candidate_tasks(agent)),
+        )
         if not candidates:
             self._resolve_selection_blocker(agent.agent_id, reason="no_candidates")
             self._escalate_incident_if_needed(agent, self._recent_incidents_for_agent(agent))
@@ -3984,6 +5029,49 @@ class ManufacturingWorld:
         weight = float((self.current_job_plan.task_priority_weights or {}).get(priority_key, 1.0))
         return float(task.priority) * weight
 
+    def _handover_item_candidates(self, agent: Agent, priority: float) -> list[Task]:
+        if not self.product_collaboration_enabled:
+            return []
+        if agent.discharged or agent.carrying_item_id is not None or agent.awaiting_battery_from is not None:
+            return []
+        candidates: list[Task] = []
+        for session in list(self.product_transport_sessions.values()):
+            if not isinstance(session, dict) or str(session.get("status", "active")) != "active":
+                continue
+            carrier_ids = [str(worker_id) for worker_id in session.get("carrier_ids", []) if str(worker_id)]
+            if agent.agent_id in carrier_ids:
+                continue
+            if len(carrier_ids) >= int(session.get("max_carriers", self.product_collaboration_max_carriers) or self.product_collaboration_max_carriers):
+                continue
+            source_agent_id = str(session.get("primary_worker_id", ""))
+            source_agent = self.agents.get(source_agent_id)
+            if source_agent is None or source_agent.carrying_item_id != str(session.get("item_id", "")):
+                continue
+            if not self._product_session_has_remaining_path(session):
+                continue
+            if not self._product_session_join_feasible(agent, session):
+                continue
+            candidates.append(
+                Task(
+                    task_id=self._next_task_id("HND"),
+                    task_type="HANDOVER_ITEM",
+                    priority_key="handover_item",
+                    priority=priority,
+                    location=self.agent_display_location(source_agent),
+                    payload={
+                        "handover_kind": "product_collaboration_join",
+                        "transport_session_id": str(session.get("session_id", "")),
+                        "item_id": str(session.get("item_id", "")),
+                        "item_type": "product",
+                        "source_agent_id": source_agent_id,
+                        "recipient_agent_id": agent.agent_id,
+                        "destination": str(session.get("destination", "")),
+                        "max_carriers": int(session.get("max_carriers", self.product_collaboration_max_carriers) or self.product_collaboration_max_carriers),
+                    },
+                )
+            )
+        return candidates
+
     def _candidate_tasks(self, agent: Agent) -> list[Task]:
         tasks: list[Task] = []
         deliver_priority_discharged = float(self._rule("world.task_priority.battery_delivery_discharged", 149.0))
@@ -3995,10 +5083,13 @@ class ManufacturingWorld:
         priority_inter_station_transfer = float(self._rule("world.task_priority.inter_station_transfer", 85.0))
         priority_material_supply = float(self._rule("world.task_priority.material_supply", 85.0))
         priority_inspect_product = float(self._rule("world.task_priority.inspect_product", 72.0))
+        priority_handover_item = float(self._rule("world.task_priority.handover_item", 100.0))
 
         proactive_swap = self._proactive_battery_swap_task(agent)
         if proactive_swap is not None:
             tasks.append(proactive_swap)
+
+        tasks.extend(self._handover_item_candidates(agent, priority_handover_item))
 
         for other in self.agents.values():
             if other.agent_id == agent.agent_id:
@@ -4189,16 +5280,20 @@ class ManufacturingWorld:
         movement_started = False
         planned_path: list[Tile] = [start_tile]
         planned_duration = 0.0
+        move_id = ""
+        segment_index = 0
+        ignore_dynamic = self._traffic_observe_conflicts()
+        self._ensure_product_transport_session(agent, destination=dst)
 
         while True:
             current_tile = agent.tile
             if current_tile is None:
                 return
-            destination_tiles = grid.destination_tiles(dst, worker_id=agent.agent_id, from_tile=current_tile)
+            destination_tiles = grid.destination_tiles(dst, worker_id=agent.agent_id, from_tile=current_tile, ignore_dynamic=ignore_dynamic)
             if current_tile in destination_tiles:
                 break
 
-            path = grid.find_path(current_tile, destination_tiles, worker_id=agent.agent_id)
+            path = grid.find_path(current_tile, destination_tiles, worker_id=agent.agent_id, ignore_dynamic=ignore_dynamic)
             if not path or len(path) < 2:
                 if blocked_started_at is None:
                     blocked_started_at = float(self.env.now)
@@ -4224,7 +5319,11 @@ class ManufacturingWorld:
             if not movement_started:
                 movement_started = True
                 planned_path = path
-                planned_duration = max(0.0, float(len(path) - 1) * grid.tile_time_min)
+                planned_duration = max(0.0, float(len(path) - 1) * grid.tile_time_min * self._current_transport_time_multiplier(agent))
+                move_id = f"{agent.agent_id}-move-{next(self.traffic_move_counter):06d}"
+                agent.current_move_id = move_id
+                agent.current_move_started_at = float(self.env.now)
+                agent.current_move_logical_destination = logical_dst
                 self._set_in_transit(agent, str(agent.location), logical_dst, 0.0, planned_duration)
                 self._set_worker_motion(
                     agent,
@@ -4250,57 +5349,167 @@ class ManufacturingWorld:
                             "to_tile": self._tile_payload(path[-1]),
                             "path_tiles": [self._tile_payload(tile) for tile in path],
                             "tile_time_min": round(float(grid.tile_time_min), 6),
+                            "carrying_item_type": agent.carrying_item_type,
+                            "carrying_item_id": agent.carrying_item_id,
+                            "item_time_multiplier": round(self._item_transport_multiplier(agent.carrying_item_type), 3),
+                            "effective_time_multiplier": round(self._current_transport_time_multiplier(agent), 3),
+                            "transport_session": self._worker_cargo_payload(agent).get("transport_session_id"),
+                            "carrier_ids": self._worker_cargo_payload(agent).get("carrier_ids", []),
+                            "move_id": move_id,
                         },
                     )
+                self._traffic_register_plan(
+                    agent,
+                    move_id,
+                    planned_path,
+                    started_at=float(self.env.now),
+                    ended_at=float(self.env.now) + planned_duration,
+                )
 
             next_tile = path[1]
-            if not grid.try_reserve(agent.agent_id, next_tile):
+            if self._traffic_strict_reservation() and not grid.try_reserve(agent.agent_id, next_tile):
                 if blocked_started_at is None:
                     blocked_started_at = float(self.env.now)
+                if self.traffic_enabled:
+                    details = {
+                        "conflict_type": "TRAFFIC_WAIT",
+                        "severity": "warning",
+                        "collision": False,
+                        "primary_worker_id": agent.agent_id,
+                        "worker_ids": [agent.agent_id],
+                        "move_id": move_id,
+                        "tile": self._tile_payload(next_tile),
+                        "time_window": {
+                            "started_at": round(float(self.env.now), 3),
+                            "ended_at": round(float(self.env.now + grid.tile_time_min), 3),
+                        },
+                        "humanoid_state": self._humanoid_state_payload(agent),
+                        "traffic_mode": self.traffic_mode,
+                        "collision_effect": self.traffic_collision_effect,
+                    }
+                    self.traffic_conflicts.append(copy.deepcopy(details))
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type="AGENT_TRAFFIC_CONFLICT",
+                        entity_id=agent.agent_id,
+                        location=self.agent_display_location(agent),
+                        details=details,
+                    )
                 yield self.env.timeout(grid.tile_time_min)
                 continue
 
             blocked_started_at = None
             agent.reserved_tile = next_tile
+            segment_index += 1
+            segment_started_at = float(self.env.now)
+            segment_duration = float(grid.tile_time_min) * self._current_transport_time_multiplier(agent)
+            segment_ended_at = segment_started_at + segment_duration
+            agent.current_move_segment_index = segment_index
+            agent.current_move_segment_from_tile = current_tile
+            agent.current_move_segment_to_tile = next_tile
+            agent.current_move_logical_destination = logical_dst
+            self._traffic_begin_segment(
+                agent,
+                move_id=move_id,
+                segment_index=segment_index,
+                from_tile=current_tile,
+                to_tile=next_tile,
+                started_at=segment_started_at,
+                ended_at=segment_ended_at,
+                logical_destination=logical_dst,
+            )
+            self._start_shared_transport_segment(
+                agent,
+                from_tile=current_tile,
+                to_tile=next_tile,
+                logical_destination=logical_dst,
+                segment_duration=segment_duration,
+                segment_index=segment_index,
+            )
 
             if self._should_interrupt_for_battery(agent, eps):
                 grid.release_reservation(agent.agent_id, next_tile)
                 agent.reserved_tile = None
+                self._close_current_move_segment(agent, logical_destination=logical_dst)
+                if move_id:
+                    self._traffic_complete_plan(move_id)
+                self._log_interrupted_move(agent, reason="battery_depleted", logical_destination=logical_dst)
+                self._clear_current_move(agent)
                 if not agent.discharged:
                     self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
                 raise simpy.Interrupt("battery_depleted")
 
             remaining = self.battery_remaining(agent)
-            if not self._battery_interrupt_exempt(agent) and remaining + eps < grid.tile_time_min:
+            if not self._battery_interrupt_exempt(agent) and remaining + eps < segment_duration:
                 try:
                     yield self.env.timeout(max(eps, remaining))
                 finally:
                     grid.release_reservation(agent.agent_id, next_tile)
                     agent.reserved_tile = None
+                    self._close_current_move_segment(agent, logical_destination=logical_dst)
+                    if move_id:
+                        self._traffic_complete_plan(move_id)
+                    self._log_interrupted_move(agent, reason="battery_depleted", logical_destination=logical_dst)
+                    self._clear_current_move(agent)
                 if not agent.discharged:
                     self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
                 raise simpy.Interrupt("battery_depleted")
 
             try:
-                yield self.env.timeout(grid.tile_time_min)
-            except simpy.Interrupt:
+                yield self.env.timeout(segment_duration)
+            except simpy.Interrupt as intr:
                 grid.release_reservation(agent.agent_id, next_tile)
                 agent.reserved_tile = None
+                self._close_current_move_segment(agent, logical_destination=logical_dst)
+                if move_id:
+                    self._traffic_complete_plan(move_id)
+                self._log_interrupted_move(agent, reason=str(intr.cause or "interrupted"), logical_destination=logical_dst)
+                self._clear_current_move(agent)
                 raise
 
-            grid.move_worker_to_reserved(agent.agent_id, next_tile)
+            if self._traffic_strict_reservation():
+                grid.move_worker_to_reserved(agent.agent_id, next_tile)
+            else:
+                grid.move_worker(agent.agent_id, next_tile)
             agent.tile = next_tile
             agent.reserved_tile = None
+            self._traffic_end_segment(
+                agent,
+                move_id=move_id,
+                segment_index=segment_index,
+                from_tile=current_tile,
+                to_tile=next_tile,
+                ended_at=float(self.env.now),
+                logical_destination=logical_dst,
+            )
+            self._finish_shared_transport_segment(
+                agent,
+                to_tile=next_tile,
+                logical_destination=logical_dst,
+                segment_duration=segment_duration,
+            )
+            agent.current_move_segment_index = 0
+            agent.current_move_segment_from_tile = None
+            agent.current_move_segment_to_tile = None
             if planned_duration > 1e-9 and planned_path:
                 try:
                     current_index = max(0, planned_path.index(next_tile))
                     progress = min(1.0, max(0.0, current_index / max(1, len(planned_path) - 1)))
                 except ValueError:
-                    progress = min(1.0, float(agent.in_transit_progress) + (grid.tile_time_min / planned_duration))
-                self._set_in_transit(agent, str(agent.location), logical_dst, progress, planned_duration)
+                    progress = min(1.0, float(agent.in_transit_progress) + (segment_duration / max(1e-9, planned_duration)))
+                remaining_edges = max(0, (len(planned_path) - 1) - max(0, int(round(progress * max(1, len(planned_path) - 1)))))
+                dynamic_total = max(
+                    segment_duration,
+                    (float(self.env.now) - float(agent.current_move_started_at or self.env.now))
+                    + (remaining_edges * float(grid.tile_time_min) * self._current_transport_time_multiplier(agent)),
+                )
+                self._set_in_transit(agent, str(agent.location), logical_dst, progress, dynamic_total)
 
         old_location = str(agent.location)
         agent.location = logical_dst
+        for helper in self._shared_transport_followers(agent):
+            helper.location = logical_dst
         self._clear_in_transit(agent)
         if movement_started:
             if emit_move_events:
@@ -4311,12 +5520,17 @@ class ManufacturingWorld:
                     entity_id=agent.agent_id,
                     location=logical_dst,
                     details={
-                        "from": old_location,
-                        "to": logical_dst,
-                        "from_tile": self._tile_payload(start_tile),
-                        "to_tile": self._tile_payload(agent.tile),
-                    },
-                )
+                            "from": old_location,
+                            "to": logical_dst,
+                            "from_tile": self._tile_payload(start_tile),
+                            "to_tile": self._tile_payload(agent.tile),
+                            "carrying_item_type": agent.carrying_item_type,
+                            "carrying_item_id": agent.carrying_item_id,
+                            "transport_session": self._worker_cargo_payload(agent).get("transport_session_id"),
+                            "carrier_ids": self._worker_cargo_payload(agent).get("carrier_ids", []),
+                            "move_id": move_id,
+                        },
+                    )
             else:
                 self.logger.log(
                     t=self.env.now,
@@ -4325,13 +5539,21 @@ class ManufacturingWorld:
                     entity_id=agent.agent_id,
                     location=logical_dst,
                     details={
-                        "from": old_location,
-                        "to": logical_dst,
-                        "duration": round(planned_duration, 3),
-                        "from_tile": self._tile_payload(start_tile),
-                        "to_tile": self._tile_payload(agent.tile),
-                    },
-                )
+                            "from": old_location,
+                            "to": logical_dst,
+                            "duration": round(planned_duration, 3),
+                            "from_tile": self._tile_payload(start_tile),
+                            "to_tile": self._tile_payload(agent.tile),
+                            "carrying_item_type": agent.carrying_item_type,
+                            "carrying_item_id": agent.carrying_item_id,
+                            "transport_session": self._worker_cargo_payload(agent).get("transport_session_id"),
+                            "carrier_ids": self._worker_cargo_payload(agent).get("carrier_ids", []),
+                            "move_id": move_id,
+                        },
+                    )
+            if move_id:
+                self._traffic_complete_plan(move_id)
+            self._clear_current_move(agent)
         if agent.current_task_type:
             task = Task(
                 task_id=str(agent.current_task_id or ""),
@@ -4340,10 +5562,13 @@ class ManufacturingWorld:
                 priority=0.0,
                 location=logical_dst,
                 payload={},
+                task_code=str(agent.current_task_code or ""),
+                instance_id=str(agent.current_task_instance_id or ""),
+                assigned_robot_id=agent.agent_id,
             )
-            self._set_worker_state(agent, self._worker_state_for_task(agent, task), reason="arrived_for_task", task_id=agent.current_task_id)
+            self._set_humanoid_for_task(agent, task, reason="arrived_for_task", task_id=agent.current_task_id)
         elif not agent.discharged:
-            self._set_worker_state(agent, WorkerState.IDLE, reason="move_completed")
+            self._set_humanoid_for_task(agent, None, reason="move_completed")
 
     def move_agent(self, agent: Agent, dst: str, emit_move_events: bool = True):
         if self.grid_map is not None:
@@ -4369,7 +5594,9 @@ class ManufacturingWorld:
             self._clear_in_transit(agent)
 
         src = agent.location
-        move_t = self.travel_time(src, dst)
+        self._ensure_product_transport_session(agent, destination=dst)
+        base_move_t = self.travel_time(src, dst)
+        move_t = base_move_t * self._current_transport_time_multiplier(agent)
 
         # A discharged agent cannot initiate movement.
         if self._should_interrupt_for_battery(agent, eps):
@@ -4385,7 +5612,18 @@ class ManufacturingWorld:
                     event_type="AGENT_MOVE_START",
                     entity_id=agent.agent_id,
                     location=src,
-                    details={"from": src, "to": dst, "duration": round(move_t, 3)},
+                    details={
+                        "from": src,
+                        "to": dst,
+                        "duration": round(move_t, 3),
+                        "base_duration": round(base_move_t, 3),
+                        "carrying_item_type": agent.carrying_item_type,
+                        "carrying_item_id": agent.carrying_item_id,
+                        "item_time_multiplier": round(self._item_transport_multiplier(agent.carrying_item_type), 3),
+                        "effective_time_multiplier": round(self._current_transport_time_multiplier(agent), 3),
+                        "transport_session": self._worker_cargo_payload(agent).get("transport_session_id"),
+                        "carrier_ids": self._worker_cargo_payload(agent).get("carrier_ids", []),
+                    },
                 )
             move_start_t = self.env.now
             self._set_in_transit(agent, src, dst, 0.0, move_t)
@@ -4431,7 +5669,14 @@ class ManufacturingWorld:
                     event_type="AGENT_MOVE_END",
                     entity_id=agent.agent_id,
                     location=dst,
-                    details={"from": src, "to": dst},
+                    details={
+                        "from": src,
+                        "to": dst,
+                        "carrying_item_type": agent.carrying_item_type,
+                        "carrying_item_id": agent.carrying_item_id,
+                        "transport_session": self._worker_cargo_payload(agent).get("transport_session_id"),
+                        "carrier_ids": self._worker_cargo_payload(agent).get("carrier_ids", []),
+                    },
                 )
             else:
                 self.logger.log(
@@ -4450,12 +5695,23 @@ class ManufacturingWorld:
                 priority=0.0,
                 location=dst,
                 payload={},
+                task_code=str(agent.current_task_code or ""),
+                instance_id=str(agent.current_task_instance_id or ""),
+                assigned_robot_id=agent.agent_id,
             )
-            self._set_worker_state(agent, self._worker_state_for_task(agent, task), reason="arrived_for_task", task_id=agent.current_task_id)
+            self._set_humanoid_for_task(agent, task, reason="arrived_for_task", task_id=agent.current_task_id)
         elif not agent.discharged:
-            self._set_worker_state(agent, WorkerState.IDLE, reason="move_completed")
+            self._set_humanoid_for_task(agent, None, reason="move_completed")
 
     def execute_task(self, agent: Agent, task: Task):
+        runtime = getattr(self, "humanoid_runtime", None)
+        if runtime is not None and getattr(runtime, "enabled", False):
+            result = yield from runtime.execute(agent, task)
+            return result
+        result = yield from self._execute_task_domain_action(agent, task)
+        return result
+
+    def _execute_task_domain_action(self, agent: Agent, task: Task):
         task_type = task.task_type
 
         if task_type in {"UNLOAD_MACHINE", "SETUP_MACHINE", "PREVENTIVE_MAINTENANCE"}:
@@ -4464,6 +5720,50 @@ class ManufacturingWorld:
             if machine.broken:
                 return False
 
+        if task_type == "HANDOVER_ITEM":
+            if str(task.payload.get("handover_kind", "")) != "product_collaboration_join":
+                return False
+            session_id = str(task.payload.get("transport_session_id", ""))
+            session = self.product_transport_sessions.get(session_id)
+            if not isinstance(session, dict) or str(session.get("status", "active")) != "active":
+                return False
+            source_agent = self.agents.get(str(task.payload.get("source_agent_id", "")))
+            if source_agent is None or source_agent.worker_id == agent.worker_id:
+                return False
+            if agent.carrying_item_id is not None and agent.carrying_item_id != str(session.get("item_id", "")):
+                return False
+            if agent.worker_id in session.get("carrier_ids", []):
+                return True
+            if len(session.get("carrier_ids", [])) >= int(session.get("max_carriers", self.product_collaboration_max_carriers) or self.product_collaboration_max_carriers):
+                return False
+            if not self._product_session_join_feasible(agent, session):
+                return False
+            self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+            yield from self._move_agent_to_in_transit_position(agent, source_agent, emit_move_events=True)
+            session = self.product_transport_sessions.get(session_id)
+            if not isinstance(session, dict) or str(session.get("status", "active")) != "active":
+                return False
+            source_agent = self.agents.get(str(task.payload.get("source_agent_id", "")))
+            if source_agent is None or source_agent.carrying_item_id != str(session.get("item_id", "")):
+                return False
+            if not self._product_session_has_remaining_path(session):
+                return False
+            self._set_humanoid_primitive_hint(agent, "ANNOUNCE_INTENT")
+            yield self.env.timeout(max(0.0, float(getattr(self.humanoid_runtime, "default_primitive_min_duration", 0.0) or 0.0)))
+            self._set_humanoid_primitive_hint(agent, "EXECUTE_HUMAN_COLLABORATION_ACTION")
+            if not self._join_product_transport_session(agent, session_id, task=task):
+                return False
+            done_event = session.get("done_event")
+            if done_event is not None and hasattr(done_event, "triggered") and not done_event.triggered:
+                try:
+                    yield done_event
+                finally:
+                    if str(session.get("status", "active")) == "active":
+                        self._leave_product_transport_session(agent, reason="handover_task_interrupted")
+            self._set_humanoid_primitive_hint(agent, "CONFIRM_OPERATOR_STATE")
+            self._set_humanoid_primitive_hint(agent, "LOG_RESULT")
+            return True
+
         if task_type == "BATTERY_SWAP":
             if agent.battery_service_owner is not None and agent.battery_service_owner != agent.agent_id:
                 return False
@@ -4471,10 +5771,12 @@ class ManufacturingWorld:
             try:
                 if agent.discharged:
                     return False
+                self._set_humanoid_primitive_hint(agent, "CHECK_CONTEXT")
+                self._set_humanoid_primitive_hint(agent, "EXECUTE_SYSTEM_ACTION")
                 yield from self.move_agent(agent, "battery_rack", emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, "battery_rack", task, "battery_swap"):
                     return False
-                self._set_worker_state(agent, WorkerState.BATTERY_SWAPPING, reason="battery_swap", task_id=task.task_id)
+                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", power="CHARGING", reason="battery_swap", source="mansim.power", task_id=task.task_id)
                 yield self.env.timeout(float(self.agent_cfg["battery_pickup_time_min"]))
                 battery_item_id = str(task.payload.get("battery_item_id", ""))
                 if not battery_item_id:
@@ -4486,7 +5788,7 @@ class ManufacturingWorld:
                 agent.discharged = False
                 agent.discharged_since = None
                 agent.low_battery_alerted = False
-                self._set_worker_state(agent, WorkerState.BATTERY_SWAPPING, reason="battery_recharged", task_id=task.task_id)
+                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", power="CHARGING", reason="battery_recharged", source="mansim.power", task_id=task.task_id)
                 self._clear_agent_carrying(agent, destination="BatteryStation")
                 self.logger.log(
                     t=self.env.now,
@@ -4497,6 +5799,7 @@ class ManufacturingWorld:
                     details={"target_agent_id": agent.agent_id},
                 )
                 task.payload.pop("battery_item_id", None)
+                self._set_humanoid_primitive_hint(agent, "VERIFY_ROBOT_STATE")
                 return True
             finally:
                 if agent.battery_service_owner == agent.agent_id:
@@ -4506,21 +5809,25 @@ class ManufacturingWorld:
             machine = self.machines[task.payload["machine_id"]]
             if not machine.broken:
                 return False
+            self._set_humanoid_primitive_hint(agent, "CHECK_SAFETY_ZONE")
             yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
             if not self._confirm_object_service_tile(agent, machine.machine_id, task, "repair_machine"):
                 return False
-            self._set_worker_state(agent, WorkerState.REPAIRING_MACHINE, reason="repair_machine", task_id=task.task_id)
+            self._set_humanoid_primitive_hint(agent, "INSPECT_OR_DIAGNOSE")
+            self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="repair_machine", source="mansim.maintenance", task_id=task.task_id)
             try:
                 if not machine.broken:
                     return False
                 if not self._join_repair_team(machine, agent.agent_id):
                     return False
+                self._set_humanoid_primitive_hint(agent, "EXECUTE_MAINTENANCE_ACTION")
                 task.payload["repair_team_size"] = self._repair_team_size(machine)
                 task.payload["repair_slots_remaining"] = self._repair_slots_remaining(machine)
                 task.payload["repair_remaining_min"] = round(float(machine.repair_work_remaining_min), 3)
                 task.payload["repair_anchor"] = self._repair_worker_anchor(machine, agent.agent_id)
                 done_event = self._ensure_repair_done_event(machine)
                 yield done_event
+                self._set_humanoid_primitive_hint(agent, "VERIFY_MACHINE_STATE")
                 return True
             finally:
                 if machine.broken:
@@ -4532,27 +5839,43 @@ class ManufacturingWorld:
                 return False
             machine.unload_owner = agent.agent_id
             try:
-                if machine.broken or machine.output_intermediate is None:
+                output_id = str(task.payload.get("unloaded_output_id", "") or "")
+                carrying_unloaded_output = bool(output_id and agent.carrying_item_id == output_id)
+                if machine.broken or (machine.output_intermediate is None and not carrying_unloaded_output):
                     return False
-                yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
-                if not self._confirm_object_service_tile(agent, machine.machine_id, task, "unload_machine"):
-                    return False
-                self._set_worker_state(agent, WorkerState.UNLOADING_MACHINE, reason="unload_machine", task_id=task.task_id)
-                if machine.broken:
-                    return False
-                yield self.env.timeout(float(self.movement_cfg["unload_min"]))
-                if machine.broken:
-                    return False
-                output_id = machine.output_intermediate
-                if output_id is not None:
+
+                if not carrying_unloaded_output:
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                    yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, machine.machine_id, task, "unload_machine"):
+                        return False
+                    self._set_humanoid_primitive_hint(agent, "READ_MACHINE_STATE")
+                    self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="unload_machine", source="mansim.machine", task_id=task.task_id)
+                    if machine.broken:
+                        return False
+                    self._set_humanoid_primitive_hint(agent, "EXECUTE_MACHINE_ACTION")
+                    yield self.env.timeout(float(self.movement_cfg["unload_min"]))
+                    if machine.broken:
+                        return False
+                    output_id = str(machine.output_intermediate or "")
                     carried_kind = "product" if machine.station == self.last_processing_station else "intermediate"
                     if not self._set_agent_carrying(agent, carried_kind, output_id):
                         return False
-                machine.output_intermediate = None
-                self._set_machine_state(machine, MachineState.WAIT_INPUT if not machine.broken else MachineState.BROKEN, reason="unloaded")
-                if output_id is not None:
+                    task.payload["unloaded_output_id"] = output_id
+                    machine.output_intermediate = None
+                    self._set_machine_state(machine, MachineState.WAIT_INPUT if not machine.broken else MachineState.BROKEN, reason="unloaded")
+                    self._set_humanoid_primitive_hint(agent, "VERIFY_MACHINE_STATE")
+
+                if output_id:
+                    output_buffer_id = f"output_buffer_station_{machine.station}"
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                    yield from self.move_agent(agent, output_buffer_id, emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, output_buffer_id, task, "unload_output_dropoff"):
+                        return False
+                    self._set_humanoid_primitive_hint(agent, "PLACE")
                     self.output_buffers[machine.station].append(output_id)
                     self._clear_agent_carrying(agent, destination=f"output_buffer_station_{machine.station}")
+                    self._set_humanoid_primitive_hint(agent, "RELEASE")
                     self.logger.log(
                         t=self.env.now,
                         day=self.day_for_time(self.env.now),
@@ -4561,6 +5884,7 @@ class ManufacturingWorld:
                         location=f"Station{machine.station}",
                         details={"from": machine.machine_id, "to": f"output_buffer_station_{machine.station}"},
                     )
+                    task.payload.pop("unloaded_output_id", None)
                 return True
             finally:
                 if machine.unload_owner == agent.agent_id:
@@ -4585,16 +5909,19 @@ class ManufacturingWorld:
                     battery_item_id = str(task.payload.get("transfer_item_id", ""))
                     battery_loaded = bool(task.payload.get("battery_loaded", False))
                     if not battery_loaded:
+                        self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                         yield from self.move_agent(agent, "battery_rack", emit_move_events=True)
                         if not self._confirm_object_service_tile(agent, "battery_rack", task, "battery_delivery_pickup"):
                             return False
-                        self._set_worker_state(agent, WorkerState.BATTERY_DELIVERING, reason="battery_delivery_pickup", task_id=task.task_id)
+                        self._set_humanoid_primitive_hint(agent, "GRASP")
+                        self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", manipulation="REACHING", reason="battery_delivery_pickup", source="mansim.power", task_id=task.task_id)
                         yield self.env.timeout(float(self.agent_cfg["battery_pickup_time_min"]))
                         if not battery_item_id:
                             battery_item_id = self._next_item_id("BAT")
                             task.payload["transfer_item_id"] = battery_item_id
                         if not self._set_agent_carrying(agent, "battery_fresh", battery_item_id):
                             return False
+                        self._set_humanoid_primitive_hint(agent, "LIFT")
                         task.payload["battery_loaded"] = True
                     elif agent.carrying_item_type != "battery_fresh":
                         if not battery_item_id:
@@ -4602,9 +5929,11 @@ class ManufacturingWorld:
                             task.payload["transfer_item_id"] = battery_item_id
                         if not self._set_agent_carrying(agent, "battery_fresh", battery_item_id):
                             return False
+                        self._set_humanoid_primitive_hint(agent, "LIFT")
 
                     agent.battery_swap_critical = True
                     target_agent.battery_swap_critical = True
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                     handover_location = yield from self._move_agent_to_in_transit_position(
                         agent,
                         target_agent,
@@ -4630,6 +5959,7 @@ class ManufacturingWorld:
 
                     if not self._has_in_transit_position(target_agent):
                         if agent.location != target_agent.location:
+                            self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                             yield from self.move_agent(agent, target_agent.agent_id, emit_move_events=True)
                         if agent.location != target_agent.location:
                             return False
@@ -4644,12 +5974,14 @@ class ManufacturingWorld:
                             return False
 
                     became_discharged_during_delivery = target_agent.discharged
+                    self._set_humanoid_primitive_hint(agent, "PLACE")
                     target_agent.last_battery_swap = self.env.now
                     target_agent.discharged = False
                     target_agent.discharged_since = None
                     target_agent.low_battery_alerted = False
-                    self._set_worker_state(target_agent, WorkerState.IDLE, reason="battery_delivered")
+                    self._set_humanoid_axes(target_agent, availability="AVAILABLE", mobility="STATIONARY", power="POWER_NORMAL", manipulation="FREE", reason="battery_delivered", source="mansim.power", clear_task_context=True)
                     self._clear_agent_carrying(agent, destination=handover_location)
+                    self._set_humanoid_primitive_hint(agent, "RELEASE")
                     spent_battery_id = str(task.payload.get("spent_battery_item_id", ""))
                     if not spent_battery_id:
                         spent_battery_id = self._next_item_id("BAT-USED")
@@ -4682,10 +6014,12 @@ class ManufacturingWorld:
                     )
                     if target_agent.suspended_task is not None and target_agent.suspended_task.task_type == "BATTERY_SWAP":
                         target_agent.suspended_task = None
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                     yield from self.move_agent(agent, "battery_rack", emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, "battery_rack", task, "battery_delivery_return"):
                         return False
                     self._clear_agent_carrying(agent, destination="BatteryStation")
+                    self._set_humanoid_primitive_hint(agent, "VERIFY_PLACEMENT")
                     task.payload.pop("battery_loaded", None)
                     task.payload.pop("transfer_item_id", None)
                     task.payload.pop("spent_battery_item_id", None)
@@ -4714,29 +6048,37 @@ class ManufacturingWorld:
                 if not moved_item_id:
                     from_location = "Inspection" if from_station == self.inspection_queue_station else f"Station{from_station}"
                     output_buffer_id = f"output_buffer_station_{from_station}"
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                     yield from self.move_agent(agent, output_buffer_id, emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, output_buffer_id, task, "inter_station_pickup"):
                         return False
-                    self._set_worker_state(agent, WorkerState.TRANSFERRING_INTERMEDIATE, reason="inter_station_pickup", task_id=task.task_id)
+                    self._set_humanoid_primitive_hint(agent, "LOCALIZE_OBJECT")
+                    self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="inter_station_pickup", source="mansim.transfer", task_id=task.task_id)
                     if not self.output_buffers[from_station]:
                         return False
                     moved_item_id = self.output_buffers[from_station].popleft()
                     task.payload["transfer_item_id"] = moved_item_id
                     moved_item_kind = "product" if from_station >= self.last_processing_station else "intermediate"
+                    self._set_humanoid_primitive_hint(agent, "GRASP")
                     if not self._set_agent_carrying(agent, moved_item_kind, moved_item_id):
                         self.output_buffers[from_station].appendleft(moved_item_id)
                         task.payload.pop("transfer_item_id", None)
                         return False
+                    self._set_humanoid_primitive_hint(agent, "LIFT")
                 elif agent.carrying_item_id != moved_item_id:
                     moved_item_kind = "product" if from_station >= self.last_processing_station else "intermediate"
+                    self._set_humanoid_primitive_hint(agent, "GRASP")
                     if not self._set_agent_carrying(agent, moved_item_kind, moved_item_id):
                         return False
+                    self._set_humanoid_primitive_hint(agent, "LIFT")
                 if from_station == self.inspection_queue_station:
                     # Final logistics leg: inspected product -> Warehouse.
                     to_location = "Warehouse"
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                     yield from self.move_agent(agent, "warehouse_buffer", emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, "warehouse_buffer", task, "completed_product_dropoff"):
                         return False
+                    self._set_humanoid_primitive_hint(agent, "PLACE")
                     self.product_count += 1
                     if moved_item_id in self.items:
                         self._set_item_state(moved_item_id, ItemState.COMPLETED, location="Warehouse", ref="warehouse_buffer", item_type="product")
@@ -4745,13 +6087,17 @@ class ManufacturingWorld:
                     to_location = f"Station{to_station}" if to_station <= self.last_processing_station else "Inspection"
                     target_queue_station = to_station if to_station <= self.last_processing_station else self.inspection_queue_station
                     target_queue_id = f"intermediate_queue_{target_queue_station}"
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                     yield from self.move_agent(agent, target_queue_id, emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, target_queue_id, task, "inter_station_dropoff"):
                         return False
+                    self._set_humanoid_primitive_hint(agent, "PLACE")
                     self._push_intermediate_queue(target_queue_station, moved_item_id)
                 task.payload.pop("transfer_item_id", None)
                 moved_item_kind = "product" if from_station >= self.last_processing_station else "intermediate"
+                self._set_humanoid_primitive_hint(agent, "RELEASE")
                 self._clear_agent_carrying(agent, destination=to_location)
+                self._set_humanoid_primitive_hint(agent, "VERIFY_PLACEMENT")
                 if from_station == self.inspection_queue_station:
                     move_to = "Warehouse"
                 else:
@@ -4792,8 +6138,10 @@ class ManufacturingWorld:
                 try:
                     item_id = str(task.payload.get("transfer_item_id", ""))
                     if not item_id:
+                        self._set_humanoid_primitive_hint(agent, "EXECUTE_REPLENISHMENT_ACTION")
                         yield from self.move_agent(agent, "Warehouse", emit_move_events=True)
-                        self._set_worker_state(agent, WorkerState.SUPPLYING_MATERIAL, reason="material_pickup", task_id=task.task_id)
+                        self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
+                        self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="material_pickup", source="mansim.replenishment", task_id=task.task_id)
                         item_id = self._next_item_id(f"MAT-S{station}")
                         task.payload["transfer_item_id"] = item_id
                         self.items[item_id] = Item(
@@ -4809,15 +6157,19 @@ class ManufacturingWorld:
                             return False
                     elif agent.carrying_item_id != item_id:
                         if agent.location != "Warehouse":
+                            self._set_humanoid_primitive_hint(agent, "EXECUTE_REPLENISHMENT_ACTION")
                             yield from self.move_agent(agent, "Warehouse", emit_move_events=True)
+                        self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
                         if not self._set_agent_carrying(agent, "material", item_id):
                             return False
                     material_queue_id = f"material_queue_{station}"
+                    self._set_humanoid_primitive_hint(agent, "EXECUTE_REPLENISHMENT_ACTION")
                     yield from self.move_agent(agent, material_queue_id, emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, material_queue_id, task, "material_supply_dropoff"):
                         return False
                     self._push_material_queue(station, item_id)
                     self._clear_agent_carrying(agent, destination=f"Station{station}")
+                    self._set_humanoid_primitive_hint(agent, "VERIFY_LEVEL_OR_QUANTITY")
                     self.logger.log(
                         t=self.env.now,
                         day=self.day_for_time(self.env.now),
@@ -4826,6 +6178,7 @@ class ManufacturingWorld:
                         location=f"Station{station}",
                         details={"from": "Warehouse", "to": f"material_queue_{station}"},
                     )
+                    self._set_humanoid_primitive_hint(agent, "UPDATE_RECORD")
                     task.payload.pop("transfer_item_id", None)
                     task.payload.pop("material_item_id", None)
                     return True
@@ -4884,13 +6237,16 @@ class ManufacturingWorld:
                 if needs_intermediate and not has_reserved_intermediate and not self.intermediate_queues[station]:
                     return False
 
+                self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                 yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, machine.machine_id, task, "setup_machine"):
                     return False
-                self._set_worker_state(agent, WorkerState.SETTING_UP_MACHINE, reason="setup_machine", task_id=task.task_id)
+                self._set_humanoid_primitive_hint(agent, "READ_MACHINE_STATE")
+                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="setup_machine", source="mansim.machine", task_id=task.task_id)
 
                 setup_step = float(self.movement_cfg["setup_min"])
                 self._set_machine_state(machine, MachineState.SETUP, reason="setup_started")
+                self._set_humanoid_primitive_hint(agent, "EXECUTE_MACHINE_ACTION")
                 setup_started = True
                 setup_start_t = float(self.env.now)
                 self.logger.log(
@@ -4905,6 +6261,13 @@ class ManufacturingWorld:
                 if needs_material:
                     material_id = str(task.payload.get("material_id", ""))
                     if not material_id:
+                        material_queue_id = f"material_queue_{station}"
+                        self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                        yield from self.move_agent(agent, material_queue_id, emit_move_events=True)
+                        if not self._confirm_object_service_tile(agent, material_queue_id, task, "setup_material_pickup"):
+                            self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="material_queue_unreachable")
+                            _close_setup_event("material_queue_unreachable")
+                            return False
                         popped_material = self._pop_material_queue(station)
                         if popped_material is None:
                             self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="missing_material")
@@ -4913,21 +6276,38 @@ class ManufacturingWorld:
                         material_id = popped_material
                         task.payload["material_id"] = material_id
                     # One carry slot: load material first.
+                    self._set_humanoid_primitive_hint(agent, "GRASP")
                     if not self._set_agent_carrying(agent, "material", material_id):
                         self.material_queues[station].appendleft(material_id)
                         task.payload.pop("material_id", None)
                         self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="carry_failed_material")
                         _close_setup_event("carry_failed_material")
                         return False
+                    self._set_humanoid_primitive_hint(agent, "LIFT")
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                    yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, machine.machine_id, task, "setup_material_load"):
+                        self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="machine_unreachable_material")
+                        _close_setup_event("machine_unreachable_material")
+                        return False
+                    self._set_humanoid_primitive_hint(agent, "PLACE")
                     yield self.env.timeout(setup_step)
                     machine.input_material = material_id
                     self._set_item_state(material_id, ItemState.LOADED_ON_MACHINE, location=f"Station{station}", ref=machine.machine_id, item_type="material")
                     task.payload.pop("material_id", None)
                     self._clear_agent_carrying(agent, destination=machine.machine_id)
+                    self._set_humanoid_primitive_hint(agent, "RELEASE")
 
                 if needs_intermediate:
                     intermediate_id = str(task.payload.get("intermediate_id", ""))
                     if not intermediate_id:
+                        intermediate_queue_id = f"intermediate_queue_{station}"
+                        self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                        yield from self.move_agent(agent, intermediate_queue_id, emit_move_events=True)
+                        if not self._confirm_object_service_tile(agent, intermediate_queue_id, task, "setup_intermediate_pickup"):
+                            self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="intermediate_queue_unreachable")
+                            _close_setup_event("intermediate_queue_unreachable")
+                            return False
                         popped_intermediate = self._pop_intermediate_queue(station)
                         if popped_intermediate is None:
                             self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="missing_intermediate")
@@ -4936,17 +6316,27 @@ class ManufacturingWorld:
                         intermediate_id = popped_intermediate
                         task.payload["intermediate_id"] = intermediate_id
                     # Then load intermediate as a separate one-item carry.
+                    self._set_humanoid_primitive_hint(agent, "GRASP")
                     if not self._set_agent_carrying(agent, "intermediate", intermediate_id):
                         self.intermediate_queues[station].appendleft(intermediate_id)
                         task.payload.pop("intermediate_id", None)
                         self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="carry_failed_intermediate")
                         _close_setup_event("carry_failed_intermediate")
                         return False
+                    self._set_humanoid_primitive_hint(agent, "LIFT")
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                    yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, machine.machine_id, task, "setup_intermediate_load"):
+                        self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="machine_unreachable_intermediate")
+                        _close_setup_event("machine_unreachable_intermediate")
+                        return False
+                    self._set_humanoid_primitive_hint(agent, "PLACE")
                     yield self.env.timeout(setup_step)
                     machine.input_intermediate = intermediate_id
                     self._set_item_state(intermediate_id, ItemState.LOADED_ON_MACHINE, location=f"Station{station}", ref=machine.machine_id, item_type="intermediate")
                     task.payload.pop("intermediate_id", None)
                     self._clear_agent_carrying(agent, destination=machine.machine_id)
+                    self._set_humanoid_primitive_hint(agent, "RELEASE")
 
                 if machine.input_material is None or (requires_intermediate and machine.input_intermediate is None):
                     self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="incomplete_inputs")
@@ -4954,6 +6344,7 @@ class ManufacturingWorld:
                     return False
 
                 self._set_machine_state(machine, MachineState.IDLE, reason="setup_completed")
+                self._set_humanoid_primitive_hint(agent, "VERIFY_MACHINE_STATE")
                 _close_setup_event("completed")
                 return True
 
@@ -4977,35 +6368,50 @@ class ManufacturingWorld:
                 product_id = str(task.payload.get("inspection_product_id", ""))
                 if not product_id and not self.intermediate_queues[self.inspection_queue_station]:
                     return False
-                yield from self.move_agent(agent, "intermediate_queue_4", emit_move_events=True)
-                if not self._confirm_object_service_tile(agent, "intermediate_queue_4", task, "inspect_product_pickup"):
-                    return False
-                self._set_worker_state(agent, WorkerState.INSPECTING_PRODUCT, reason="inspect_product", task_id=task.task_id)
-                if not product_id:
-                    popped = self._pop_intermediate_queue(4)
-                    if popped is None:
+
+                if not product_id or agent.carrying_item_id != product_id:
+                    self._set_humanoid_primitive_hint(agent, "LOCALIZE_OBJECT")
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                    yield from self.move_agent(agent, "intermediate_queue_4", emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, "intermediate_queue_4", task, "inspect_product_pickup"):
                         return False
-                    product_id = popped
-                    task.payload["inspection_product_id"] = product_id
-                if not self._set_agent_carrying(agent, "product", product_id):
-                    self.intermediate_queues[self.inspection_queue_station].appendleft(product_id)
-                    task.payload.pop("inspection_product_id", None)
+                    self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
+                    self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="inspect_product_pickup", source="mansim.quality", task_id=task.task_id)
+                    if not product_id:
+                        popped = self._pop_intermediate_queue(self.inspection_queue_station)
+                        if popped is None:
+                            return False
+                        product_id = popped
+                        task.payload["inspection_product_id"] = product_id
+                    self._set_humanoid_primitive_hint(agent, "GRASP")
+                    if not self._set_agent_carrying(agent, "product", product_id):
+                        self.intermediate_queues[self.inspection_queue_station].appendleft(product_id)
+                        task.payload.pop("inspection_product_id", None)
+                        return False
+                    self._set_humanoid_primitive_hint(agent, "LIFT")
+
+                self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                yield from self.move_agent(agent, "inspection_table", emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, "inspection_table", task, "inspect_product_table"):
                     return False
+                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="inspect_product_at_table", source="mansim.quality", task_id=task.task_id)
                 self.inspection_active_agents += 1
                 try:
+                    self._set_humanoid_primitive_hint(agent, "EXECUTE_QUALITY_ACTION")
                     yield self.env.timeout(max(self.inspection_min_time_min, self.inspection_base_time_min))
                 finally:
                     self.inspection_active_agents = max(0, self.inspection_active_agents - 1)
                 defect_prob = float(self.quality_cfg["defect_prob"])
+                self._set_humanoid_primitive_hint(agent, "CLASSIFY_RESULT")
                 if self.rng.random() < defect_prob:
                     self.scrap_count += 1
-                    self._set_item_state(product_id, ItemState.SCRAPPED, location="Inspection", ref="scrap", item_type="product")
+                    self._set_item_state(product_id, ItemState.SCRAPPED, location="Inspection", ref="inspection_table", item_type="product")
                     self.logger.log(
                         t=self.env.now,
                         day=self.day_for_time(self.env.now),
                         event_type="INSPECT_FAIL",
                         entity_id=product_id,
-                        location="Inspection",
+                        location="inspection_table",
                         details={"inspector": agent.agent_id},
                     )
                     self.logger.log(
@@ -5013,12 +6419,17 @@ class ManufacturingWorld:
                         day=self.day_for_time(self.env.now),
                         event_type="SCRAP",
                         entity_id=product_id,
-                        location="Inspection",
+                        location="inspection_table",
                         details={},
                     )
-                    self._clear_agent_carrying(agent, destination="Inspection")
+                    self._clear_agent_carrying(agent, destination="scrap")
                 else:
-                    # Inspection pass: move product to inspection output buffer.
+                    # Inspection pass: carry the product from the table to the output buffer.
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                    yield from self.move_agent(agent, "inspection_output_queue", emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, "inspection_output_queue", task, "inspect_product_output_dropoff"):
+                        return False
+                    self._set_humanoid_primitive_hint(agent, "PLACE")
                     self.logger.log(
                         t=self.env.now,
                         day=self.day_for_time(self.env.now),
@@ -5026,7 +6437,7 @@ class ManufacturingWorld:
                         entity_id=product_id,
                         location="Inspection",
                         details={
-                            "from": "Inspection",
+                            "from": "inspection_table",
                             "to": f"output_buffer_station_{self.inspection_queue_station}",
                             "item_type": "product",
                         },
@@ -5051,6 +6462,8 @@ class ManufacturingWorld:
                         agent,
                         destination=f"output_buffer_station_{self.inspection_queue_station}",
                     )
+                    self._set_humanoid_primitive_hint(agent, "RELEASE")
+                self._set_humanoid_primitive_hint(agent, "RECORD_RESULT")
                 task.payload.pop("inspection_product_id", None)
                 return True
             finally:
@@ -5065,11 +6478,15 @@ class ManufacturingWorld:
             try:
                 if machine.broken or machine.state == MachineState.PROCESSING:
                     return False
+                self._set_humanoid_primitive_hint(agent, "CHECK_SAFETY_ZONE")
+                self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                 yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, machine.machine_id, task, "preventive_maintenance"):
                     return False
-                self._set_worker_state(agent, WorkerState.PREVENTIVE_MAINTENANCE, reason="preventive_maintenance", task_id=task.task_id)
+                self._set_humanoid_primitive_hint(agent, "INSPECT_OR_DIAGNOSE")
+                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="preventive_maintenance", source="mansim.maintenance", task_id=task.task_id)
                 self._set_machine_state(machine, MachineState.UNDER_PM, reason="pm_started")
+                self._set_humanoid_primitive_hint(agent, "EXECUTE_MAINTENANCE_ACTION")
                 pm_start = self.env.now
                 self.logger.log(
                     t=self.env.now,
@@ -5086,6 +6503,7 @@ class ManufacturingWorld:
                 machine.last_pm_at = self.env.now
                 machine.pm_until = self.env.now + self.pm_effect_duration_min
                 self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="pm_completed")
+                self._set_humanoid_primitive_hint(agent, "VERIFY_MACHINE_STATE")
                 self.logger.log(
                     t=self.env.now,
                     day=self.day_for_time(self.env.now),
@@ -5250,6 +6668,48 @@ class ManufacturingWorld:
             return "physical"
         return "coordination"
 
+    def close_open_activity_at_horizon(self, *, reason: str = "horizon_reached") -> None:
+        """Close observation events that are still open when the run horizon stops SimPy."""
+        for agent in self.agents.values():
+            if agent.current_move_id:
+                self._close_current_move_segment(agent, logical_destination=agent.current_move_logical_destination)
+                self._log_interrupted_move(agent, reason=reason, logical_destination=agent.current_move_logical_destination)
+                self._traffic_complete_plan(str(agent.current_move_id))
+                self._clear_current_move(agent)
+                self._clear_in_transit(agent)
+
+            if not agent.current_task_id:
+                if not agent.discharged:
+                    self._set_humanoid_for_task(agent, None, reason=reason)
+                continue
+
+            task = self._current_task_stub(agent)
+            runtime = getattr(self, "humanoid_runtime", None)
+            if runtime is not None and getattr(runtime, "enabled", False):
+                if agent.current_step_id or agent.current_primitive_call_code:
+                    step = {
+                        "step_id": str(agent.current_step_id or ""),
+                        "call_code": str(agent.current_primitive_call_code or ""),
+                        "depends_on": [],
+                    }
+                    runtime._log_step_event(
+                        "HUMANOID_STEP_END",
+                        agent,
+                        task,
+                        step,
+                        status="interrupted",
+                        error=reason,
+                    )
+                runtime._log_task_event("HUMANOID_TASK_END", agent, task, status="interrupted")
+
+            self.finish_agent_task(
+                agent,
+                task,
+                float(agent.current_task_started_at if agent.current_task_started_at is not None else self.env.now),
+                status="interrupted",
+                reason=reason,
+            )
+
     def finalize_day(self, day: int) -> dict[str, Any]:
         products_today = self.product_count - int(self.day_baseline["products"])
         scrap_today = self.scrap_count - int(self.day_baseline["scrap"])
@@ -5308,11 +6768,15 @@ class ManufacturingWorld:
 
         task_slice = self.task_records[int(self.day_baseline["task_count"]) :]
         task_breakdown: dict[str, float] = defaultdict(float)
+        humanoid_task_breakdown: dict[str, float] = defaultdict(float)
         local_response_task_count = 0
         commitment_dispatch_task_count = 0
         for rec in task_slice:
             if rec["status"] == "completed":
                 task_breakdown[rec["task_type"]] += float(rec["duration"])
+                humanoid_code = str(rec.get("humanoid_task_code", "")).strip()
+                if humanoid_code:
+                    humanoid_task_breakdown[humanoid_code] += float(rec["duration"])
             decision_source = str(rec.get("decision_source", "")).strip().lower()
             if decision_source == "worker_local_response":
                 local_response_task_count += 1
@@ -5377,6 +6841,7 @@ class ManufacturingWorld:
             "commitment_dispatch_task_count": int(commitment_dispatch_task_count),
             "days_since_last_product": int(days_since_last_product),
             "task_minutes": dict(task_breakdown),
+            "humanoid_task_minutes": dict(humanoid_task_breakdown),
             "machine_processing_min": processing_delta,
             "machine_broken_min": broken_delta,
             "machine_pm_min": pm_delta,
@@ -5402,17 +6867,29 @@ class ManufacturingWorld:
         total_checked = self.product_count + self.scrap_count
         total_time = max(1.0, float(self.env.now))
 
-        task_totals: dict[str, float] = defaultdict(float)
+        humanoid_task_totals: dict[str, float] = defaultdict(float)
         for rec in self.task_records:
             if rec["status"] == "completed":
-                task_totals[rec["task_type"]] += rec["duration"]
+                humanoid_code = str(rec.get("humanoid_task_code", "")).strip()
+                if humanoid_code:
+                    humanoid_task_totals[humanoid_code] += rec["duration"]
 
         discharged_metrics = self._agent_discharged_metrics()
         buffer_wait_metrics = self._buffer_wait_metrics()
         lead_time_metrics = self._completed_product_lead_time_metrics()
         machine_time_metrics = self._machine_time_metrics()
         machine_state_metrics = self._machine_state_time_metrics()
-        worker_state_metrics = self._worker_state_time_metrics()
+        humanoid_state_time_by_worker = self._humanoid_state_time_metrics()
+        humanoid_state_time_by_axis = self._humanoid_state_axis_totals(humanoid_state_time_by_worker)
+        humanoid_state_ratio_by_worker = self._humanoid_state_ratios(humanoid_state_time_by_worker)
+        humanoid_execution_ratio_by_worker = self._humanoid_execution_ratios(humanoid_state_time_by_worker)
+        humanoid_unavailable_ratio_by_worker = self._humanoid_unavailable_ratios(humanoid_state_time_by_worker)
+        humanoid_execution_ratio_avg = mean(humanoid_execution_ratio_by_worker.values()) if humanoid_execution_ratio_by_worker else 0.0
+        humanoid_unavailable_ratio_avg = mean(humanoid_unavailable_ratio_by_worker.values()) if humanoid_unavailable_ratio_by_worker else 0.0
+        humanoid_primitive_minutes = self._humanoid_primitive_minutes()
+        humanoid_task_taxonomy = self._humanoid_task_taxonomy_metrics(dict(humanoid_task_totals))
+        traffic_metrics = self._traffic_metrics()
+        transport_metrics = self._transport_metrics()
         incident_event_total = sum(int(summary.get("incident_event_count", 0) or 0) for summary in self.daily_summaries)
         physical_incident_total = sum(int(summary.get("physical_incident_count", 0) or 0) for summary in self.daily_summaries)
         coordination_incident_total = sum(int(summary.get("coordination_incident_count", 0) or 0) for summary in self.daily_summaries)
@@ -5472,15 +6949,23 @@ class ManufacturingWorld:
             "planner_escalation_total": int(planner_escalation_total),
             "worker_local_response_total": int(local_response_task_total),
             "commitment_dispatch_total": int(commitment_dispatch_task_total),
-            "agent_task_minutes": dict(task_totals),
+            "humanoid_task_minutes": dict(humanoid_task_totals),
             "agent_discharged_time_min_total": discharged_metrics["total_min"],
             "agent_discharged_time_min_avg": discharged_metrics["avg_min_per_agent"],
             "agent_discharged_time_min_by_agent": discharged_metrics["by_agent"],
             "agent_discharged_ratio": discharged_metrics["discharged_ratio"],
             "agent_discharged_ratio_by_agent": discharged_metrics["ratio_by_agent"],
-            "agent_availability_ratio": discharged_metrics["availability_ratio"],
-            "worker_state_time_by_worker": worker_state_metrics["state_time_by_worker"],
-            "worker_utilization_by_worker": worker_state_metrics["utilization_by_worker"],
+            "humanoid_state_time_by_worker": humanoid_state_time_by_worker,
+            "humanoid_state_time_by_axis": humanoid_state_time_by_axis,
+            "humanoid_state_ratio_by_worker": humanoid_state_ratio_by_worker,
+            "humanoid_execution_ratio_by_worker": humanoid_execution_ratio_by_worker,
+            "humanoid_execution_ratio_avg": round(float(humanoid_execution_ratio_avg), 6),
+            "humanoid_unavailable_ratio_by_worker": humanoid_unavailable_ratio_by_worker,
+            "humanoid_unavailable_ratio_avg": round(float(humanoid_unavailable_ratio_avg), 6),
+            "humanoid_primitive_minutes": humanoid_primitive_minutes,
+            "humanoid_task_taxonomy": humanoid_task_taxonomy,
+            **traffic_metrics,
+            **transport_metrics,
             "buffer_wait_avg_min": buffer_wait_metrics["avg_wait_min"],
             "buffer_wait_avg_min_including_open": buffer_wait_metrics["avg_wait_min_including_open"],
             "buffer_wait_completed_count": buffer_wait_metrics["completed_wait_count"],

@@ -527,6 +527,9 @@ def run(
                 stop_event = env.any_of([world.termination_event, env.timeout(day_end - env.now)])
                 env.run(until=stop_event)
 
+            if day == total_days and not world.terminated:
+                world.close_open_activity_at_horizon(reason="horizon_reached")
+
             day_summary = world.finalize_day(day)
             if world.terminated:
                 event_logger.log(
@@ -578,8 +581,8 @@ def run(
                         location="OperationsReview",
                         details=agent_priority_update_trace,
                     )
-                # ?? ?? ???? ?? ?? ???.
-                # replay? ? ???? ????? ????? ????.
+                # Keep daily review messages out of the replay chat stream.
+                # Replay Studio renders only operational chat events.
                 event_logger.log(
                     t=env.now,
                     day=day,
@@ -800,7 +803,6 @@ def run(
         "llm_graph_path": str(run_meta.get("llm_graph_path", "")).strip(),
         "llm_wiki_dashboard_path": str(run_meta.get("llm_wiki_dashboard_path", "")).strip(),
     }
-
 
 
 

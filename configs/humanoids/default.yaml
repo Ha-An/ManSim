@@ -1,0 +1,61 @@
+# Humanoid_Tasks integration.
+# ManSim imports the installed `humanoids` package and executes selected
+# manufacturing tasks through its TaskSpec -> StepCall hierarchy.
+enabled: true
+missing_package_policy: error
+catalog_root: null
+validation_mode: filter
+
+# ManSim owns environment-specific primitive timing.
+# Unit is simulation minutes; non-domain primitives use this minimum so Replay
+# can show the TaskSpec primitive sequence instead of collapsing zero-time steps.
+primitive_timing:
+  unit: min
+  default_min: 0.1
+  by_call_code: {}
+
+profiles:
+  A1:
+    humanoid_id: A1
+    capabilities: &default_capabilities
+      - navigation
+      - object_localization
+      - manipulation
+      - payload_handling
+      - inventory_interaction
+      - machine_interface
+      - safety_zone_check
+      - maintenance
+      - diagnostics
+      - inspection
+      - measurement
+      - digital_recording
+      - digital_context
+      - digital_transaction
+      - traceability
+      - system_operation
+      - tool_use
+      - vehicle_operation
+      - equipment_interaction
+      - human_collaboration
+      - handover
+      - safe_interaction
+      - high_risk_task
+    max_payload_kg: 25.0
+    supported_tools: ["*"]
+    supported_vehicles: ["*"]
+    supported_equipment: ["*"]
+  A2:
+    humanoid_id: A2
+    capabilities: *default_capabilities
+    max_payload_kg: 25.0
+    supported_tools: ["*"]
+    supported_vehicles: ["*"]
+    supported_equipment: ["*"]
+  A3:
+    humanoid_id: A3
+    capabilities: *default_capabilities
+    max_payload_kg: 25.0
+    supported_tools: ["*"]
+    supported_vehicles: ["*"]
+    supported_equipment: ["*"]

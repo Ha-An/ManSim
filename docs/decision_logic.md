@@ -61,11 +61,11 @@ Worker별 canonical task family allowlist를 강제하는 scripted mode입니다
 
 ### `llm_planner`
 
-Legacy LLM mode입니다. Planner가 commitment를 생성하고 worker가 commitment를 우선합니다. 현재 production path는 아닙니다.
+Legacy LLM mode입니다. Planner가 commitment를 생성하고 worker가 commitment를 우선합니다. 현재 주력 path는 아닙니다.
 
 ### `openclaw_adaptive_priority`
 
-현재 production LLM mode입니다.
+현재 주력 LLM manager mode입니다. 기본 simulation path는 여전히 OpenClaw 없는 `adaptive_priority`이며, 이 mode는 LLM manager loop를 명시적으로 사용할 때 선택합니다.
 
 - Strategist가 day-start intent를 생성합니다.
 - Deterministic compiler가 intent를 executable policy로 변환합니다.

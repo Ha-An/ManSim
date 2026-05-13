@@ -3,7 +3,7 @@ name: mfg_basic
 
 horizon:
   # 총 시뮬레이션 일수
-  num_days: 10
+  num_days: 5
   # 하루 길이(분). 240=4시간, 480=8시간, 1440=24시간
   minutes_per_day: 240
 
@@ -36,6 +36,31 @@ movement:
   to_battery_station_min: 4
   # 그 외 기본 이동 시간
   default_min: 6
+  # Carrying an item changes only the tile/edge travel time while the worker is loaded.
+  # Material is the baseline. Intermediate and product are heavier.
+  item_transport:
+    weight_time_multiplier:
+      material: 1.0
+      intermediate: 1.5
+      product: 2.0
+      battery: 1.0
+      battery_fresh: 1.0
+      battery_spent: 1.0
+    product_collaboration:
+      enabled: true
+      max_carriers: 2
+      # A second carrier divides the remaining product movement time from the next tile segment.
+      divide_time_by_carrier_count: true
+  # Worker 동선 겹침과 충돌 가능 상황을 다루는 traffic model.
+  # strict_reservation은 다음 tile을 예약하지 못하면 대기하고 TRAFFIC_WAIT을 기록한다.
+  # observe_conflicts로 바꾸면 이동을 막지 않고 tile/edge conflict를 event와 Replay overlay로 남긴다.
+  traffic:
+    enabled: true
+    mode: strict_reservation
+    fidelity: tile_edge
+    collision_effect: log_only
+    near_miss_headway_min: 0.05
+    emit_tile_step_events: true
 
 map:
   # Tile 기반 공간 모델. false로 두면 기존 zone-name 이동시간 모델로 fallback한다.

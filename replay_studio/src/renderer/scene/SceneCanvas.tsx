@@ -555,9 +555,9 @@ function drawSegments(
 function progressFromWindow(windowValue: unknown, currentTime: number): number | undefined {
   if (!windowValue || typeof windowValue !== "object") return undefined;
   const windowRecord = windowValue as Record<string, unknown>;
-  const startedAt = typeof windowRecord.started_at === "number" ? windowRecord.started_at : undefined;
-  const endedAt = typeof windowRecord.ended_at === "number" ? windowRecord.ended_at : undefined;
-  if (startedAt === undefined || endedAt === undefined) return undefined;
+  const startedAt = Number(windowRecord.started_at);
+  const endedAt = Number(windowRecord.ended_at);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt)) return undefined;
   if (endedAt <= startedAt) return 1;
   return clamp((currentTime - startedAt) / (endedAt - startedAt), 0, 1);
 }
@@ -600,24 +600,97 @@ function drawGaugeBar(
   }
 }
 
-function workerBatteryProgress(entity: { attributes: Record<string, unknown> }, currentTime: number): number | undefined {
-  const batteryPeriodMin = Number(entity.attributes.battery_period_min);
-  const lastSwapAt = Number(entity.attributes.last_swap_at);
+function workerBatteryProgress(entity: { attributes: Record<string, unknown> }): number | undefined {
   const batteryPct = Number(entity.attributes.battery_pct);
-  if (Number.isFinite(batteryPeriodMin) && batteryPeriodMin > 0 && Number.isFinite(lastSwapAt)) {
-    if (Number.isFinite(batteryPct) && batteryPct <= 0) return 0;
-    return clamp(1 - (currentTime - lastSwapAt) / batteryPeriodMin, 0, 1);
-  }
   if (!Number.isFinite(batteryPct)) return undefined;
   return clamp(batteryPct / 100, 0, 1);
 }
 
 function workerTaskProgress(entity: { state: string; attributes: Record<string, unknown> }, currentTime: number): number | undefined {
-  const taskWindowProgress = progressFromWindow(entity.attributes.task_window, currentTime);
-  if (taskWindowProgress !== undefined) return taskWindowProgress;
-  const motionProgress = progressFromWindow(entity.attributes.motion, currentTime);
-  if (entity.state === "moving" && motionProgress !== undefined) return motionProgress;
-  return undefined;
+  return progressFromWindow(entity.attributes.task_window, currentTime);
+}
+
+function humanoidStateRecord(entity: { attributes: Record<string, unknown> }): Record<string, unknown> {
+  const value = entity.attributes.humanoid_state;
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function humanoidTaskContext(entity: { attributes: Record<string, unknown> }): Record<string, unknown> {
+  const context = humanoidStateRecord(entity).task_context;
+  return context && typeof context === "object" ? (context as Record<string, unknown>) : {};
+}
+
+function humanoidStateValue(entity: { attributes: Record<string, unknown> }, key: string): string {
+  const value = humanoidStateRecord(entity)[key];
+  return typeof value === "string" ? value.trim().toUpperCase() : "";
+}
+
+function workerPrimitiveCode(entity: { attributes: Record<string, unknown> }): string {
+  const contextPrimitive = humanoidTaskContext(entity).primitive_call_code;
+  if (typeof contextPrimitive === "string" && contextPrimitive.trim()) return contextPrimitive.trim().toUpperCase();
+  return "";
+}
+
+function activeMotionWindow(entity: { attributes: Record<string, unknown> }, currentTime: number): boolean {
+  const motion = entity.attributes.motion;
+  if (!motion || typeof motion !== "object") return false;
+  const startedAt = Number((motion as Record<string, unknown>).started_at);
+  const endedAt = Number((motion as Record<string, unknown>).ended_at);
+  return Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt > startedAt && currentTime >= startedAt && currentTime < endedAt;
+}
+
+function workerTaskCode(entity: { attributes: Record<string, unknown> }): string {
+  const contextTask = humanoidTaskContext(entity).task_code;
+  if (typeof contextTask === "string" && contextTask.trim()) return contextTask.trim().toUpperCase();
+  if (humanoidStateValue(entity, "availability") === "AVAILABLE") return "";
+  const direct = entity.attributes.current_task_code;
+  return typeof direct === "string" && direct.trim() ? direct.trim().toUpperCase() : "";
+}
+
+function workerTaskBadge(entity: { attributes: Record<string, unknown> }): { text: string; accent: string } {
+  switch (workerTaskCode(entity)) {
+    case "REPLENISH_MATERIAL":
+      return { text: "MAT", accent: "#62a9ff" };
+    case "SETUP_MACHINE":
+      return { text: "SET", accent: "#8e7dff" };
+    case "UNLOAD_MACHINE":
+      return { text: "UNLD", accent: "#ffb85e" };
+    case "TRANSFER":
+      return { text: "MOVE", accent: "#5ba3ff" };
+    case "INSPECT_PRODUCT":
+      return { text: "INSP", accent: "#44b7ff" };
+    case "REPAIR_MACHINE":
+      return { text: "FIX", accent: "#4fcf8b" };
+    case "PREVENTIVE_MAINTENANCE":
+      return { text: "PMNT", accent: "#9d95ff" };
+    case "MANAGE_ROBOT_POWER":
+    case "BATTERY_SWAP":
+      return { text: "PWR", accent: "#39c4ab" };
+    default:
+      return { text: "TASK", accent: "#4fcf8b" };
+  }
+}
+
+function shouldShowWorkerTaskBubble(entity: { state: string; attributes: Record<string, unknown> }, currentTime: number): boolean {
+  if (activeMotionWindow(entity, currentTime)) return false;
+  const mobility = humanoidStateValue(entity, "mobility");
+  if (mobility === "NAVIGATING" || mobility === "DOCKING") return false;
+  if (humanoidStateValue(entity, "availability") !== "EXECUTING") return false;
+  const primitive = workerPrimitiveCode(entity);
+  const visiblePrimitive = new Set([
+    "EXECUTE_REPLENISHMENT_ACTION",
+    "EXECUTE_MACHINE_ACTION",
+    "EXECUTE_QUALITY_ACTION",
+    "EXECUTE_MAINTENANCE_ACTION",
+    "EXECUTE_SYSTEM_ACTION",
+    "EXECUTE_HUMAN_COLLABORATION_ACTION",
+    "GRASP",
+    "LIFT",
+    "PLACE",
+    "RELEASE",
+  ]);
+  if (!visiblePrimitive.has(primitive)) return false;
+  return Boolean(workerTaskCode(entity));
 }
 
 function machineProcessProgress(entity: { attributes: Record<string, unknown> }, currentTime: number): number | undefined {
@@ -1245,8 +1318,10 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
       if (node.entity.entity_type === "worker" || node.entity.entity_type === "robot" || node.entity.entity_type === "transporter") {
         const workerVisualState = getWorkerVisualState(node.entity);
         const workerFrame = getWorkerSpriteFrame(workerSpriteSheet, node.entity, currentTime);
-        const batteryProgress = workerBatteryProgress(node.entity, currentTime);
+        const batteryProgress = workerBatteryProgress(node.entity);
         const taskProgress = workerTaskProgress(node.entity, currentTime);
+        const showTaskBubble = shouldShowWorkerTaskBubble(node.entity, currentTime);
+        const taskBadge = workerTaskBadge(node.entity);
         const spriteHeight = clamp(nodeHeight - 28, 42, 72);
         const spriteWidth = workerFrame ? spriteHeight * (workerFrame.width / Math.max(1, workerFrame.height)) : 12 * spriteScale;
         const spriteX = transformed.x - spriteWidth / 2;
@@ -1281,26 +1356,26 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
           );
         }
         drawPlainLabel(ctx, headCenterX, Math.max(10, spriteY - 6), labelText(node.entity.label), "#274b74");
-        const workerBubble = drawSpeechBubble(
-          ctx,
-          spriteX - 42,
-          spriteY + 4,
-          workerVisualState.badgeText,
-          workerVisualState.badgeAccent,
-          {
-            tailSide: "right",
-            fill: "rgba(255,255,255,0.94)",
-          },
-        );
-        if (taskProgress !== undefined && node.entity.state !== "idle") {
+        if (showTaskBubble) {
+          const workerBubble = drawSpeechBubble(
+            ctx,
+            spriteX - 42,
+            spriteY + 4,
+            taskBadge.text,
+            taskBadge.accent,
+            {
+              tailSide: "right",
+              fill: "rgba(255,255,255,0.94)",
+            },
+          );
           drawGaugeBar(
             ctx,
             workerBubble.left + 4,
             workerBubble.top + workerBubble.height + 4,
             Math.max(18, workerBubble.width - 8),
             6,
-            taskProgress,
-            workerVisualState.badgeAccent,
+            taskProgress ?? 0,
+            taskBadge.accent,
           );
         }
       } else if (node.entity.entity_type === "machine" || node.entity.entity_type === "workstation") {

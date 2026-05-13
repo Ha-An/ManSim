@@ -20,6 +20,7 @@ ARTIFACT_LABELS = {
     "operations_replay.html": "Operations Replay",
     "manager_replay_dashboard.html": "Manager Replay",
     "replay_studio": "Replay Studio",
+    "replay_studio_3d": "Replay Studio 3D",
     "task_priority_dashboard.html": "Task Priority",
     "knowledge_dashboard.html": "Knowledge",
     "llm_wiki_dashboard.html": "LLM Wiki",
@@ -166,6 +167,24 @@ def build_replay_studio_url(
     return f"{base}/?{'&'.join(params)}" if params else base
 
 
+def build_replay_studio_3d_url(
+    *,
+    port: int = 5174,
+    log_path: str | None = None,
+    manifest_path: Path | None = None,
+    run_id: str | None = None,
+) -> str:
+    base = f"http://localhost:{int(port)}"
+    params: list[str] = []
+    if manifest_path is not None:
+        params.append(f"manifest={quote(Path(manifest_path).resolve().as_posix(), safe='')}")
+    if run_id:
+        params.append(f"run={quote(str(run_id), safe='')}")
+    if log_path:
+        params.append(f"log={quote(str(log_path), safe='/')}")
+    return f"{base}/?{'&'.join(params)}" if params else base
+
+
 def _run_selector_options(*, manifest: dict[str, Any] | None, current_page_path: Path, current_artifact: str, current_run_id: str | None) -> tuple[str, str]:
     if not isinstance(manifest, dict):
         return ("", "")
@@ -215,6 +234,12 @@ def _nav_links(*, manifest: dict[str, Any] | None, current_page_path: Path, curr
         run_id=str(run.get("id", "")).strip(),
     )
     items.insert(2, (ARTIFACT_LABELS["replay_studio"], replay_studio_href, current_artifact == "replay_studio"))
+    replay_studio_3d_href = build_replay_studio_3d_url(
+        port=int(manifest.get("replay_studio_3d_preferred_port", 5174) or 5174) if isinstance(manifest, dict) else 5174,
+        manifest_path=manifest_path,
+        run_id=str(run.get("id", "")).strip(),
+    )
+    items.insert(3, (ARTIFACT_LABELS["replay_studio_3d"], replay_studio_3d_href, current_artifact == "replay_studio_3d"))
     if _show_manager_replay(run):
         href = build_replay_studio_url(
             port=int(manifest.get("replay_studio_preferred_port", 5173) or 5173) if isinstance(manifest, dict) else 5173,
