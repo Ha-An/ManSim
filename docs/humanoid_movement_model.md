@@ -1,6 +1,6 @@
 # Humanoid Movement Model
 
-이 문서는 ManSim에서 휴머노이드 worker가 목적지까지 이동하는 방식과 traffic reservation 동작을 설명합니다. State/Task 정의는 `Humanoid_Tasks`에서 가져오고, ManSim은 실제 factory scenario에서 이동 경로를 계산하고 이벤트로 기록합니다.
+이 문서는 ManSim에서 휴머노이드 worker가 목적지까지 이동하는 방식과 traffic reservation 동작을 설명합니다. State/Task 정의는 `HumanoidSim`에서 가져오고, ManSim은 실제 factory scenario에서 이동 경로를 계산하고 이벤트로 기록합니다.
 
 Humanoid State/Task/Primitive 전체 설명은 [humanoid_worker_model.md](humanoid_worker_model.md)를 보세요.
 

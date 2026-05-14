@@ -1,6 +1,6 @@
 # ManSim v0.4.3
 
-ManSim은 제조 라인의 discrete-event simulation을 실행하고, 그 결과를 KPI dashboard와 Replay Studio로 관찰하는 실험 프레임워크입니다. v0.4.3의 중심 변화는 worker를 단순 작업자가 아니라 `Humanoid_Tasks`에서 정의한 휴머노이드 로봇으로 다루고, 그 state/task/primitive를 Replay와 KPI에서 그대로 관찰할 수 있게 한 것입니다.
+ManSim은 제조 라인의 discrete-event simulation을 실행하고, 그 결과를 KPI dashboard와 Replay Studio로 관찰하는 실험 프레임워크입니다. v0.4.3의 중심 변화는 worker를 단순 작업자가 아니라 `HumanoidSim`에서 정의한 휴머노이드 로봇으로 다루고, 그 state/task/primitive를 Replay와 KPI에서 그대로 관찰할 수 있게 한 것입니다.
 
 ![Replay Studio factory replay 화면](docs/assets/replay-studio-worker-replay.png)
 
@@ -8,10 +8,10 @@ ManSim은 제조 라인의 discrete-event simulation을 실행하고, 그 결과
 
 v0.4.3은 v0.4.2의 tile 기반 factory map과 Replay Studio 개편 위에 Humanoid runtime을 본격 통합한 버전입니다.
 
-- Worker/task 실행 엔진을 `Humanoid_Tasks`의 `TaskSpec -> StepCall -> Primitive` hierarchy 기반으로 전환했습니다.
-- Worker 상태를 `Humanoid_Tasks`의 `HumanoidStateSnapshot` 하나로 통일했습니다. State 축은 `availability`, `mobility`, `power`, `manipulation`입니다.
+- Worker/task 실행 엔진을 `HumanoidSim`의 `TaskSpec -> StepCall -> Primitive` hierarchy 기반으로 전환했습니다.
+- Worker 상태를 `HumanoidSim`의 `HumanoidStateSnapshot` 하나로 통일했습니다. State 축은 `availability`, `mobility`, `power`, `manipulation`입니다.
 - ManSim에서 사용하는 Humanoid task subset을 명확히 연결했습니다: `REPLENISH_MATERIAL`, `TRANSFER`, `MANAGE_ROBOT_POWER`, `SETUP_MACHINE`, `UNLOAD_MACHINE`, `INSPECT_PRODUCT`, `REPAIR_MACHINE`, `PREVENTIVE_MAINTENANCE`, `HANDOVER_ITEM`.
-- Primitive별 최소 duration을 설정해 Replay Studio에서 task 내부 primitive sequence가 사라지지 않도록 했습니다. 기본값은 `configs/humanoids/default.yaml`의 `primitive_timing.default_min: 0.1`분입니다.
+- Primitive별 최소 duration을 설정해 Replay Studio에서 task 내부 primitive sequence가 사라지지 않도록 했습니다. 기본값은 `configs/humanoidsim/default.yaml`의 `primitive_timing.default_min: 0.1`분입니다.
 - Setup, unload, inspection은 queue와 machine/table/output buffer 사이의 실제 carry 이동을 포함합니다.
 - Inspection은 worker가 `inspection_table` service tile에 도착한 뒤에만 수행되며, inspection output queue까지 직접 운반합니다.
 - Item weight 기반 이동 시간을 추가했습니다. 기본값은 material `1.0`, intermediate `1.5`, product `2.0`입니다.
@@ -47,7 +47,7 @@ v0.4.3은 v0.4.2의 tile 기반 factory map과 Replay Studio 개편 위에 Human
 
 ## Humanoid Worker Model
 
-ManSim에서 worker는 `Humanoid_Tasks` 라이브러리의 정의를 import해서 사용하는 휴머노이드 로봇입니다. State, Task, Primitive의 정의 주체는 ManSim이 아니라 `Humanoid_Tasks`입니다. ManSim은 특정 factory scenario에서 이 정의가 어떻게 실행되고 관찰되는지를 기록합니다.
+ManSim에서 worker는 `HumanoidSim` 라이브러리의 정의를 import해서 사용하는 휴머노이드 로봇입니다. State, Task, Primitive의 정의 주체는 ManSim이 아니라 `HumanoidSim`입니다. ManSim은 특정 factory scenario에서 이 정의가 어떻게 실행되고 관찰되는지를 기록합니다.
 
 현재 ManSim에서 쓰는 Humanoid task subset:
 
@@ -86,10 +86,10 @@ Worker 이동은 tile map 위에서 이루어집니다. `TileGridMap.find_path()
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pip install -e ..\Humanoid_Tasks
+.\.venv\Scripts\python.exe -m pip install -e ..\HumanoidSim
 ```
 
-`Humanoid_Tasks`는 ManSim과 같은 `C:\Github` 아래에 있는 독립 라이브러리입니다. 패키지가 설치되어 있지 않으면 Humanoid hierarchy runtime은 시작 시 명확한 에러를 냅니다.
+`HumanoidSim`는 ManSim과 같은 `C:\Github` 아래에 있는 독립 라이브러리입니다. 패키지가 설치되어 있지 않으면 Humanoid hierarchy runtime은 시작 시 명확한 에러를 냅니다.
 
 1일 smoke run:
 
@@ -186,5 +186,5 @@ npm.cmd run build
 
 - 기본 config는 `decision=adaptive_priority`, `scenario.horizon.num_days=5`입니다.
 - `task_type`과 priority key는 decision layer 호환용 label입니다. 실제 실행과 분석 기준은 `task_code`, `step_id`, `primitive_call_code`, `humanoid_state`입니다.
-- State/Task/Primitive의 정의와 관계는 `Humanoid_Tasks`가 소유합니다. ManSim은 이를 import해서 실행하고 관찰합니다.
+- State/Task/Primitive의 정의와 관계는 `HumanoidSim`가 소유합니다. ManSim은 이를 import해서 실행하고 관찰합니다.
 - LLM Wiki와 knowledge graph는 optional manager knowledge layer이며 simulator state를 대체하지 않습니다.

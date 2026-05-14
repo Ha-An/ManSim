@@ -1,10 +1,10 @@
 # Humanoid Worker Model
 
-이 문서는 ManSim에서 worker를 `Humanoid_Tasks` 기반 휴머노이드 로봇으로 사용하는 방식을 정리합니다. State, Task, Primitive의 정의 주체는 `Humanoid_Tasks`입니다. ManSim은 이 정의를 import해서 factory scenario 안에서 실행하고, 그 결과를 event, KPI, Replay Studio로 관찰합니다.
+이 문서는 ManSim에서 worker를 `HumanoidSim` 기반 휴머노이드 로봇으로 사용하는 방식을 정리합니다. State, Task, Primitive의 정의 주체는 `HumanoidSim`입니다. ManSim은 이 정의를 import해서 factory scenario 안에서 실행하고, 그 결과를 event, KPI, Replay Studio로 관찰합니다.
 
 ## Ownership
 
-`Humanoid_Tasks`가 소유하는 것:
+`HumanoidSim`가 소유하는 것:
 
 - State schema
 - Task schema
@@ -22,7 +22,7 @@ ManSim이 소유하는 것:
 - primitive별 environment-specific duration
 - event log, KPI, Replay export
 
-즉 `REPLENISH_MATERIAL`이 어떤 primitive sequence를 갖는지는 `Humanoid_Tasks`의 task JSON에 있고, 그 primitive가 ManSim factory에서 어떤 queue와 item을 바꾸는지는 ManSim runtime에 있습니다.
+즉 `REPLENISH_MATERIAL`이 어떤 primitive sequence를 갖는지는 `HumanoidSim`의 task JSON에 있고, 그 primitive가 ManSim factory에서 어떤 queue와 item을 바꾸는지는 ManSim runtime에 있습니다.
 
 ## State Snapshot
 
@@ -138,7 +138,7 @@ Primitive는 state hint를 줄 수 있습니다.
 
 ## ManSim Task Subset
 
-ManSim은 `Humanoid_Tasks`의 82개 제조 task 중 현재 scenario에 맞는 subset만 실행합니다.
+ManSim은 `HumanoidSim`의 82개 제조 task 중 현재 scenario에 맞는 subset만 실행합니다.
 
 | Task Code | Level | Category | Template | ManSim 역할 |
 | --- | --- | --- | --- | --- |
@@ -172,7 +172,7 @@ Decision layer는 여전히 priority family 이름을 사용합니다. Humanoid 
 
 ## Task Primitive Sequences
 
-아래 sequence는 `Humanoid_Tasks/data/tasks/*.json`의 `steps`를 기준으로 합니다.
+아래 sequence는 `HumanoidSim/data/tasks/*.json`의 `steps`를 기준으로 합니다.
 
 ### `MANAGE_ROBOT_POWER`
 
@@ -368,7 +368,7 @@ VERIFY_PLACEMENT
 VERIFY_ROBOT_STATE
 ```
 
-위 목록 중 현재 ManSim에서 적용하는 9개 task의 primitive sequence에 실제로 들어가는 것은 30개입니다. `CREATE_OR_UPDATE_RECORD`는 ManSim runtime이 지원하지만 현재 적용 중인 9개 task에는 들어가지 않습니다. 다만 `Humanoid_Tasks` 전체 catalog에는 `RECORD_QUALITY_RESULT`, `REPORT_HAZARD`, `UPDATE_INVENTORY_RECORD`, work order/traceability 계열 task에서 사용됩니다. 즉 문서에만 있는 값은 아니고, 향후 해당 task를 ManSim에 연결할 때 바로 쓸 수 있도록 runtime 지원 목록에 포함되어 있습니다.
+위 목록 중 현재 ManSim에서 적용하는 9개 task의 primitive sequence에 실제로 들어가는 것은 30개입니다. `CREATE_OR_UPDATE_RECORD`는 ManSim runtime이 지원하지만 현재 적용 중인 9개 task에는 들어가지 않습니다. 다만 `HumanoidSim` 전체 catalog에는 `RECORD_QUALITY_RESULT`, `REPORT_HAZARD`, `UPDATE_INVENTORY_RECORD`, work order/traceability 계열 task에서 사용됩니다. 즉 문서에만 있는 값은 아니고, 향후 해당 task를 ManSim에 연결할 때 바로 쓸 수 있도록 runtime 지원 목록에 포함되어 있습니다.
 
 Domain side effect가 있는 핵심 primitive:
 
@@ -386,7 +386,7 @@ Domain side effect가 있는 핵심 primitive:
 
 ## Primitive Timing
 
-ManSim의 simulation clock 단위는 minute입니다. Primitive별 최소 duration은 [../configs/humanoids/default.yaml](../configs/humanoids/default.yaml)에 있습니다.
+ManSim의 simulation clock 단위는 minute입니다. Primitive별 최소 duration은 [../configs/humanoidsim/default.yaml](../configs/humanoidsim/default.yaml)에 있습니다.
 
 ```yaml
 primitive_timing:
@@ -399,7 +399,7 @@ primitive_timing:
 
 ## Humanoid Profiles
 
-기본 profile은 [../configs/humanoids/default.yaml](../configs/humanoids/default.yaml)에 정의되어 있습니다. `A1`, `A2`, `A3`는 같은 capability set을 갖습니다.
+기본 profile은 [../configs/humanoidsim/default.yaml](../configs/humanoidsim/default.yaml)에 정의되어 있습니다. `A1`, `A2`, `A3`는 같은 capability set을 갖습니다.
 
 주요 capability:
 
@@ -542,7 +542,7 @@ Worker/Humanoid KPI:
 - `humanoid_primitive_minutes`
 - `humanoid_task_taxonomy`
 
-Task grouping은 임의 grouping을 쓰지 않고 `Humanoid_Tasks` catalog 기준만 사용합니다.
+Task grouping은 임의 grouping을 쓰지 않고 `HumanoidSim` catalog 기준만 사용합니다.
 
 - `TaskSpec.level`
 - `metadata.catalog.category_id`

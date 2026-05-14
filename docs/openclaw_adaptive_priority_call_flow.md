@@ -98,7 +98,7 @@ Compiler는 LLM agent가 아니라 system stage입니다. Strategist intent, pre
 
 Worker는 shop-floor executor입니다.
 
-실제 물리 실행은 simulator core와 `Humanoid_Tasks` hierarchy runtime이 담당합니다. Manager/Compiler는 priority, role, safety floor 같은 실행 policy를 조정할 뿐 task primitive를 직접 실행하지 않습니다.
+실제 물리 실행은 simulator core와 `HumanoidSim` hierarchy runtime이 담당합니다. Manager/Compiler는 priority, role, safety floor 같은 실행 policy를 조정할 뿐 task primitive를 직접 실행하지 않습니다.
 
 선택 순서:
 

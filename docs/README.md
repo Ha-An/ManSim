@@ -6,8 +6,8 @@
 
 - 기본 simulation path: `adaptive_priority`
 - 기본 horizon: 5일
-- worker runtime: `Humanoid_Tasks`의 `TaskSpec -> StepCall -> Primitive` hierarchy
-- worker state: `Humanoid_Tasks`의 `HumanoidStateSnapshot`
+- worker runtime: `HumanoidSim`의 `TaskSpec -> StepCall -> Primitive` hierarchy
+- worker state: `HumanoidSim`의 `HumanoidStateSnapshot`
 - movement reservation: `movement.traffic.mode=strict_reservation`
 - primary objective: `completed products` 최대화
 - optional LLM manager path: `openclaw_adaptive_priority`

@@ -1401,7 +1401,7 @@ class ManufacturingWorld:
         )
 
     def _set_humanoid_primitive_hint(self, agent: Agent, primitive_call_code: str, *, reason: str = "primitive_hint") -> None:
-        """Update the Humanoid_Tasks state snapshot for domain-internal primitives."""
+        """Update the HumanoidSim state snapshot for domain-internal primitives."""
         runtime = getattr(self, "humanoid_runtime", None)
         if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "set_step_state"):
             task = self._current_task_stub(agent)

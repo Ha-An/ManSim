@@ -8,8 +8,8 @@ import unittest
 import simpy
 import yaml
 
-from humanoids import HumanoidProfile, load_task_catalog, validate_task_sequence
-from humanoids.task_schema import TaskInstance
+from humanoidsim import HumanoidProfile, load_task_catalog, validate_task_sequence
+from humanoidsim.task_schema import TaskInstance
 
 from manufacturing_sim.simulation.scenarios.manufacturing.humanoid_runtime import (
     HumanoidTaskRuntime,
@@ -79,7 +79,7 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.catalog = load_task_catalog()
-        cfg_path = Path(__file__).resolve().parents[1] / "configs" / "humanoids" / "default.yaml"
+        cfg_path = Path(__file__).resolve().parents[1] / "configs" / "humanoidsim" / "default.yaml"
         cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
         cls.profile = HumanoidProfile.from_dict(cfg["profiles"]["A1"])
 
@@ -134,7 +134,7 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
             agents={"A1": worker},
             battery_remaining=lambda _worker: 100.0,
         )
-        runtime = HumanoidTaskRuntime(world, {"humanoids": {"enabled": True}})
+        runtime = HumanoidTaskRuntime(world, {"humanoidsim": {"enabled": True}})
         task = Task(
             task_id="TASK-1",
             task_type="TRANSFER",
@@ -178,7 +178,7 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
             agents={"A1": worker},
             battery_remaining=lambda _worker: 100.0,
         )
-        runtime = HumanoidTaskRuntime(world, {"humanoids": {"enabled": True, "primitive_timing": {"unit": "min", "default_min": 0.1}}})
+        runtime = HumanoidTaskRuntime(world, {"humanoidsim": {"enabled": True, "primitive_timing": {"unit": "min", "default_min": 0.1}}})
         task = Task(
             task_id="TASK-1",
             task_type="REPLENISH_MATERIAL",

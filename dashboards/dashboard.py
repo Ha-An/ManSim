@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import html
 from pathlib import Path
@@ -115,7 +115,7 @@ def _humanoid_state_axis_defs() -> dict[str, dict[str, Any]]:
         "manipulation": {"name": "Manipulation State", "states": ["FREE", "REACHING", "HOLDING", "PLACING"]},
     }
     try:
-        from humanoids import load_state_schema
+        from humanoidsim import load_state_schema
 
         schema = load_state_schema()
         return {
@@ -356,7 +356,7 @@ def _worker_table(kpi: dict[str, Any]) -> str:
     )
     if not body:
         body = "<tr><td colspan='3'>No per-worker humanoid state data.</td></tr>"
-    return "<div class='panel'><h2>Humanoid Availability Ratios</h2><p class='muted'>Ratios are derived from Humanoid_Tasks Availability State only.</p><table><thead><tr><th>Worker</th><th>EXECUTING</th><th>DISABLED/OFFLINE</th></tr></thead><tbody>" + body + "</tbody></table></div>"
+    return "<div class='panel'><h2>Humanoid Availability Ratios</h2><p class='muted'>Ratios are derived from HumanoidSim Availability State only.</p><table><thead><tr><th>Worker</th><th>EXECUTING</th><th>DISABLED/OFFLINE</th></tr></thead><tbody>" + body + "</tbody></table></div>"
 
 
 def _traffic_table(kpi: dict[str, Any]) -> str:
@@ -582,7 +582,7 @@ def export_kpi_dashboard(
     worker_task_fig = go.Figure()
     worker_task_fig.add_trace(go.Bar(name="Task Minutes", x=task_types, y=task_values, text=[f"{value:.1f}m" for value in task_values], textposition="outside", marker_color="#90be6d"))
     _common_layout(worker_task_fig, y_title="Minutes", x_title="Humanoid task code")
-    _add_panel("worker_task_minutes", "Humanoid Task Minutes", worker_task_fig, "Completed task minutes by Humanoid_Tasks task code.")
+    _add_panel("worker_task_minutes", "Humanoid Task Minutes", worker_task_fig, "Completed task minutes by HumanoidSim task code.")
 
     worker_util_fig = go.Figure()
     worker_util_fig.add_trace(go.Bar(name="EXECUTING", x=worker_labels, y=worker_execution_values, text=[_format_ratio_percent(value) for value in worker_execution_values], textposition="outside", marker_color="#4361ee"))
@@ -591,13 +591,13 @@ def export_kpi_dashboard(
 
     task_level_fig = go.Figure()
     task_level_fig.add_trace(go.Bar(name="Task Level", x=list(task_by_level.keys()), y=[_safe_float(v) for v in task_by_level.values()], marker_color="#4d908e"))
-    _common_layout(task_level_fig, y_title="Minutes", x_title="Humanoid_Tasks level")
-    _add_panel("humanoid_task_level_minutes", "Humanoid Task Minutes by Level", task_level_fig, "Grouped only by Humanoid_Tasks TaskSpec.level.")
+    _common_layout(task_level_fig, y_title="Minutes", x_title="HumanoidSim level")
+    _add_panel("humanoid_task_level_minutes", "Humanoid Task Minutes by Level", task_level_fig, "Grouped only by HumanoidSim TaskSpec.level.")
 
     task_category_fig = go.Figure()
     task_category_fig.add_trace(go.Bar(name="Task Category", x=list(task_by_category.keys()), y=[_safe_float(v) for v in task_by_category.values()], marker_color="#f8961e"))
-    _common_layout(task_category_fig, y_title="Minutes", x_title="Humanoid_Tasks category", height=430)
-    _add_panel("humanoid_task_category_minutes", "Humanoid Task Minutes by Category", task_category_fig, "Grouped only by Humanoid_Tasks catalog category.")
+    _common_layout(task_category_fig, y_title="Minutes", x_title="HumanoidSim category", height=430)
+    _add_panel("humanoid_task_category_minutes", "Humanoid Task Minutes by Category", task_category_fig, "Grouped only by HumanoidSim catalog category.")
 
     primitive_fig = go.Figure()
     primitive_pairs = sorted(((str(key), _safe_float(value)) for key, value in primitive_minutes.items()), key=lambda item: item[1], reverse=True)
@@ -676,7 +676,7 @@ def export_kpi_dashboard(
             f"humanoid_state_{axis_id}",
             str(axis_def.get("name", axis_id)),
             state_fig,
-            "State order and grouping follow Humanoid_Tasks state_schema_core.json.",
+            "State order and grouping follow HumanoidSim state_schema_core.json.",
         )
 
     current_run = _find_run(manifest, current_run_id)
@@ -708,7 +708,7 @@ def export_kpi_dashboard(
     )
     worker_section = _group_section(
         "Worker Metrics",
-        "Humanoid_Tasks state axes, task taxonomy, primitive execution, and local response activity.",
+        "HumanoidSim state axes, task taxonomy, primitive execution, and local response activity.",
         _summary_cards(kpi, METRIC_GROUPS["worker"]),
         "<div class='grid cards-2'>"
         + panel_figures["worker_task_minutes"]

@@ -29,7 +29,7 @@ Simulator core가 담당하지 않는 것:
 - `manufacturing_sim/simulation/scenarios/manufacturing/world.py`
   - Factory world state, task enumeration, execution, KPI aggregation.
 - `manufacturing_sim/simulation/scenarios/manufacturing/humanoid_runtime.py`
-  - `Humanoid_Tasks` catalog/profile validation, TaskSpec step flattening, primitive execution bridge.
+  - `HumanoidSim` catalog/profile validation, TaskSpec step flattening, primitive execution bridge.
 - `manufacturing_sim/simulation/scenarios/manufacturing/grid_map.py`
   - Tile map, pathfinding, worker tile occupancy.
 - `manufacturing_sim/simulation/scenarios/manufacturing/traffic.py`
@@ -86,7 +86,7 @@ Warehouse material
 
 ### Worker
 
-Worker는 ManSim 내부 entity이지만 상태와 task 의미는 `Humanoid_Tasks`에서 가져온 정의를 사용합니다. `Worker.humanoid_state`는 `HumanoidStateSnapshot` dictionary이며, `availability`, `mobility`, `power`, `manipulation`, `task_context`, `reason`을 담습니다.
+Worker는 ManSim 내부 entity이지만 상태와 task 의미는 `HumanoidSim`에서 가져온 정의를 사용합니다. `Worker.humanoid_state`는 `HumanoidStateSnapshot` dictionary이며, `availability`, `mobility`, `power`, `manipulation`, `task_context`, `reason`을 담습니다.
 
 자세한 상태 축과 task 목록은 [humanoid_worker_model.md](humanoid_worker_model.md)를 보세요.
 
@@ -126,7 +126,7 @@ Item state도 Humanoid state와 별개입니다. Worker가 item을 들면 worker
 
 ## Task Runtime Boundary
 
-Simulator는 현재 factory state에서 실행 가능한 task 후보를 만듭니다. Decision mode는 후보 중 하나를 선택합니다. 선택된 task는 `HumanoidTaskRuntime`을 통해 `Humanoid_Tasks`의 task catalog와 worker profile validation을 거친 뒤 실행됩니다.
+Simulator는 현재 factory state에서 실행 가능한 task 후보를 만듭니다. Decision mode는 후보 중 하나를 선택합니다. 선택된 task는 `HumanoidTaskRuntime`을 통해 `HumanoidSim`의 task catalog와 worker profile validation을 거친 뒤 실행됩니다.
 
 `task_type`과 priority key는 기존 decision layer 호환용 label입니다. 실제 실행 단위는 `task_code`입니다.
 

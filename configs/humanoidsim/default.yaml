@@ -1,5 +1,5 @@
-# Humanoid_Tasks integration.
-# ManSim imports the installed `humanoids` package and executes selected
+# HumanoidSim integration.
+# ManSim imports the installed `humanoidsim` package and executes selected
 # manufacturing tasks through its TaskSpec -> StepCall hierarchy.
 enabled: true
 missing_package_policy: error

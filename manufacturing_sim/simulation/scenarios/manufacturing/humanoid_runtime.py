@@ -73,7 +73,7 @@ SUPPORTED_PRIMITIVE_CALLS: set[str] = {
 
 
 class HumanoidTaskRuntime:
-    """Bridge Humanoid_Tasks hierarchy into the ManSim discrete-event world.
+    """Bridge HumanoidSim hierarchy into the ManSim discrete-event world.
 
     The runner owns catalog/profile validation and emits task/step events. Domain
     side effects still live in the world helper that mutates queues, machines,
@@ -83,13 +83,13 @@ class HumanoidTaskRuntime:
     def __init__(self, world: Any, cfg: dict[str, Any]) -> None:
         self.world = world
         self.cfg = cfg if isinstance(cfg, dict) else {}
-        humanoid_cfg = self.cfg.get("humanoids", {}) if isinstance(self.cfg.get("humanoids", {}), dict) else {}
-        self.enabled = bool(humanoid_cfg.get("enabled", True))
-        self.validation_mode = str(humanoid_cfg.get("validation_mode", "filter")).strip().lower() or "filter"
+        humanoidsim_cfg = self.cfg.get("humanoidsim", {}) if isinstance(self.cfg.get("humanoidsim", {}), dict) else {}
+        self.enabled = bool(humanoidsim_cfg.get("enabled", True))
+        self.validation_mode = str(humanoidsim_cfg.get("validation_mode", "filter")).strip().lower() or "filter"
         self._imports: dict[str, Any] = {}
         self.catalog: Any | None = None
         self.profiles: dict[str, Any] = {}
-        timing_cfg = humanoid_cfg.get("primitive_timing", {}) if isinstance(humanoid_cfg.get("primitive_timing", {}), dict) else {}
+        timing_cfg = humanoidsim_cfg.get("primitive_timing", {}) if isinstance(humanoidsim_cfg.get("primitive_timing", {}), dict) else {}
         self.primitive_timing_unit = str(timing_cfg.get("unit", "min")).strip().lower() or "min"
         self.default_primitive_min_duration = self._duration_to_minutes(timing_cfg.get("default_min", 0.0))
         by_call_code = timing_cfg.get("by_call_code", {}) if isinstance(timing_cfg.get("by_call_code", {}), dict) else {}
@@ -99,7 +99,7 @@ class HumanoidTaskRuntime:
         }
         if not self.enabled:
             return
-        self._load_humanoids(humanoid_cfg)
+        self._load_humanoidsim(humanoidsim_cfg)
 
     @property
     def supported_call_codes(self) -> set[str]:
@@ -120,9 +120,9 @@ class HumanoidTaskRuntime:
             float(self.primitive_min_duration_by_call_code.get(str(call_code), self.default_primitive_min_duration) or 0.0),
         )
 
-    def _load_humanoids(self, humanoid_cfg: dict[str, Any]) -> None:
+    def _load_humanoidsim(self, humanoidsim_cfg: dict[str, Any]) -> None:
         try:
-            from humanoids import (
+            from humanoidsim import (
                 StateReason,
                 apply_primitive_state_hint,
                 build_state_snapshot_for_task_lifecycle,
@@ -134,18 +134,18 @@ class HumanoidTaskRuntime:
                 validate_task_sequence,
                 HumanoidProfile,
             )
-            from humanoids.task_schema import TaskInstance
+            from humanoidsim.task_schema import TaskInstance
         except ModuleNotFoundError as exc:
-            policy = str(humanoid_cfg.get("missing_package_policy", "error")).strip().lower()
+            policy = str(humanoidsim_cfg.get("missing_package_policy", "error")).strip().lower()
             if policy == "disable":
                 self.enabled = False
                 return
             raise RuntimeError(
-                "Humanoid_Tasks integration is enabled, but the `humanoids` package is not installed. "
-                "Install it with: .\\.venv\\Scripts\\python.exe -m pip install -e ..\\Humanoid_Tasks"
+                "HumanoidSim integration is enabled, but the `humanoidsim` package is not installed. "
+                "Install it with: .\\.venv\\Scripts\\python.exe -m pip install -e ..\\HumanoidSim"
             ) from exc
 
-        catalog_root = humanoid_cfg.get("catalog_root")
+        catalog_root = humanoidsim_cfg.get("catalog_root")
         self.catalog = load_task_catalog(catalog_root if catalog_root else None)
         self._imports = {
             "HumanoidProfile": HumanoidProfile,
@@ -159,7 +159,7 @@ class HumanoidTaskRuntime:
             "primitive_state_hint": primitive_state_hint,
             "validate_state_snapshot": validate_state_snapshot,
         }
-        profiles_cfg = humanoid_cfg.get("profiles", {}) if isinstance(humanoid_cfg.get("profiles", {}), dict) else {}
+        profiles_cfg = humanoidsim_cfg.get("profiles", {}) if isinstance(humanoidsim_cfg.get("profiles", {}), dict) else {}
         self.profiles = {
             str(agent_id): HumanoidProfile.from_dict({"humanoid_id": str(agent_id), **(profile if isinstance(profile, dict) else {})})
             for agent_id, profile in profiles_cfg.items()

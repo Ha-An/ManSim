@@ -1,4 +1,4 @@
-﻿# ManSim vNext root config (Hydra)
+# ManSim vNext root config (Hydra)
 # 기본 실행 조합을 정하는 루트 preset.
 # 개별 실행 시에는 `decision=...`, `scenario=...` 식으로 override할 수 있다.
 defaults:
@@ -11,7 +11,7 @@ defaults:
   # - openclaw_adaptive_priority: OpenClaw manager-only priority-driven LLM mode
   - decision: adaptive_priority
   - heuristic_rules: default
-  - humanoids: default
+  - humanoidsim: default
   - runtime: default
   - worker: default
   - _self_
