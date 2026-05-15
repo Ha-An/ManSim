@@ -1402,6 +1402,7 @@ class ManufacturingWorld:
 
     def _set_humanoid_primitive_hint(self, agent: Agent, primitive_call_code: str, *, reason: str = "primitive_hint") -> None:
         """Update the HumanoidSim state snapshot for domain-internal primitives."""
+        agent.current_primitive_call_code = str(primitive_call_code or "")
         runtime = getattr(self, "humanoid_runtime", None)
         if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "set_step_state"):
             task = self._current_task_stub(agent)
@@ -1410,16 +1411,20 @@ class ManufacturingWorld:
         return
 
     def _current_task_stub(self, worker: Worker) -> Task:
+        task_code = str(worker.current_child_task_code or worker.current_task_code or "")
+        task_instance_id = str(worker.current_child_task_instance_id or worker.current_task_instance_id or "")
+        task_name = str(worker.current_child_task_name or "")
         return Task(
-            task_id=str(worker.current_task_id or ""),
-            task_type=str(worker.current_task_type or ""),
+            task_id=str(worker.current_child_task_instance_id or worker.current_task_id or ""),
+            task_type=task_code or str(worker.current_task_type or ""),
             priority_key="",
             priority=0.0,
             location=str(worker.location),
             payload={},
-            task_code=str(worker.current_task_code or ""),
-            instance_id=str(worker.current_task_instance_id or ""),
+            task_code=task_code,
+            instance_id=task_instance_id,
             assigned_robot_id=worker.worker_id,
+            task_spec_name=task_name,
         )
 
     def _sync_humanoid_cargo_state(self, worker: Worker, *, destination: str = "") -> None:
@@ -3738,6 +3743,11 @@ class ManufacturingWorld:
         agent.current_task_type = task.task_type
         agent.current_task_code = task.task_code or ""
         agent.current_task_instance_id = task.instance_id or ""
+        agent.current_child_task_code = None
+        agent.current_child_task_name = None
+        agent.current_child_task_instance_id = None
+        agent.current_task_path = None
+        agent.current_task_depth = 0
         agent.current_task_started_at = start_t
         self._set_humanoid_axes(
             agent,
@@ -3903,6 +3913,11 @@ class ManufacturingWorld:
         agent.current_task_type = None
         agent.current_task_code = None
         agent.current_task_instance_id = None
+        agent.current_child_task_code = None
+        agent.current_child_task_name = None
+        agent.current_child_task_instance_id = None
+        agent.current_task_path = None
+        agent.current_task_depth = 0
         agent.current_step_id = None
         agent.current_primitive_call_code = None
         agent.current_task_started_at = None

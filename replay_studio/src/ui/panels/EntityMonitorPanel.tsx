@@ -167,6 +167,9 @@ function statusLabel(entity: BaseEntityState): string {
 }
 
 function workerTaskLabel(entity: BaseEntityState): string {
+  if (typeof entity.attributes.current_parent_task_code === "string" && entity.attributes.current_parent_task_code.trim()) {
+    return entity.attributes.current_parent_task_code.trim();
+  }
   const taskCode = humanoidTaskContext(entity).task_code;
   if (typeof taskCode === "string" && taskCode.trim()) return taskCode.trim();
   if (hasActiveHumanoidTask(entity) && typeof entity.attributes.task_label === "string" && entity.attributes.task_label.trim()) return entity.attributes.task_label;
@@ -175,11 +178,24 @@ function workerTaskLabel(entity: BaseEntityState): string {
 }
 
 function workerTaskCode(entity: BaseEntityState): string {
+  if (typeof entity.attributes.current_parent_task_code === "string" && entity.attributes.current_parent_task_code.trim()) {
+    return entity.attributes.current_parent_task_code.trim();
+  }
   const taskCode = humanoidTaskContext(entity).task_code;
   if (typeof taskCode === "string" && taskCode.trim()) return taskCode.trim();
   if (hasActiveHumanoidTask(entity) && typeof entity.attributes.current_task_code === "string" && entity.attributes.current_task_code.trim()) {
     return entity.attributes.current_task_code.trim();
   }
+  return "-";
+}
+
+function workerChildTask(entity: BaseEntityState): string {
+  const childName =
+    typeof entity.attributes.current_child_task_name === "string" ? entity.attributes.current_child_task_name.trim() : "";
+  const childCode =
+    typeof entity.attributes.current_child_task_code === "string" ? entity.attributes.current_child_task_code.trim() : "";
+  if (childName && childCode && childName !== childCode) return `${childName} / ${childCode}`;
+  if (childCode) return childCode;
   return "-";
 }
 
@@ -212,10 +228,21 @@ function workerMotionPath(entity: BaseEntityState, currentTime: number): string 
   return from && to ? "2 tiles" : "0 tiles";
 }
 
-function workerTrafficConflict(entity: BaseEntityState): string {
+function trafficConflictIsActive(conflict: Record<string, unknown>, currentTime: number): boolean {
+  const timeWindow = conflict.time_window;
+  if (!timeWindow || typeof timeWindow !== "object") return true;
+  const payload = timeWindow as Record<string, unknown>;
+  const startedAt = Number(payload.started_at);
+  const endedAt = Number(payload.ended_at);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt)) return true;
+  return currentTime >= startedAt && currentTime <= endedAt;
+}
+
+function workerTrafficConflict(entity: BaseEntityState, currentTime: number): string {
   const conflict = entity.attributes.last_traffic_conflict;
   if (!conflict || typeof conflict !== "object") return "-";
   const payload = conflict as Record<string, unknown>;
+  if (!trafficConflictIsActive(payload, currentTime)) return "-";
   const type = typeof payload.conflict_type === "string" ? payload.conflict_type : "TRAFFIC";
   const primary = typeof payload.primary_worker_id === "string" ? payload.primary_worker_id : "";
   let other = typeof payload.other_worker_id === "string" ? payload.other_worker_id : "";
@@ -360,7 +387,7 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
             const power = humanoidStateValue(worker, "power");
             const manipulation = humanoidStateValue(worker, "manipulation");
             const motionPath = workerMotionPath(worker, currentTime);
-            const trafficConflict = workerTrafficConflict(worker);
+            const trafficConflict = workerTrafficConflict(worker, currentTime);
             const sharedCarry = cargoSharedCarry(worker);
             return (
               <article className="worker-monitor-card" key={worker.entity_id}>
@@ -423,6 +450,10 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                   <div>
                     <span className="worker-monitor-key">Task / Code</span>
                     <span className="worker-monitor-value">{workerTaskLabel(worker)} / {workerTaskCode(worker)}</span>
+                  </div>
+                  <div>
+                    <span className="worker-monitor-key">Child Task</span>
+                    <span className="worker-monitor-value">{workerChildTask(worker)}</span>
                   </div>
                   <div>
                     <span className="worker-monitor-key">Primitive</span>

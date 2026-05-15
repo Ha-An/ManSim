@@ -37,6 +37,13 @@ DOMAIN_ACTION_CALLS: dict[str, set[str]] = {
 }
 
 
+NESTED_DOMAIN_ACTION_CHILD_CALLS: dict[str, set[str]] = {
+    "REPLENISH_MATERIAL": {"TRANSFER"},
+    "SETUP_MACHINE": {"LOAD_MACHINE"},
+    "PREVENTIVE_MAINTENANCE": {"INSPECT_MACHINE"},
+}
+
+
 SUPPORTED_PRIMITIVE_CALLS: set[str] = {
     "CHECK_CONTEXT",
     "CHECK_REQUEST",
@@ -133,6 +140,7 @@ class HumanoidTaskRuntime:
                 validate_state_snapshot,
                 validate_task_sequence,
                 HumanoidProfile,
+                expand_task_steps,
             )
             from humanoidsim.task_schema import TaskInstance
         except ModuleNotFoundError as exc:
@@ -158,6 +166,7 @@ class HumanoidTaskRuntime:
             "parse_humanoid_state_snapshot": parse_humanoid_state_snapshot,
             "primitive_state_hint": primitive_state_hint,
             "validate_state_snapshot": validate_state_snapshot,
+            "expand_task_steps": expand_task_steps,
         }
         profiles_cfg = humanoidsim_cfg.get("profiles", {}) if isinstance(humanoidsim_cfg.get("profiles", {}), dict) else {}
         self.profiles = {
@@ -436,7 +445,7 @@ class HumanoidTaskRuntime:
         task.assigned_robot_id = agent.agent_id
         task.args = dict(instance.args)
         task.task_spec_name = str(spec.name or task_code)
-        task.step_plan = self._step_plan(spec)
+        task.step_plan = self._step_plan(spec, task.args)
         task.humanoid = {
             "task_code": task_code,
             "task_name": task.task_spec_name,
@@ -543,16 +552,24 @@ class HumanoidTaskRuntime:
             }
         return dict(payload)
 
-    def _step_plan(self, spec: Any) -> list[dict[str, Any]]:
-        return [
-            {
-                "step_id": str(step.step_id),
-                "call_code": str(step.call_code),
-                "depends_on": [str(item) for item in getattr(step, "depends_on", [])],
-                "optional": bool(getattr(step, "optional", False)),
-            }
-            for step in getattr(spec, "steps", []) or []
-        ]
+    def _step_plan(self, spec: Any, args: dict[str, Any]) -> list[dict[str, Any]]:
+        expand = self._imports.get("expand_task_steps")
+        if expand is None:
+            return [
+                {
+                    "path": str(step.step_id),
+                    "depth": 1,
+                    "parent_task_code": str(getattr(spec, "code", "")),
+                    "step_id": str(step.step_id),
+                    "call_code": str(step.call_code),
+                    "call_level": "PRIMITIVE_SKILL",
+                    "args": dict(getattr(step, "args", {}) or {}),
+                    "depends_on": [str(item) for item in getattr(step, "depends_on", [])],
+                    "optional": bool(getattr(step, "optional", False)),
+                }
+                for step in getattr(spec, "steps", []) or []
+            ]
+        return [dict(row) for row in expand(str(spec.code), dict(args or {}), catalog=self.catalog)]
 
     def execute(self, agent: Worker, task: Task):
         if not self.enabled:
@@ -570,28 +587,66 @@ class HumanoidTaskRuntime:
         end_status = "failed"
         end_logged = False
         active_step: dict[str, Any] | None = None
+        active_children: list[tuple[str, Task]] = []
+        skipped_prefixes: set[str] = set()
         try:
             steps = list(task.step_plan or [])
             if not steps:
                 success = bool((yield from self.world._execute_task_domain_action(agent, task)))
                 executed_domain_action = True
             for step in steps:
+                path = str(step.get("path", step.get("step_id", "")) or "")
+                if self._path_is_skipped(path, skipped_prefixes):
+                    continue
+                while active_children and not self._path_is_descendant(path, active_children[-1][0]):
+                    _, child_task = active_children.pop()
+                    self._log_child_task_event("HUMANOID_TASK_END", agent, task, child_task, step, status="completed")
+
+                call_level = str(step.get("call_level", "PRIMITIVE_SKILL") or "PRIMITIVE_SKILL")
                 call_code = str(step.get("call_code", ""))
+                if call_level != "PRIMITIVE_SKILL":
+                    child_task = self._child_task_from_step(task, step)
+                    active_children.append((path, child_task))
+                    self._log_child_task_event("HUMANOID_TASK_START", agent, task, child_task, step, status="running")
+                    if self._is_nested_domain_action_step(task, step) and not executed_domain_action:
+                        active_step = step
+                        step_ok = bool((yield from self.world._execute_task_domain_action(agent, task)))
+                        executed_domain_action = True
+                        active_step = None
+                        _, finished_child = active_children.pop()
+                        self._log_child_task_event(
+                            "HUMANOID_TASK_END",
+                            agent,
+                            task,
+                            finished_child,
+                            step,
+                            status="completed" if step_ok else "failed",
+                        )
+                        skipped_prefixes.add(path)
+                        if not step_ok:
+                            success = False
+                            break
+                    continue
+
                 if call_code not in SUPPORTED_PRIMITIVE_CALLS:
                     self._log_step_event("HUMANOID_STEP_END", agent, task, step, status="failed", error=f"Unsupported primitive {call_code}")
                     return False
+                context_task = active_children[-1][1] if active_children else task
                 agent.current_step_id = str(step.get("step_id", ""))
                 agent.current_primitive_call_code = call_code
                 active_step = step
-                self._log_step_event("HUMANOID_STEP_START", agent, task, step, status="running")
-                step_ok = yield from self._execute_step(agent, task, step, executed_domain_action)
-                if self._is_domain_action_step(task, call_code):
+                self._log_step_event("HUMANOID_STEP_START", agent, context_task, step, status="running", parent_task=task)
+                step_ok = yield from self._execute_step(agent, task, step, executed_domain_action, allow_domain_action=not bool(active_children))
+                if not active_children and self._is_domain_action_step(task, call_code):
                     executed_domain_action = True
-                self._log_step_event("HUMANOID_STEP_END", agent, task, step, status="completed" if step_ok else "failed")
+                self._log_step_event("HUMANOID_STEP_END", agent, context_task, step, status="completed" if step_ok else "failed", parent_task=task)
                 active_step = None
                 if not step_ok:
                     success = False
                     break
+            while active_children:
+                _, child_task = active_children.pop()
+                self._log_child_task_event("HUMANOID_TASK_END", agent, task, child_task, {}, status="completed" if success else "failed")
             if success and not executed_domain_action:
                 success = bool((yield from self.world._execute_task_domain_action(agent, task)))
             end_status = "completed" if success else "failed"
@@ -611,16 +666,32 @@ class HumanoidTaskRuntime:
             end_logged = True
             raise
         finally:
+            while active_children:
+                _, child_task = active_children.pop()
+                self._log_child_task_event("HUMANOID_TASK_END", agent, task, child_task, {}, status="interrupted")
             agent.current_step_id = None
             agent.current_primitive_call_code = None
+            agent.current_child_task_code = None
+            agent.current_child_task_name = None
+            agent.current_child_task_instance_id = None
+            agent.current_task_path = None
+            agent.current_task_depth = 0
             if not end_logged and not agent.discharged:
                 self._log_task_event("HUMANOID_TASK_END", agent, task, status=end_status)
 
-    def _execute_step(self, agent: Worker, task: Task, step: dict[str, Any], executed_domain_action: bool):
+    def _execute_step(
+        self,
+        agent: Worker,
+        task: Task,
+        step: dict[str, Any],
+        executed_domain_action: bool,
+        *,
+        allow_domain_action: bool = True,
+    ):
         call_code = str(step.get("call_code", ""))
         start_t = float(self.world.env.now)
         result = True
-        if self._is_domain_action_step(task, call_code) and not executed_domain_action:
+        if allow_domain_action and self._is_domain_action_step(task, call_code) and not executed_domain_action:
             result = bool((yield from self.world._execute_task_domain_action(agent, task)))
         elif call_code in {"READ_MACHINE_STATE", "VERIFY_MACHINE_STATE"} and task.payload.get("machine_id"):
             result = str(task.payload.get("machine_id")) in self.world.machines
@@ -639,6 +710,9 @@ class HumanoidTaskRuntime:
     def _is_domain_action_step(self, task: Task, call_code: str) -> bool:
         return str(call_code) in DOMAIN_ACTION_CALLS.get(str(task.task_code), set())
 
+    def _is_nested_domain_action_step(self, task: Task, step: dict[str, Any]) -> bool:
+        return str(step.get("call_code", "")) in NESTED_DOMAIN_ACTION_CHILD_CALLS.get(str(task.task_code), set())
+
     def _log_task_event(self, event_type: str, agent: Worker, task: Task, *, status: str) -> None:
         self.set_task_lifecycle_state(agent, task, event_type=event_type, status=status)
         self.world.logger.log(
@@ -650,13 +724,28 @@ class HumanoidTaskRuntime:
             details=self._task_event_details(agent, task, status=status),
         )
 
-    def _log_step_event(self, event_type: str, agent: Worker, task: Task, step: dict[str, Any], *, status: str, error: str = "") -> None:
+    def _log_step_event(
+        self,
+        event_type: str,
+        agent: Worker,
+        task: Task,
+        step: dict[str, Any],
+        *,
+        status: str,
+        error: str = "",
+        parent_task: Task | None = None,
+    ) -> None:
         self.set_step_state(agent, task, step, event_type=event_type, status=status)
         details = self._task_event_details(agent, task, status=status)
         details.update(
             {
                 "step_id": str(step.get("step_id", "")),
                 "primitive_call_code": str(step.get("call_code", "")),
+                "call_level": str(step.get("call_level", "PRIMITIVE_SKILL")),
+                "task_path": str(step.get("path", "")),
+                "depth": int(step.get("depth", 0) or 0),
+                "parent_task_code": str((parent_task or task).task_code or ""),
+                "parent_instance_id": str((parent_task or task).instance_id or ""),
                 "depends_on": list(step.get("depends_on", [])),
                 "error": error,
             }
@@ -670,6 +759,56 @@ class HumanoidTaskRuntime:
             details=details,
         )
 
+    def _log_child_task_event(
+        self,
+        event_type: str,
+        agent: Worker,
+        parent_task: Task,
+        child_task: Task,
+        step: dict[str, Any],
+        *,
+        status: str,
+    ) -> None:
+        path = str(step.get("path", agent.current_task_path or "") or "")
+        depth = int(step.get("depth", agent.current_task_depth or 0) or 0)
+        if event_type == "HUMANOID_TASK_START":
+            agent.current_child_task_code = child_task.task_code
+            agent.current_child_task_name = child_task.task_spec_name
+            agent.current_child_task_instance_id = child_task.instance_id
+            agent.current_task_path = path
+            agent.current_task_depth = depth
+            self.set_task_lifecycle_state(agent, child_task, event_type=event_type, status=status)
+
+        details = self._task_event_details(agent, child_task, status=status)
+        details.update(
+            {
+                "parent_task_id": parent_task.task_id,
+                "parent_task_type": parent_task.task_type,
+                "parent_task_code": parent_task.task_code,
+                "parent_instance_id": parent_task.instance_id,
+                "child_task_code": child_task.task_code,
+                "child_task_name": child_task.task_spec_name,
+                "child_instance_id": child_task.instance_id,
+                "task_path": path,
+                "depth": depth,
+            }
+        )
+        self.world.logger.log(
+            t=self.world.env.now,
+            day=self.world.day_for_time(self.world.env.now),
+            event_type=event_type,
+            entity_id=agent.agent_id,
+            location=self.world.agent_display_location(agent),
+            details=details,
+        )
+        if event_type == "HUMANOID_TASK_END":
+            agent.current_child_task_code = None
+            agent.current_child_task_name = None
+            agent.current_child_task_instance_id = None
+            agent.current_task_path = None
+            agent.current_task_depth = 0
+            self.set_task_lifecycle_state(agent, parent_task, event_type="HUMANOID_TASK_START", status="running")
+
     def _task_event_details(self, agent: Worker, task: Task, *, status: str) -> dict[str, Any]:
         return {
             "task_id": task.task_id,
@@ -679,6 +818,11 @@ class HumanoidTaskRuntime:
             "task_name": task.task_spec_name,
             "instance_id": task.instance_id,
             "assigned_robot_id": task.assigned_robot_id,
+            "child_task_code": agent.current_child_task_code or "",
+            "child_task_name": agent.current_child_task_name or "",
+            "child_instance_id": agent.current_child_task_instance_id or "",
+            "task_path": agent.current_task_path or "",
+            "depth": int(agent.current_task_depth or 0),
             "status": status,
             "args": dict(task.args),
             "payload": dict(task.payload),
@@ -709,3 +853,42 @@ class HumanoidTaskRuntime:
         if isinstance(issue, dict):
             return dict(issue)
         return {"message": str(issue)}
+
+    def _child_task_from_step(self, parent_task: Task, step: dict[str, Any]) -> Task:
+        task_code = str(step.get("call_code", ""))
+        task_name = task_code
+        try:
+            if self.catalog is not None:
+                spec = self.catalog.get(task_code)
+                task_name = str(getattr(spec, "name", "") or task_code)
+        except KeyError:
+            pass
+        return Task(
+            task_id=f"{parent_task.task_id}:{step.get('step_id', task_code)}",
+            task_type=task_code,
+            priority_key=parent_task.priority_key,
+            priority=parent_task.priority,
+            location=parent_task.location,
+            payload=dict(parent_task.payload),
+            selection_meta=dict(parent_task.selection_meta),
+            task_code=task_code,
+            instance_id=f"{parent_task.instance_id}/{step.get('step_id', task_code)}:{task_code}",
+            assigned_robot_id=parent_task.assigned_robot_id,
+            args=dict(step.get("args", {}) if isinstance(step.get("args", {}), dict) else {}),
+            task_spec_name=task_name,
+            step_plan=[],
+            humanoid={
+                "parent_task_code": parent_task.task_code,
+                "parent_instance_id": parent_task.instance_id,
+                "task_path": str(step.get("path", "")),
+                "depth": int(step.get("depth", 0) or 0),
+            },
+        )
+
+    @staticmethod
+    def _path_is_descendant(path: str, parent_path: str) -> bool:
+        return bool(parent_path) and (path == parent_path or path.startswith(parent_path + "/"))
+
+    @classmethod
+    def _path_is_skipped(cls, path: str, skipped_prefixes: set[str]) -> bool:
+        return any(cls._path_is_descendant(path, prefix) for prefix in skipped_prefixes)

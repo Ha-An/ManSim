@@ -8,12 +8,20 @@ export function humanoidStateValue(entity: BaseEntityState, key: string): string
 }
 
 export function taskCode(entity: BaseEntityState): string {
+  const parent = entity.attributes.current_parent_task_code;
+  if (typeof parent === "string" && parent.trim()) return parent.trim().toUpperCase();
   const context = taskContext(entity);
   const value = context.task_code;
   if (typeof value === "string" && value.trim()) return value.trim().toUpperCase();
   if (humanoidStateValue(entity, "availability") === "AVAILABLE") return "";
   const direct = entity.attributes.current_task_code;
   return typeof direct === "string" ? direct.trim().toUpperCase() : "";
+}
+
+export function childTaskCode(entity: BaseEntityState): string {
+  const child = entity.attributes.current_child_task_code;
+  if (typeof child === "string" && child.trim()) return child.trim().toUpperCase();
+  return "";
 }
 
 export function primitiveCode(entity: BaseEntityState): string {

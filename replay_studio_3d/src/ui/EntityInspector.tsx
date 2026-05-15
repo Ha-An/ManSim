@@ -1,6 +1,6 @@
 import type { BaseEntityState } from "../replay-core/types/entity";
 import type { ManifestRun } from "../routes";
-import { cargoItemId, humanoidStateValue, primitiveCode, taskCode } from "../scene/entityVisuals";
+import { cargoItemId, childTaskCode, humanoidStateValue, primitiveCode, taskCode } from "../scene/entityVisuals";
 import { isMotionActive, motionPathPoints } from "../scene/coordinates";
 
 interface EntityInspectorProps {
@@ -20,10 +20,21 @@ function motionPathLabel(entity: BaseEntityState, currentTime: number): string {
   return `${Math.max(0, motionPathPoints(motion).length)} tiles`;
 }
 
-function trafficConflict(entity: BaseEntityState): string {
+function trafficConflictIsActive(conflict: Record<string, unknown>, currentTime: number): boolean {
+  const timeWindow = conflict.time_window;
+  if (!timeWindow || typeof timeWindow !== "object") return true;
+  const payload = timeWindow as Record<string, unknown>;
+  const startedAt = Number(payload.started_at);
+  const endedAt = Number(payload.ended_at);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt)) return true;
+  return currentTime >= startedAt && currentTime <= endedAt;
+}
+
+function trafficConflict(entity: BaseEntityState, currentTime: number): string {
   const conflict = entity.attributes.last_traffic_conflict;
   if (!conflict || typeof conflict !== "object") return "-";
   const payload = conflict as Record<string, unknown>;
+  if (!trafficConflictIsActive(payload, currentTime)) return "-";
   const type = valueOrDash(payload.conflict_type);
   const other = typeof payload.other_worker_id === "string" ? ` with ${payload.other_worker_id}` : "";
   return `${type}${other}`;
@@ -70,6 +81,8 @@ export function EntityInspector({ entity, currentTime, selectedRun }: EntityInsp
             <dd>{valueOrDash(humanoidStateValue(entity, "manipulation"))}</dd>
             <dt>Task / Code</dt>
             <dd>{valueOrDash(taskCode(entity))}</dd>
+            <dt>Child Task</dt>
+            <dd>{valueOrDash(childTaskCode(entity))}</dd>
             <dt>Primitive</dt>
             <dd>{valueOrDash(primitiveCode(entity))}</dd>
             <dt>Cargo</dt>
@@ -79,7 +92,7 @@ export function EntityInspector({ entity, currentTime, selectedRun }: EntityInsp
             <dt>Motion Path</dt>
             <dd>{motionPathLabel(entity, currentTime)}</dd>
             <dt>Traffic</dt>
-            <dd>{trafficConflict(entity)}</dd>
+            <dd>{trafficConflict(entity, currentTime)}</dd>
           </dl>
           <details className="raw-details">
             <summary>Raw attributes</summary>

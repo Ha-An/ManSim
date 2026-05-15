@@ -641,6 +641,20 @@ def convert_events(
             attrs["current_task_name"] = details.get("task_name")
         if "instance_id" in details and has_active_task_context:
             attrs["current_task_instance_id"] = details.get("instance_id")
+        if "parent_task_code" in details:
+            attrs["current_parent_task_code"] = details.get("parent_task_code")
+        if "parent_instance_id" in details:
+            attrs["current_parent_task_instance_id"] = details.get("parent_instance_id")
+        if "child_task_code" in details:
+            attrs["current_child_task_code"] = details.get("child_task_code")
+        if "child_task_name" in details:
+            attrs["current_child_task_name"] = details.get("child_task_name")
+        if "child_instance_id" in details:
+            attrs["current_child_task_instance_id"] = details.get("child_instance_id")
+        if "task_path" in details:
+            attrs["current_task_path"] = details.get("task_path")
+        if "depth" in details:
+            attrs["current_task_depth"] = details.get("depth")
         if "step_id" in details and has_active_task_context:
             attrs["current_step_id"] = details.get("step_id")
         if "primitive_call_code" in details and has_active_task_context:
@@ -725,8 +739,20 @@ def convert_events(
 
         if raw_type == "HUMANOID_TASK_END" and entity_id:
             attrs = canonical_worker_attributes(details, index, entity_id)
+            if details.get("parent_task_code"):
+                attrs.update(
+                    {
+                        "current_task_code": details.get("parent_task_code"),
+                        "current_task_instance_id": details.get("parent_instance_id"),
+                        "current_child_task_code": None,
+                        "current_child_task_name": None,
+                        "current_child_task_instance_id": None,
+                        "current_task_path": None,
+                        "current_task_depth": 0,
+                    }
+                )
             task_context = (attrs.get("humanoid_state") or {}).get("task_context") if isinstance(attrs.get("humanoid_state"), dict) else None
-            if not isinstance(task_context, dict) or not str(task_context.get("task_code") or "").strip():
+            if not details.get("parent_task_code") and (not isinstance(task_context, dict) or not str(task_context.get("task_code") or "").strip()):
                 attrs.update(
                     {
                         "active_task": None,

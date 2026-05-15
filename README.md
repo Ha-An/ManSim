@@ -8,7 +8,8 @@ ManSim은 제조 라인의 discrete-event simulation을 실행하고, 그 결과
 
 v0.4.3은 v0.4.2의 tile 기반 factory map과 Replay Studio 개편 위에 Humanoid runtime을 본격 통합한 버전입니다.
 
-- Worker/task 실행 엔진을 `HumanoidSim`의 `TaskSpec -> StepCall -> Primitive` hierarchy 기반으로 전환했습니다.
+- Worker/task 실행 엔진을 `HumanoidSim`의 `TaskSpec -> nested child Task -> Primitive` hierarchy 기반으로 전환했습니다.
+- `COMPOSITE_TASK`는 최소 하나 이상의 child task call을 포함하는 workflow로 해석합니다. 예를 들어 `REPLENISH_MATERIAL -> TRANSFER`, `SETUP_MACHINE -> LOAD_MACHINE` 구조가 이벤트와 Replay에 그대로 남습니다.
 - Worker 상태를 `HumanoidSim`의 `HumanoidStateSnapshot` 하나로 통일했습니다. State 축은 `availability`, `mobility`, `power`, `manipulation`입니다.
 - ManSim에서 사용하는 Humanoid task subset을 명확히 연결했습니다: `REPLENISH_MATERIAL`, `TRANSFER`, `MANAGE_ROBOT_POWER`, `SETUP_MACHINE`, `UNLOAD_MACHINE`, `INSPECT_PRODUCT`, `REPAIR_MACHINE`, `PREVENTIVE_MAINTENANCE`, `HANDOVER_ITEM`.
 - Primitive별 최소 duration을 설정해 Replay Studio에서 task 내부 primitive sequence가 사라지지 않도록 했습니다. 기본값은 `configs/humanoidsim/default.yaml`의 `primitive_timing.default_min: 0.1`분입니다.
@@ -19,7 +20,7 @@ v0.4.3은 v0.4.2의 tile 기반 factory map과 Replay Studio 개편 위에 Human
 - 이동 모델에 traffic layer를 추가했습니다. 기본값은 `strict_reservation`이며, 다음 tile 예약에 실패하면 worker가 대기하고 `TRAFFIC_WAIT`을 기록합니다.
 - `observe_conflicts` 모드에서는 동선 겹침, near miss, collision 가능 상황을 막지 않고 event/KPI/Replay overlay로 관찰할 수 있습니다.
 - Replay Studio는 worker 이동을 출발지와 목적지의 직선이 아니라 simulator가 기록한 tile path 기준으로 보간합니다.
-- Replay Studio worker panel은 `Availability`, `Mobility`, `Power`, `Manipulation`, `Task / Code`, `Primitive`, `Motion Path`, `Traffic`, carry item ID, shared carry 정보를 표시합니다.
+- Replay Studio worker panel은 `Availability`, `Mobility`, `Power`, `Manipulation`, `Task / Code`, `Child Task`, `Primitive`, `Motion Path`, `Traffic`, carry item ID, shared carry 정보를 표시합니다.
 - Replay Studio 표시 버그를 정리했습니다. 종료된 task의 stale label, 자기 자신과의 traffic 표시, 이동 중 부적절한 task 말풍선이 나오지 않도록 했습니다.
 - 독립 실험 앱인 `replay_studio_3d/`를 추가했습니다. 기존 2D Replay Studio와 직접 import 관계가 없어서 분리해서 삭제할 수 있습니다.
 - Humanoid 관련 문서를 [docs/humanoid_worker_model.md](docs/humanoid_worker_model.md)와 [docs/humanoid_movement_model.md](docs/humanoid_movement_model.md)로 분리했습니다.
@@ -185,6 +186,6 @@ npm.cmd run build
 ## Notes
 
 - 기본 config는 `decision=adaptive_priority`, `scenario.horizon.num_days=5`입니다.
-- `task_type`과 priority key는 decision layer 호환용 label입니다. 실제 실행과 분석 기준은 `task_code`, `step_id`, `primitive_call_code`, `humanoid_state`입니다.
+- `task_type`과 priority key는 decision layer 호환용 label입니다. 실제 실행과 분석 기준은 `task_code`, child task path, `step_id`, `primitive_call_code`, `humanoid_state`입니다.
 - State/Task/Primitive의 정의와 관계는 `HumanoidSim`가 소유합니다. ManSim은 이를 import해서 실행하고 관찰합니다.
 - LLM Wiki와 knowledge graph는 optional manager knowledge layer이며 simulator state를 대체하지 않습니다.

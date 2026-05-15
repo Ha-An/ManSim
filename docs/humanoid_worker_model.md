@@ -22,7 +22,7 @@ ManSim이 소유하는 것:
 - primitive별 environment-specific duration
 - event log, KPI, Replay export
 
-즉 `REPLENISH_MATERIAL`이 어떤 primitive sequence를 갖는지는 `HumanoidSim`의 task JSON에 있고, 그 primitive가 ManSim factory에서 어떤 queue와 item을 바꾸는지는 ManSim runtime에 있습니다.
+즉 `REPLENISH_MATERIAL`이 어떤 nested task sequence를 갖는지는 `HumanoidSim`의 task JSON에 있고, 그 child task와 primitive가 ManSim factory에서 어떤 queue와 item을 바꾸는지는 ManSim runtime에 있습니다.
 
 ## State Snapshot
 
@@ -170,9 +170,9 @@ Decision layer는 여전히 priority family 이름을 사용합니다. Humanoid 
 | `preventive_maintenance` | `PREVENTIVE_MAINTENANCE` |
 | `handover_item` | `HANDOVER_ITEM` |
 
-## Task Primitive Sequences
+## Task / Nested Sequences
 
-아래 sequence는 `HumanoidSim/data/tasks/*.json`의 `steps`를 기준으로 합니다.
+아래 sequence는 `HumanoidSim/data/tasks/*.json`의 `steps`를 기준으로 합니다. `[...]` 표기는 해당 step이 primitive가 아니라 child task call임을 뜻합니다.
 
 ### `MANAGE_ROBOT_POWER`
 
@@ -215,7 +215,7 @@ ManSim 적용:
 ```text
 CHECK_REQUEST
 -> PRIMITIVE_IDENTIFY_ITEM
--> EXECUTE_REPLENISHMENT_ACTION
+-> TRANSFER [ATOMIC_TASK]
 -> VERIFY_LEVEL_OR_QUANTITY
 -> UPDATE_RECORD
 ```
@@ -229,9 +229,8 @@ ManSim 적용:
 
 ```text
 CHECK_SAFETY_ZONE
--> NAVIGATE_TO
 -> READ_MACHINE_STATE
--> EXECUTE_MACHINE_ACTION
+-> LOAD_MACHINE [ATOMIC_TASK]
 -> VERIFY_MACHINE_STATE
 -> LOG_RESULT
 ```
@@ -282,10 +281,7 @@ ManSim 적용:
 
 ```text
 CHECK_SAFETY_ZONE
--> VERIFY_LOCKOUT_IF_REQUIRED
--> INSPECT_OR_DIAGNOSE
--> EXECUTE_MAINTENANCE_ACTION
--> VERIFY_MACHINE_STATE
+-> INSPECT_MACHINE [ATOMIC_TASK]
 -> LOG_RESULT
 ```
 
@@ -299,8 +295,7 @@ ManSim 적용:
 
 ```text
 CHECK_SAFETY_ZONE
--> VERIFY_LOCKOUT_IF_REQUIRED
--> INSPECT_OR_DIAGNOSE
+-> INSPECT_MACHINE [ATOMIC_TASK]
 -> EXECUTE_MAINTENANCE_ACTION
 -> VERIFY_MACHINE_STATE
 -> LOG_RESULT
@@ -368,20 +363,20 @@ VERIFY_PLACEMENT
 VERIFY_ROBOT_STATE
 ```
 
-위 목록 중 현재 ManSim에서 적용하는 9개 task의 primitive sequence에 실제로 들어가는 것은 30개입니다. `CREATE_OR_UPDATE_RECORD`는 ManSim runtime이 지원하지만 현재 적용 중인 9개 task에는 들어가지 않습니다. 다만 `HumanoidSim` 전체 catalog에는 `RECORD_QUALITY_RESULT`, `REPORT_HAZARD`, `UPDATE_INVENTORY_RECORD`, work order/traceability 계열 task에서 사용됩니다. 즉 문서에만 있는 값은 아니고, 향후 해당 task를 ManSim에 연결할 때 바로 쓸 수 있도록 runtime 지원 목록에 포함되어 있습니다.
+위 목록 중 현재 ManSim에서 적용하는 9개 task의 expanded primitive leaf에 실제로 들어가는 것은 29개입니다. `CREATE_OR_UPDATE_RECORD`는 ManSim runtime이 지원하지만 현재 적용 중인 9개 task에는 들어가지 않습니다. 다만 `HumanoidSim` 전체 catalog에는 `RECORD_QUALITY_RESULT`, `REPORT_HAZARD`, `UPDATE_INVENTORY_RECORD`, work order/traceability 계열 task에서 사용됩니다. 즉 문서에만 있는 값은 아니고, 향후 해당 task를 ManSim에 연결할 때 바로 쓸 수 있도록 runtime 지원 목록에 포함되어 있습니다.
 
-Domain side effect가 있는 핵심 primitive:
+Domain side effect가 있는 핵심 trigger:
 
-| Task | Domain action primitive |
+| Task | Domain action trigger |
 | --- | --- |
 | `TRANSFER` | `GRASP` |
-| `REPLENISH_MATERIAL` | `EXECUTE_REPLENISHMENT_ACTION` |
+| `REPLENISH_MATERIAL` | child task `TRANSFER` |
 | `MANAGE_ROBOT_POWER` | `EXECUTE_SYSTEM_ACTION` |
-| `SETUP_MACHINE` | `EXECUTE_MACHINE_ACTION` |
+| `SETUP_MACHINE` | child task `LOAD_MACHINE` |
 | `UNLOAD_MACHINE` | `EXECUTE_MACHINE_ACTION` |
 | `INSPECT_PRODUCT` | `EXECUTE_QUALITY_ACTION` |
 | `REPAIR_MACHINE` | `EXECUTE_MAINTENANCE_ACTION` |
-| `PREVENTIVE_MAINTENANCE` | `EXECUTE_MAINTENANCE_ACTION` |
+| `PREVENTIVE_MAINTENANCE` | child task `INSPECT_MACHINE` |
 | `HANDOVER_ITEM` | `EXECUTE_HUMAN_COLLABORATION_ACTION` |
 
 ## Primitive Timing
@@ -527,7 +522,7 @@ Replay Studio worker panel은 다음 값을 `humanoid_state`에서 읽습니다.
 - Carry item id
 - Shared carry
 
-Worker 말풍선과 progress bar는 이동 중에는 표시하지 않습니다. 정지 상태이고 실제 물리/domain primitive를 수행할 때만 task 기준 progress를 표시합니다.
+Worker panel은 parent task, active child task, primitive를 분리해 표시합니다. Worker 말풍선과 progress bar는 이동 중에는 표시하지 않습니다. 정지 상태이고 실제 물리/domain primitive를 수행할 때만 task 기준 progress를 표시합니다.
 
 ## KPI
 

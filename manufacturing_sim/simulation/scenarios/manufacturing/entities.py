@@ -96,6 +96,11 @@ class Worker:
     current_task_type: Optional[str] = None
     current_task_code: Optional[str] = None
     current_task_instance_id: Optional[str] = None
+    current_child_task_code: Optional[str] = None
+    current_child_task_name: Optional[str] = None
+    current_child_task_instance_id: Optional[str] = None
+    current_task_path: Optional[str] = None
+    current_task_depth: int = 0
     current_step_id: Optional[str] = None
     current_primitive_call_code: Optional[str] = None
     current_task_started_at: Optional[float] = None

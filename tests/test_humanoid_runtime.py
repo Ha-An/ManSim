@@ -8,7 +8,7 @@ import unittest
 import simpy
 import yaml
 
-from humanoidsim import HumanoidProfile, load_task_catalog, validate_task_sequence
+from humanoidsim import HumanoidProfile, expand_task_steps, load_task_catalog, validate_task_sequence
 from humanoidsim.task_schema import TaskInstance
 
 from manufacturing_sim.simulation.scenarios.manufacturing.humanoid_runtime import (
@@ -91,9 +91,39 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
     def test_selected_primitives_are_supported(self) -> None:
         for task_code in sorted(set(TASK_CODE_BY_PRIORITY_KEY.values())):
             with self.subTest(task_code=task_code):
-                spec = self.catalog.get(task_code)
-                missing = [step.call_code for step in spec.steps if step.call_code not in SUPPORTED_PRIMITIVE_CALLS]
+                rows = expand_task_steps(task_code, SELECTED_TASK_ARGS[task_code], catalog=self.catalog)
+                missing = [
+                    str(row.get("call_code"))
+                    for row in rows
+                    if row.get("call_level") == "PRIMITIVE_SKILL" and str(row.get("call_code")) not in SUPPORTED_PRIMITIVE_CALLS
+                ]
                 self.assertEqual([], missing)
+
+    def test_nested_step_plan_preserves_child_task_rows(self) -> None:
+        worker = Worker(worker_id="A1")
+        world = SimpleNamespace(
+            env=SimpleNamespace(now=0.0),
+            agents={"A1": worker},
+            battery_remaining=lambda _worker: 100.0,
+            _task_priority_key=lambda _task: "material_supply",
+            inventory_targets={"material": {"station1": 10}},
+        )
+        runtime = HumanoidTaskRuntime(world, {"humanoidsim": {"enabled": True}})
+        task = Task(
+            task_id="TASK-1",
+            task_type="REPLENISH_MATERIAL",
+            priority_key="material_supply",
+            priority=1.0,
+            location="Warehouse",
+            payload={"station": 1},
+        )
+        bound = runtime.bind_candidate(worker, task)
+        self.assertIsNotNone(bound)
+        assert bound is not None
+        transfer_rows = [row for row in bound.step_plan if row.get("call_code") == "TRANSFER"]
+        self.assertEqual(1, len(transfer_rows))
+        self.assertEqual("ATOMIC_TASK", transfer_rows[0].get("call_level"))
+        self.assertTrue(any(row.get("parent_task_code") == "TRANSFER" and row.get("call_code") == "GRASP" for row in bound.step_plan))
 
     def test_default_profile_validates_selected_task_subset(self) -> None:
         instances = [
@@ -169,6 +199,27 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         self.assertEqual(worker.humanoid_state["availability"], "DISABLED")
         self.assertEqual(worker.humanoid_state["power"], "DEPLETED")
         self.assertEqual(worker.humanoid_state["reason"]["code"], "battery_depleted")
+
+    def test_domain_internal_primitive_hint_updates_current_context(self) -> None:
+        worker = Worker(worker_id="A1")
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.env = SimpleNamespace(now=0.0)
+        world.agents = {"A1": worker}
+        world.battery_remaining = lambda _worker: 100.0
+        runtime = HumanoidTaskRuntime(world, {"humanoidsim": {"enabled": True}})
+        world.humanoid_runtime = runtime
+        worker.current_task_id = "TASK-1"
+        worker.current_task_type = "INSPECT_PRODUCT"
+        worker.current_task_code = "INSPECT_PRODUCT"
+        worker.current_task_instance_id = "TASK-1:INSPECT_PRODUCT"
+        worker.current_step_id = "s03_execute_quality_action"
+        worker.current_primitive_call_code = "EXECUTE_QUALITY_ACTION"
+
+        ManufacturingWorld._set_humanoid_primitive_hint(world, worker, "NAVIGATE_TO")
+
+        self.assertEqual(worker.current_primitive_call_code, "NAVIGATE_TO")
+        self.assertEqual(worker.humanoid_state["mobility"], "NAVIGATING")
+        self.assertEqual(worker.humanoid_state["task_context"]["primitive_call_code"], "NAVIGATE_TO")
 
     def test_non_domain_primitive_consumes_minimum_duration(self) -> None:
         env = simpy.Environment()
