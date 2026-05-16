@@ -9,6 +9,7 @@ import {
   createCoordinateMapper,
   footprintForEntity,
   isMotionActive,
+  motionDisplayPathPoints,
   motionPathPoints,
   samplePath,
   type CoordinateMapper,
@@ -111,6 +112,24 @@ function RegionPlates({ regions, mapper }: { regions: RenderRegion[]; mapper: Co
   );
 }
 
+function regionForTile(tile: { x: number; y: number }, regions: RenderRegion[], mapper: CoordinateMapper): RenderRegion | undefined {
+  return regions.find((region) => {
+    const startX = Math.floor(region.position.x / mapper.tileWidth);
+    const endX = Math.ceil((region.position.x + region.size.width) / mapper.tileWidth);
+    const startY = Math.floor(region.position.y / mapper.tileHeight);
+    const endY = Math.ceil((region.position.y + region.size.height) / mapper.tileHeight);
+    return tile.x >= startX && tile.x < endX && tile.y >= startY && tile.y < endY;
+  });
+}
+
+function wallColor(tile: { x: number; y: number }, regions: RenderRegion[], mapper: CoordinateMapper): string {
+  const region = regionForTile(tile, regions, mapper);
+  if (region?.region_id === "station_1_region") return "#175775";
+  if (region?.region_id === "station_2_region") return "#266753";
+  if (region?.region_id === "inspection_region") return "#815323";
+  return "#10223a";
+}
+
 function GridShell({ renderModel, mapper }: { renderModel: ReplayRenderModel; mapper: CoordinateMapper }) {
   const grid = renderModel.grid;
   return (
@@ -120,7 +139,7 @@ function GridShell({ renderModel, mapper }: { renderModel: ReplayRenderModel; ma
       <RegionPlates regions={renderModel.regions} mapper={mapper} />
       {(grid?.walls ?? []).map((tile, index) => {
         const center = mapper.tileCenterToWorld({ x: tile.x + 0.5, y: tile.y + 0.5 }, 0.7);
-        return <Block key={`wall:${index}`} position={[center.x, center.y, center.z]} size={[1, 1.4, 1]} color="#10223a" />;
+        return <Block key={`wall:${index}`} position={[center.x, center.y, center.z]} size={[1, 1.4, 1]} color={wallColor(tile, renderModel.regions, mapper)} />;
       })}
       {(grid?.doors ?? []).map((tile, index) => {
         const center = mapper.tileCenterToWorld({ x: tile.x + 0.5, y: tile.y + 0.5 }, 0.08);
@@ -254,18 +273,24 @@ function PlatformModel({
   const footprint = footprintForEntity(grid, entity.entity_id);
   const rect = footprint ? mapper.footprintToWorldRect(footprint) : { center: mapper.pointToWorld(node.position), width: 4, depth: 2 };
   const queueSize = Number(entity.attributes.queue_size ?? entity.attributes.item_count ?? 0);
+  const isMaterialSlot = entity.entity_type === "material_slot";
+  const isShelf = entity.entity_type === "shelf";
+  const occupied = Boolean(entity.attributes.occupied || entity.attributes.material_item_id);
   const baseColor = entity.entity_type === "charger" ? "#4fcf8b" : entity.entity_type === "buffer" ? "#75a7ff" : "#f4b642";
   return (
     <group position={[rect.center.x, 0, rect.center.z]} onClick={(event) => stopSelect(event, entity.entity_id, onSelect)}>
       <SelectionRing selected={selected} width={rect.width} depth={rect.depth} />
-      <Block position={[0, 0.18, 0]} size={[rect.width, 0.36, rect.depth]} color="#2c3f58" />
-      <Block position={[0, 0.42, 0]} size={[rect.width * 0.88, 0.1, rect.depth * 0.72]} color={baseColor} />
-      {Array.from({ length: Math.min(8, Math.max(0, queueSize)) }).map((_, index) => {
+      <Block position={[0, isMaterialSlot ? 0.04 : 0.18, 0]} size={[rect.width, isMaterialSlot ? 0.08 : 0.36, rect.depth]} color={isMaterialSlot ? "#30435c" : "#2c3f58"} />
+      {!isMaterialSlot && <Block position={[0, 0.42, 0]} size={[rect.width * 0.88, 0.1, rect.depth * 0.72]} color={isShelf ? "#52657d" : baseColor} />}
+      {isMaterialSlot && occupied && (
+        <Block position={[0, 0.32, 0]} size={[Math.max(0.24, rect.width * 0.78), 0.42, Math.max(0.24, rect.depth * 0.78)]} color={itemColor("material")} />
+      )}
+      {!isMaterialSlot && Array.from({ length: Math.min(8, Math.max(0, queueSize)) }).map((_, index) => {
         const x = -rect.width * 0.36 + (index % 4) * 0.55;
         const z = -rect.depth * 0.18 + Math.floor(index / 4) * 0.55;
         return <Block key={index} position={[x, 0.75, z]} size={[0.36, 0.36, 0.36]} color={itemColor(String(entity.attributes.item_type ?? entity.entity_type))} />;
       })}
-      <Label text={entity.label || entity.entity_id} position={{ x: 0, y: 1.05, z: 0 }} />
+      {!isMaterialSlot && !isShelf && <Label text={entity.label || entity.entity_id} position={{ x: 0, y: 1.05, z: 0 }} />}
     </group>
   );
 }
@@ -319,7 +344,14 @@ function EntityModels({
         if (node.entity.entity_type === "machine" || node.entity.entity_type === "workstation") {
           return <MachineModel key={node.entity.entity_id} node={node} grid={grid} mapper={mapper} currentTime={currentTime} selected={selected} onSelect={onSelectEntity} />;
         }
-        if (node.entity.entity_type === "queue" || node.entity.entity_type === "buffer" || node.entity.entity_type === "storage" || node.entity.entity_type === "charger") {
+        if (
+          node.entity.entity_type === "queue" ||
+          node.entity.entity_type === "buffer" ||
+          node.entity.entity_type === "storage" ||
+          node.entity.entity_type === "charger" ||
+          node.entity.entity_type === "shelf" ||
+          node.entity.entity_type === "material_slot"
+        ) {
           return <PlatformModel key={node.entity.entity_id} node={node} grid={grid} mapper={mapper} selected={selected} onSelect={onSelectEntity} />;
         }
         return <ItemModel key={node.entity.entity_id} node={node} mapper={mapper} selected={selected} onSelect={onSelectEntity} />;
@@ -334,7 +366,7 @@ function MotionPathOverlay({ renderModel, mapper, currentTime }: { renderModel: 
       {renderModel.nodes.map((node) => {
         const motion = node.entity.attributes.motion;
         if (!isMotionActive(motion, currentTime)) return null;
-        const points = motionPathPoints(motion);
+        const points = motionDisplayPathPoints(motion);
         if (points.length < 2) return null;
         const worldPoints = points.map((point) => {
           const world = mapper.pointToWorld(point, 0.16);

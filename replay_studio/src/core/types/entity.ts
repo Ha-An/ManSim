@@ -15,6 +15,8 @@ export type EntityType =
   | "charger"
   | "maintenance_station"
   | "storage"
+  | "shelf"
+  | "material_slot"
   | "buffer";
 
 export type EntityStatus =

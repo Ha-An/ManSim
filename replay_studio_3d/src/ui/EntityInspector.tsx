@@ -1,12 +1,15 @@
 import type { BaseEntityState } from "../replay-core/types/entity";
+import type { LayoutGridConfig } from "../replay-core/types/layout";
 import type { ManifestRun } from "../routes";
 import { cargoItemId, childTaskCode, humanoidStateValue, primitiveCode, taskCode } from "../scene/entityVisuals";
-import { isMotionActive, motionPathPoints } from "../scene/coordinates";
+import { DEFAULT_GRID, DEFAULT_VIEWPORT, isMotionActive, motionDisplayPathPoints, motionPathPoints, samplePath } from "../scene/coordinates";
 
 interface EntityInspectorProps {
   entity?: BaseEntityState;
   currentTime: number;
   selectedRun?: ManifestRun;
+  grid?: LayoutGridConfig;
+  viewport?: { width: number; height: number };
 }
 
 function valueOrDash(value: unknown): string {
@@ -14,10 +17,48 @@ function valueOrDash(value: unknown): string {
   return String(value);
 }
 
-function motionPathLabel(entity: BaseEntityState, currentTime: number): string {
+function pointToTile(
+  point: { x: number; y: number } | undefined,
+  grid: LayoutGridConfig | undefined,
+  viewport: { width: number; height: number } | undefined,
+): { x: number; y: number } | undefined {
+  if (!point) return undefined;
+  const gridWidth = grid?.width_tiles ?? DEFAULT_GRID.width_tiles;
+  const gridHeight = grid?.height_tiles ?? DEFAULT_GRID.height_tiles;
+  const view = viewport ?? DEFAULT_VIEWPORT;
+  if (gridWidth <= 0 || gridHeight <= 0 || view.width <= 0 || view.height <= 0) return undefined;
+  const tileWidth = view.width / gridWidth;
+  const tileHeight = view.height / gridHeight;
+  return {
+    x: Math.min(gridWidth - 1, Math.max(0, Math.round(point.x / tileWidth - 0.5))),
+    y: Math.min(gridHeight - 1, Math.max(0, Math.round(point.y / tileHeight - 0.5))),
+  };
+}
+
+function formatTileCoord(point: { x: number; y: number } | undefined): string {
+  return point ? `(${point.x}, ${point.y})` : "(-, -)";
+}
+
+function currentMotionPoint(entity: BaseEntityState, currentTime: number): { x: number; y: number } | undefined {
   const motion = entity.attributes.motion;
-  if (!isMotionActive(motion, currentTime)) return "0 tiles";
-  return `${Math.max(0, motionPathPoints(motion).length)} tiles`;
+  if (!isMotionActive(motion, currentTime)) return entity.position;
+  const payload = motion as Record<string, unknown>;
+  const startedAt = Number(payload.started_at);
+  const endedAt = Number(payload.ended_at);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt) || endedAt <= startedAt) return entity.position;
+  return samplePath(motionPathPoints(motion), (currentTime - startedAt) / (endedAt - startedAt))?.point ?? entity.position;
+}
+
+function motionPathLabel(
+  entity: BaseEntityState,
+  currentTime: number,
+  grid: LayoutGridConfig | undefined,
+  viewport: { width: number; height: number } | undefined,
+): string {
+  const coord = formatTileCoord(pointToTile(currentMotionPoint(entity, currentTime), grid, viewport));
+  const motion = entity.attributes.motion;
+  if (!isMotionActive(motion, currentTime)) return `0 tiles ${coord}`;
+  return `${Math.max(0, motionDisplayPathPoints(motion).length)} tiles ${coord}`;
 }
 
 function trafficConflictIsActive(conflict: Record<string, unknown>, currentTime: number): boolean {
@@ -55,7 +96,7 @@ function prettyJson(value: unknown): string {
   return JSON.stringify(value ?? {}, null, 2);
 }
 
-export function EntityInspector({ entity, currentTime, selectedRun }: EntityInspectorProps) {
+export function EntityInspector({ entity, currentTime, selectedRun, grid, viewport }: EntityInspectorProps) {
   return (
     <aside className="inspector-panel">
       <div className="panel-title">Inspector</div>
@@ -75,11 +116,9 @@ export function EntityInspector({ entity, currentTime, selectedRun }: EntityInsp
             <dd>{valueOrDash(humanoidStateValue(entity, "availability"))}</dd>
             <dt>Mobility</dt>
             <dd>{valueOrDash(humanoidStateValue(entity, "mobility"))}</dd>
-            <dt>Power</dt>
-            <dd>{valueOrDash(humanoidStateValue(entity, "power"))}</dd>
             <dt>Manipulation</dt>
             <dd>{valueOrDash(humanoidStateValue(entity, "manipulation"))}</dd>
-            <dt>Task / Code</dt>
+            <dt>Task</dt>
             <dd>{valueOrDash(taskCode(entity))}</dd>
             <dt>Child Task</dt>
             <dd>{valueOrDash(childTaskCode(entity))}</dd>
@@ -90,7 +129,7 @@ export function EntityInspector({ entity, currentTime, selectedRun }: EntityInsp
             <dt>Shared Carry</dt>
             <dd>{sharedCarry(entity)}</dd>
             <dt>Motion Path</dt>
-            <dd>{motionPathLabel(entity, currentTime)}</dd>
+            <dd>{motionPathLabel(entity, currentTime, grid, viewport)}</dd>
             <dt>Traffic</dt>
             <dd>{trafficConflict(entity, currentTime)}</dd>
           </dl>

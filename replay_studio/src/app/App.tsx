@@ -563,6 +563,8 @@ export default function App() {
             items={itemEntities}
             regions={renderModel.regions}
             currentTime={currentFrame.time}
+            grid={log?.layout?.grid}
+            viewport={log?.layout?.viewport ?? { width: 1200, height: 760 }}
           />
         </aside>
       </main>

@@ -12,6 +12,7 @@
 - queue, machine, inspection, battery, repair side effect
 - tile 기반 pathfinding과 worker occupancy 관리
 - tile/edge traffic conflict observation
+- warehouse material shelf, completed product zone, scrap disposal flow
 - event logging과 KPI source 생성
 
 ## 주요 모듈
@@ -35,6 +36,14 @@ Worker는 `HumanoidSim`의 `HumanoidStateSnapshot`과 `TaskSpec -> StepCall -> P
 - Primitive step 중 domain action은 ManSim queue/machine/inspection/battery side effect를 호출합니다.
 - Setup, unload, inspection은 queue와 machine/table/output buffer 사이의 carry 이동을 실제 tile path로 수행합니다.
 - 비도메인 primitive는 `configs/humanoidsim/default.yaml`의 `primitive_timing.default_min`만큼 최소 시간을 소비합니다.
+
+## 현재 제조 Flow 확장
+
+- Warehouse material은 `warehouse_material_shelf`의 개별 slot에 보관됩니다.
+- Worker는 material slot의 service tile까지 이동해야 material을 pickup할 수 있습니다.
+- Inspection pass product는 output queue를 거쳐 `CompletedProducts` zone의 `completed_product_buffer`까지 운반되어야 최종 count에 반영됩니다.
+- Inspection fail product는 `inspection_scrap_queue`에 쌓인 뒤 `COLLECT_WASTE_OR_SCRAP` task로 `scrap_disposal_bin`까지 batch 운반됩니다.
+- Product 운반은 weight multiplier가 적용되며, `HANDOVER_ITEM`을 통해 최대 2명의 worker가 공동 운반할 수 있습니다.
 
 ## 경계
 

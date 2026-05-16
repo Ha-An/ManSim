@@ -65,11 +65,19 @@ class TileGridMap:
         "station_2_region": "Station2",
         "inspection_region": "Inspection",
         "battery_station_region": "BatteryStation",
+        "completed_products_region": "CompletedProducts",
+        "scrap_disposal_region": "ScrapDisposal",
         "output_buffer_station_1": "station_1_output_queue",
         "output_buffer_station_2": "station_2_output_queue",
         "output_buffer_station_4": "inspection_output_queue",
         "product_queue_4": "intermediate_queue_4",
-        "warehouse_buffer": "warehouse_buffer",
+        "warehouse_buffer": "completed_product_buffer",
+        "completed_product_buffer": "completed_product_buffer",
+        "completed_products": "CompletedProducts",
+        "scrap_disposal": "ScrapDisposal",
+        "scrap_disposal_bin": "scrap_disposal_bin",
+        "inspection_scrap_queue": "inspection_scrap_queue",
+        "warehouse_material_shelf": "warehouse_material_shelf",
         "battery_rack": "battery_rack",
         "inspection_table": "inspection_table",
         "inspection_desk": "inspection_table",
@@ -82,6 +90,8 @@ class TileGridMap:
         "Station2": "station_2_region",
         "Inspection": "inspection_region",
         "BatteryStation": "battery_station_region",
+        "CompletedProducts": "completed_products_region",
+        "ScrapDisposal": "scrap_disposal_region",
     }
 
     REGION_LABEL = {
@@ -90,6 +100,8 @@ class TileGridMap:
         "Station2": "Station 2",
         "Inspection": "Inspection",
         "BatteryStation": "Battery Station",
+        "CompletedProducts": "Completed Products",
+        "ScrapDisposal": "Scrap Disposal",
     }
 
     REGION_KIND = {
@@ -98,6 +110,8 @@ class TileGridMap:
         "Station2": "station",
         "Inspection": "inspection",
         "BatteryStation": "battery",
+        "CompletedProducts": "completed_products",
+        "ScrapDisposal": "scrap_disposal",
     }
 
     REGION_ACCENT = {
@@ -106,6 +120,8 @@ class TileGridMap:
         "Station2": "#8fb6ff",
         "Inspection": "#adc0eb",
         "BatteryStation": "#96c3f7",
+        "CompletedProducts": "#9ad6b2",
+        "ScrapDisposal": "#f0a7a7",
     }
 
     def __init__(
@@ -161,7 +177,15 @@ class TileGridMap:
         zones = cls._default_zones(width, height)
         doors = cls._default_doors(zones)
         walls = cls._perimeter_walls(zones, doors)
-        objects = cls._default_objects(zones, stations=stations, machines_per_station=machines_per_station)
+        warehouse_cfg = cfg.get("warehouse", {}) if isinstance(cfg.get("warehouse", {}), dict) else {}
+        shelf_cfg = warehouse_cfg.get("material_shelf", {}) if isinstance(warehouse_cfg.get("material_shelf", {}), dict) else {}
+        material_shelf_capacity = max(0, int(shelf_cfg.get("capacity", 10) or 10))
+        objects = cls._default_objects(
+            zones,
+            stations=stations,
+            machines_per_station=machines_per_station,
+            material_shelf_capacity=material_shelf_capacity,
+        )
         service_tiles = cls._build_object_service_tiles(width, height, walls, objects)
         zone_service_tiles = cls._build_zone_service_tiles(width, height, zones, walls, objects)
         return cls(
@@ -187,6 +211,8 @@ class TileGridMap:
             "Station2": ZoneRect("Station2", max(1, width // 2 - 13), 24, 26, 22),
             "Inspection": ZoneRect("Inspection", max(1, width - 30), 24, 26, 22),
             "BatteryStation": ZoneRect("BatteryStation", max(1, width // 2 - 13), max(1, height - 16), 26, 10),
+            "CompletedProducts": ZoneRect("CompletedProducts", max(1, width - 30), 4, 26, 12),
+            "ScrapDisposal": ZoneRect("ScrapDisposal", max(1, width - 30), max(1, height - 16), 26, 10),
         }
 
     @staticmethod
@@ -206,6 +232,8 @@ class TileGridMap:
         station2 = zones["Station2"]
         inspection = zones["Inspection"]
         battery = zones["BatteryStation"]
+        completed = zones["CompletedProducts"]
+        scrap = zones["ScrapDisposal"]
         add_horizontal(warehouse, warehouse.y1)
         add_horizontal(station1, station1.y)
         add_vertical(station1, station1.x1)
@@ -214,8 +242,13 @@ class TileGridMap:
         add_vertical(station2, station2.x1)
         add_horizontal(station2, station2.y1)
         add_horizontal(inspection, inspection.y)
+        add_horizontal(inspection, inspection.y1)
         add_vertical(inspection, inspection.x)
         add_horizontal(battery, battery.y)
+        add_horizontal(completed, completed.y1)
+        add_vertical(completed, completed.x)
+        add_horizontal(scrap, scrap.y)
+        add_vertical(scrap, scrap.x)
         return doors
 
     @staticmethod
@@ -237,6 +270,7 @@ class TileGridMap:
         *,
         stations: Iterable[int],
         machines_per_station: int,
+        material_shelf_capacity: int = 10,
     ) -> dict[str, ObjectFootprint]:
         objects: dict[str, ObjectFootprint] = {}
 
@@ -266,7 +300,20 @@ class TileGridMap:
         queue_width, queue_height = cls.QUEUE_FOOTPRINT
         machine_width, machine_height = cls.MACHINE_FOOTPRINT
 
-        add("warehouse_buffer", "buffer", "Warehouse", 15, 5, queue_width, queue_height)
+        shelf_capacity = max(0, int(material_shelf_capacity or 0))
+        slots_per_row = max(1, min(10, shelf_capacity or 1))
+        shelf_rows = max(1, (shelf_capacity + slots_per_row - 1) // slots_per_row)
+        shelf_width = max(4, min(22, slots_per_row * 2))
+        shelf_height = max(2, min(8, shelf_rows * 2))
+        add("warehouse_material_shelf", "shelf", "Warehouse", 2, 3, shelf_width, shelf_height)
+        for index in range(1, shelf_capacity + 1):
+            row = (index - 1) // slots_per_row
+            col = (index - 1) % slots_per_row
+            rel_x = 2 + min(shelf_width - 1, col * 2)
+            rel_y = 3 + min(shelf_height - 1, row * 2 + 1)
+            add(f"warehouse_material_slot_{index:02d}", "material_slot", "Warehouse", rel_x, rel_y, 1, 1, blocking=False)
+        add("completed_product_buffer", "buffer", "CompletedProducts", 9, 5, queue_width, queue_height)
+        add("scrap_disposal_bin", "scrap_bin", "ScrapDisposal", 9, 4, queue_width, queue_height)
         add("battery_rack", "charger", "BatteryStation", 4, 3, 5, 3)
         for station in sorted(int(s) for s in stations):
             if station == 1:
@@ -286,8 +333,9 @@ class TileGridMap:
                 rel_x = 4 if idx == 1 else 16
                 add(f"S{station}M{idx}", "machine", zone_name, rel_x, 14, machine_width, machine_height)
         add("intermediate_queue_4", "queue", "Inspection", 3, 6, queue_width, queue_height)
-        add("inspection_output_queue", "buffer", "Inspection", 15, 6, queue_width, queue_height)
-        add("inspection_table", "inspection_table", "Inspection", 10, 12, 6, 4, blocking=False)
+        add("inspection_output_queue", "buffer", "Inspection", 15, 4, queue_width, queue_height)
+        add("inspection_scrap_queue", "scrap_queue", "Inspection", 15, 8, queue_width, queue_height)
+        add("inspection_table", "inspection_table", "Inspection", 10, 14, 6, 4, blocking=False)
         return objects
 
     @classmethod
@@ -305,6 +353,14 @@ class TileGridMap:
             if obj.object_type == "inspection_table":
                 center = obj.center()
                 out[obj.object_id] = [center] if 0 <= center[0] < width and 0 <= center[1] < height and center not in walls else []
+                continue
+            if obj.object_type == "material_slot":
+                south = (obj.x, obj.y + obj.height)
+                out[obj.object_id] = (
+                    [south]
+                    if 0 <= south[0] < width and 0 <= south[1] < height and south not in blocked
+                    else []
+                )
                 continue
             candidates: set[Tile] = set()
             for x in range(obj.x, obj.x + obj.width):
@@ -632,6 +688,10 @@ class TileGridMap:
             "buffer": "buffer",
             "machine": "machine",
             "charger": "charger",
+            "shelf": "shelf",
+            "material_slot": "material_slot",
+            "scrap_queue": "queue",
+            "scrap_bin": "buffer",
         }
         for obj in self.objects.values():
             nodes.append(

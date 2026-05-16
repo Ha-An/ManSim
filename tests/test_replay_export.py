@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+import unittest
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "replay_studio" / "examples"))
+from replay_studio.examples.export_mansim_run import (
+    build_humanoid_task_window_index,
+    humanoid_task_window,
+)
+
+
+class ReplayExportTests(unittest.TestCase):
+    def test_child_task_end_restores_parent_task_window(self) -> None:
+        raw_events = [
+            {
+                "t": 10.0,
+                "type": "HUMANOID_TASK_START",
+                "entity_id": "A1",
+                "details": {"task_id": "PARENT-1", "instance_id": "PARENT-1:REPAIR_MACHINE", "task_code": "REPAIR_MACHINE"},
+            },
+            {
+                "t": 11.0,
+                "type": "HUMANOID_TASK_START",
+                "entity_id": "A1",
+                "details": {"task_id": "PARENT-1:s02", "instance_id": "PARENT-1:s02", "task_code": "INSPECT_MACHINE"},
+            },
+            {
+                "t": 12.0,
+                "type": "HUMANOID_TASK_END",
+                "entity_id": "A1",
+                "details": {"task_id": "PARENT-1:s02", "instance_id": "PARENT-1:s02", "task_code": "INSPECT_MACHINE"},
+            },
+            {
+                "t": 20.0,
+                "type": "HUMANOID_TASK_END",
+                "entity_id": "A1",
+                "details": {"task_id": "PARENT-1", "instance_id": "PARENT-1:REPAIR_MACHINE", "task_code": "REPAIR_MACHINE"},
+            },
+        ]
+        index = build_humanoid_task_window_index(raw_events)
+
+        window = humanoid_task_window(
+            index,
+            "A1",
+            12.0,
+            {"task_id": "PARENT-1", "instance_id": "PARENT-1:REPAIR_MACHINE", "task_code": "REPAIR_MACHINE"},
+        )
+
+        self.assertEqual(10.0, window["started_at"])
+        self.assertEqual(20.0, window["ended_at"])
+        self.assertEqual("REPAIR_MACHINE", window["task_code"])
+
+
+if __name__ == "__main__":
+    unittest.main()

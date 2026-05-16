@@ -90,9 +90,25 @@ function drawTileGridOverlays(
     };
   };
 
+  const regionForTile = (tile: { x: number; y: number }) => {
+    return renderModel.regions.find((region) => {
+      const startX = Math.floor(region.position.x / tileWidth);
+      const endX = Math.ceil((region.position.x + region.size.width) / tileWidth);
+      const startY = Math.floor(region.position.y / tileHeight);
+      const endY = Math.ceil((region.position.y + region.size.height) / tileHeight);
+      return tile.x >= startX && tile.x < endX && tile.y >= startY && tile.y < endY;
+    });
+  };
+
+  const wallPalette = (tile: { x: number; y: number }) => {
+    const region = regionForTile(tile);
+    if (region?.region_id === "station_1_region") return { fill: "rgba(23, 87, 117, 0.96)", stroke: "rgba(8, 44, 64, 0.92)" };
+    if (region?.region_id === "station_2_region") return { fill: "rgba(38, 103, 83, 0.96)", stroke: "rgba(13, 55, 43, 0.92)" };
+    if (region?.region_id === "inspection_region") return { fill: "rgba(129, 83, 35, 0.96)", stroke: "rgba(78, 47, 18, 0.92)" };
+    return { fill: "rgba(13, 30, 52, 0.94)", stroke: "rgba(0, 0, 0, 0.92)" };
+  };
+
   ctx.save();
-  ctx.fillStyle = "rgba(13, 30, 52, 0.94)";
-  ctx.strokeStyle = "rgba(0, 0, 0, 0.92)";
   ctx.lineWidth = 1;
   for (const wall of grid.walls ?? []) {
     const rect = tileRect(wall);
@@ -100,6 +116,9 @@ function drawTileGridOverlays(
     const y = rect.y - 0.8;
     const wallWidth = Math.max(2, rect.width + 1.6);
     const wallHeight = Math.max(2, rect.height + 1.6);
+    const palette = wallPalette(wall);
+    ctx.fillStyle = palette.fill;
+    ctx.strokeStyle = palette.stroke;
     ctx.fillRect(x, y, wallWidth, wallHeight);
     ctx.strokeRect(x + 0.5, y + 0.5, Math.max(1, wallWidth - 1), Math.max(1, wallHeight - 1));
   }
@@ -114,7 +133,11 @@ function drawTileGridOverlays(
   ctx.strokeStyle = "rgba(16, 38, 68, 0.28)";
   ctx.lineWidth = 1.2;
   for (const footprint of grid.object_footprints ?? []) {
-    if (["machine", "queue", "buffer"].includes(String(footprint.object_type ?? ""))) {
+    if (
+      ["machine", "queue", "buffer", "scrap_queue", "scrap_bin", "inspection_table"].includes(
+        String(footprint.object_type ?? ""),
+      )
+    ) {
       continue;
     }
     const topLeft = project({ x: footprint.x * tileWidth, y: footprint.y * tileHeight }, viewport, width, height);
@@ -322,78 +345,6 @@ function drawRegion(
   ctx.fillStyle = "#183353";
   ctx.font = "700 14px Consolas";
   ctx.fillText(region.label, x + 16, y + 22);
-  ctx.restore();
-}
-
-function drawStorageRegionDecoration(
-  ctx: CanvasRenderingContext2D,
-  region: RenderRegion,
-  viewport: { width: number; height: number },
-  width: number,
-  height: number,
-  completedCount = 0,
-) {
-  const topLeft = project(region.position, viewport, width, height);
-  const bottomRight = project(
-    { x: region.position.x + region.size.width, y: region.position.y + region.size.height },
-    viewport,
-    width,
-    height,
-  );
-  const regionWidth = bottomRight.x - topLeft.x;
-  const regionHeight = bottomRight.y - topLeft.y;
-  const baseX = topLeft.x + regionWidth * 0.23;
-  const baseY = topLeft.y + regionHeight * 0.63;
-  const pixel = clamp(Math.round((regionWidth / 420) * 3), 2, 4);
-
-  ctx.save();
-  pixelRect(ctx, baseX, baseY + pixel * 5, pixel * 30, pixel * 2, "#40608a");
-  const crateOffsets = [0, 9, 18];
-  for (const offset of crateOffsets) {
-    pixelRect(ctx, baseX + offset * pixel, baseY + pixel * 2, pixel * 6, pixel * 5, "#72a8ff");
-    pixelRect(ctx, baseX + offset * pixel + pixel, baseY + pixel * 3, pixel * 4, pixel * 3, "#eef6ff");
-    pixelRect(ctx, baseX + offset * pixel, baseY + pixel * 2, pixel * 6, pixel, "#274b74");
-  }
-  for (let i = 0; i < 7; i += 1) {
-    pixelRect(ctx, baseX + pixel * (34 + i * 2), baseY + pixel * (2 + (i % 2)), pixel, pixel, "rgba(91, 154, 247, 0.5)");
-  }
-  ctx.fillStyle = "#183353";
-  ctx.font = "700 11px Consolas";
-  ctx.fillText(`COMPLETED ${completedCount}`, baseX + pixel * 2, baseY + pixel * 12);
-  ctx.restore();
-}
-
-function drawBatteryRegionDecoration(
-  ctx: CanvasRenderingContext2D,
-  region: RenderRegion,
-  viewport: { width: number; height: number },
-  width: number,
-  height: number,
-) {
-  const topLeft = project(region.position, viewport, width, height);
-  const bottomRight = project(
-    { x: region.position.x + region.size.width, y: region.position.y + region.size.height },
-    viewport,
-    width,
-    height,
-  );
-  const regionWidth = bottomRight.x - topLeft.x;
-  const regionHeight = bottomRight.y - topLeft.y;
-  const pixel = clamp(Math.round((regionWidth / 420) * 3), 2, 4);
-  const rackX = topLeft.x + regionWidth * 0.14;
-  const rackY = topLeft.y + regionHeight * 0.54;
-
-  ctx.save();
-  pixelRect(ctx, rackX, rackY, pixel * 24, pixel * 2, "#35577f");
-  for (let i = 0; i < 5; i += 1) {
-    const cellX = rackX + pixel * (2 + i * 4);
-    pixelRect(ctx, cellX, rackY - pixel * 6, pixel * 3, pixel * 6, "#4a6f9a");
-    pixelRect(ctx, cellX + pixel, rackY - pixel * 5, pixel, pixel * 4, "#52d39c");
-    pixelRect(ctx, cellX, rackY - pixel * 7, pixel * 3, pixel, "#183353");
-  }
-  for (let i = 0; i < 6; i += 1) {
-    pixelRect(ctx, rackX + pixel * (28 + i * 2), rackY - pixel * (1 + (i % 2)), pixel, pixel, "rgba(84, 202, 151, 0.45)");
-  }
   ctx.restore();
 }
 
@@ -1088,6 +1039,41 @@ function drawQueueFootprintSprite(
   return { width: targetWidth, height: targetHeight };
 }
 
+function drawMaterialSlot(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  targetWidth: number,
+  targetHeight: number,
+  occupied: boolean,
+  sceneIcons: SceneIconSet | null,
+) {
+  ctx.save();
+  ctx.fillStyle = occupied ? "rgba(91, 154, 247, 0.22)" : "rgba(16, 38, 68, 0.06)";
+  ctx.strokeStyle = occupied ? "rgba(45, 105, 175, 0.62)" : "rgba(16, 38, 68, 0.22)";
+  ctx.lineWidth = 1;
+  ctx.fillRect(x, y, targetWidth, targetHeight);
+  ctx.strokeRect(x + 0.5, y + 0.5, Math.max(1, targetWidth - 1), Math.max(1, targetHeight - 1));
+  if (occupied) {
+    if (sceneIcons) {
+      const iconHeight = clamp(targetHeight * 1.35, 12, 22);
+      const aspect = sceneIcons.material.width / Math.max(1, sceneIcons.material.height);
+      const iconWidth = iconHeight * aspect;
+      drawSceneIconFrame(
+        ctx,
+        sceneIcons.material,
+        x + (targetWidth - iconWidth) / 2,
+        y + (targetHeight - iconHeight) / 2,
+        iconHeight,
+      );
+    } else {
+      pixelRect(ctx, x + targetWidth * 0.2, y + targetHeight * 0.18, targetWidth * 0.6, targetHeight * 0.64, "#62a9ff");
+      pixelRect(ctx, x + targetWidth * 0.28, y + targetHeight * 0.26, targetWidth * 0.44, targetHeight * 0.12, "#d9ecff");
+    }
+  }
+  ctx.restore();
+}
+
 function drawStorageSprite(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -1173,6 +1159,7 @@ function carryingIconFrame(entity: { attributes: Record<string, unknown> }, scen
 function drawInspectionFacility(
   ctx: CanvasRenderingContext2D,
   region: RenderRegion,
+  grid: ReplayRenderModel["grid"],
   viewport: { width: number; height: number },
   width: number,
   height: number,
@@ -1188,11 +1175,12 @@ function drawInspectionFacility(
   );
   const regionWidth = bottomRight.x - topLeft.x;
   const regionHeight = bottomRight.y - topLeft.y;
-  const spriteHeight = clamp(regionHeight * 0.36 * 0.7, 32, 58);
+  const footprintRect = entityFootprintRect(grid, "inspection_table", viewport, width, height);
+  const spriteHeight = footprintRect ? clamp(footprintRect.height * 1.15, 32, 58) : clamp(regionHeight * 0.36 * 0.7, 32, 58);
   const spriteAspect = sceneIcons.inspectFacility.width / Math.max(1, sceneIcons.inspectFacility.height);
   const spriteWidth = spriteHeight * spriteAspect;
-  const spriteX = topLeft.x + (regionWidth - spriteWidth) / 2;
-  const spriteY = topLeft.y + (regionHeight - spriteHeight) / 2 + 12;
+  const spriteX = footprintRect ? footprintRect.x + (footprintRect.width - spriteWidth) / 2 : topLeft.x + (regionWidth - spriteWidth) / 2;
+  const spriteY = footprintRect ? footprintRect.y + (footprintRect.height - spriteHeight) / 2 : topLeft.y + (regionHeight - spriteHeight) / 2 + 12;
   drawSceneIconFrame(ctx, sceneIcons.inspectFacility, spriteX, spriteY, spriteHeight);
 }
 
@@ -1269,25 +1257,20 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
     drawPixelGrid(ctx, width, height);
     drawTileGridFloor(ctx, renderModel, viewport, width, height);
     boundsRef.current = [];
-    const warehouseBufferNode = renderModel.nodes.find((node) => node.entity.entity_id === "warehouse_buffer");
-    const warehouseCompletedCount = Number(
-      warehouseBufferNode?.entity.attributes.completed_count ?? warehouseBufferNode?.entity.attributes.queue_size ?? 0,
-    );
-
     for (const region of renderModel.regions) {
       drawRegion(ctx, region, viewport, width, height, renderModel.grid);
     }
     for (const region of renderModel.regions) {
-      if (region.kind === "storage") drawStorageRegionDecoration(ctx, region, viewport, width, height, warehouseCompletedCount);
-      if (region.kind === "battery") drawBatteryRegionDecoration(ctx, region, viewport, width, height);
-    }
-    for (const region of renderModel.regions) {
-      drawInspectionFacility(ctx, region, viewport, width, height, sceneIconSet);
+      drawInspectionFacility(ctx, region, renderModel.grid, viewport, width, height, sceneIconSet);
     }
     drawTileGridOverlays(ctx, renderModel, viewport, width, height);
 
     for (const node of renderModel.nodes) {
-      if (node.entity.entity_id === "battery_rack" || node.entity.entity_id === "warehouse_buffer") {
+      if (
+        node.entity.entity_id === "battery_rack" ||
+        node.entity.entity_id === "warehouse_buffer" ||
+        node.entity.entity_id === "warehouse_material_shelf"
+      ) {
         continue;
       }
       const style = getEntityNodeStyle(node.entity);
@@ -1299,7 +1282,9 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
         (node.entity.entity_type === "machine" ||
           node.entity.entity_type === "workstation" ||
           node.entity.entity_type === "queue" ||
-          node.entity.entity_type === "buffer");
+          node.entity.entity_type === "buffer" ||
+          node.entity.entity_type === "shelf" ||
+          node.entity.entity_type === "material_slot");
       const spriteScale = Math.max(2, Math.round(transformed.scale * 2.4));
       const nodeWidth = useFootprintRect ? footprintRect.width : size.width * transformed.scale * 0.9;
       const nodeHeight = useFootprintRect ? footprintRect.height : size.height * transformed.scale * 0.9;
@@ -1315,7 +1300,10 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
         ctx.shadowColor = style.glow;
       }
 
-      if (node.entity.entity_type === "worker" || node.entity.entity_type === "robot" || node.entity.entity_type === "transporter") {
+      if (node.entity.entity_type === "material_slot") {
+        const occupied = Boolean(node.entity.attributes.occupied || node.entity.attributes.material_item_id);
+        drawMaterialSlot(ctx, x, y, nodeWidth, nodeHeight, occupied, sceneIconSet);
+      } else if (node.entity.entity_type === "worker" || node.entity.entity_type === "robot" || node.entity.entity_type === "transporter") {
         const workerVisualState = getWorkerVisualState(node.entity);
         const workerFrame = getWorkerSpriteFrame(workerSpriteSheet, node.entity, currentTime);
         const batteryProgress = workerBatteryProgress(node.entity);
@@ -1494,10 +1482,10 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
           node.entity.entity_id,
           sceneIconSet,
         );
-      } else if (node.entity.entity_type === "storage") {
+      } else if (node.entity.entity_type === "storage" || node.entity.entity_type === "shelf") {
         drawMiniHud(ctx, x + 2, y, 70, labelText(node.entity.label), "BUF", style.accent);
         drawStorageSprite(ctx, x + 14, y + 30, spriteScale, sceneIconSet);
-        const count = Number(node.entity.attributes.completed_count ?? node.entity.attributes.jobs_remaining ?? 0);
+        const count = Number(node.entity.attributes.shelf_count ?? node.entity.attributes.completed_count ?? node.entity.attributes.jobs_remaining ?? 0);
         ctx.fillStyle = "#17314d";
         ctx.font = "700 9px Consolas";
         ctx.fillText(String(count), x + 52, y + 52);

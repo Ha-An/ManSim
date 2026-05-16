@@ -6,6 +6,8 @@ const DEFAULT_VIEWPORT = { width: 1200, height: 760 };
 const typeAnchors: Record<EntityType, { x: number; y: number }> = {
   queue: { x: 180, y: 220 },
   storage: { x: 180, y: 520 },
+  shelf: { x: 180, y: 520 },
+  material_slot: { x: 180, y: 560 },
   buffer: { x: 360, y: 220 },
   machine: { x: 560, y: 220 },
   workstation: { x: 560, y: 420 },

@@ -41,6 +41,9 @@ profiles:
       - handover
       - safe_interaction
       - high_risk_task
+      - cleaning
+      - ehs_audit
+      - hazard_reporting
     max_payload_kg: 25.0
     supported_tools: ["*"]
     supported_vehicles: ["*"]

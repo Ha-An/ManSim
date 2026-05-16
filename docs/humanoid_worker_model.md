@@ -151,6 +151,7 @@ ManSim은 `HumanoidSim`의 82개 제조 task 중 현재 scenario에 맞는 subse
 | `PREVENTIVE_MAINTENANCE` | `COMPOSITE_TASK` | Maintenance, Repair & Calibration | `PT-MAINTENANCE` | idle machine 예방 정비 |
 | `REPAIR_MACHINE` | `COMPOSITE_TASK` | Maintenance, Repair & Calibration | `PT-MAINTENANCE` | broken machine repair |
 | `HANDOVER_ITEM` | `ATOMIC_TASK` | Human Collaboration & Operator Assistance | `PT-HUMAN` | product 공동 운반 합류 |
+| `COLLECT_WASTE_OR_SCRAP` | `COMPOSITE_TASK` | Cleaning, 5S, EHS & Safety Patrol | `PT-EHS` | inspection fail product를 scrap disposal zone으로 batch 운반 |
 
 ## Priority Key Mapping
 
@@ -169,6 +170,7 @@ Decision layer는 여전히 priority family 이름을 사용합니다. Humanoid 
 | `repair_machine` | `REPAIR_MACHINE` |
 | `preventive_maintenance` | `PREVENTIVE_MAINTENANCE` |
 | `handover_item` | `HANDOVER_ITEM` |
+| `scrap_disposal` | `COLLECT_WASTE_OR_SCRAP` |
 
 ## Task / Nested Sequences
 
@@ -223,7 +225,10 @@ CHECK_REQUEST
 ManSim 적용:
 
 - station material queue가 목표보다 낮을 때 후보가 됩니다.
-- warehouse에서 material을 생성/집고 target material queue로 이동해 보충합니다.
+- warehouse material shelf의 개별 slot 앞 service tile까지 이동합니다.
+- 선반 slot에 실제 material item이 있을 때만 집을 수 있습니다.
+- target station material queue까지 carry 이동한 뒤 보충합니다.
+- 선반이 비어 있으면 material supply 후보를 만들지 않고 `MATERIAL_SHELF_EMPTY` event와 KPI로 기록합니다.
 
 ### `SETUP_MACHINE`
 
@@ -274,7 +279,7 @@ ManSim 적용:
 - `inspection_table` service tile 중앙까지 이동합니다.
 - table에 도착한 뒤에만 inspection 시간이 소모됩니다.
 - pass면 inspection output queue로 직접 운반합니다.
-- fail이면 scrap 처리합니다.
+- fail이면 inspection zone 내부 `inspection_scrap_queue`로 운반합니다.
 - inspection workbench는 한 번에 하나의 worker만 점유합니다.
 
 ### `PREVENTIVE_MAINTENANCE`
@@ -325,6 +330,21 @@ ManSim 적용:
 - helper가 합류하면 같은 product id를 shared carry로 들고, 다음 tile segment부터 product 이동 시간이 carrier 수로 나뉩니다.
 - 현재 기본 구현은 product 공동 운반 합류이며, 단순 소유권 인계 모드는 별도 확장 대상입니다.
 
+### `COLLECT_WASTE_OR_SCRAP`
+
+```text
+TRANSFER [ATOMIC_TASK]
+-> UPDATE_INVENTORY_RECORD [ATOMIC_TASK]
+```
+
+ManSim 적용:
+
+- inspection fail item이 `inspection_scrap_queue`에 있을 때 후보가 됩니다.
+- worker는 `inspection_scrap_queue` service tile까지 이동해 최대 `quality.scrap_transport.max_carry_count`개를 batch로 집습니다.
+- 기본 최대 batch 크기는 3개입니다.
+- `scrap_disposal_bin`까지 운반해 dropoff하면 item state가 `SCRAPPED`가 되고 `disposed_scrap_count`가 증가합니다.
+- `scrap_count`는 inspection fail 판정 시 증가하고, `disposed_scrap_count`는 scrap disposal zone에 실제로 운반 완료됐을 때 증가합니다.
+
 ## Supported Primitive Calls
 
 ManSim runtime이 인식하는 primitive call code:
@@ -341,7 +361,6 @@ EXECUTE_HUMAN_COLLABORATION_ACTION
 EXECUTE_MACHINE_ACTION
 EXECUTE_MAINTENANCE_ACTION
 EXECUTE_QUALITY_ACTION
-EXECUTE_REPLENISHMENT_ACTION
 EXECUTE_SYSTEM_ACTION
 GRASP
 INSPECT_OR_DIAGNOSE
@@ -351,11 +370,14 @@ LOG_RESULT
 NAVIGATE_TO
 PLACE
 PRIMITIVE_IDENTIFY_ITEM
+READ_CONTEXT
 READ_MACHINE_STATE
 REACH_TO
 RECORD_RESULT
 RELEASE
+UPDATE_INVENTORY_RECORD
 UPDATE_RECORD
+VERIFY_TRANSACTION
 VERIFY_LEVEL_OR_QUANTITY
 VERIFY_LOCKOUT_IF_REQUIRED
 VERIFY_MACHINE_STATE
@@ -363,7 +385,9 @@ VERIFY_PLACEMENT
 VERIFY_ROBOT_STATE
 ```
 
-위 목록 중 현재 ManSim에서 적용하는 9개 task의 expanded primitive leaf에 실제로 들어가는 것은 29개입니다. `CREATE_OR_UPDATE_RECORD`는 ManSim runtime이 지원하지만 현재 적용 중인 9개 task에는 들어가지 않습니다. 다만 `HumanoidSim` 전체 catalog에는 `RECORD_QUALITY_RESULT`, `REPORT_HAZARD`, `UPDATE_INVENTORY_RECORD`, work order/traceability 계열 task에서 사용됩니다. 즉 문서에만 있는 값은 아니고, 향후 해당 task를 ManSim에 연결할 때 바로 쓸 수 있도록 runtime 지원 목록에 포함되어 있습니다.
+위 목록은 현재 ManSim에서 연결한 task subset의 expanded primitive leaf와 nested child task에서 필요한 primitive를 기준으로 합니다. `COLLECT_WASTE_OR_SCRAP`가 `UPDATE_INVENTORY_RECORD [ATOMIC_TASK]`를 child task로 포함하므로 `READ_CONTEXT`, `CREATE_OR_UPDATE_RECORD`, `VERIFY_TRANSACTION`, `LOG_RESULT` 계열도 runtime 지원 목록에 포함됩니다.
+
+`REPLENISH_MATERIAL`은 nested composite task입니다. ManSim에서는 parent task의 직접 primitive로 `EXECUTE_REPLENISHMENT_ACTION`을 실행하지 않고, child task `TRANSFER`가 자재 운반 side effect를 담당합니다.
 
 Domain side effect가 있는 핵심 trigger:
 
@@ -378,6 +402,7 @@ Domain side effect가 있는 핵심 trigger:
 | `REPAIR_MACHINE` | `EXECUTE_MAINTENANCE_ACTION` |
 | `PREVENTIVE_MAINTENANCE` | child task `INSPECT_MACHINE` |
 | `HANDOVER_ITEM` | `EXECUTE_HUMAN_COLLABORATION_ACTION` |
+| `COLLECT_WASTE_OR_SCRAP` | child task `TRANSFER` |
 
 ## Primitive Timing
 
@@ -513,11 +538,11 @@ Replay Studio worker panel은 다음 값을 `humanoid_state`에서 읽습니다.
 
 - Availability
 - Mobility
-- Power
 - Manipulation
-- Task / Code
+- Task
+- Child Task
 - Primitive
-- Motion Path
+- Motion Path, 현재 tile 좌표
 - Traffic
 - Carry item id
 - Shared carry

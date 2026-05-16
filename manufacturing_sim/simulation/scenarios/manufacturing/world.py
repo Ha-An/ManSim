@@ -125,6 +125,23 @@ class ManufacturingWorld:
         self.product_transport_session_by_item: dict[str, str] = {}
         self.product_transport_session_by_worker: dict[str, str] = {}
         self.quality_cfg = cfg["quality"]
+        scrap_transport_cfg = self.quality_cfg.get("scrap_transport", {}) if isinstance(self.quality_cfg.get("scrap_transport", {}), dict) else {}
+        self.scrap_transport_max_carry_count = max(1, int(scrap_transport_cfg.get("max_carry_count", 3) or 3))
+        warehouse_cfg = cfg.get("warehouse", {}) if isinstance(cfg.get("warehouse", {}), dict) else {}
+        material_shelf_cfg = (
+            warehouse_cfg.get("material_shelf", {})
+            if isinstance(warehouse_cfg.get("material_shelf", {}), dict)
+            else {}
+        )
+        self.material_shelf_capacity = max(0, int(material_shelf_cfg.get("capacity", 10) or 10))
+        self.material_shelf_initial_fill = max(
+            0,
+            min(
+                self.material_shelf_capacity,
+                int(material_shelf_cfg.get("initial_fill", self.material_shelf_capacity) or self.material_shelf_capacity),
+            ),
+        )
+        self.material_shelf_restock_policy = str(material_shelf_cfg.get("restock_policy", "day_boundary") or "day_boundary").strip().lower()
         self.machine_failure_cfg = cfg["machine_failure"]
         legacy_agent_cfg = cfg.get("agent", {}) if isinstance(cfg.get("agent", {}), dict) else {}
         worker_cfg = cfg.get("worker", {}) if isinstance(cfg.get("worker", {}), dict) else {}
@@ -227,12 +244,21 @@ class ManufacturingWorld:
         # inspection queue station: inspection-pass output waiting transfer to Warehouse
         self.output_buffers: dict[int, deque[str]] = {station: deque() for station in self.stations}
         self.output_buffers[self.inspection_queue_station] = deque()
+        self.inspection_scrap_queue: deque[str] = deque()
         self.material_supply_owner: dict[int, str | None] = {station: None for station in self.stations}
+        self.scrap_disposal_owner: str | None = None
 
         self.items: dict[str, Item] = {}
         self.item_counter = itertools.count(1)
         self.task_counter = itertools.count(1)
         self.machine_cycle_counter = itertools.count(1)
+        self.warehouse_material_shelf_slots: dict[str, dict[str, Any]] = {}
+        self.material_shelf_empty_alerted = False
+        self.warehouse_material_restock_count = 0
+        self.material_shelf_pick_count = 0
+        self.disposed_scrap_count = 0
+        self.scrap_transport_batches = 0
+        self.scrap_transport_items = 0
 
         map_cfg = cfg.get("map", {}) if isinstance(cfg.get("map", {}), dict) else {}
         self.map_enabled = bool(map_cfg.get("enabled", True))
@@ -314,6 +340,9 @@ class ManufacturingWorld:
     def bootstrap(self) -> None:
         from manufacturing_sim.simulation.scenarios.manufacturing import processes
 
+        self._ensure_material_shelf_slots()
+        self._restock_material_shelf(reason="initial_fill", target_fill=self.material_shelf_initial_fill)
+
         initial_inventory_cfg = self.cfg.get("initial_inventory", {})
         initial_material_cfg = initial_inventory_cfg.get("material", {}) if isinstance(initial_inventory_cfg, dict) else {}
         for station in self.stations:
@@ -338,6 +367,8 @@ class ManufacturingWorld:
     def start_day(self, day: int, strategy: StrategyState, job_plan: JobPlan) -> None:
         self.current_day = day
         self.current_strategy = strategy
+        if self.material_shelf_restock_policy == "day_boundary":
+            self._restock_material_shelf(reason="day_boundary")
         job_plan.ensure_runtime_context(tuple(sorted(self.agents.keys())))
         self.current_job_plan = job_plan
         self._materialize_commitments()
@@ -353,6 +384,10 @@ class ManufacturingWorld:
             "machine_broken": {mid: m.total_broken_min for mid, m in self.machines.items()},
             "machine_pm": {mid: m.total_pm_min for mid, m in self.machines.items()},
             "task_count": len(self.task_records),
+            "disposed_scrap": int(self.disposed_scrap_count),
+            "warehouse_material_restock": int(self.warehouse_material_restock_count),
+            "scrap_transport_batches": int(self.scrap_transport_batches),
+            "scrap_transport_items": int(self.scrap_transport_items),
         }
         self.logger.log(
             t=self.env.now,
@@ -1291,6 +1326,10 @@ class ManufacturingWorld:
                 "material_queue_lengths": {k: len(v) for k, v in self.material_queues.items()},
                 "intermediate_queue_lengths": {k: len(v) for k, v in self.intermediate_queues.items()},
                 "output_buffer_lengths": {k: len(v) for k, v in self.output_buffers.items()},
+                "warehouse_material_shelf_count": self._material_shelf_count(),
+                "warehouse_material_shelf_capacity": self.material_shelf_capacity,
+                "inspection_scrap_queue_length": len(self.inspection_scrap_queue),
+                "disposed_scrap_count": int(self.disposed_scrap_count),
                 "machine_states": {mid: m.state.value for mid, m in self.machines.items()},
                 "worker_tiles": {
                     worker_id: self._tile_payload(worker.tile)
@@ -1408,6 +1447,22 @@ class ManufacturingWorld:
             task = self._current_task_stub(agent)
             step = {"step_id": agent.current_step_id or "", "call_code": primitive_call_code}
             runtime.set_step_state(agent, task, step, event_type="HUMANOID_STEP_START", status="running")
+        logger = getattr(self, "logger", None)
+        if logger is not None and hasattr(logger, "log"):
+            logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="WORKER_STATE_CHANGED",
+                entity_id=agent.worker_id,
+                location=self.worker_display_location(agent),
+                details={
+                    "humanoid_state": self._humanoid_state_payload(agent),
+                    "cargo": self._worker_cargo_payload(agent),
+                    "motion": self._worker_motion_payload(agent),
+                    "tile": self._tile_payload(agent.tile),
+                    "battery_remaining_min": round(float(self.battery_remaining(agent)), 3),
+                },
+            )
         return
 
     def _current_task_stub(self, worker: Worker) -> Task:
@@ -1448,9 +1503,15 @@ class ManufacturingWorld:
 
     def _worker_cargo_payload(self, worker: Worker) -> dict[str, Any]:
         session = self._transport_session_for_worker(worker)
+        item_ids = [str(item_id) for item_id in getattr(worker, "carrying_item_ids", []) if str(item_id)]
+        if not item_ids and worker.carrying_item_id:
+            item_ids = [str(worker.carrying_item_id)]
         payload: dict[str, Any] = {
             "item_id": worker.carrying_item_id,
             "item_type": worker.carrying_item_type,
+            "item_ids": item_ids,
+            "item_count": int(worker.carrying_item_count or len(item_ids)),
+            "max_item_count": int(worker.carrying_item_max_count or 1),
         }
         if session is not None:
             carrier_ids = [str(worker_id) for worker_id in session.get("carrier_ids", [])]
@@ -1592,10 +1653,6 @@ class ManufacturingWorld:
         helper.transport_session_id = str(session.get("session_id", ""))
         helper.shared_carry_role = "helper"
         self.product_transport_session_by_worker[helper.worker_id] = helper.transport_session_id
-        primary = self.workers.get(str(session.get("primary_worker_id", "")))
-        if self.grid_map is not None and primary is not None and primary.tile is not None:
-            self.grid_map.move_worker(helper.worker_id, primary.tile)
-            helper.tile = primary.tile
         for carrier_id in session.get("carrier_ids", []):
             carrier = self.workers.get(str(carrier_id))
             if carrier is not None and carrier.carrying_item_id == item_id:
@@ -1698,6 +1755,67 @@ class ManufacturingWorld:
                 self._set_worker_cargo(worker, None, None, destination=destination)
         if item_id:
             self.product_transport_session_by_item.pop(item_id, None)
+
+    def _complete_product_transport_session_keep_primary_cargo(
+        self,
+        primary: Worker,
+        *,
+        destination: str,
+        outcome: str = "arrived_at_handling_point",
+    ) -> None:
+        session = self._transport_session_for_worker(primary)
+        if not isinstance(session, dict) or str(session.get("status", "active")) != "active":
+            return
+        item_id = str(session.get("item_id", ""))
+        if not item_id or str(primary.carrying_item_id or "") != item_id:
+            return
+        session["status"] = str(outcome or "completed")
+        session["completed_at"] = float(self.env.now)
+        carrier_ids = [str(worker_id) for worker_id in session.get("carrier_ids", []) if str(worker_id)]
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="PRODUCT_CARRY_COMPLETED",
+            entity_id=item_id,
+            location=str(destination),
+            details={
+                **self._transport_session_event_details(session, destination=destination, outcome=outcome),
+                "duration": round(max(0.0, float(self.env.now) - float(session.get("started_at", self.env.now) or self.env.now)), 3),
+                "primary_kept_cargo": True,
+            },
+        )
+        done_event = session.get("done_event")
+        if done_event is not None and hasattr(done_event, "triggered") and not done_event.triggered:
+            done_event.succeed(str(outcome or "completed"))
+        for worker_id in carrier_ids:
+            worker = self.workers.get(worker_id)
+            if worker is None:
+                continue
+            self.product_transport_session_by_worker.pop(worker_id, None)
+            worker.transport_session_id = None
+            worker.shared_carry_role = None
+            if worker.worker_id == primary.worker_id:
+                self._set_worker_cargo(worker, item_id, "product", destination=destination)
+                continue
+            if worker.carrying_item_id == item_id:
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="AGENT_DROP_ITEM",
+                    entity_id=worker.worker_id,
+                    location=self.agent_display_location(worker),
+                    details={
+                        "item_id": item_id,
+                        "item_type": "product",
+                        "to": destination,
+                        "transport_session_id": str(session.get("session_id", "")),
+                        "shared_carry": True,
+                        "reason": "shared_carry_completed",
+                        "humanoid_state": self._humanoid_state_payload(worker),
+                    },
+                )
+                self._set_worker_cargo(worker, None, None, destination=destination)
+        self.product_transport_session_by_item.pop(item_id, None)
 
     def _product_session_has_remaining_path(self, session: dict[str, Any]) -> bool:
         primary = self.workers.get(str(session.get("primary_worker_id", "")))
@@ -1802,9 +1920,11 @@ class ManufacturingWorld:
         segment_index: int,
     ) -> None:
         for helper in self._shared_transport_followers(primary):
+            helper_from_tile = helper.tile or from_tile
+            helper_to_tile = from_tile if helper_from_tile != from_tile else helper_from_tile
             helper.current_move_segment_index = segment_index
-            helper.current_move_segment_from_tile = from_tile
-            helper.current_move_segment_to_tile = to_tile
+            helper.current_move_segment_from_tile = helper_from_tile
+            helper.current_move_segment_to_tile = helper_to_tile
             helper.current_move_logical_destination = logical_destination
             self._set_worker_motion(
                 helper,
@@ -1812,24 +1932,26 @@ class ManufacturingWorld:
                 logical_destination,
                 0.0,
                 segment_duration,
-                path_tiles=[from_tile, to_tile],
-                target_tile=to_tile,
+                path_tiles=[helper_from_tile, helper_to_tile] if helper_from_tile != helper_to_tile else [helper_from_tile],
+                target_tile=helper_to_tile,
             )
 
     def _finish_shared_transport_segment(
         self,
         primary: Worker,
         *,
+        from_tile: Tile,
         to_tile: Tile,
         logical_destination: str,
         segment_duration: float,
     ) -> None:
         grid = self.grid_map
         for helper in self._shared_transport_followers(primary):
+            helper_to_tile = from_tile
             if grid is not None:
                 grid.release_reservation(helper.worker_id)
-                grid.move_worker(helper.worker_id, to_tile)
-            helper.tile = to_tile
+                grid.move_worker(helper.worker_id, helper_to_tile)
+            helper.tile = helper_to_tile
             helper.current_move_segment_index = 0
             helper.current_move_segment_from_tile = None
             helper.current_move_segment_to_tile = None
@@ -1901,6 +2023,38 @@ class ManufacturingWorld:
         normalized_type = str(item_type).strip().lower() if item_type is not None else None
         worker.carrying_item_id = normalized_id or None
         worker.carrying_item_type = normalized_type or None
+        worker.carrying_item_ids = [normalized_id] if normalized_id else []
+        worker.carrying_item_count = 1 if normalized_id else 0
+        worker.carrying_item_max_count = 1
+        self._sync_humanoid_cargo_state(worker, destination=destination)
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="WORKER_CARGO_CHANGED",
+            entity_id=worker.worker_id,
+            location=self.worker_display_location(worker),
+            details={
+                "cargo": self._worker_cargo_payload(worker),
+                "humanoid_state": self._humanoid_state_payload(worker),
+            },
+        )
+
+    def _set_worker_cargo_batch(
+        self,
+        worker: Worker,
+        item_ids: list[str],
+        item_type: str,
+        *,
+        max_item_count: int,
+        destination: str = "",
+    ) -> None:
+        normalized_ids = [str(item_id).strip() for item_id in item_ids if str(item_id).strip()]
+        normalized_type = str(item_type).strip().lower()
+        worker.carrying_item_id = normalized_ids[0] if normalized_ids else None
+        worker.carrying_item_type = normalized_type or None
+        worker.carrying_item_ids = normalized_ids
+        worker.carrying_item_count = len(normalized_ids)
+        worker.carrying_item_max_count = max(1, int(max_item_count or 1))
         self._sync_humanoid_cargo_state(worker, destination=destination)
         self.logger.log(
             t=self.env.now,
@@ -1964,7 +2118,7 @@ class ManufacturingWorld:
             suffix = location.removeprefix("Station")
             if suffix.isdigit():
                 item.current_station = int(suffix)
-        elif location in {"Warehouse", "BatteryStation"}:
+        elif location in {"Warehouse", "BatteryStation", "CompletedProducts", "ScrapDisposal"}:
             item.current_station = None
         if ref:
             item.metadata["state_ref"] = ref
@@ -2040,7 +2194,8 @@ class ManufacturingWorld:
     def _clear_agent_carrying(self, agent: Worker, destination: str = "", emit_event: bool = True) -> None:
         item_id = agent.carrying_item_id
         item_type = agent.carrying_item_type
-        if item_id is None and item_type is None:
+        item_ids = [str(candidate) for candidate in getattr(agent, "carrying_item_ids", []) if str(candidate)]
+        if item_id is None and item_type is None and not item_ids:
             return
         session = self._transport_session_for_worker(agent)
         if session is not None and str(item_id or "") == str(session.get("item_id", "")):
@@ -2055,6 +2210,8 @@ class ManufacturingWorld:
                 location=self.agent_display_location(agent),
                 details={
                     "item_id": item_id or "",
+                    "item_ids": item_ids,
+                    "item_count": len(item_ids),
                     "item_type": (item_type or ""),
                     "to": destination,
                     "humanoid_state": self._humanoid_state_payload(agent),
@@ -2088,6 +2245,44 @@ class ManufacturingWorld:
             details={"item_id": item_id, "queue": "material"},
         )
         return item_id
+
+    def _push_inspection_scrap_queue(self, item_id: str) -> None:
+        if not item_id:
+            return
+        self.inspection_scrap_queue.append(item_id)
+        self._set_item_state(
+            item_id,
+            ItemState.WAITING_SCRAP_DISPOSAL,
+            location="Inspection",
+            ref="inspection_scrap_queue",
+            item_type="product",
+        )
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="INSPECTION_SCRAP_QUEUED",
+            entity_id=item_id,
+            location="Inspection",
+            details={
+                "queue_id": "inspection_scrap_queue",
+                "queue_length": len(self.inspection_scrap_queue),
+            },
+        )
+
+    def _pop_inspection_scrap_batch(self, max_count: int) -> list[str]:
+        count = max(1, int(max_count or 1))
+        item_ids: list[str] = []
+        while self.inspection_scrap_queue and len(item_ids) < count:
+            item_ids.append(self.inspection_scrap_queue.popleft())
+        for item_id in item_ids:
+            self._set_item_state(
+                item_id,
+                ItemState.CARRIED_BY_WORKER,
+                location="Inspection",
+                ref="inspection_scrap_queue",
+                item_type="product",
+            )
+        return item_ids
 
     def _push_intermediate_queue(self, station: int, item_id: str) -> None:
         if station not in self.intermediate_queues:
@@ -2964,6 +3159,136 @@ class ManufacturingWorld:
         self.items[item_id] = Item(item_id=item_id, item_type="material", created_at=self.env.now, current_station=station)
         self._push_material_queue(station, item_id)
         return item_id
+
+    def _ensure_material_shelf_slots(self) -> None:
+        if self.warehouse_material_shelf_slots:
+            return
+        for index in range(1, self.material_shelf_capacity + 1):
+            slot_id = f"warehouse_material_slot_{index:02d}"
+            shelf_tile = None
+            service_tile = None
+            if self.grid_map is not None:
+                obj = self.grid_map.objects.get(slot_id)
+                if obj is not None:
+                    shelf_tile = obj.center()
+                service_tiles = self.grid_map.service_tiles.get(slot_id, [])
+                if service_tiles:
+                    service_tile = service_tiles[0]
+            self.warehouse_material_shelf_slots[slot_id] = {
+                "slot_id": slot_id,
+                "material_item_id": None,
+                "shelf_tile": shelf_tile,
+                "service_tile": service_tile,
+                "occupied": False,
+            }
+
+    def _material_shelf_count(self) -> int:
+        self._ensure_material_shelf_slots()
+        return sum(1 for slot in self.warehouse_material_shelf_slots.values() if slot.get("material_item_id"))
+
+    def _restock_material_shelf(self, *, reason: str, target_fill: int | None = None) -> int:
+        self._ensure_material_shelf_slots()
+        target = self.material_shelf_capacity if target_fill is None else max(0, min(self.material_shelf_capacity, int(target_fill)))
+        current = self._material_shelf_count()
+        needed = max(0, target - current)
+        if needed <= 0:
+            self.material_shelf_empty_alerted = False
+            return 0
+        restocked_slots: list[dict[str, Any]] = []
+        for slot_id, slot in sorted(self.warehouse_material_shelf_slots.items()):
+            if needed <= 0:
+                break
+            if slot.get("material_item_id"):
+                continue
+            item_id = self._next_item_id("MAT-WH")
+            self.items[item_id] = Item(item_id=item_id, item_type="material", created_at=float(self.env.now))
+            slot["material_item_id"] = item_id
+            slot["occupied"] = True
+            self._set_item_state(item_id, ItemState.IN_STORAGE, location="Warehouse", ref=slot_id, item_type="material")
+            restocked_slots.append(
+                {
+                    "slot_id": slot_id,
+                    "item_id": item_id,
+                    "shelf_tile": self._tile_payload(slot.get("shelf_tile")),
+                    "service_tile": self._tile_payload(slot.get("service_tile")),
+                }
+            )
+            needed -= 1
+        if restocked_slots:
+            self.warehouse_material_restock_count += len(restocked_slots)
+            self.material_shelf_empty_alerted = False
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="WAREHOUSE_MATERIAL_RESTOCK",
+                entity_id="warehouse_material_shelf",
+                location="Warehouse",
+                details={
+                    "reason": reason,
+                    "restocked_count": len(restocked_slots),
+                    "shelf_count": self._material_shelf_count(),
+                    "shelf_capacity": self.material_shelf_capacity,
+                    "slots": restocked_slots,
+                },
+            )
+        return len(restocked_slots)
+
+    def _first_available_material_shelf_slot(self) -> dict[str, Any] | None:
+        self._ensure_material_shelf_slots()
+        for slot in self.warehouse_material_shelf_slots.values():
+            if slot.get("material_item_id"):
+                return slot
+        return None
+
+    def _log_material_shelf_empty_once(self) -> None:
+        if self.material_shelf_empty_alerted:
+            return
+        self.material_shelf_empty_alerted = True
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="MATERIAL_SHELF_EMPTY",
+            entity_id="warehouse_material_shelf",
+            location="Warehouse",
+            details={
+                "shelf_count": self._material_shelf_count(),
+                "shelf_capacity": self.material_shelf_capacity,
+            },
+        )
+
+    def _pop_material_shelf_item(self, slot_id: str | None = None) -> tuple[str, str] | None:
+        slot = None
+        if slot_id:
+            candidate = self.warehouse_material_shelf_slots.get(str(slot_id))
+            if isinstance(candidate, dict) and candidate.get("material_item_id"):
+                slot = candidate
+            else:
+                return None
+        if slot is None:
+            slot = self._first_available_material_shelf_slot()
+        if slot is None:
+            return None
+        item_id = str(slot.get("material_item_id") or "")
+        if not item_id:
+            return None
+        slot["material_item_id"] = None
+        slot["occupied"] = False
+        self.material_shelf_pick_count += 1
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="WAREHOUSE_MATERIAL_PICKED",
+            entity_id=item_id,
+            location="Warehouse",
+            details={
+                "slot_id": str(slot.get("slot_id", "")),
+                "shelf_tile": self._tile_payload(slot.get("shelf_tile")),
+                "service_tile": self._tile_payload(slot.get("service_tile")),
+                "shelf_count": self._material_shelf_count(),
+                "shelf_capacity": self.material_shelf_capacity,
+            },
+        )
+        return str(slot.get("slot_id", "")), item_id
 
     def machine_failure_lambda(self, machine: Machine) -> float:
         multiplier = self.pm_lambda_multiplier if self.env.now < machine.pm_until else 1.0
@@ -5227,16 +5552,19 @@ class ManufacturingWorld:
         for station in self.stations:
             material_target = int(self.inventory_targets["material"][f"station{station}"])
             if len(self.material_queues[station]) < material_target and self.material_supply_owner.get(station) is None:
-                tasks.append(
-                    Task(
-                        task_id=self._next_task_id("MAT"),
-                        task_type="TRANSFER",
-                        priority_key="material_supply",
-                        priority=priority_material_supply,
-                        location="Warehouse",
-                        payload={"transfer_kind": "material_supply", "station": station},
+                if self._material_shelf_count() > 0:
+                    tasks.append(
+                        Task(
+                            task_id=self._next_task_id("MAT"),
+                            task_type="TRANSFER",
+                            priority_key="material_supply",
+                            priority=priority_material_supply,
+                            location="Warehouse",
+                            payload={"transfer_kind": "material_supply", "station": station},
+                        )
                     )
-                )
+                else:
+                    self._log_material_shelf_empty_once()
 
         if self.intermediate_queues[self.inspection_queue_station] and self.inspection_owner is None:
             tasks.append(
@@ -5247,6 +5575,21 @@ class ManufacturingWorld:
                     priority=priority_inspect_product,
                     location="Inspection",
                     payload={},
+                )
+            )
+        if self.inspection_scrap_queue and self.scrap_disposal_owner is None:
+            tasks.append(
+                Task(
+                    task_id=self._next_task_id("SCRAP"),
+                    task_type="COLLECT_WASTE_OR_SCRAP",
+                    priority_key="scrap_disposal",
+                    priority=max(priority_inspect_product, float(self._rule("world.task_priority.scrap_disposal", 118.0))),
+                    location="Inspection",
+                    payload={
+                        "source": "inspection_scrap_queue",
+                        "destination": "scrap_disposal_bin",
+                        "max_carry_count": self.scrap_transport_max_carry_count,
+                    },
                 )
             )
         return tasks
@@ -5500,6 +5843,7 @@ class ManufacturingWorld:
             )
             self._finish_shared_transport_segment(
                 agent,
+                from_tile=current_tile,
                 to_tile=next_tile,
                 logical_destination=logical_dst,
                 segment_duration=segment_duration,
@@ -6087,16 +6431,16 @@ class ManufacturingWorld:
                         return False
                     self._set_humanoid_primitive_hint(agent, "LIFT")
                 if from_station == self.inspection_queue_station:
-                    # Final logistics leg: inspected product -> Warehouse.
-                    to_location = "Warehouse"
+                    # Final logistics leg: inspected product -> completed product zone.
+                    to_location = "CompletedProducts"
                     self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
-                    yield from self.move_agent(agent, "warehouse_buffer", emit_move_events=True)
-                    if not self._confirm_object_service_tile(agent, "warehouse_buffer", task, "completed_product_dropoff"):
+                    yield from self.move_agent(agent, "completed_product_buffer", emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, "completed_product_buffer", task, "completed_product_dropoff"):
                         return False
                     self._set_humanoid_primitive_hint(agent, "PLACE")
                     self.product_count += 1
                     if moved_item_id in self.items:
-                        self._set_item_state(moved_item_id, ItemState.COMPLETED, location="Warehouse", ref="warehouse_buffer", item_type="product")
+                        self._set_item_state(moved_item_id, ItemState.COMPLETED, location="CompletedProducts", ref="completed_product_buffer", item_type="product")
                 else:
                     to_station = from_station + 1
                     to_location = f"Station{to_station}" if to_station <= self.last_processing_station else "Inspection"
@@ -6114,7 +6458,7 @@ class ManufacturingWorld:
                 self._clear_agent_carrying(agent, destination=to_location)
                 self._set_humanoid_primitive_hint(agent, "VERIFY_PLACEMENT")
                 if from_station == self.inspection_queue_station:
-                    move_to = "Warehouse"
+                    move_to = "completed_product_buffer"
                 else:
                     move_to = (
                         f"product_queue_{self.inspection_queue_station}"
@@ -6139,8 +6483,8 @@ class ManufacturingWorld:
                         day=self.day_for_time(self.env.now),
                         event_type="COMPLETED_PRODUCT",
                         entity_id=moved_item_id,
-                        location="Warehouse",
-                        details={},
+                        location="CompletedProducts",
+                        details={"target": "completed_product_buffer"},
                     )
                 return True
 
@@ -6153,32 +6497,45 @@ class ManufacturingWorld:
                 try:
                     item_id = str(task.payload.get("transfer_item_id", ""))
                     if not item_id:
-                        self._set_humanoid_primitive_hint(agent, "EXECUTE_REPLENISHMENT_ACTION")
-                        yield from self.move_agent(agent, "Warehouse", emit_move_events=True)
+                        slot = self._first_available_material_shelf_slot()
+                        if slot is None:
+                            self._log_material_shelf_empty_once()
+                            return False
+                        slot_id = str(slot.get("slot_id", ""))
+                        self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                        yield from self.move_agent(agent, slot_id, emit_move_events=True)
+                        if not self._confirm_object_service_tile(agent, slot_id, task, "material_shelf_pickup"):
+                            return False
                         self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
                         self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="material_pickup", source="mansim.replenishment", task_id=task.task_id)
-                        item_id = self._next_item_id(f"MAT-S{station}")
+                        picked = self._pop_material_shelf_item(slot_id)
+                        if picked is None:
+                            if self._material_shelf_count() <= 0:
+                                self._log_material_shelf_empty_once()
+                            return False
+                        picked_slot_id, item_id = picked
+                        task.payload["source_slot_id"] = picked_slot_id
                         task.payload["transfer_item_id"] = item_id
-                        self.items[item_id] = Item(
-                            item_id=item_id,
-                            item_type="material",
-                            created_at=self.env.now,
-                            current_station=station,
-                        )
-                        self._set_item_state(item_id, ItemState.IN_STORAGE, location="Warehouse", ref="warehouse", item_type="material")
                         if not self._set_agent_carrying(agent, "material", item_id):
-                            self.items.pop(item_id, None)
+                            # Put the item back into the same slot if the worker could not pick it.
+                            slot_back = self.warehouse_material_shelf_slots.get(picked_slot_id)
+                            if slot_back is not None:
+                                slot_back["material_item_id"] = item_id
+                                slot_back["occupied"] = True
+                                self._set_item_state(item_id, ItemState.IN_STORAGE, location="Warehouse", ref=picked_slot_id, item_type="material")
                             task.payload.pop("transfer_item_id", None)
+                            task.payload.pop("source_slot_id", None)
                             return False
                     elif agent.carrying_item_id != item_id:
+                        source_slot_id = str(task.payload.get("source_slot_id") or "warehouse_material_shelf")
                         if agent.location != "Warehouse":
-                            self._set_humanoid_primitive_hint(agent, "EXECUTE_REPLENISHMENT_ACTION")
-                            yield from self.move_agent(agent, "Warehouse", emit_move_events=True)
+                            self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                            yield from self.move_agent(agent, source_slot_id, emit_move_events=True)
                         self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
                         if not self._set_agent_carrying(agent, "material", item_id):
                             return False
                     material_queue_id = f"material_queue_{station}"
-                    self._set_humanoid_primitive_hint(agent, "EXECUTE_REPLENISHMENT_ACTION")
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                     yield from self.move_agent(agent, material_queue_id, emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, material_queue_id, task, "material_supply_dropoff"):
                         return False
@@ -6196,6 +6553,7 @@ class ManufacturingWorld:
                     self._set_humanoid_primitive_hint(agent, "UPDATE_RECORD")
                     task.payload.pop("transfer_item_id", None)
                     task.payload.pop("material_item_id", None)
+                    task.payload.pop("source_slot_id", None)
                     return True
                 finally:
                     if self.material_supply_owner.get(station) == agent.agent_id:
@@ -6409,10 +6767,15 @@ class ManufacturingWorld:
                 yield from self.move_agent(agent, "inspection_table", emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, "inspection_table", task, "inspect_product_table"):
                     return False
+                self._complete_product_transport_session_keep_primary_cargo(
+                    agent,
+                    destination="inspection_table",
+                    outcome="arrived_for_inspection",
+                )
+                self._set_humanoid_primitive_hint(agent, "EXECUTE_QUALITY_ACTION")
                 self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="inspect_product_at_table", source="mansim.quality", task_id=task.task_id)
                 self.inspection_active_agents += 1
                 try:
-                    self._set_humanoid_primitive_hint(agent, "EXECUTE_QUALITY_ACTION")
                     yield self.env.timeout(max(self.inspection_min_time_min, self.inspection_base_time_min))
                 finally:
                     self.inspection_active_agents = max(0, self.inspection_active_agents - 1)
@@ -6420,7 +6783,6 @@ class ManufacturingWorld:
                 self._set_humanoid_primitive_hint(agent, "CLASSIFY_RESULT")
                 if self.rng.random() < defect_prob:
                     self.scrap_count += 1
-                    self._set_item_state(product_id, ItemState.SCRAPPED, location="Inspection", ref="inspection_table", item_type="product")
                     self.logger.log(
                         t=self.env.now,
                         day=self.day_for_time(self.env.now),
@@ -6435,9 +6797,16 @@ class ManufacturingWorld:
                         event_type="SCRAP",
                         entity_id=product_id,
                         location="inspection_table",
-                        details={},
+                        details={"queue_id": "inspection_scrap_queue"},
                     )
-                    self._clear_agent_carrying(agent, destination="scrap")
+                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                    yield from self.move_agent(agent, "inspection_scrap_queue", emit_move_events=True)
+                    if not self._confirm_object_service_tile(agent, "inspection_scrap_queue", task, "inspect_product_scrap_dropoff"):
+                        return False
+                    self._set_humanoid_primitive_hint(agent, "PLACE")
+                    self._push_inspection_scrap_queue(product_id)
+                    self._clear_agent_carrying(agent, destination="inspection_scrap_queue")
+                    self._set_humanoid_primitive_hint(agent, "RELEASE")
                 else:
                     # Inspection pass: carry the product from the table to the output buffer.
                     self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
@@ -6484,6 +6853,90 @@ class ManufacturingWorld:
             finally:
                 if self.inspection_owner == agent.agent_id:
                     self.inspection_owner = None
+
+        if task_type == "COLLECT_WASTE_OR_SCRAP":
+            if self.scrap_disposal_owner is not None and self.scrap_disposal_owner != agent.agent_id:
+                return False
+            self.scrap_disposal_owner = agent.agent_id
+            try:
+                max_count = max(1, int(task.payload.get("max_carry_count", self.scrap_transport_max_carry_count) or self.scrap_transport_max_carry_count))
+                if not self.inspection_scrap_queue and not task.payload.get("item_ids"):
+                    return False
+                self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                yield from self.move_agent(agent, "inspection_scrap_queue", emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, "inspection_scrap_queue", task, "scrap_batch_pickup"):
+                    return False
+                self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
+                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="scrap_pickup", source="mansim.scrap", task_id=task.task_id)
+                item_ids = [str(item_id) for item_id in task.payload.get("item_ids", []) if str(item_id)] if isinstance(task.payload.get("item_ids"), list) else []
+                if not item_ids:
+                    item_ids = self._pop_inspection_scrap_batch(max_count)
+                    task.payload["item_ids"] = list(item_ids)
+                if not item_ids:
+                    return False
+                self._set_humanoid_primitive_hint(agent, "GRASP")
+                if agent.carrying_item_id is None and not getattr(agent, "carrying_item_ids", []):
+                    self._set_worker_cargo_batch(
+                        agent,
+                        item_ids,
+                        "product",
+                        max_item_count=max_count,
+                        destination="scrap_disposal_bin",
+                    )
+                self._set_humanoid_primitive_hint(agent, "LIFT")
+                self.scrap_transport_batches += 1
+                self.scrap_transport_items += len(item_ids)
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="SCRAP_BATCH_PICKED",
+                    entity_id=agent.agent_id,
+                    location="Inspection",
+                    details={
+                        "item_ids": item_ids,
+                        "item_count": len(item_ids),
+                        "max_item_count": max_count,
+                        "queue_id": "inspection_scrap_queue",
+                        "queue_length": len(self.inspection_scrap_queue),
+                        "cargo": self._worker_cargo_payload(agent),
+                        "humanoid_state": self._humanoid_state_payload(agent),
+                    },
+                )
+                self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                yield from self.move_agent(agent, "scrap_disposal_bin", emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, "scrap_disposal_bin", task, "scrap_disposal_dropoff"):
+                    return False
+                self._set_humanoid_primitive_hint(agent, "PLACE")
+                for item_id in item_ids:
+                    self._set_item_state(
+                        item_id,
+                        ItemState.SCRAPPED,
+                        location="ScrapDisposal",
+                        ref="scrap_disposal_bin",
+                        item_type="product",
+                    )
+                self.disposed_scrap_count += len(item_ids)
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="SCRAP_DISPOSED",
+                    entity_id="scrap_disposal_bin",
+                    location="ScrapDisposal",
+                    details={
+                        "item_ids": item_ids,
+                        "item_count": len(item_ids),
+                        "disposed_scrap_count": int(self.disposed_scrap_count),
+                        "scrap_transport_batches": int(self.scrap_transport_batches),
+                        "humanoid_state": self._humanoid_state_payload(agent),
+                    },
+                )
+                self._clear_agent_carrying(agent, destination="scrap_disposal_bin")
+                self._set_humanoid_primitive_hint(agent, "RELEASE")
+                task.payload.pop("item_ids", None)
+                return True
+            finally:
+                if self.scrap_disposal_owner == agent.agent_id:
+                    self.scrap_disposal_owner = None
 
         if task_type == "PREVENTIVE_MAINTENANCE":
             machine = self.machines[task.payload["machine_id"]]
@@ -6834,7 +7287,20 @@ class ManufacturingWorld:
             "day": day,
             "products": products_today,
             "scrap": scrap_today,
+            "disposed_scrap": int(self.disposed_scrap_count - int(self.day_baseline.get("disposed_scrap", 0) or 0)),
             "scrap_rate": round(scrap_rate, 5),
+            "warehouse_material_shelf_count": self._material_shelf_count(),
+            "warehouse_material_shelf_capacity": self.material_shelf_capacity,
+            "warehouse_material_restock_count": int(
+                self.warehouse_material_restock_count - int(self.day_baseline.get("warehouse_material_restock", 0) or 0)
+            ),
+            "inspection_scrap_queue_length": len(self.inspection_scrap_queue),
+            "scrap_transport_batches": int(
+                self.scrap_transport_batches - int(self.day_baseline.get("scrap_transport_batches", 0) or 0)
+            ),
+            "scrap_transport_items": int(
+                self.scrap_transport_items - int(self.day_baseline.get("scrap_transport_items", 0) or 0)
+            ),
             "machine_breakdowns": machine_breakdowns,
             "avg_wip_material": round(avg_wip_material, 3),
             "avg_wip_intermediate": round(avg_wip_intermediate, 3),
@@ -6927,7 +7393,14 @@ class ManufacturingWorld:
         return {
             "total_products": self.product_count,
             "scrap_count": self.scrap_count,
+            "disposed_scrap_count": int(self.disposed_scrap_count),
             "scrap_rate": round((self.scrap_count / total_checked) if total_checked > 0 else 0.0, 6),
+            "warehouse_material_shelf_count": self._material_shelf_count(),
+            "warehouse_material_shelf_capacity": int(self.material_shelf_capacity),
+            "warehouse_material_restock_count": int(self.warehouse_material_restock_count),
+            "inspection_scrap_queue_length": len(self.inspection_scrap_queue),
+            "scrap_transport_batches": int(self.scrap_transport_batches),
+            "scrap_transport_items": int(self.scrap_transport_items),
             "station_throughput": dict(self.station_throughput),
             "stage_throughput": stage_throughput,
             "avg_daily_products": round(self.product_count / self.num_days, 4),

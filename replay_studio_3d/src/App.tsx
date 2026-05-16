@@ -188,7 +188,13 @@ export default function App() {
         </div>
       </header>
 
-      <EntityInspector entity={selectedEntity} currentTime={currentTime} selectedRun={selectedRun} />
+      <EntityInspector
+        entity={selectedEntity}
+        currentTime={currentTime}
+        selectedRun={selectedRun}
+        grid={log?.layout?.grid}
+        viewport={viewport}
+      />
 
       <footer className="playback-bar">
         <button type="button" onClick={togglePlay} disabled={!log}>

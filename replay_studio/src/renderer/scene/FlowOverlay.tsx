@@ -62,7 +62,7 @@ function asXY(value: unknown): { x: number; y: number } | undefined {
 function motionRoute(node: ReplayRenderModel["nodes"][number]): Array<{ x: number; y: number }> {
   const motion = node.entity.attributes.motion;
   if (!motion || typeof motion !== "object") return [];
-  const rawPath = (motion as Record<string, unknown>).path;
+  const rawPath = (motion as Record<string, unknown>).display_path ?? (motion as Record<string, unknown>).path;
   if (Array.isArray(rawPath)) {
     const path = rawPath.map(asXY).filter((point): point is { x: number; y: number } => Boolean(point));
     if (path.length >= 2) return path;

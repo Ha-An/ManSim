@@ -9,6 +9,9 @@ from .shell import render_page_shell
 
 PRIMARY_METRICS = [
     ("Accepted Products", "total_products", "count", True, "Finished products accepted in this run."),
+    ("Disposed Scrap", "disposed_scrap_count", "count", True, "Inspection-fail products delivered to ScrapDisposal."),
+    ("Shelf Materials", "warehouse_material_shelf_count", "count", True, "Material items currently available on the shared warehouse shelf."),
+    ("Shelf Restocks", "warehouse_material_restock_count", "count", True, "Material items restocked at initial fill or day boundary."),
     ("Closure Ratio", "downstream_closure_ratio", "ratio", True, "Share of downstream output that actually closed."),
     ("Throughput / Sim Hour", "throughput_per_sim_hour", "float", True, "Accepted products normalized by simulated hour."),
     ("Machine Utilization", "machine_utilization", "ratio", True, "Processing minutes divided by total machine-minutes."),
@@ -33,7 +36,7 @@ PRIMARY_METRICS = [
 
 PRIMARY_METRIC_LOOKUP = {key: (label, key, kind, higher_is_better, description) for (label, key, kind, higher_is_better, description) in PRIMARY_METRICS}
 METRIC_GROUPS = {
-    "item": ["total_products", "downstream_closure_ratio", "throughput_per_sim_hour", "completed_product_lead_time_avg_min"],
+    "item": ["total_products", "disposed_scrap_count", "warehouse_material_shelf_count", "downstream_closure_ratio", "throughput_per_sim_hour", "completed_product_lead_time_avg_min"],
     "machine": ["machine_utilization", "machine_broken_ratio", "machine_pm_ratio", "wall_clock_sec"],
     "worker": ["humanoid_execution_ratio_avg", "humanoid_unavailable_ratio_avg", "handover_item_count", "shared_product_carry_time_min"],
     "traffic": ["collision_count", "near_miss_count", "edge_conflict_count", "path_overlap_count"],

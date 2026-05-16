@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
-import type { BaseEntityState } from "../../core/types/entity";
+import type { BaseEntityState, XY } from "../../core/types/entity";
+import type { LayoutGridConfig } from "../../core/types/layout";
 import type { RenderRegion } from "../../core/types/replay";
 import { getWorkerSpriteThumbUrl } from "../../renderer/nodes/workerSpriteSheet";
 import { getWorkerVisualState } from "../../renderer/nodes/workerVisualState";
@@ -12,7 +13,12 @@ interface EntityMonitorPanelProps {
   items: BaseEntityState[];
   regions: RenderRegion[];
   currentTime: number;
+  grid?: LayoutGridConfig;
+  viewport?: { width: number; height: number };
 }
+
+const DEFAULT_GRID = { width_tiles: 100, height_tiles: 70 };
+const DEFAULT_VIEWPORT = { width: 1600, height: 960 };
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -166,17 +172,6 @@ function statusLabel(entity: BaseEntityState): string {
   return entity.state.toUpperCase();
 }
 
-function workerTaskLabel(entity: BaseEntityState): string {
-  if (typeof entity.attributes.current_parent_task_code === "string" && entity.attributes.current_parent_task_code.trim()) {
-    return entity.attributes.current_parent_task_code.trim();
-  }
-  const taskCode = humanoidTaskContext(entity).task_code;
-  if (typeof taskCode === "string" && taskCode.trim()) return taskCode.trim();
-  if (hasActiveHumanoidTask(entity) && typeof entity.attributes.task_label === "string" && entity.attributes.task_label.trim()) return entity.attributes.task_label;
-  if (hasActiveHumanoidTask(entity) && typeof entity.attributes.current_task_type === "string" && entity.attributes.current_task_type.trim()) return entity.attributes.current_task_type;
-  return "No active task";
-}
-
 function workerTaskCode(entity: BaseEntityState): string {
   if (typeof entity.attributes.current_parent_task_code === "string" && entity.attributes.current_parent_task_code.trim()) {
     return entity.attributes.current_parent_task_code.trim();
@@ -190,11 +185,8 @@ function workerTaskCode(entity: BaseEntityState): string {
 }
 
 function workerChildTask(entity: BaseEntityState): string {
-  const childName =
-    typeof entity.attributes.current_child_task_name === "string" ? entity.attributes.current_child_task_name.trim() : "";
   const childCode =
     typeof entity.attributes.current_child_task_code === "string" ? entity.attributes.current_child_task_code.trim() : "";
-  if (childName && childCode && childName !== childCode) return `${childName} / ${childCode}`;
   if (childCode) return childCode;
   return "-";
 }
@@ -208,9 +200,91 @@ function workerPrimitive(entity: BaseEntityState): string {
   return "-";
 }
 
-function workerMotionPath(entity: BaseEntityState, currentTime: number): string {
+function asXY(value: unknown): XY | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Record<string, unknown>;
+  const x = Number(candidate.x);
+  const y = Number(candidate.y);
+  return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : undefined;
+}
+
+function motionPathPoints(motion: unknown): XY[] {
+  if (!motion || typeof motion !== "object") return [];
+  const payload = motion as Record<string, unknown>;
+  if (Array.isArray(payload.path)) {
+    const path = payload.path.map(asXY).filter((point): point is XY => Boolean(point));
+    if (path.length >= 2) return path;
+  }
+  const from = asXY(payload.from);
+  const to = asXY(payload.to);
+  return from && to ? [from, to] : [];
+}
+
+function motionDisplayPathPoints(motion: unknown): XY[] {
+  if (!motion || typeof motion !== "object") return [];
+  const displayPath = (motion as Record<string, unknown>).display_path;
+  if (Array.isArray(displayPath)) {
+    const path = displayPath.map(asXY).filter((point): point is XY => Boolean(point));
+    if (path.length >= 2) return path;
+  }
+  return motionPathPoints(motion);
+}
+
+function samplePathPoint(points: XY[], progress: number): XY | undefined {
+  if (points.length < 2) return undefined;
+  const distances: number[] = [];
+  let total = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    const distance = Math.hypot(points[index].x - points[index - 1].x, points[index].y - points[index - 1].y);
+    distances.push(distance);
+    total += distance;
+  }
+  if (total <= 0) return undefined;
+  const targetDistance = clamp(progress, 0, 1) * total;
+  let walked = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    const segment = distances[index - 1];
+    if (segment <= 0) continue;
+    if (walked + segment >= targetDistance) {
+      const source = points[index - 1];
+      const target = points[index];
+      const local = (targetDistance - walked) / segment;
+      return {
+        x: source.x + (target.x - source.x) * local,
+        y: source.y + (target.y - source.y) * local,
+      };
+    }
+    walked += segment;
+  }
+  return points[points.length - 1];
+}
+
+function pointToTile(
+  point: XY | undefined,
+  grid: LayoutGridConfig | undefined,
+  viewport: { width: number; height: number } | undefined,
+): XY | undefined {
+  if (!point) return undefined;
+  const gridWidth = grid?.width_tiles ?? DEFAULT_GRID.width_tiles;
+  const gridHeight = grid?.height_tiles ?? DEFAULT_GRID.height_tiles;
+  const view = viewport ?? DEFAULT_VIEWPORT;
+  if (gridWidth <= 0 || gridHeight <= 0 || view.width <= 0 || view.height <= 0) return undefined;
+  const tileWidth = view.width / gridWidth;
+  const tileHeight = view.height / gridHeight;
+  return {
+    x: clamp(Math.round(point.x / tileWidth - 0.5), 0, gridWidth - 1),
+    y: clamp(Math.round(point.y / tileHeight - 0.5), 0, gridHeight - 1),
+  };
+}
+
+function formatTileCoord(point: XY | undefined): string {
+  return point ? `(${point.x}, ${point.y})` : "(-, -)";
+}
+
+function currentWorkerPoint(entity: BaseEntityState, currentTime: number): XY | undefined {
   const motion = entity.attributes.motion;
-  if (!motion || typeof motion !== "object") return "0 tiles";
+  const fallback = entity.position;
+  if (!motion || typeof motion !== "object") return fallback;
   const payload = motion as Record<string, unknown>;
   const startedAt = Number(payload.started_at);
   const endedAt = Number(payload.ended_at);
@@ -220,12 +294,34 @@ function workerMotionPath(entity: BaseEntityState, currentTime: number): string 
     endedAt > startedAt &&
     currentTime >= startedAt &&
     currentTime < endedAt;
-  if (!isMoving) return "0 tiles";
-  const path = payload.path;
-  if (Array.isArray(path) && path.length >= 2) return `${path.length} tiles`;
-  const from = payload.from;
-  const to = payload.to;
-  return from && to ? "2 tiles" : "0 tiles";
+  if (!isMoving) return fallback;
+  const path = motionPathPoints(payload);
+  const progress = clamp((currentTime - startedAt) / (endedAt - startedAt), 0, 1);
+  return samplePathPoint(path, progress) ?? fallback;
+}
+
+function workerMotionPath(
+  entity: BaseEntityState,
+  currentTime: number,
+  grid: LayoutGridConfig | undefined,
+  viewport: { width: number; height: number } | undefined,
+): string {
+  const tile = pointToTile(currentWorkerPoint(entity, currentTime), grid, viewport);
+  const coord = formatTileCoord(tile);
+  const motion = entity.attributes.motion;
+  if (!motion || typeof motion !== "object") return `0 tiles ${coord}`;
+  const payload = motion as Record<string, unknown>;
+  const startedAt = Number(payload.started_at);
+  const endedAt = Number(payload.ended_at);
+  const isMoving =
+    Number.isFinite(startedAt) &&
+    Number.isFinite(endedAt) &&
+    endedAt > startedAt &&
+    currentTime >= startedAt &&
+    currentTime < endedAt;
+  if (!isMoving) return `0 tiles ${coord}`;
+  const pathLength = motionDisplayPathPoints(payload).length;
+  return `${pathLength >= 2 ? pathLength : 0} tiles ${coord}`;
 }
 
 function trafficConflictIsActive(conflict: Record<string, unknown>, currentTime: number): boolean {
@@ -328,7 +424,7 @@ function MonitorTabs({
   );
 }
 
-export function EntityMonitorPanel({ workers, machines, items, regions, currentTime }: EntityMonitorPanelProps) {
+export function EntityMonitorPanel({ workers, machines, items, regions, currentTime, grid, viewport }: EntityMonitorPanelProps) {
   const [mode, setMode] = useState<MonitorMode>("worker");
 
   const groupedItems = useMemo(
@@ -384,9 +480,8 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
             const carryingId = cargoItemId(worker) || "-";
             const availability = humanoidStateValue(worker, "availability");
             const mobility = humanoidStateValue(worker, "mobility");
-            const power = humanoidStateValue(worker, "power");
             const manipulation = humanoidStateValue(worker, "manipulation");
-            const motionPath = workerMotionPath(worker, currentTime);
+            const motionPath = workerMotionPath(worker, currentTime, grid, viewport);
             const trafficConflict = workerTrafficConflict(worker, currentTime);
             const sharedCarry = cargoSharedCarry(worker);
             return (
@@ -440,16 +535,12 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                     <span className="worker-monitor-value">{mobility}</span>
                   </div>
                   <div>
-                    <span className="worker-monitor-key">Power</span>
-                    <span className="worker-monitor-value">{power}</span>
-                  </div>
-                  <div>
                     <span className="worker-monitor-key">Manipulation</span>
                     <span className="worker-monitor-value">{manipulation}</span>
                   </div>
                   <div>
-                    <span className="worker-monitor-key">Task / Code</span>
-                    <span className="worker-monitor-value">{workerTaskLabel(worker)} / {workerTaskCode(worker)}</span>
+                    <span className="worker-monitor-key">Task</span>
+                    <span className="worker-monitor-value">{workerTaskCode(worker)}</span>
                   </div>
                   <div>
                     <span className="worker-monitor-key">Child Task</span>
@@ -477,10 +568,6 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                   <div>
                     <span className="worker-monitor-key">Shared Carry</span>
                     <span className="worker-monitor-value">{sharedCarry}</span>
-                  </div>
-                  <div>
-                    <span className="worker-monitor-key">Updated</span>
-                    <span className="worker-monitor-value">{worker.updated_at.toFixed(2)}</span>
                   </div>
                 </div>
               </article>
@@ -540,10 +627,6 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                     <span className="worker-monitor-key">Output Item</span>
                     <span className="worker-monitor-value">{String(machine.attributes.output_item_id ?? "-")}</span>
                   </div>
-                  <div>
-                    <span className="worker-monitor-key">Updated</span>
-                    <span className="worker-monitor-value">{machine.updated_at.toFixed(2)}</span>
-                  </div>
                 </div>
               </article>
             );
@@ -594,10 +677,6 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                             <div>
                               <span className="worker-monitor-key">Reference</span>
                               <span className="worker-monitor-value">{itemRefLabel(item)}</span>
-                            </div>
-                            <div>
-                              <span className="worker-monitor-key">Updated</span>
-                              <span className="worker-monitor-value">{item.updated_at.toFixed(2)}</span>
                             </div>
                           </div>
                         </article>

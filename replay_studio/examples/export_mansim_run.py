@@ -26,6 +26,8 @@ REGION_ID = {
     "Station2": "station_2_region",
     "Inspection": "inspection_region",
     "BatteryStation": "battery_station_region",
+    "CompletedProducts": "completed_products_region",
+    "ScrapDisposal": "scrap_disposal_region",
 }
 
 QUEUE_META = {
@@ -33,7 +35,11 @@ QUEUE_META = {
     "material_queue_2": ("queue", "S2 Material Queue"),
     "intermediate_queue_2": ("buffer", "S2 Transfer Queue"),
     "intermediate_queue_4": ("queue", "Inspection Queue"),
+    "completed_product_buffer": ("buffer", "Completed Products"),
     "warehouse_buffer": ("buffer", "Completed Buffer"),
+    "inspection_scrap_queue": ("queue", "Inspection Scrap Queue"),
+    "scrap_disposal_bin": ("buffer", "Scrap Disposal"),
+    "warehouse_material_shelf": ("shelf", "Warehouse Material Shelf"),
     "battery_rack": ("charger", "Battery Rack"),
 }
 
@@ -98,8 +104,9 @@ LAYOUT_TEMPLATE: Dict[str, Any] = {
         {"entity_id": "station_2_output_queue", "entity_type": "buffer", "region_id": "station_2_region", "anchor": {"x": 0.84, "y": 0.46}},
         {"entity_id": "S2M1", "entity_type": "machine", "region_id": "station_2_region", "anchor": {"x": 0.60, "y": 0.36}},
         {"entity_id": "S2M2", "entity_type": "machine", "region_id": "station_2_region", "anchor": {"x": 0.60, "y": 0.72}},
-        {"entity_id": "intermediate_queue_4", "entity_type": "queue", "region_id": "inspection_region", "anchor": {"x": 0.20, "y": 0.46}},
-        {"entity_id": "inspection_output_queue", "entity_type": "buffer", "region_id": "inspection_region", "anchor": {"x": 0.82, "y": 0.46}},
+        {"entity_id": "intermediate_queue_4", "entity_type": "queue", "region_id": "inspection_region", "anchor": {"x": 0.20, "y": 0.32}},
+        {"entity_id": "inspection_output_queue", "entity_type": "buffer", "region_id": "inspection_region", "anchor": {"x": 0.82, "y": 0.30}},
+        {"entity_id": "inspection_scrap_queue", "entity_type": "queue", "region_id": "inspection_region", "anchor": {"x": 0.82, "y": 0.60}},
     ],
 }
 
@@ -243,15 +250,47 @@ def path_tiles_to_positions(layout: Dict[str, Any], tiles: Any) -> List[Dict[str
     return positions
 
 
+def initial_warehouse_material_state(raw_events: List[Dict[str, Any]]) -> tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    shelf_attributes = {"shelf_count": 0, "shelf_capacity": 0}
+    slot_attributes: Dict[str, Dict[str, Any]] = {}
+    for raw in raw_events:
+        if raw.get("type") != "WAREHOUSE_MATERIAL_RESTOCK":
+            continue
+        details = raw.get("details", {}) if isinstance(raw.get("details", {}), dict) else {}
+        if details.get("reason") != "initial_fill":
+            continue
+        shelf_attributes = {
+            "shelf_count": details.get("shelf_count", 0),
+            "shelf_capacity": details.get("shelf_capacity", 0),
+            "restocked_count": details.get("restocked_count", 0),
+        }
+        for slot in details.get("slots", []) or []:
+            if not isinstance(slot, dict):
+                continue
+            slot_id = str(slot.get("slot_id", "") or "")
+            if not slot_id:
+                continue
+            slot_attributes[slot_id] = {
+                "occupied": True,
+                "material_item_id": slot.get("item_id"),
+                "item_type": "material",
+            }
+        break
+    return shelf_attributes, slot_attributes
+
+
 def build_initial_state(
     worker_ids: List[str],
     machine_ids: List[str],
     layout: Dict[str, Any],
     battery_period_min: float,
     repair_total_min: float,
+    initial_shelf_attributes: Dict[str, Any] | None = None,
+    initial_material_slots: Dict[str, Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     positions = layout_positions(layout)
     entities: Dict[str, Dict[str, Any]] = {}
+    material_slot_attrs = initial_material_slots or {}
 
     def add_entity(entity_id: str, entity_type: str, label: str, state: str, *, attributes: Dict[str, Any] | None = None) -> None:
         entities[entity_id] = {
@@ -267,9 +306,38 @@ def build_initial_state(
 
     for queue_id, (entity_type, label) in QUEUE_META.items():
         attributes = {"queue_size": 0}
-        if queue_id == "warehouse_buffer":
+        if queue_id in {"completed_product_buffer", "warehouse_buffer"}:
             attributes = {"completed_count": 0}
+        if queue_id == "inspection_scrap_queue":
+            attributes = {"queue_size": 0, "queue_kind": "scrap"}
+        if queue_id == "scrap_disposal_bin":
+            attributes = {"disposed_scrap_count": 0}
+        if queue_id == "warehouse_material_shelf":
+            attributes = dict(initial_shelf_attributes or {"shelf_count": 0, "shelf_capacity": 0})
         add_entity(queue_id, entity_type, label, "waiting", attributes=attributes)
+
+    for node in layout.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        entity_id = str(node.get("entity_id", "") or "")
+        entity_type = str(node.get("entity_type", "") or "")
+        if entity_id.startswith("warehouse_material_slot_") and entity_id not in entities:
+            add_entity(
+                entity_id,
+                "material_slot",
+                entity_id.replace("warehouse_material_slot_", "Material Slot "),
+                "waiting",
+                attributes=dict(
+                    material_slot_attrs.get(
+                        entity_id,
+                        {
+                            "occupied": False,
+                            "material_item_id": None,
+                            "item_type": "material",
+                        },
+                    )
+                ),
+            )
 
     for queue_id, (entity_type, label, source_ref) in OUTPUT_QUEUE_META.items():
         add_entity(
@@ -323,7 +391,15 @@ def build_initial_state(
 
     queues = {
         queue_id: {"queue_id": queue_id, "item_ids": [], "updated_at": 0}
-        for queue_id in ("material_queue_1", "material_queue_2", "intermediate_queue_2", "intermediate_queue_4", "warehouse_buffer")
+        for queue_id in (
+            "material_queue_1",
+            "material_queue_2",
+            "intermediate_queue_2",
+            "intermediate_queue_4",
+            "inspection_scrap_queue",
+            "completed_product_buffer",
+            "warehouse_buffer",
+        )
     }
     return {
         "timestamp": 0,
@@ -378,42 +454,61 @@ def humanoid_task_key(worker_id: str, details: Dict[str, Any]) -> tuple[Any, ...
     )
 
 
-def build_humanoid_task_end_index(raw_events: List[Dict[str, Any]]) -> Dict[tuple[Any, ...], List[float]]:
+def build_humanoid_task_window_index(raw_events: List[Dict[str, Any]]) -> Dict[tuple[Any, ...], Dict[str, float]]:
+    start_index: Dict[tuple[Any, ...], List[float]] = {}
     end_index: Dict[tuple[Any, ...], List[float]] = {}
     for event in raw_events:
-        if event.get("type") != "HUMANOID_TASK_END":
+        event_type = event.get("type")
+        if event_type not in {"HUMANOID_TASK_START", "HUMANOID_TASK_END"}:
             continue
         worker_id = event.get("entity_id")
         details = event.get("details", {})
         if not isinstance(worker_id, str) or not isinstance(details, dict):
             continue
-        end_index.setdefault(humanoid_task_key(worker_id, details), []).append(float(event["t"]))
-    return end_index
+        key = humanoid_task_key(worker_id, details)
+        if event_type == "HUMANOID_TASK_START":
+            start_index.setdefault(key, []).append(float(event["t"]))
+        else:
+            end_index.setdefault(key, []).append(float(event["t"]))
+    windows: Dict[tuple[Any, ...], Dict[str, float]] = {}
+    for key, starts in start_index.items():
+        sorted_ends = sorted(end_index.get(key, []))
+        for started_at in sorted(starts):
+            ended_at = next((candidate for candidate in sorted_ends if candidate >= started_at), None)
+            if ended_at is None or ended_at <= started_at:
+                ended_at = started_at + MIN_VISIBLE_TASK_WINDOW_MIN
+            windows[key] = {"started_at": started_at, "ended_at": ended_at}
+    return windows
 
 
-def find_humanoid_task_end_time(
-    task_end_by_key: Dict[tuple[Any, ...], List[float]],
+def find_humanoid_task_window(
+    task_window_by_key: Dict[tuple[Any, ...], Dict[str, float]],
     worker_id: str,
     timestamp: float,
     details: Dict[str, Any],
-) -> float | None:
-    for ended_at in task_end_by_key.get(humanoid_task_key(worker_id, details), []):
-        if ended_at >= timestamp:
-            return ended_at
-    return None
+) -> Dict[str, float] | None:
+    window = task_window_by_key.get(humanoid_task_key(worker_id, details))
+    if not window:
+        return None
+    ended_at = float(window.get("ended_at", timestamp) or timestamp)
+    if ended_at < timestamp:
+        return None
+    return window
 
 
 def humanoid_task_window(
-    task_end_by_key: Dict[tuple[Any, ...], List[float]],
+    task_window_by_key: Dict[tuple[Any, ...], Dict[str, float]],
     worker_id: str,
     timestamp: float,
     details: Dict[str, Any],
 ) -> Dict[str, Any]:
-    ended_at = find_humanoid_task_end_time(task_end_by_key, worker_id, timestamp, details)
-    if ended_at is None or ended_at <= timestamp:
+    indexed_window = find_humanoid_task_window(task_window_by_key, worker_id, timestamp, details)
+    started_at = float(indexed_window.get("started_at", timestamp) if indexed_window else timestamp)
+    ended_at = float(indexed_window.get("ended_at", timestamp) if indexed_window else timestamp)
+    if ended_at <= timestamp:
         ended_at = timestamp + MIN_VISIBLE_TASK_WINDOW_MIN
     return {
-        "started_at": timestamp,
+        "started_at": started_at,
         "ended_at": ended_at,
         "task_id": details.get("task_id"),
         "task_code": details.get("task_code"),
@@ -508,9 +603,10 @@ def convert_events(
 ) -> List[Dict[str, Any]]:
     builder = ReplayEventBuilder()
     task_end_by_id = build_task_end_index(raw_events)
-    task_end_by_key = build_humanoid_task_end_index(raw_events)
+    task_window_by_key = build_humanoid_task_window_index(raw_events)
     positions = layout_positions(layout)
     active_tasks: Dict[str, Dict[str, Any]] = {}
+    active_move_paths: Dict[str, List[Dict[str, float]]] = {}
     completed_count = 0
     output_buffer_alias = {
         "output_buffer_station_1": "station_1_output_queue",
@@ -595,6 +691,7 @@ def convert_events(
         }
         if path_positions:
             payload["path"] = path_positions
+            payload["display_path"] = path_positions
         return payload
 
     def canonical_worker_attributes(details: Dict[str, Any], event_index: int, worker_id: str) -> Dict[str, Any]:
@@ -733,13 +830,18 @@ def convert_events(
 
         if raw_type == "HUMANOID_TASK_START" and entity_id:
             attrs = canonical_worker_attributes(details, index, entity_id)
-            attrs["task_window"] = humanoid_task_window(task_end_by_key, entity_id, timestamp, details)
+            attrs["task_window"] = humanoid_task_window(task_window_by_key, entity_id, timestamp, details)
             push("state_changed", timestamp, {"primary": entity_id}, {"attributes": attrs})
             continue
 
         if raw_type == "HUMANOID_TASK_END" and entity_id:
             attrs = canonical_worker_attributes(details, index, entity_id)
             if details.get("parent_task_code"):
+                parent_window_details = {
+                    "task_id": details.get("parent_task_id"),
+                    "instance_id": details.get("parent_instance_id"),
+                    "task_code": details.get("parent_task_code"),
+                }
                 attrs.update(
                     {
                         "current_task_code": details.get("parent_task_code"),
@@ -749,6 +851,7 @@ def convert_events(
                         "current_child_task_instance_id": None,
                         "current_task_path": None,
                         "current_task_depth": 0,
+                        "task_window": humanoid_task_window(task_window_by_key, entity_id, timestamp, parent_window_details),
                     }
                 )
             task_context = (attrs.get("humanoid_state") or {}).get("task_context") if isinstance(attrs.get("humanoid_state"), dict) else None
@@ -767,9 +870,10 @@ def convert_events(
                 {
                     "current_step_id": "",
                     "current_primitive_call_code": "",
-                    "task_window": None,
                 }
             )
+            if not details.get("parent_task_code"):
+                attrs["task_window"] = None
             push("state_changed", timestamp, {"primary": entity_id}, {"attributes": attrs})
             continue
 
@@ -867,10 +971,59 @@ def convert_events(
             )
             continue
 
+        if raw_type == "AGENT_MOVE_TILE_START" and entity_id:
+            from_position = tile_to_position(layout, details.get("from_tile"))
+            to_position = tile_to_position(layout, details.get("to_tile"))
+            if from_position and to_position:
+                started_at = float(details.get("started_at", timestamp) or timestamp)
+                ended_at = float(details.get("ended_at", started_at) or started_at)
+                move_id = str(details.get("move_id") or "")
+                display_path = active_move_paths.get(move_id) or [from_position, to_position]
+                push(
+                    "entity_moved",
+                    timestamp,
+                    {"primary": entity_id},
+                    {
+                        "from": from_position,
+                        "to": to_position,
+                        "path": [from_position, to_position],
+                        "display_path": display_path,
+                        "label": f"tile {details.get('from_tile', '')} -> {details.get('to_tile', '')}",
+                        "move_id": details.get("move_id"),
+                        "segment_index": details.get("segment_index"),
+                    },
+                    durative={
+                        "started_at": started_at,
+                        "ended_at": ended_at,
+                        "expected_duration": max(0.0, ended_at - started_at),
+                    },
+                    suffix=f"tile-start-{details.get('segment_index', 0)}",
+                )
+            continue
+
+        if raw_type == "AGENT_MOVE_TILE_END" and entity_id:
+            to_position = tile_to_position(layout, details.get("to_tile"))
+            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs["motion"] = None
+            payload: Dict[str, Any] = {"attributes": attrs}
+            if to_position is not None:
+                payload["position"] = to_position
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": entity_id},
+                payload,
+                suffix=f"tile-end-{details.get('segment_index', 0)}",
+            )
+            continue
+
         if raw_type == "AGENT_MOVE_START":
             source = resolve_region_id(details.get("from"))
             target = resolve_region_id(details.get("to"))
             path_positions = path_tiles_to_positions(layout, details.get("path_tiles"))
+            move_id = str(details.get("move_id") or "")
+            if move_id and path_positions:
+                active_move_paths[move_id] = path_positions
             from_position = tile_to_position(layout, details.get("from_tile")) or (positions.get(source) if source else None)
             to_position = tile_to_position(layout, details.get("to_tile")) or (positions.get(target) if target else None)
             if entity_id and source and target and from_position and to_position:
@@ -882,6 +1035,7 @@ def convert_events(
                         "from": from_position,
                         "to": to_position,
                         "path": path_positions,
+                        "display_path": path_positions,
                         "label": f"{details.get('from', '')} -> {details.get('to', '')}",
                         "move_id": details.get("move_id"),
                     },
@@ -894,6 +1048,9 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_MOVE_END" and entity_id:
+            move_id = str(details.get("move_id") or "")
+            if move_id:
+                active_move_paths.pop(move_id, None)
             if has_canonical_worker_events:
                 continue
             current_task = active_tasks.get(entity_id)
@@ -1056,6 +1213,104 @@ def convert_events(
                     {"primary": details.get("item_id"), "source": queue_id, "target": resolve_region_id(location)},
                     {"item_id": details.get("item_id"), "queue_id": queue_id},
                 )
+            continue
+
+        if raw_type == "WAREHOUSE_MATERIAL_RESTOCK":
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": "warehouse_material_shelf"},
+                {
+                    "attributes": {
+                        "shelf_count": details.get("shelf_count", 0),
+                        "shelf_capacity": details.get("shelf_capacity", 0),
+                        "restocked_count": details.get("restocked_count", 0),
+                    }
+                },
+            )
+            for index_slot, slot in enumerate(details.get("slots", []) or []):
+                if not isinstance(slot, dict):
+                    continue
+                slot_id = str(slot.get("slot_id", "") or "")
+                if not slot_id:
+                    continue
+                push(
+                    "state_changed",
+                    timestamp,
+                    {"primary": slot_id},
+                    {
+                        "attributes": {
+                            "occupied": True,
+                            "material_item_id": slot.get("item_id"),
+                            "item_type": "material",
+                        }
+                    },
+                    suffix=f"slot-{index_slot}",
+                )
+            continue
+
+        if raw_type == "WAREHOUSE_MATERIAL_PICKED":
+            slot_id = str(details.get("slot_id", "") or "")
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": "warehouse_material_shelf"},
+                {
+                    "attributes": {
+                        "shelf_count": details.get("shelf_count", 0),
+                        "shelf_capacity": details.get("shelf_capacity", 0),
+                    }
+                },
+            )
+            if slot_id:
+                push(
+                    "state_changed",
+                    timestamp,
+                    {"primary": slot_id},
+                    {
+                        "attributes": {
+                            "occupied": False,
+                            "material_item_id": None,
+                            "item_type": "material",
+                        }
+                    },
+                    suffix="slot",
+                )
+            continue
+
+        if raw_type == "INSPECTION_SCRAP_QUEUED":
+            push(
+                "queue_entered",
+                timestamp,
+                {"primary": entity_id, "source": "inspection_table", "target": "inspection_scrap_queue"},
+                {"item_id": entity_id, "queue_id": "inspection_scrap_queue", "queue_size": details.get("queue_length", 0)},
+            )
+            continue
+
+        if raw_type == "SCRAP_BATCH_PICKED":
+            for index_item, item_id in enumerate(details.get("item_ids", []) or []):
+                push(
+                    "queue_exited",
+                    timestamp,
+                    {"primary": item_id, "source": "inspection_scrap_queue", "target": entity_id},
+                    {"item_id": item_id, "queue_id": "inspection_scrap_queue", "queue_size": details.get("queue_length", 0)},
+                    suffix=f"scrap-pick-{index_item}",
+                )
+            continue
+
+        if raw_type == "SCRAP_DISPOSED":
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": "scrap_disposal_bin"},
+                {
+                    "attributes": {
+                        "disposed_scrap_count": details.get("disposed_scrap_count", 0),
+                        "last_disposed_item_ids": details.get("item_ids", []),
+                        "last_disposed_item_count": details.get("item_count", 0),
+                    }
+                },
+            )
             continue
 
         if raw_type == "ITEM_MOVED":
@@ -1341,8 +1596,8 @@ def convert_events(
 
         if raw_type == "COMPLETED_PRODUCT":
             completed_count += 1
-            push("message_sent", timestamp, {"source": "inspection_region", "target": "warehouse_buffer", "related": [entity_id] if entity_id else []}, {"message": "COMPLETED"})
-            push("state_changed", timestamp, {"primary": "warehouse_buffer"}, {"attributes": {"completed_count": completed_count}}, suffix="b")
+            push("message_sent", timestamp, {"source": "inspection_region", "target": "completed_product_buffer", "related": [entity_id] if entity_id else []}, {"message": "COMPLETED"})
+            push("state_changed", timestamp, {"primary": "completed_product_buffer"}, {"attributes": {"completed_count": completed_count}}, suffix="b")
             continue
 
         if raw_type == "INCIDENT_EVENT":
@@ -1415,6 +1670,7 @@ def export_run(run_dir: Path, output_log: Path, output_layout: Path) -> None:
     repair_total_min = float(runtime_cfg.get("repair_time_min", 20.0))
     layout = build_layout(worker_ids, scenario_cfg)
     converted_events = convert_events(raw_events, layout, battery_period_min, repair_total_min)
+    initial_shelf_attributes, initial_material_slots = initial_warehouse_material_state(raw_events)
 
     replay_log = {
         "schema_version": "1.0",
@@ -1431,7 +1687,15 @@ def export_run(run_dir: Path, output_log: Path, output_layout: Path) -> None:
             "visual_corrections": False,
         },
         "layout": layout,
-        "initial_state": build_initial_state(worker_ids, machine_ids, layout, battery_period_min, repair_total_min),
+        "initial_state": build_initial_state(
+            worker_ids,
+            machine_ids,
+            layout,
+            battery_period_min,
+            repair_total_min,
+            initial_shelf_attributes,
+            initial_material_slots,
+        ),
         "events": converted_events,
     }
 

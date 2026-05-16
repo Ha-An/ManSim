@@ -90,6 +90,16 @@ export function motionPathPoints(motion: unknown): XY[] {
   return from && to ? [from, to] : [];
 }
 
+export function motionDisplayPathPoints(motion: unknown): XY[] {
+  if (!motion || typeof motion !== "object") return [];
+  const displayPath = (motion as Record<string, unknown>).display_path;
+  if (Array.isArray(displayPath)) {
+    const path = displayPath.map(asXY).filter((point): point is XY => Boolean(point));
+    if (path.length >= 2) return path;
+  }
+  return motionPathPoints(motion);
+}
+
 export function isMotionActive(motion: unknown, currentTime: number): boolean {
   if (!motion || typeof motion !== "object") return false;
   const payload = motion as Record<string, unknown>;
@@ -135,4 +145,3 @@ export function samplePath(points: XY[], progress: number): { point: XY; angle: 
 export function footprintForEntity(grid: LayoutGridConfig | undefined, entityId: string): LayoutGridObjectFootprint | undefined {
   return grid?.object_footprints?.find((footprint) => footprint.object_id === entityId);
 }
-

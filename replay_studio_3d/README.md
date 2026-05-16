@@ -7,7 +7,8 @@ Replay Studio 3D는 기존 `replay_studio/`를 건드리지 않는 독립 실험
 - 기존 `replay_studio_log.json` v1.0을 그대로 읽습니다.
 - 기존 factory layout, tile grid, object footprint, worker motion path를 3D로 표현합니다.
 - 2D sprite를 쓰지 않고 Three.js procedural block model로 worker, machine, queue, buffer, charger, item을 그립니다.
-- 기존 hub와 2D Replay Studio에는 연결하지 않습니다.
+- 기존 2D Replay Studio와 코드를 직접 공유하지 않습니다.
+- Results Hub의 “Replay Studio 3D” 메뉴에서 현재 run log를 전달받아 열 수 있습니다.
 
 ## 실행
 
@@ -65,4 +66,3 @@ npm run test:visual
 ```
 
 `test:visual`은 Playwright로 desktop/mobile viewport에서 3D canvas가 비어 있지 않은지, replay object들이 렌더링되는지 확인합니다.
-

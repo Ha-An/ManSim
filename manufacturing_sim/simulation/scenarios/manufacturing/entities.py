@@ -41,6 +41,7 @@ class ItemState(str, Enum):
     WAITING_INSPECTION = "WAITING_INSPECTION"
     INSPECTING = "INSPECTING"
     WAITING_INSPECTION_OUTPUT = "WAITING_INSPECTION_OUTPUT"
+    WAITING_SCRAP_DISPOSAL = "WAITING_SCRAP_DISPOSAL"
     COMPLETED = "COMPLETED"
     SCRAPPED = "SCRAPPED"
 
@@ -116,6 +117,9 @@ class Worker:
     in_transit_total_min: float = 0.0
     carrying_item_id: Optional[str] = None
     carrying_item_type: Optional[str] = None
+    carrying_item_ids: list[str] = field(default_factory=list)
+    carrying_item_count: int = 0
+    carrying_item_max_count: int = 1
     transport_session_id: Optional[str] = None
     shared_carry_role: Optional[str] = None
     battery_swap_critical: bool = False

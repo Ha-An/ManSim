@@ -189,6 +189,7 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
         from,
         to,
         path: Array.isArray(event.payload.path) ? event.payload.path : undefined,
+        display_path: Array.isArray(event.payload.display_path) ? event.payload.display_path : undefined,
         started_at: event.durative?.started_at ?? event.timestamp,
         ended_at: event.durative?.ended_at ?? event.timestamp,
       };

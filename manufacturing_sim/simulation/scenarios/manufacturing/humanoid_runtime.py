@@ -21,12 +21,12 @@ TASK_CODE_BY_PRIORITY_KEY: dict[str, str] = {
     "repair_machine": "REPAIR_MACHINE",
     "preventive_maintenance": "PREVENTIVE_MAINTENANCE",
     "handover_item": "HANDOVER_ITEM",
+    "scrap_disposal": "COLLECT_WASTE_OR_SCRAP",
 }
 
 
 DOMAIN_ACTION_CALLS: dict[str, set[str]] = {
     "TRANSFER": {"GRASP"},
-    "REPLENISH_MATERIAL": {"EXECUTE_REPLENISHMENT_ACTION"},
     "MANAGE_ROBOT_POWER": {"EXECUTE_SYSTEM_ACTION"},
     "SETUP_MACHINE": {"EXECUTE_MACHINE_ACTION"},
     "UNLOAD_MACHINE": {"EXECUTE_MACHINE_ACTION"},
@@ -34,6 +34,7 @@ DOMAIN_ACTION_CALLS: dict[str, set[str]] = {
     "REPAIR_MACHINE": {"EXECUTE_MAINTENANCE_ACTION"},
     "PREVENTIVE_MAINTENANCE": {"EXECUTE_MAINTENANCE_ACTION"},
     "HANDOVER_ITEM": {"EXECUTE_HUMAN_COLLABORATION_ACTION"},
+    "COLLECT_WASTE_OR_SCRAP": set(),
 }
 
 
@@ -41,6 +42,7 @@ NESTED_DOMAIN_ACTION_CHILD_CALLS: dict[str, set[str]] = {
     "REPLENISH_MATERIAL": {"TRANSFER"},
     "SETUP_MACHINE": {"LOAD_MACHINE"},
     "PREVENTIVE_MAINTENANCE": {"INSPECT_MACHINE"},
+    "COLLECT_WASTE_OR_SCRAP": {"TRANSFER"},
 }
 
 
@@ -56,7 +58,6 @@ SUPPORTED_PRIMITIVE_CALLS: set[str] = {
     "EXECUTE_MACHINE_ACTION",
     "EXECUTE_MAINTENANCE_ACTION",
     "EXECUTE_QUALITY_ACTION",
-    "EXECUTE_REPLENISHMENT_ACTION",
     "EXECUTE_SYSTEM_ACTION",
     "GRASP",
     "INSPECT_OR_DIAGNOSE",
@@ -67,10 +68,13 @@ SUPPORTED_PRIMITIVE_CALLS: set[str] = {
     "PLACE",
     "PRIMITIVE_IDENTIFY_ITEM",
     "READ_MACHINE_STATE",
+    "READ_CONTEXT",
     "REACH_TO",
     "RECORD_RESULT",
     "RELEASE",
     "UPDATE_RECORD",
+    "UPDATE_INVENTORY_RECORD",
+    "VERIFY_TRANSACTION",
     "VERIFY_LEVEL_OR_QUANTITY",
     "VERIFY_LOCKOUT_IF_REQUIRED",
     "VERIFY_MACHINE_STATE",
@@ -495,7 +499,7 @@ class HumanoidTaskRuntime:
                 }
             from_station = int(payload.get("from_station", 0) or 0)
             if from_station == self.world.inspection_queue_station:
-                destination = "Warehouse"
+                destination = "completed_product_buffer"
                 item_type = "product"
             else:
                 destination = f"intermediate_queue_{from_station + 1}"
@@ -548,6 +552,30 @@ class HumanoidTaskRuntime:
                     "transport_session_id": str(payload.get("transport_session_id") or ""),
                     "destination": str(payload.get("destination") or ""),
                     "max_carriers": int(payload.get("max_carriers", 2) or 2),
+                },
+            }
+        if task_code == "COLLECT_WASTE_OR_SCRAP":
+            item_ids = payload.get("item_ids")
+            if not isinstance(item_ids, list):
+                item_ids = []
+            return {
+                "item": {
+                    "entity_type": "scrap_batch",
+                    "entity_ids": [str(item_id) for item_id in item_ids],
+                },
+                "waste_or_scrap": {
+                    "entity_type": "scrap_batch",
+                    "entity_ids": [str(item_id) for item_id in item_ids],
+                },
+                "items": {
+                    "entity_type": "scrap_batch",
+                    "entity_ids": [str(item_id) for item_id in item_ids],
+                },
+                "source": str(payload.get("source") or "inspection_scrap_queue"),
+                "destination": str(payload.get("destination") or "scrap_disposal_bin"),
+                "sorting_rule": {
+                    "max_carry_count": int(payload.get("max_carry_count", getattr(self.world, "scrap_transport_max_carry_count", 3)) or 3),
+                    "item_type": "product",
                 },
             }
         return dict(payload)

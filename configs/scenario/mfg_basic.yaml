@@ -72,7 +72,19 @@ map:
 
 quality:
   # Inspection에서 scrap으로 판정될 확률(0~1)
-  defect_prob: 0.00
+  defect_prob: 0.10
+  scrap_transport:
+    # Inspection scrap queue에서 ScrapDisposal까지 한 번에 옮길 수 있는 불량품 수
+    max_carry_count: 3
+
+warehouse:
+  material_shelf:
+    # Warehouse 선반에 놓일 수 있는 material slot 수
+    capacity: 10
+    # 매 day boundary마다 빈 slot만 capacity까지 보충한다.
+    restock_policy: day_boundary
+    # 시뮬레이션 시작 시 채워둘 material 수
+    initial_fill: 10
 
 machine_failure:
   # 평균 고장 간격(분). exponential 분포 기반

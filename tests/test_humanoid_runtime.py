@@ -72,6 +72,14 @@ SELECTED_TASK_ARGS = {
             "max_carriers": 2,
         },
     },
+    "COLLECT_WASTE_OR_SCRAP": {
+        "item": {"entity_type": "scrap_batch", "entity_ids": ["SCRAP-1"]},
+        "waste_or_scrap": {"entity_type": "scrap_batch", "entity_ids": ["SCRAP-1"]},
+        "items": {"entity_type": "scrap_batch", "entity_ids": ["SCRAP-1"]},
+        "source": "inspection_scrap_queue",
+        "destination": "scrap_disposal_bin",
+        "sorting_rule": {"max_carry_count": 3, "item_type": "product"},
+    },
 }
 
 
