@@ -348,6 +348,132 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual([], world._handover_item_candidates(helper, 100.0))
 
+    def test_transport_metrics_include_shared_carry_collaboration(self) -> None:
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.logger = SimpleNamespace(
+            events=[
+                {
+                    "t": 5.0,
+                    "type": "PRODUCT_CARRY_JOINED",
+                    "entity_id": "PRODUCT-1",
+                    "details": {"helper_worker_id": "A2", "carrier_ids": ["A1", "A2"]},
+                },
+                {
+                    "t": 12.0,
+                    "type": "PRODUCT_CARRY_COMPLETED",
+                    "entity_id": "PRODUCT-1",
+                    "details": {
+                        "duration": 12.0,
+                        "shared_duration": 7.0,
+                        "carrier_count": 2,
+                        "carrier_ids": ["A1", "A2"],
+                    },
+                },
+            ]
+        )
+
+        metrics = world._transport_metrics()
+
+        self.assertEqual(1, metrics["handover_item_count"])
+        self.assertEqual(1, metrics["shared_product_carry_completed_count"])
+        self.assertAlmostEqual(12.0, metrics["product_carry_time_min"])
+        self.assertAlmostEqual(7.0, metrics["shared_product_carry_time_min"])
+        self.assertAlmostEqual(5.0, metrics["solo_product_carry_time_min"])
+        self.assertAlmostEqual(7.0 / 12.0, metrics["shared_product_carry_ratio"], places=6)
+        self.assertEqual({"A1": 7.0, "A2": 7.0}, metrics["shared_product_carry_time_by_worker"])
+        self.assertEqual({"A1 / A2": 7.0}, metrics["shared_product_carry_time_by_pair"])
+
+    def test_repair_collaboration_metrics_integrate_team_size(self) -> None:
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.env = SimpleNamespace(now=20.0)
+        world.logger = SimpleNamespace(
+            events=[
+                {
+                    "t": 0.0,
+                    "type": "MACHINE_REPAIR_START",
+                    "entity_id": "S1M1",
+                    "details": {"by": "A1", "repair_team": ["A1"], "repair_team_size": 1},
+                },
+                {
+                    "t": 5.0,
+                    "type": "MACHINE_REPAIR_HELPER_JOIN",
+                    "entity_id": "S1M1",
+                    "details": {"by": "A2", "repair_team": ["A1", "A2"], "repair_team_size": 2},
+                },
+                {
+                    "t": 15.0,
+                    "type": "MACHINE_REPAIR_HELPER_LEAVE",
+                    "entity_id": "S1M1",
+                    "details": {"by": "A2", "repair_team": ["A1"], "repair_team_size": 1},
+                },
+                {
+                    "t": 20.0,
+                    "type": "MACHINE_REPAIRED",
+                    "entity_id": "S1M1",
+                    "details": {"by": "A1", "repair_team": ["A1"], "repair_team_size": 1},
+                },
+            ]
+        )
+
+        metrics = world._repair_collaboration_metrics()
+
+        self.assertEqual(1, metrics["repair_helper_join_count"])
+        self.assertEqual({"S1M1": 1}, metrics["repair_helper_join_count_by_machine"])
+        self.assertEqual({"A2": 1}, metrics["repair_helper_join_count_by_worker"])
+        self.assertEqual({"1": 10.0, "2": 10.0}, metrics["repair_team_time_by_size"])
+        self.assertAlmostEqual(10.0, metrics["repair_collaboration_time_min"])
+        self.assertAlmostEqual(10.0, metrics["repair_solo_time_min"])
+        self.assertAlmostEqual(0.5, metrics["repair_collaboration_ratio"])
+        self.assertAlmostEqual(1.5, metrics["repair_team_size_avg"])
+        self.assertEqual({"S1M1": 10.0}, metrics["repair_collaboration_time_by_machine"])
+        self.assertEqual({"A1": 10.0, "A2": 10.0}, metrics["repair_collaboration_time_by_worker"])
+        episodes = metrics["repair_collaboration_episodes"]
+        self.assertEqual(1, len(episodes))
+        self.assertEqual("S1M1", episodes[0]["machine_id"])
+        self.assertAlmostEqual(0.0, episodes[0]["started_at"])
+        self.assertAlmostEqual(20.0, episodes[0]["ended_at"])
+        self.assertAlmostEqual(20.0, episodes[0]["active_repair_time_min"])
+        self.assertAlmostEqual(10.0, episodes[0]["collaboration_time_min"])
+        self.assertEqual(2, episodes[0]["max_team_size"])
+        self.assertEqual(1, episodes[0]["helper_join_count"])
+        self.assertEqual({"1": 10.0, "2": 10.0}, episodes[0]["team_time_by_size"])
+        self.assertEqual(["A1"], episodes[0]["final_team"])
+        self.assertEqual("completed", episodes[0]["status"])
+
+    def test_precondition_failed_task_end_sets_blocked_availability(self) -> None:
+        events: list[dict] = []
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.env = SimpleNamespace(now=12.0)
+        world.logger = SimpleNamespace(log=lambda **payload: events.append(payload))
+        world.humanoid_runtime = None
+        world.task_records = []
+        world.product_transport_session_by_worker = {}
+        world.product_transport_sessions = {}
+        world.day_for_time = lambda _t: 1  # type: ignore[method-assign]
+        world.worker_display_location = lambda worker: worker.location  # type: ignore[method-assign]
+        world.battery_remaining = lambda _worker: 100.0  # type: ignore[method-assign]
+        worker = Worker(worker_id="A2", location="warehouse_material_slot_01")
+        task = Task(
+            task_id="MAT-1",
+            task_type="TRANSFER",
+            priority_key="material_supply",
+            priority=85.0,
+            location="Warehouse",
+            payload={"transfer_kind": "material_supply", "station": 1},
+            task_code="REPLENISH_MATERIAL",
+            instance_id="MAT-1",
+            assigned_robot_id="A2",
+            task_spec_name="REPLENISH_MATERIAL",
+        )
+
+        world.finish_agent_task(worker, task, start_t=10.0, status="skipped", reason="material_shelf_slot_empty")
+
+        self.assertEqual("BLOCKED", worker.humanoid_state["availability"])
+        task_end = next(event for event in events if event["event_type"] == "AGENT_TASK_END")
+        self.assertEqual("material_shelf_slot_empty", task_end["details"]["reason"])
+        self.assertEqual("skipped", world.task_records[-1]["status"])
+        self.assertEqual("material_supply", world.task_records[-1]["priority_key"])
+
     def test_legacy_state_contract_removed(self) -> None:
         root = Path(__file__).resolve().parents[1]
         checked_roots = ["manufacturing_sim", "dashboards", "replay_studio/src", "replay_studio/examples", "docs", "README.md"]

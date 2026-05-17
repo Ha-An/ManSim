@@ -453,6 +453,12 @@ def _raw_artifacts(current_page_path: Path, run: dict[str, Any] | None) -> str:
     if not isinstance(run, dict):
         return ""
     artifacts = run.get("artifacts", {}) if isinstance(run.get("artifacts", {}), dict) else {}
+    def _existing_artifact(path: Any) -> str:
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        return text if Path(text).exists() else ""
+
     raw_links = [
         ("run_reflection.json", artifacts.get("run_reflection.json", "")),
         ("run_reflection.md", artifacts.get("run_reflection.md", "")),
@@ -462,9 +468,10 @@ def _raw_artifacts(current_page_path: Path, run: dict[str, Any] | None) -> str:
         ("kpi.json", artifacts.get("kpi.json", "")),
     ]
     items = "".join(
-        f"<li><a href='{html.escape(rel_href(current_page_path, path))}'>{html.escape(label)}</a></li>"
+        f"<li><a href='{html.escape(rel_href(current_page_path, existing_path))}'>{html.escape(label)}</a></li>"
         for label, path in raw_links
-        if str(path).strip()
+        for existing_path in [_existing_artifact(path)]
+        if existing_path
     )
     return f"<section class='section'><div class='panel'><h2>Raw Artifacts</h2><ul class='clean'>{items}</ul></div></section>" if items else ""
 

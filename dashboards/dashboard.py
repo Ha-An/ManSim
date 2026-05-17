@@ -18,9 +18,15 @@ PRIMARY_METRICS = [
     ("Machine Broken Ratio", "machine_broken_ratio", "ratio", False, "Broken minutes divided by total machine-minutes."),
     ("Machine PM Ratio", "machine_pm_ratio", "ratio", False, "Preventive-maintenance minutes divided by total machine-minutes."),
     ("Humanoid Executing Ratio", "humanoid_execution_ratio_avg", "ratio", True, "Average share of worker-minutes with availability=EXECUTING."),
+    ("Humanoid Blocked Ratio", "humanoid_blocked_ratio_avg", "ratio", False, "Average share of worker-minutes with availability=BLOCKED."),
     ("Humanoid Unavailable Ratio", "humanoid_unavailable_ratio_avg", "ratio", False, "Average share of worker-minutes with availability=DISABLED or OFFLINE."),
     ("Handover Items", "handover_item_count", "count", True, "HANDOVER_ITEM executions where a humanoid joined product transport."),
     ("Shared Carry Time", "shared_product_carry_time_min", "minutes", True, "Product carry minutes after a second carrier joined."),
+    ("Shared Carry Ratio", "shared_product_carry_ratio", "ratio", True, "Share of product carry time performed with two active carriers."),
+    ("Repair Helper Joins", "repair_helper_join_count", "count", True, "Times a second humanoid joined an active machine repair."),
+    ("Repair Collaboration Time", "repair_collaboration_time_min", "minutes", True, "Machine repair minutes with two or more humanoids working together."),
+    ("Repair Collaboration Ratio", "repair_collaboration_ratio", "ratio", True, "Share of active repair time performed by a repair team larger than one."),
+    ("Repair Team Size Avg", "repair_team_size_avg", "float", True, "Time-weighted average repair team size while repair was active."),
     ("Worker Local Responses", "worker_local_response_total", "count", True, "Local recoveries or local reorder attempts taken by workers."),
     ("Worker Discharged Ratio", "agent_discharged_ratio", "ratio", False, "Battery-depletion event time ratio."),
     ("Traffic Collisions", "collision_count", "count", False, "Tile/edge traffic conflicts with overlapping movement windows."),
@@ -38,7 +44,8 @@ PRIMARY_METRIC_LOOKUP = {key: (label, key, kind, higher_is_better, description) 
 METRIC_GROUPS = {
     "item": ["total_products", "disposed_scrap_count", "warehouse_material_shelf_count", "downstream_closure_ratio", "throughput_per_sim_hour", "completed_product_lead_time_avg_min"],
     "machine": ["machine_utilization", "machine_broken_ratio", "machine_pm_ratio", "wall_clock_sec"],
-    "worker": ["humanoid_execution_ratio_avg", "humanoid_unavailable_ratio_avg", "handover_item_count", "shared_product_carry_time_min"],
+    "worker": ["humanoid_execution_ratio_avg", "humanoid_blocked_ratio_avg", "humanoid_unavailable_ratio_avg", "worker_local_response_total", "commitment_dispatch_total"],
+    "collaboration": ["handover_item_count", "shared_product_carry_time_min", "shared_product_carry_ratio", "repair_helper_join_count", "repair_collaboration_time_min", "repair_collaboration_ratio", "repair_team_size_avg"],
     "traffic": ["collision_count", "near_miss_count", "edge_conflict_count", "path_overlap_count"],
 }
 
@@ -373,6 +380,53 @@ def _traffic_table(kpi: dict[str, Any]) -> str:
     return "<div class='panel'><h2>Traffic Conflicts by Worker Pair</h2><p class='muted'>Pairs are recorded directly from AGENT_TRAFFIC_CONFLICT events.</p><table><thead><tr><th>Worker Pair</th><th>Conflicts</th></tr></thead><tbody>" + rows + "</tbody></table></div>"
 
 
+def _repair_collaboration_episode_table(kpi: dict[str, Any]) -> str:
+    raw_episodes = kpi.get("repair_collaboration_episodes", [])
+    episodes = raw_episodes if isinstance(raw_episodes, list) else []
+
+    def _team_time_label(value: Any) -> str:
+        if not isinstance(value, dict):
+            return "-"
+        parts = []
+        for size, minutes in sorted(value.items(), key=lambda item: int(str(item[0])) if str(item[0]).isdigit() else 999):
+            parts.append(f"{html.escape(str(size))}w {_safe_float(minutes):.1f}m")
+        return ", ".join(parts) or "-"
+
+    rows = []
+    for raw in sorted(
+        (row for row in episodes if isinstance(row, dict)),
+        key=lambda row: (_safe_float(row.get("started_at")), str(row.get("machine_id", ""))),
+    ):
+        final_team = raw.get("final_team", [])
+        team_label = ", ".join(str(worker_id) for worker_id in final_team) if isinstance(final_team, list) else str(final_team or "")
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(raw.get('machine_id', '-')))}</td>"
+            f"<td>{_safe_float(raw.get('started_at')):.2f}</td>"
+            f"<td>{_safe_float(raw.get('ended_at')):.2f}</td>"
+            f"<td>{_safe_int(raw.get('max_team_size'))}</td>"
+            f"<td>{_safe_int(raw.get('helper_join_count'))}</td>"
+            f"<td>{_safe_float(raw.get('collaboration_time_min')):.1f}m</td>"
+            f"<td>{_team_time_label(raw.get('team_time_by_size'))}</td>"
+            f"<td>{html.escape(team_label or '-')}</td>"
+            f"<td>{html.escape(str(raw.get('status', '-')))}</td>"
+            "</tr>"
+        )
+    body = "".join(rows)
+    if not body:
+        body = "<tr><td colspan='9'>No repair episodes were recorded.</td></tr>"
+    return (
+        "<div class='panel'>"
+        "<h2>Repair Collaboration Episodes</h2>"
+        "<p class='muted'>Each row is one machine repair window. Collaboration minutes count only intervals with team size above one.</p>"
+        "<table><thead><tr>"
+        "<th>Machine</th><th>Start</th><th>End</th><th>Max Team</th><th>Helper Joins</th><th>Collab</th><th>Team Time</th><th>Final Team</th><th>Status</th>"
+        "</tr></thead><tbody>"
+        + body
+        + "</tbody></table></div>"
+    )
+
+
 def _figure_html(fig: Any, *, include_plotlyjs: bool) -> str:
     return fig.to_html(full_html=False, include_plotlyjs=include_plotlyjs, config={"displaylogo": False, "responsive": True})
 
@@ -458,6 +512,11 @@ def export_kpi_dashboard(
     traffic_by_type = kpi.get("traffic_conflicts_by_type", {}) if isinstance(kpi.get("traffic_conflicts_by_type", {}), dict) else {}
     traffic_by_pair = kpi.get("traffic_conflicts_by_worker_pair", {}) if isinstance(kpi.get("traffic_conflicts_by_worker_pair", {}), dict) else {}
     item_transport_time = kpi.get("item_transport_time_by_type", {}) if isinstance(kpi.get("item_transport_time_by_type", {}), dict) else {}
+    shared_carry_by_worker = kpi.get("shared_product_carry_time_by_worker", {}) if isinstance(kpi.get("shared_product_carry_time_by_worker", {}), dict) else {}
+    shared_carry_by_pair = kpi.get("shared_product_carry_time_by_pair", {}) if isinstance(kpi.get("shared_product_carry_time_by_pair", {}), dict) else {}
+    repair_team_time_by_size = kpi.get("repair_team_time_by_size", {}) if isinstance(kpi.get("repair_team_time_by_size", {}), dict) else {}
+    repair_collab_by_machine = kpi.get("repair_collaboration_time_by_machine", {}) if isinstance(kpi.get("repair_collaboration_time_by_machine", {}), dict) else {}
+    repair_helper_by_machine = kpi.get("repair_helper_join_count_by_machine", {}) if isinstance(kpi.get("repair_helper_join_count_by_machine", {}), dict) else {}
 
     panel_figures: dict[str, str] = {}
     include_plotlyjs = True
@@ -628,6 +687,154 @@ def export_kpi_dashboard(
         "Loaded movement time uses ManSim item weight multipliers: material 1.0, intermediate 1.5, product 2.0 divided by active product carriers.",
     )
 
+    product_collab_fig = go.Figure()
+    product_collab_fig.add_trace(
+        go.Bar(
+            name="Solo product carry",
+            x=["Product carry"],
+            y=[_safe_float(kpi.get("solo_product_carry_time_min"))],
+            text=[f"{_safe_float(kpi.get('solo_product_carry_time_min')):.1f}m"],
+            textposition="outside",
+            marker_color="#8d99ae",
+        )
+    )
+    product_collab_fig.add_trace(
+        go.Bar(
+            name="Shared product carry",
+            x=["Product carry"],
+            y=[_safe_float(kpi.get("shared_product_carry_time_min"))],
+            text=[f"{_safe_float(kpi.get('shared_product_carry_time_min')):.1f}m"],
+            textposition="outside",
+            marker_color="#2a9d8f",
+        )
+    )
+    _common_layout(product_collab_fig, y_title="Minutes", x_title="", barmode="stack", height=330)
+    _add_panel(
+        "product_carry_collaboration",
+        "Product Carry Collaboration",
+        product_collab_fig,
+        "Product transport minutes split into solo carry and shared carry after HANDOVER_ITEM joined a session.",
+    )
+
+    collaboration_counts_fig = go.Figure()
+    collaboration_count_labels = ["Handover joins", "Shared carry completed", "Repair helper joins"]
+    collaboration_count_values = [
+        _safe_float(kpi.get("handover_item_count")),
+        _safe_float(kpi.get("shared_product_carry_completed_count")),
+        _safe_float(kpi.get("repair_helper_join_count")),
+    ]
+    collaboration_counts_fig.add_trace(
+        go.Bar(
+            name="Collaboration events",
+            x=collaboration_count_labels,
+            y=collaboration_count_values,
+            text=[f"{value:.0f}" for value in collaboration_count_values],
+            textposition="outside",
+            marker_color="#f8961e",
+        )
+    )
+    _common_layout(collaboration_counts_fig, y_title="Count", x_title="", height=330)
+    _add_panel(
+        "collaboration_event_counts",
+        "Collaboration Event Counts",
+        collaboration_counts_fig,
+        "Counts only explicit collaboration events: product handover joins, shared product transports, and repair helper joins.",
+    )
+
+    shared_carry_worker_fig = go.Figure()
+    shared_worker_pairs = sorted(((str(key), _safe_float(value)) for key, value in shared_carry_by_worker.items()), key=lambda item: item[0])
+    shared_carry_worker_fig.add_trace(
+        go.Bar(
+            name="Shared carry minutes",
+            x=[key for key, _ in shared_worker_pairs],
+            y=[value for _, value in shared_worker_pairs],
+            text=[f"{value:.1f}m" for _, value in shared_worker_pairs],
+            textposition="outside",
+            marker_color="#00a896",
+        )
+    )
+    _common_layout(shared_carry_worker_fig, y_title="Minutes", x_title="Worker", height=330)
+    _add_panel(
+        "shared_carry_time_by_worker",
+        "Shared Carry Time by Worker",
+        shared_carry_worker_fig,
+        "Each worker receives the shared-carry interval minutes for product transports they participated in.",
+    )
+
+    shared_carry_pair_fig = go.Figure()
+    shared_pair_values = sorted(((str(key), _safe_float(value)) for key, value in shared_carry_by_pair.items()), key=lambda item: item[1], reverse=True)
+    shared_carry_pair_fig.add_trace(
+        go.Bar(
+            name="Shared carry minutes",
+            x=[key for key, _ in shared_pair_values],
+            y=[value for _, value in shared_pair_values],
+            text=[f"{value:.1f}m" for _, value in shared_pair_values],
+            textposition="outside",
+            marker_color="#4361ee",
+        )
+    )
+    _common_layout(shared_carry_pair_fig, y_title="Minutes", x_title="Worker pair", height=330)
+    _add_panel(
+        "shared_carry_time_by_pair",
+        "Shared Carry Time by Worker Pair",
+        shared_carry_pair_fig,
+        "Pairs are the carrier ids recorded in PRODUCT_CARRY_COMPLETED events, without extra dashboard grouping.",
+    )
+
+    repair_team_size_fig = go.Figure()
+    repair_size_pairs = sorted(((str(key), _safe_float(value)) for key, value in repair_team_time_by_size.items()), key=lambda item: int(item[0]) if item[0].isdigit() else 999)
+    repair_team_size_fig.add_trace(
+        go.Bar(
+            name="Repair minutes",
+            x=[f"{key} worker" if key == "1" else f"{key} workers" for key, _ in repair_size_pairs],
+            y=[value for _, value in repair_size_pairs],
+            text=[f"{value:.1f}m" for _, value in repair_size_pairs],
+            textposition="outside",
+            marker_color="#8338ec",
+        )
+    )
+    _common_layout(repair_team_size_fig, y_title="Minutes", x_title="Repair team size", height=330)
+    _add_panel(
+        "repair_team_time_by_size",
+        "Repair Team Time by Size",
+        repair_team_size_fig,
+        "Repair time is integrated between repair team events. Team size > 1 is counted as collaboration.",
+    )
+
+    repair_machine_fig = go.Figure()
+    repair_machine_labels = sorted(set(str(key) for key in repair_collab_by_machine.keys()) | set(str(key) for key in repair_helper_by_machine.keys()), key=_machine_sort_key)
+    repair_machine_fig.add_trace(
+        go.Bar(
+            name="Collaboration minutes",
+            x=repair_machine_labels,
+            y=[_safe_float(repair_collab_by_machine.get(machine_id)) for machine_id in repair_machine_labels],
+            text=[f"{_safe_float(repair_collab_by_machine.get(machine_id)):.1f}m" for machine_id in repair_machine_labels],
+            textposition="outside",
+            marker_color="#7b2cbf",
+        )
+    )
+    repair_machine_fig.add_trace(
+        go.Scatter(
+            name="Helper joins",
+            x=repair_machine_labels,
+            y=[_safe_float(repair_helper_by_machine.get(machine_id)) for machine_id in repair_machine_labels],
+            mode="lines+markers+text",
+            text=[f"{_safe_float(repair_helper_by_machine.get(machine_id)):.0f}" for machine_id in repair_machine_labels],
+            textposition="top center",
+            yaxis="y2",
+            line=dict(color="#e76f51", width=3),
+            marker=dict(size=8),
+        )
+    )
+    _common_layout(repair_machine_fig, y_title="Collaboration minutes", x_title="Machine", height=360)
+    repair_machine_fig.update_layout(yaxis2=dict(title="Helper joins", overlaying="y", side="right", rangemode="tozero"))
+    _add_panel(
+        "repair_collaboration_by_machine",
+        "Repair Collaboration by Machine",
+        repair_machine_fig,
+        "Bars show repair minutes with team size above one; the line shows helper join counts.",
+    )
+
     traffic_type_fig = go.Figure()
     traffic_type_pairs = sorted(((str(key), _safe_float(value)) for key, value in traffic_by_type.items()), key=lambda item: item[0])
     traffic_type_fig.add_trace(
@@ -660,6 +867,7 @@ def export_kpi_dashboard(
 
     for axis_id, axis_def in axis_defs.items():
         state_fig = go.Figure()
+        rendered_states: set[str] = set()
         for state_name in axis_def.get("states", []):
             values = [
                 _safe_float(
@@ -674,6 +882,20 @@ def export_kpi_dashboard(
             ]
             if any(value > 0 for value in values):
                 state_fig.add_trace(go.Bar(name=state_name, x=worker_labels, y=values))
+                rendered_states.add(str(state_name))
+        for state_name in axis_def.get("states", []):
+            if str(state_name) in rendered_states:
+                continue
+            state_fig.add_trace(
+                go.Bar(
+                    name=str(state_name),
+                    x=worker_labels or ["-"],
+                    y=[0.0 for _ in (worker_labels or ["-"])],
+                    visible="legendonly",
+                    showlegend=True,
+                    hoverinfo="skip",
+                )
+            )
         _common_layout(state_fig, y_title="Minutes", x_title="Worker", barmode="stack", height=390)
         _add_panel(
             f"humanoid_state_{axis_id}",
@@ -726,6 +948,20 @@ def export_kpi_dashboard(
         + panel_figures["humanoid_state_manipulation"]
         + "</div>",
     )
+    collaboration_section = _group_section(
+        "Worker Collaboration",
+        "Collaboration KPIs are derived from explicit handover/product-carry and repair-team events rather than inferred from proximity.",
+        _summary_cards(kpi, METRIC_GROUPS["collaboration"]),
+        "<div class='grid cards-2'>"
+        + panel_figures["collaboration_event_counts"]
+        + panel_figures["product_carry_collaboration"]
+        + panel_figures["shared_carry_time_by_worker"]
+        + panel_figures["shared_carry_time_by_pair"]
+        + panel_figures["repair_team_time_by_size"]
+        + panel_figures["repair_collaboration_by_machine"]
+        + "</div>"
+        + _repair_collaboration_episode_table(kpi),
+    )
     traffic_section = _group_section(
         "Movement / Traffic Safety",
         "Observed route overlap, near-miss, tile conflict, and edge conflict events. These are reproduced for inspection, not minimized by policy in this version.",
@@ -742,6 +978,7 @@ def export_kpi_dashboard(
         + item_section
         + machine_section
         + worker_section
+        + collaboration_section
         + traffic_section
     )
     html_text = render_page_shell(

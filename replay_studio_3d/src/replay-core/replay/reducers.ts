@@ -113,6 +113,27 @@ function mergePayloadAttributes(entity: BaseEntityState, payload: Record<string,
   Object.assign(entity.attributes, raw as Record<string, unknown>);
 }
 
+function clearHumanoidTaskAttributes(entity: BaseEntityState): void {
+  delete entity.attributes.active_task;
+  delete entity.attributes.active_target_id;
+  delete entity.attributes.task_label;
+  delete entity.attributes.task_kind;
+  delete entity.attributes.current_task_type;
+  delete entity.attributes.current_task_code;
+  delete entity.attributes.current_task_name;
+  delete entity.attributes.current_task_instance_id;
+  delete entity.attributes.current_parent_task_code;
+  delete entity.attributes.current_parent_task_instance_id;
+  delete entity.attributes.current_child_task_code;
+  delete entity.attributes.current_child_task_name;
+  delete entity.attributes.current_child_task_instance_id;
+  delete entity.attributes.current_task_path;
+  delete entity.attributes.current_task_depth;
+  delete entity.attributes.current_step_id;
+  delete entity.attributes.current_primitive_call_code;
+  delete entity.attributes.current_execution_status;
+}
+
 function upsertResource(next: DomainState, resourceId: string): ResourceState {
   const existing = next.resources[resourceId];
   if (existing) {
@@ -207,6 +228,14 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       }
       if (rawAttributes && typeof rawAttributes === "object" && (rawAttributes as Record<string, unknown>).task_window === null) {
         delete entity.attributes.task_window;
+      }
+      const humanoidState = rawAttributes && typeof rawAttributes === "object" ? (rawAttributes as Record<string, unknown>).humanoid_state : undefined;
+      if (
+        humanoidState &&
+        typeof humanoidState === "object" &&
+        (humanoidState as Record<string, unknown>).task_context === null
+      ) {
+        clearHumanoidTaskAttributes(entity);
       }
       entity.updated_at = event.timestamp;
       return next;

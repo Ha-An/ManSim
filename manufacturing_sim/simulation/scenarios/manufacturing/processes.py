@@ -88,7 +88,7 @@ def worker_work_loop(env: simpy.Environment, world: ManufacturingWorld, worker_i
                 completed = yield from world.execute_task(agent, task)
                 if not completed:
                     status = "skipped"
-                    reason = "precondition_failed"
+                    reason = str(task.payload.pop("failure_reason", "") or "precondition_failed")
                 elif resumed_task and agent.suspended_task is task:
                     agent.suspended_task = None
             except simpy.Interrupt as intr:

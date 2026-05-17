@@ -102,6 +102,110 @@ def event_intervals(events: list[dict], start_events: set[str], end_events: set[
     return {entity_id: merge_intervals(chunks) for entity_id, chunks in rows.items()}
 
 
+def humanoid_state_time_from_events(events: list[dict], agent_ids: set[str], sim_end: float) -> dict[str, dict[str, dict[str, float]]]:
+    axes = ("availability", "mobility", "power", "manipulation")
+    current: dict[str, dict] = {
+        agent_id: {
+            "availability": "AVAILABLE",
+            "mobility": "STATIONARY",
+            "power": "POWER_NORMAL",
+            "manipulation": "FREE",
+        }
+        for agent_id in sorted(agent_ids)
+    }
+    last_t: dict[str, float] = {agent_id: 0.0 for agent_id in current}
+    totals: dict[str, dict[str, dict[str, float]]] = {
+        agent_id: {axis: defaultdict(float) for axis in axes}
+        for agent_id in current
+    }
+
+    def add_duration(agent_id: str, end_t: float) -> None:
+        start_t = float(last_t.get(agent_id, 0.0))
+        duration = max(0.0, float(end_t) - start_t)
+        if duration <= 0.0:
+            return
+        state = current.get(agent_id, {})
+        for axis in axes:
+            value = str(state.get(axis, "") or "").strip() or "UNKNOWN"
+            totals[agent_id][axis][value] += duration
+
+    for event in events:
+        agent_id = str(event.get("entity_id", "")).strip()
+        if agent_id not in current:
+            continue
+        details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+        humanoid_state = details.get("humanoid_state")
+        if not isinstance(humanoid_state, dict):
+            continue
+        event_t = float(event.get("t", 0.0) or 0.0)
+        add_duration(agent_id, event_t)
+        current[agent_id] = dict(humanoid_state)
+        last_t[agent_id] = event_t
+
+    for agent_id in current:
+        add_duration(agent_id, sim_end)
+
+    return {
+        agent_id: {
+            axis: {state: round3(duration) for state, duration in sorted(axis_totals.items())}
+            for axis, axis_totals in axis_map.items()
+        }
+        for agent_id, axis_map in totals.items()
+    }
+
+
+def humanoid_axis_totals(by_worker: dict[str, dict[str, dict[str, float]]]) -> dict[str, dict[str, float]]:
+    rows: dict[str, dict[str, float]] = {axis: defaultdict(float) for axis in ("availability", "mobility", "power", "manipulation")}
+    for worker_rows in by_worker.values():
+        for axis, state_rows in worker_rows.items():
+            if axis not in rows:
+                continue
+            for state, minutes in state_rows.items():
+                rows[axis][state] += float(minutes or 0.0)
+    return {axis: {state: round3(minutes) for state, minutes in sorted(state_rows.items())} for axis, state_rows in rows.items()}
+
+
+def humanoid_state_ratios(by_worker: dict[str, dict[str, dict[str, float]]]) -> dict[str, dict[str, dict[str, float]]]:
+    ratios: dict[str, dict[str, dict[str, float]]] = {}
+    for worker_id, worker_rows in by_worker.items():
+        ratios[worker_id] = {}
+        for axis, state_rows in worker_rows.items():
+            total = sum(float(value or 0.0) for value in state_rows.values())
+            ratios[worker_id][axis] = {
+                state: round6((float(minutes or 0.0) / total) if total > 0.0 else 0.0)
+                for state, minutes in sorted(state_rows.items())
+            }
+    return ratios
+
+
+def humanoid_execution_ratios(by_worker: dict[str, dict[str, dict[str, float]]]) -> dict[str, float]:
+    ratios: dict[str, float] = {}
+    for worker_id, worker_rows in by_worker.items():
+        availability = worker_rows.get("availability", {})
+        total = sum(float(value or 0.0) for value in availability.values())
+        ratios[worker_id] = round6((float(availability.get("EXECUTING", 0.0) or 0.0) / total) if total > 0.0 else 0.0)
+    return ratios
+
+
+def humanoid_blocked_ratios(by_worker: dict[str, dict[str, dict[str, float]]]) -> dict[str, float]:
+    ratios: dict[str, float] = {}
+    for worker_id, worker_rows in by_worker.items():
+        availability = worker_rows.get("availability", {})
+        total = sum(float(value or 0.0) for value in availability.values())
+        ratios[worker_id] = round6((float(availability.get("BLOCKED", 0.0) or 0.0) / total) if total > 0.0 else 0.0)
+    return ratios
+
+
+def humanoid_unavailable_ratios(by_worker: dict[str, dict[str, dict[str, float]]]) -> dict[str, float]:
+    ratios: dict[str, float] = {}
+    for worker_id, worker_rows in by_worker.items():
+        availability = worker_rows.get("availability", {})
+        total = sum(float(value or 0.0) for value in availability.values())
+        unavailable = float(availability.get("DISABLED", 0.0) or 0.0) + float(availability.get("OFFLINE", 0.0) or 0.0)
+        ratios[worker_id] = round6((unavailable / total) if total > 0.0 else 0.0)
+    return ratios
+
+
 def approx_equal(left: float, right: float, tolerance: float = 1e-3) -> bool:
     return abs(float(left) - float(right)) <= tolerance
 
@@ -269,7 +373,7 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
     planner_total = 0
     worker_local_total = 0
     commitment_total = 0
-    task_minutes: dict[str, float] = defaultdict(float)
+    humanoid_task_minutes: dict[str, float] = defaultdict(float)
     task_start_sources: dict[str, str] = {}
     for event in events:
         event_type = str(event.get("type", "")).strip()
@@ -290,25 +394,28 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
         elif event_type == "AGENT_TASK_END":
             task_id = str(details.get("task_id", "")).strip()
             decision_source = task_start_sources.get(task_id, "")
-            if decision_source == "worker_local_response":
-                worker_local_total += 1
-            elif decision_source == "manager_commitment":
-                commitment_total += 1
             if str(details.get("status", "")).strip().lower() == "completed":
-                task_type = str(details.get("task_type", "")).strip()
-                task_minutes[task_type] += float(details.get("duration", 0.0) or 0.0)
+                if decision_source == "worker_local_response":
+                    worker_local_total += 1
+                elif decision_source == "manager_commitment":
+                    commitment_total += 1
+                task_code = str(details.get("task_code") or details.get("task_type") or "").strip()
+                if task_code:
+                    humanoid_task_minutes[task_code] += float(details.get("duration", 0.0) or 0.0)
     compare_scalar(findings, "incident_event_total", kpi.get("incident_event_total", 0), incident_total, 0.0)
     compare_scalar(findings, "physical_incident_total", kpi.get("physical_incident_total", 0), physical_total, 0.0)
     compare_scalar(findings, "coordination_incident_total", kpi.get("coordination_incident_total", 0), coordination_total, 0.0)
     compare_scalar(findings, "planner_escalation_total", kpi.get("planner_escalation_total", 0), planner_total, 0.0)
-    compare_scalar(findings, "worker_local_response_total", kpi.get("worker_local_response_total", 0), worker_local_total, 0.0)
-    compare_scalar(findings, "commitment_dispatch_total", kpi.get("commitment_dispatch_total", 0), commitment_total, 0.0)
-    for task_type in sorted(set(task_minutes) | set(kpi.get("agent_task_minutes", {}).keys())):
+    # The persisted totals are daily-summary scoped, so they intentionally do
+    # not include tasks interrupted after the last day boundary.
+    compare_scalar(findings, "worker_local_response_total", kpi.get("worker_local_response_total", 0), sum(int(day.get("local_response_task_count", 0) or 0) for day in daily), 0.0)
+    compare_scalar(findings, "commitment_dispatch_total", kpi.get("commitment_dispatch_total", 0), sum(int(day.get("commitment_dispatch_task_count", 0) or 0) for day in daily), 0.0)
+    for task_code in sorted(set(humanoid_task_minutes) | set(kpi.get("humanoid_task_minutes", {}).keys())):
         compare_scalar(
             findings,
-            f"agent_task_minutes[{task_type}]",
-            float(kpi.get("agent_task_minutes", {}).get(task_type, 0.0) or 0.0),
-            round3(task_minutes.get(task_type, 0.0)),
+            f"humanoid_task_minutes[{task_code}]",
+            float(kpi.get("humanoid_task_minutes", {}).get(task_code, 0.0) or 0.0),
+            round3(humanoid_task_minutes.get(task_code, 0.0)),
             0.01,
         )
 
@@ -334,30 +441,106 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
     compare_scalar(findings, "agent_discharged_time_min_avg", kpi.get("agent_discharged_time_min_avg", 0.0), round3(sum(discharged_totals.values()) / max(1, len(agent_ids))))
     total_agent_time = max(1.0, sim_end * max(1, len(agent_ids)))
     compare_scalar(findings, "agent_discharged_ratio", kpi.get("agent_discharged_ratio", 0.0), round6(sum(discharged_totals.values()) / total_agent_time))
-    compare_scalar(findings, "agent_availability_ratio", kpi.get("agent_availability_ratio", 0.0), round6(1.0 - (sum(discharged_totals.values()) / total_agent_time)))
     for agent_id in sorted(agent_ids):
         compare_scalar(findings, f"agent_discharged_time_min_by_agent[{agent_id}]", kpi.get("agent_discharged_time_min_by_agent", {}).get(agent_id, 0.0), discharged_totals.get(agent_id, 0.0))
         compare_scalar(findings, f"agent_discharged_ratio_by_agent[{agent_id}]", kpi.get("agent_discharged_ratio_by_agent", {}).get(agent_id, 0.0), round6(discharged_totals.get(agent_id, 0.0) / max(1.0, sim_end)))
 
-    task_intervals = event_intervals(events, {"AGENT_TASK_START"}, {"AGENT_TASK_END"}, agent_ids, sim_end)
-    move_intervals = event_intervals(events, {"AGENT_MOVE_START"}, {"AGENT_MOVE_END", "AGENT_MOVE_INTERRUPTED"}, agent_ids, sim_end)
-    worker_state = kpi.get("worker_state_time_by_worker", {})
-    worker_util = kpi.get("worker_utilization_by_worker", {})
+    expected_humanoid_state = humanoid_state_time_from_events(events, agent_ids, sim_end)
+    observed_humanoid_state = kpi.get("humanoid_state_time_by_worker", {})
     for agent_id in sorted(agent_ids):
-        working_total = max(0.0, interval_total(task_intervals.get(agent_id, [])) - interval_overlap_total(task_intervals.get(agent_id, []), move_intervals.get(agent_id, [])))
-        moving_total = interval_total(move_intervals.get(agent_id, []))
-        discharged_total = discharged_totals.get(agent_id, 0.0)
-        idle_total = max(0.0, sim_end - working_total - moving_total - discharged_total)
-        compare_scalar(findings, f"worker_state[{agent_id}].working_min", worker_state.get(agent_id, {}).get("working_min", 0.0), round3(working_total))
-        compare_scalar(findings, f"worker_state[{agent_id}].moving_min", worker_state.get(agent_id, {}).get("moving_min", 0.0), round3(moving_total))
-        compare_scalar(findings, f"worker_state[{agent_id}].discharged_min", worker_state.get(agent_id, {}).get("discharged_min", 0.0), round3(discharged_total))
-        compare_scalar(findings, f"worker_state[{agent_id}].idle_min", worker_state.get(agent_id, {}).get("idle_min", 0.0), round3(idle_total))
-        if not approx_equal(sum(float(v) for v in worker_state.get(agent_id, {}).values()), sim_end, 0.01):
-            findings.append(f"worker_state_time_by_worker[{agent_id}] does not sum to sim_end")
-        active_total = working_total + moving_total
-        compare_scalar(findings, f"worker_util[{agent_id}].util_total", worker_util.get(agent_id, {}).get("util_total", 0.0), round6(active_total / max(1.0, sim_end)))
-        available_total = max(0.0, sim_end - discharged_total)
-        compare_scalar(findings, f"worker_util[{agent_id}].util_available", worker_util.get(agent_id, {}).get("util_available", 0.0), round6((active_total / available_total) if available_total > 0.0 else 0.0))
+        expected_worker = expected_humanoid_state.get(agent_id, {})
+        observed_worker = observed_humanoid_state.get(agent_id, {}) if isinstance(observed_humanoid_state, dict) else {}
+        for axis, expected_states in expected_worker.items():
+            observed_states = observed_worker.get(axis, {}) if isinstance(observed_worker, dict) else {}
+            if not isinstance(observed_states, dict):
+                observed_states = {}
+            for state in sorted(set(expected_states) | set(observed_states)):
+                compare_scalar(
+                    findings,
+                    f"humanoid_state_time_by_worker[{agent_id}][{axis}][{state}]",
+                    float(observed_states.get(state, 0.0) or 0.0),
+                    expected_states.get(state, 0.0),
+                    0.01,
+                )
+            if not approx_equal(sum(float(v) for v in observed_states.values()), sim_end, 0.01):
+                findings.append(f"humanoid_state_time_by_worker[{agent_id}][{axis}] does not sum to sim_end")
+
+    expected_axis_totals = humanoid_axis_totals(expected_humanoid_state)
+    observed_axis_totals = kpi.get("humanoid_state_time_by_axis", {})
+    for axis, expected_states in expected_axis_totals.items():
+        observed_states = observed_axis_totals.get(axis, {}) if isinstance(observed_axis_totals, dict) else {}
+        observed_states = observed_states if isinstance(observed_states, dict) else {}
+        for state in sorted(set(expected_states) | set(observed_states)):
+            compare_scalar(
+                findings,
+                f"humanoid_state_time_by_axis[{axis}][{state}]",
+                float(observed_states.get(state, 0.0) or 0.0),
+                expected_states.get(state, 0.0),
+                0.01,
+            )
+
+    expected_ratios = humanoid_state_ratios(expected_humanoid_state)
+    observed_ratios = kpi.get("humanoid_state_ratio_by_worker", {})
+    for agent_id, worker_rows in expected_ratios.items():
+        observed_worker = observed_ratios.get(agent_id, {}) if isinstance(observed_ratios, dict) else {}
+        observed_worker = observed_worker if isinstance(observed_worker, dict) else {}
+        for axis, expected_states in worker_rows.items():
+            observed_states = observed_worker.get(axis, {}) if isinstance(observed_worker.get(axis, {}), dict) else {}
+            for state in sorted(set(expected_states) | set(observed_states)):
+                compare_scalar(
+                    findings,
+                    f"humanoid_state_ratio_by_worker[{agent_id}][{axis}][{state}]",
+                    float(observed_states.get(state, 0.0) or 0.0),
+                    expected_states.get(state, 0.0),
+                    1e-6,
+                )
+
+    expected_execution_ratios = humanoid_execution_ratios(expected_humanoid_state)
+    expected_blocked_ratios = humanoid_blocked_ratios(expected_humanoid_state)
+    expected_unavailable_ratios = humanoid_unavailable_ratios(expected_humanoid_state)
+    for agent_id in sorted(agent_ids):
+        compare_scalar(
+            findings,
+            f"humanoid_execution_ratio_by_worker[{agent_id}]",
+            kpi.get("humanoid_execution_ratio_by_worker", {}).get(agent_id, 0.0),
+            expected_execution_ratios.get(agent_id, 0.0),
+            1e-6,
+        )
+        compare_scalar(
+            findings,
+            f"humanoid_blocked_ratio_by_worker[{agent_id}]",
+            kpi.get("humanoid_blocked_ratio_by_worker", {}).get(agent_id, 0.0),
+            expected_blocked_ratios.get(agent_id, 0.0),
+            1e-6,
+        )
+        compare_scalar(
+            findings,
+            f"humanoid_unavailable_ratio_by_worker[{agent_id}]",
+            kpi.get("humanoid_unavailable_ratio_by_worker", {}).get(agent_id, 0.0),
+            expected_unavailable_ratios.get(agent_id, 0.0),
+            1e-6,
+        )
+    compare_scalar(
+        findings,
+        "humanoid_execution_ratio_avg",
+        kpi.get("humanoid_execution_ratio_avg", 0.0),
+        round6(mean(expected_execution_ratios.values()) if expected_execution_ratios else 0.0),
+        1e-6,
+    )
+    compare_scalar(
+        findings,
+        "humanoid_blocked_ratio_avg",
+        kpi.get("humanoid_blocked_ratio_avg", 0.0),
+        round6(mean(expected_blocked_ratios.values()) if expected_blocked_ratios else 0.0),
+        1e-6,
+    )
+    compare_scalar(
+        findings,
+        "humanoid_unavailable_ratio_avg",
+        kpi.get("humanoid_unavailable_ratio_avg", 0.0),
+        round6(mean(expected_unavailable_ratios.values()) if expected_unavailable_ratios else 0.0),
+        1e-6,
+    )
 
     queue_entries: dict[tuple[str, str, str], float] = {}
     output_entries: dict[tuple[str, str], float] = {}

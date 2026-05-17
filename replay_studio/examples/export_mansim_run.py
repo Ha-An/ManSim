@@ -864,6 +864,14 @@ def convert_events(
                         "current_task_code": None,
                         "current_task_name": None,
                         "current_task_instance_id": None,
+                        "current_parent_task_code": None,
+                        "current_parent_task_instance_id": None,
+                        "current_child_task_code": None,
+                        "current_child_task_name": None,
+                        "current_child_task_instance_id": None,
+                        "current_task_path": None,
+                        "current_task_depth": None,
+                        "current_execution_status": None,
                     }
                 )
             attrs.update(

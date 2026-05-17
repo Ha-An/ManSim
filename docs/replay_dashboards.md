@@ -18,6 +18,29 @@ Hub는 아래 view로 연결됩니다.
 - Graphify knowledge graph dashboard
 - Series dashboard, multi-run일 때
 
+## KPI Dashboard
+
+`kpi_dashboard.html`은 생산, 설비, worker, worker collaboration, movement/traffic safety를 분리해서 보여줍니다.
+
+Worker collaboration 섹션은 worker가 같은 작업을 실제로 함께 수행했는지 확인하기 위한 영역입니다. 단순히 같은 장소에 있거나 경로가 가까운 것만으로 협업으로 추정하지 않고, simulator가 남긴 명시적 event만 사용합니다.
+
+Worker Metrics 섹션은 `HumanoidSim` Availability State를 기준으로 `EXECUTING`, `BLOCKED`, `DISABLED/OFFLINE` 비율을 분리해서 보여줍니다. `BLOCKED`는 예상치 못한 외부 요인이나 stale precondition 때문에 현재 task를 속행하기 어려운 시간입니다.
+
+- `HANDOVER_ITEM` / `PRODUCT_CARRY_JOINED`: product 공동 운반에 helper가 합류한 횟수입니다.
+- `PRODUCT_CARRY_COMPLETED`: product 운반 완료 시점에 전체 product 운반 시간, 공동 운반 시간, worker/pair별 공동 운반 시간을 집계합니다.
+- `MACHINE_REPAIR_START`, `MACHINE_REPAIR_HELPER_JOIN`, `MACHINE_REPAIR_HELPER_LEAVE`, `MACHINE_REPAIRED`: repair team size를 시간 구간으로 적분해서 solo repair와 collaboration repair를 나눕니다.
+
+주요 collaboration KPI는 다음과 같습니다.
+
+- `handover_item_count`: product 운반 세션에 helper가 합류한 횟수.
+- `shared_product_carry_time_min`: 두 명이 함께 product를 운반한 시간.
+- `shared_product_carry_ratio`: product 운반 시간 중 공동 운반 비율.
+- `repair_helper_join_count`: 고장 수리에 helper가 합류한 횟수.
+- `repair_collaboration_time_min`: 두 명 이상이 함께 수리한 시간.
+- `repair_collaboration_ratio`: active repair time 중 team size가 2 이상인 비율.
+- `repair_team_size_avg`: active repair 중 시간 가중 평균 팀 크기.
+- `repair_collaboration_episodes`: 각 machine repair window를 start/end, 최대 팀 크기, helper join 수, 팀 크기별 시간으로 남긴 목록입니다. 예를 들어 S1M1 수리에 A3가 시작하고 A2/A1이 순차 합류하면 한 episode 안에서 `1w`, `2w`, `3w` 시간이 분리됩니다.
+
 ## Factory Replay Studio
 
 Factory replay는 아래 파일을 사용합니다.
@@ -46,6 +69,22 @@ Worker monitor는 compact 운영 패널입니다.
 - `Shared Carry`: product 공동 운반 세션의 carrier 수와 역할을 표시합니다.
 
 `Power`와 `Updated`는 worker monitor에서 제거했습니다. Worker의 배터리 상태는 상단 battery meter로 확인하고, 의미 상태는 `HumanoidStateSnapshot`의 네 축 중 현재 UI에 필요한 축만 표시합니다.
+
+## Gantt
+
+`gantt.html`은 worker lane과 machine lane을 함께 보여줍니다. Worker lane의 status와 색상은 `HumanoidSim`의 Availability State를 그대로 사용합니다.
+
+- `AVAILABLE`
+- `ASSIGNED`
+- `EXECUTING`
+- `WAITING`
+- `BLOCKED`
+- `OFFLINE`
+- `DISABLED`
+
+이전의 `MOVING`, `WORKING`, `DISCHARGED` bucket은 worker Gantt status로 사용하지 않습니다. 이동 여부는 Gantt hover의 `mobility`, `primitive_call_code`, 그리고 Replay Studio의 motion path에서 확인합니다. Machine lane은 기존처럼 `RUNNING`, `DOWN`, `FINISHED-WAIT-UNLOAD`를 표시합니다.
+
+Gantt는 worker id가 `A1`, `A2`처럼 worker 형식인 lane만 Worker로 취급합니다. Product/item id는 Gantt resource lane에 올리지 않습니다. `ASSIGNED`는 task 선택 직후 같은 timestamp에 바로 `EXECUTING`으로 넘어가면 duration이 0이라 bar로 보이지 않을 수 있지만, Availability State legend에는 항상 포함됩니다. Hover 창은 resource, status, task/primitive 또는 machine cycle, time range 정도만 표시합니다.
 
 ## Replay Studio 3D
 

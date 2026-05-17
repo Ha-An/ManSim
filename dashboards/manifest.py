@@ -81,7 +81,8 @@ def _artifact_map(output_dir: Path, row: dict[str, Any]) -> dict[str, str]:
     def _pick_optional(path_value: Any, fallback_name: str) -> str:
         text = _normalize_label(path_value)
         if text:
-            return str(Path(text).resolve())
+            path = Path(text)
+            return str(path.resolve()) if path.exists() else ""
         fallback = output_dir / fallback_name
         return str(fallback.resolve()) if fallback.exists() else ""
 
@@ -104,15 +105,15 @@ def _artifact_map(output_dir: Path, row: dict[str, Any]) -> dict[str, str]:
         "replay_studio_layout.json": _pick(row.get("replay_studio_layout_path", ""), "replay_studio_layout.json"),
         "events.jsonl": _pick(row.get("events_path", ""), "events.jsonl"),
         "daily_summary.json": _pick(row.get("daily_summary_path", ""), "daily_summary.json"),
-        "run_reflection.json": _pick(row.get("run_reflection_path", ""), "run_reflection.json"),
-        "run_reflection.md": _pick(row.get("run_reflection_markdown_path", ""), "run_reflection.md"),
+        "run_reflection.json": _pick_optional(row.get("run_reflection_path", ""), "run_reflection.json"),
+        "run_reflection.md": _pick_optional(row.get("run_reflection_markdown_path", ""), "run_reflection.md"),
         "run_meta.json": _pick(row.get("run_meta_path", ""), "run_meta.json"),
         "kpi.json": _pick(row.get("kpi_path", ""), "kpi.json"),
         "orchestration_intelligence_dashboard.html": _pick(
             row.get("orchestration_intelligence_dashboard_path", ""),
             "orchestration_intelligence_dashboard.html",
         ),
-        "llm_trace.html": _pick(row.get("llm_trace_path", ""), "llm_trace.html"),
+        "llm_trace.html": _pick_optional(row.get("llm_trace_path", ""), "llm_trace.html"),
     }
 
 

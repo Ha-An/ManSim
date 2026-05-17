@@ -2520,6 +2520,17 @@ class ManufacturingWorld:
             ratios[str(worker_id)] = round((float(availability.get("EXECUTING", 0.0) or 0.0) / total) if total > 0 else 0.0, 6)
         return ratios
 
+    def _humanoid_blocked_ratios(self, by_worker: dict[str, Any]) -> dict[str, float]:
+        ratios: dict[str, float] = {}
+        for worker_id, worker_rows in by_worker.items():
+            availability = worker_rows.get("availability", {}) if isinstance(worker_rows, dict) else {}
+            if not isinstance(availability, dict):
+                ratios[str(worker_id)] = 0.0
+                continue
+            total = sum(float(value or 0.0) for value in availability.values())
+            ratios[str(worker_id)] = round((float(availability.get("BLOCKED", 0.0) or 0.0) / total) if total > 0 else 0.0, 6)
+        return ratios
+
     def _humanoid_unavailable_ratios(self, by_worker: dict[str, Any]) -> dict[str, float]:
         ratios: dict[str, float] = {}
         for worker_id, worker_rows in by_worker.items():
@@ -2623,6 +2634,8 @@ class ManufacturingWorld:
         shared_product_carry_completed = 0
         product_carry_time = 0.0
         shared_product_carry_time = 0.0
+        shared_product_carry_time_by_worker: dict[str, float] = defaultdict(float)
+        shared_product_carry_time_by_pair: dict[str, float] = defaultdict(float)
         item_transport_time_by_type: dict[str, float] = defaultdict(float)
         active_moves: dict[tuple[str, str], tuple[float, str]] = {}
         for event in self.logger.events:
@@ -2637,6 +2650,13 @@ class ManufacturingWorld:
                     shared_product_carry_completed += 1
                 product_carry_time += float(details.get("duration", 0.0) or 0.0)
                 shared_product_carry_time += shared_duration
+                carrier_ids = [str(worker_id) for worker_id in details.get("carrier_ids", []) if str(worker_id)] if isinstance(details.get("carrier_ids", []), list) else []
+                if shared_duration > 0.0:
+                    for worker_id in carrier_ids:
+                        shared_product_carry_time_by_worker[worker_id] += shared_duration
+                    if len(carrier_ids) >= 2:
+                        pair = " / ".join(sorted(carrier_ids[:2]))
+                        shared_product_carry_time_by_pair[pair] += shared_duration
             if event_type == "AGENT_MOVE_START":
                 item_type = str(details.get("carrying_item_type", "") or "").strip().lower()
                 if item_type:
@@ -2646,14 +2666,217 @@ class ManufacturingWorld:
                 start = active_moves.pop(key, None)
                 if start is not None and event_t > start[0]:
                     item_transport_time_by_type[start[1]] += event_t - start[0]
+        shared_product_carry_ratio = (shared_product_carry_time / product_carry_time) if product_carry_time > 0.0 else 0.0
         return {
             "handover_item_count": int(handover_count),
             "shared_product_carry_completed_count": int(shared_product_carry_completed),
             "product_carry_time_min": round(product_carry_time, 3),
             "shared_product_carry_time_min": round(shared_product_carry_time, 3),
+            "solo_product_carry_time_min": round(max(0.0, product_carry_time - shared_product_carry_time), 3),
+            "shared_product_carry_ratio": round(shared_product_carry_ratio, 6),
+            "shared_product_carry_time_by_worker": {
+                key: round(value, 3) for key, value in sorted(shared_product_carry_time_by_worker.items())
+            },
+            "shared_product_carry_time_by_pair": {
+                key: round(value, 3) for key, value in sorted(shared_product_carry_time_by_pair.items())
+            },
             "item_transport_time_by_type": {
                 key: round(value, 3) for key, value in sorted(item_transport_time_by_type.items())
             },
+        }
+
+    def _repair_collaboration_metrics(self) -> dict[str, Any]:
+        active: dict[str, dict[str, Any]] = {}
+        team_time_by_size: dict[str, float] = defaultdict(float)
+        collaboration_time_by_machine: dict[str, float] = defaultdict(float)
+        collaboration_time_by_worker: dict[str, float] = defaultdict(float)
+        helper_join_count_by_machine: dict[str, int] = defaultdict(int)
+        helper_join_count_by_worker: dict[str, int] = defaultdict(int)
+        episodes: list[dict[str, Any]] = []
+        helper_join_count = 0
+        repair_window_time = 0.0
+        repair_team_size_minutes = 0.0
+        collaboration_time = 0.0
+
+        def _team_from_details(details: dict[str, Any], fallback: list[str] | None = None) -> list[str]:
+            raw_team = details.get("repair_team", [])
+            if isinstance(raw_team, list):
+                team = [str(worker_id) for worker_id in raw_team if str(worker_id)]
+                if team:
+                    return team
+            by_worker = str(details.get("by", "") or "").strip()
+            if by_worker:
+                merged = list(fallback or [])
+                if by_worker not in merged:
+                    merged.append(by_worker)
+                return merged
+            return list(fallback or [])
+
+        def _size_from_details(details: dict[str, Any], fallback: int = 0) -> int:
+            try:
+                return max(0, int(details.get("repair_team_size", fallback) or fallback))
+            except (TypeError, ValueError):
+                return max(0, int(fallback))
+
+        def _close_interval(machine_id: str, end_t: float) -> None:
+            nonlocal repair_window_time, repair_team_size_minutes, collaboration_time
+            row = active.get(machine_id)
+            if not isinstance(row, dict):
+                return
+            raw_start_t = row.get("t", end_t)
+            start_t = float(end_t if raw_start_t is None else raw_start_t)
+            duration = max(0.0, float(end_t) - start_t)
+            size = max(0, int(row.get("size", 0) or 0))
+            if duration <= 0.0 or size <= 0:
+                row["t"] = float(end_t)
+                return
+            team_time_by_size[str(size)] += duration
+            row_team_time = row.setdefault("team_time_by_size", {})
+            row_team_time[str(size)] = float(row_team_time.get(str(size), 0.0) or 0.0) + duration
+            repair_window_time += duration
+            repair_team_size_minutes += duration * size
+            row["team_size_minutes"] = float(row.get("team_size_minutes", 0.0) or 0.0) + (duration * size)
+            row["active_time"] = float(row.get("active_time", 0.0) or 0.0) + duration
+            row["max_team_size"] = max(int(row.get("max_team_size", size) or size), size)
+            if size > 1:
+                collaboration_time += duration
+                row["collaboration_time"] = float(row.get("collaboration_time", 0.0) or 0.0) + duration
+                collaboration_time_by_machine[machine_id] += duration
+                for worker_id in row.get("team", []):
+                    collaboration_time_by_worker[str(worker_id)] += duration
+            row["t"] = float(end_t)
+
+        def _episode_row(machine_id: str, row: dict[str, Any], ended_at: float, *, status: str) -> dict[str, Any]:
+            raw_started_at = row.get("started_at", ended_at)
+            started_at = float(ended_at if raw_started_at is None else raw_started_at)
+            active_time = float(row.get("active_time", 0.0) or 0.0)
+            collaboration_episode_time = float(row.get("collaboration_time", 0.0) or 0.0)
+            team_time = row.get("team_time_by_size", {}) if isinstance(row.get("team_time_by_size", {}), dict) else {}
+            return {
+                "machine_id": machine_id,
+                "started_at": round(started_at, 3),
+                "ended_at": round(float(ended_at), 3),
+                "duration": round(max(0.0, float(ended_at) - started_at), 3),
+                "active_repair_time_min": round(active_time, 3),
+                "solo_time_min": round(max(0.0, active_time - collaboration_episode_time), 3),
+                "collaboration_time_min": round(collaboration_episode_time, 3),
+                "max_team_size": int(row.get("max_team_size", 0) or 0),
+                "helper_join_count": int(row.get("helper_join_count", 0) or 0),
+                "team_time_by_size": {key: round(float(value), 3) for key, value in sorted(team_time.items(), key=lambda item: int(item[0]))},
+                "final_team": [str(worker_id) for worker_id in row.get("team", [])],
+                "status": status,
+            }
+
+        ordered_events = sorted(
+            enumerate(self.logger.events),
+            key=lambda pair: (float(pair[1].get("t", 0.0) or 0.0), pair[0]),
+        )
+        for _index, event in ordered_events:
+            event_type = str(event.get("type", "")).strip()
+            if event_type not in {
+                "MACHINE_REPAIR_START",
+                "MACHINE_REPAIR_HELPER_JOIN",
+                "MACHINE_REPAIR_HELPER_LEAVE",
+                "MACHINE_REPAIRED",
+            }:
+                continue
+            machine_id = str(event.get("entity_id", "")).strip()
+            if not machine_id:
+                continue
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            event_t = float(event.get("t", 0.0) or 0.0)
+            previous = active.get(machine_id)
+            previous_team = previous.get("team", []) if isinstance(previous, dict) else []
+            previous_size = int(previous.get("size", 0) or 0) if isinstance(previous, dict) else 0
+
+            if event_type == "MACHINE_REPAIR_START":
+                active[machine_id] = {
+                    "started_at": event_t,
+                    "t": event_t,
+                    "size": _size_from_details(details, 1),
+                    "team": _team_from_details(details),
+                    "max_team_size": _size_from_details(details, 1),
+                    "helper_join_count": 0,
+                    "team_time_by_size": {},
+                    "active_time": 0.0,
+                    "team_size_minutes": 0.0,
+                    "collaboration_time": 0.0,
+                }
+                continue
+
+            if event_type == "MACHINE_REPAIR_HELPER_JOIN":
+                _close_interval(machine_id, event_t)
+                helper_join_count += 1
+                helper_join_count_by_machine[machine_id] += 1
+                by_worker = str(details.get("by", "") or "").strip()
+                if by_worker:
+                    helper_join_count_by_worker[by_worker] += 1
+                row = active.setdefault(
+                    machine_id,
+                    {
+                        "started_at": event_t,
+                        "team_time_by_size": {},
+                        "active_time": 0.0,
+                        "team_size_minutes": 0.0,
+                        "collaboration_time": 0.0,
+                    },
+                )
+                next_size = _size_from_details(details, max(1, previous_size + 1))
+                row["t"] = event_t
+                row["size"] = next_size
+                row["team"] = _team_from_details(details, previous_team)
+                row["max_team_size"] = max(int(row.get("max_team_size", next_size) or next_size), next_size)
+                row["helper_join_count"] = int(row.get("helper_join_count", 0) or 0) + 1
+                continue
+
+            if event_type == "MACHINE_REPAIR_HELPER_LEAVE":
+                _close_interval(machine_id, event_t)
+                next_size = _size_from_details(details, max(0, previous_size - 1))
+                if next_size <= 0:
+                    active.pop(machine_id, None)
+                else:
+                    row = active[machine_id]
+                    row["t"] = event_t
+                    row["size"] = next_size
+                    row["team"] = _team_from_details(details, previous_team)
+                continue
+
+            if event_type == "MACHINE_REPAIRED":
+                _close_interval(machine_id, event_t)
+                row = active.pop(machine_id, None)
+                if isinstance(row, dict):
+                    episodes.append(_episode_row(machine_id, row, event_t, status="completed"))
+
+        sim_end = float(getattr(getattr(self, "env", None), "now", 0.0) or 0.0)
+        for machine_id in list(active.keys()):
+            _close_interval(machine_id, sim_end)
+            row = active.pop(machine_id, None)
+            if isinstance(row, dict):
+                episodes.append(_episode_row(machine_id, row, sim_end, status="open_at_horizon"))
+
+        repair_collaboration_ratio = (collaboration_time / repair_window_time) if repair_window_time > 0.0 else 0.0
+        repair_team_size_avg = (repair_team_size_minutes / repair_window_time) if repair_window_time > 0.0 else 0.0
+        return {
+            "repair_helper_join_count": int(helper_join_count),
+            "repair_helper_join_count_by_machine": dict(sorted(helper_join_count_by_machine.items())),
+            "repair_helper_join_count_by_worker": dict(sorted(helper_join_count_by_worker.items())),
+            "repair_team_time_by_size": {
+                key: round(value, 3) for key, value in sorted(team_time_by_size.items(), key=lambda item: int(item[0]))
+            },
+            "repair_collaboration_time_min": round(collaboration_time, 3),
+            "repair_solo_time_min": round(max(0.0, repair_window_time - collaboration_time), 3),
+            "repair_collaboration_ratio": round(repair_collaboration_ratio, 6),
+            "repair_team_size_avg": round(repair_team_size_avg, 6),
+            "repair_collaboration_time_by_machine": {
+                key: round(value, 3) for key, value in sorted(collaboration_time_by_machine.items())
+            },
+            "repair_collaboration_time_by_worker": {
+                key: round(value, 3) for key, value in sorted(collaboration_time_by_worker.items())
+            },
+            "repair_collaboration_episodes": sorted(
+                episodes,
+                key=lambda row: (float(row.get("started_at", 0.0) or 0.0), str(row.get("machine_id", ""))),
+            ),
         }
 
     def _buffer_wait_metrics(self) -> dict[str, Any]:
@@ -4121,6 +4344,34 @@ class ManufacturingWorld:
             details=details,
         )
 
+    @staticmethod
+    def _availability_after_incomplete_task(status: str, reason: str) -> str:
+        normalized_status = str(status or "").strip().lower()
+        normalized_reason = str(reason or "").strip().lower()
+        temporary_wait_reasons = {
+            "battery_swap_wait",
+            "horizon_reached",
+            "traffic_wait",
+            "resource_wait",
+            "task_suspended",
+        }
+        if normalized_status in {"failed", "skipped"}:
+            return "BLOCKED"
+        if normalized_status == "interrupted" and normalized_reason not in temporary_wait_reasons:
+            return "BLOCKED"
+        if normalized_reason in {
+            "precondition_failed",
+            "stale_precondition",
+            "material_shelf_empty",
+            "material_shelf_slot_empty",
+            "material_shelf_pickup_unreachable",
+            "material_supply_owner_changed",
+            "material_carry_failed",
+            "material_supply_dropoff_unreachable",
+        }:
+            return "BLOCKED"
+        return "WAITING"
+
     def finish_agent_task(self, agent: Agent, task: Task, start_t: float, status: str, reason: str = "") -> None:
         end_t = self.env.now
         duration = max(0.0, end_t - start_t)
@@ -4171,18 +4422,20 @@ class ManufacturingWorld:
                 clear_task_context=True,
             )
         elif not preserve_carrying:
+            availability = self._availability_after_incomplete_task(status, reason)
             self._set_humanoid_axes(
                 agent,
-                availability="WAITING",
+                availability=availability,
                 mobility="STATIONARY",
                 reason=reason or status,
                 source="mansim.task_end",
                 task_id=task.task_id,
             )
         else:
+            availability = self._availability_after_incomplete_task(status, reason)
             self._set_humanoid_axes(
                 agent,
-                availability="WAITING",
+                availability=availability,
                 mobility="STATIONARY",
                 manipulation="HOLDING" if agent.carrying_item_id else "FREE",
                 reason=reason or status,
@@ -6492,6 +6745,7 @@ class ManufacturingWorld:
                 station = int(task.payload["station"])
                 owner = self.material_supply_owner.get(station)
                 if owner is not None and owner != agent.agent_id:
+                    task.payload["failure_reason"] = "material_supply_owner_changed"
                     return False
                 self.material_supply_owner[station] = agent.agent_id
                 try:
@@ -6500,11 +6754,13 @@ class ManufacturingWorld:
                         slot = self._first_available_material_shelf_slot()
                         if slot is None:
                             self._log_material_shelf_empty_once()
+                            task.payload["failure_reason"] = "material_shelf_empty"
                             return False
                         slot_id = str(slot.get("slot_id", ""))
                         self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                         yield from self.move_agent(agent, slot_id, emit_move_events=True)
                         if not self._confirm_object_service_tile(agent, slot_id, task, "material_shelf_pickup"):
+                            task.payload["failure_reason"] = "material_shelf_pickup_unreachable"
                             return False
                         self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
                         self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="material_pickup", source="mansim.replenishment", task_id=task.task_id)
@@ -6512,6 +6768,7 @@ class ManufacturingWorld:
                         if picked is None:
                             if self._material_shelf_count() <= 0:
                                 self._log_material_shelf_empty_once()
+                            task.payload["failure_reason"] = "material_shelf_slot_empty"
                             return False
                         picked_slot_id, item_id = picked
                         task.payload["source_slot_id"] = picked_slot_id
@@ -6525,6 +6782,7 @@ class ManufacturingWorld:
                                 self._set_item_state(item_id, ItemState.IN_STORAGE, location="Warehouse", ref=picked_slot_id, item_type="material")
                             task.payload.pop("transfer_item_id", None)
                             task.payload.pop("source_slot_id", None)
+                            task.payload["failure_reason"] = "material_carry_failed"
                             return False
                     elif agent.carrying_item_id != item_id:
                         source_slot_id = str(task.payload.get("source_slot_id") or "warehouse_material_shelf")
@@ -6533,11 +6791,13 @@ class ManufacturingWorld:
                             yield from self.move_agent(agent, source_slot_id, emit_move_events=True)
                         self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
                         if not self._set_agent_carrying(agent, "material", item_id):
+                            task.payload["failure_reason"] = "material_carry_failed"
                             return False
                     material_queue_id = f"material_queue_{station}"
                     self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                     yield from self.move_agent(agent, material_queue_id, emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, material_queue_id, task, "material_supply_dropoff"):
+                        task.payload["failure_reason"] = "material_supply_dropoff_unreachable"
                         return False
                     self._push_material_queue(station, item_id)
                     self._clear_agent_carrying(agent, destination=f"Station{station}")
@@ -7364,13 +7624,16 @@ class ManufacturingWorld:
         humanoid_state_time_by_axis = self._humanoid_state_axis_totals(humanoid_state_time_by_worker)
         humanoid_state_ratio_by_worker = self._humanoid_state_ratios(humanoid_state_time_by_worker)
         humanoid_execution_ratio_by_worker = self._humanoid_execution_ratios(humanoid_state_time_by_worker)
+        humanoid_blocked_ratio_by_worker = self._humanoid_blocked_ratios(humanoid_state_time_by_worker)
         humanoid_unavailable_ratio_by_worker = self._humanoid_unavailable_ratios(humanoid_state_time_by_worker)
         humanoid_execution_ratio_avg = mean(humanoid_execution_ratio_by_worker.values()) if humanoid_execution_ratio_by_worker else 0.0
+        humanoid_blocked_ratio_avg = mean(humanoid_blocked_ratio_by_worker.values()) if humanoid_blocked_ratio_by_worker else 0.0
         humanoid_unavailable_ratio_avg = mean(humanoid_unavailable_ratio_by_worker.values()) if humanoid_unavailable_ratio_by_worker else 0.0
         humanoid_primitive_minutes = self._humanoid_primitive_minutes()
         humanoid_task_taxonomy = self._humanoid_task_taxonomy_metrics(dict(humanoid_task_totals))
         traffic_metrics = self._traffic_metrics()
         transport_metrics = self._transport_metrics()
+        repair_collaboration_metrics = self._repair_collaboration_metrics()
         incident_event_total = sum(int(summary.get("incident_event_count", 0) or 0) for summary in self.daily_summaries)
         physical_incident_total = sum(int(summary.get("physical_incident_count", 0) or 0) for summary in self.daily_summaries)
         coordination_incident_total = sum(int(summary.get("coordination_incident_count", 0) or 0) for summary in self.daily_summaries)
@@ -7448,12 +7711,15 @@ class ManufacturingWorld:
             "humanoid_state_ratio_by_worker": humanoid_state_ratio_by_worker,
             "humanoid_execution_ratio_by_worker": humanoid_execution_ratio_by_worker,
             "humanoid_execution_ratio_avg": round(float(humanoid_execution_ratio_avg), 6),
+            "humanoid_blocked_ratio_by_worker": humanoid_blocked_ratio_by_worker,
+            "humanoid_blocked_ratio_avg": round(float(humanoid_blocked_ratio_avg), 6),
             "humanoid_unavailable_ratio_by_worker": humanoid_unavailable_ratio_by_worker,
             "humanoid_unavailable_ratio_avg": round(float(humanoid_unavailable_ratio_avg), 6),
             "humanoid_primitive_minutes": humanoid_primitive_minutes,
             "humanoid_task_taxonomy": humanoid_task_taxonomy,
             **traffic_metrics,
             **transport_metrics,
+            **repair_collaboration_metrics,
             "buffer_wait_avg_min": buffer_wait_metrics["avg_wait_min"],
             "buffer_wait_avg_min_including_open": buffer_wait_metrics["avg_wait_min_including_open"],
             "buffer_wait_completed_count": buffer_wait_metrics["completed_wait_count"],

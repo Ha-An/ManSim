@@ -173,18 +173,20 @@ function statusLabel(entity: BaseEntityState): string {
 }
 
 function workerTaskCode(entity: BaseEntityState): string {
-  if (typeof entity.attributes.current_parent_task_code === "string" && entity.attributes.current_parent_task_code.trim()) {
+  const activeTask = hasActiveHumanoidTask(entity);
+  if (activeTask && typeof entity.attributes.current_parent_task_code === "string" && entity.attributes.current_parent_task_code.trim()) {
     return entity.attributes.current_parent_task_code.trim();
   }
   const taskCode = humanoidTaskContext(entity).task_code;
   if (typeof taskCode === "string" && taskCode.trim()) return taskCode.trim();
-  if (hasActiveHumanoidTask(entity) && typeof entity.attributes.current_task_code === "string" && entity.attributes.current_task_code.trim()) {
+  if (activeTask && typeof entity.attributes.current_task_code === "string" && entity.attributes.current_task_code.trim()) {
     return entity.attributes.current_task_code.trim();
   }
   return "-";
 }
 
 function workerChildTask(entity: BaseEntityState): string {
+  if (!hasActiveHumanoidTask(entity)) return "-";
   const childCode =
     typeof entity.attributes.current_child_task_code === "string" ? entity.attributes.current_child_task_code.trim() : "";
   if (childCode) return childCode;

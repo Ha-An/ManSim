@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import csv
+import html
 import json
 from collections import defaultdict
 from datetime import datetime
@@ -11,20 +12,37 @@ from .artifact_meta import add_plotly_meta_header
 from .shell import render_page_shell
 
 
-AGENT_TASK_TYPES_7 = [
-    "BATTERY_SWAP",
-    "REPAIR_MACHINE",
-    "UNLOAD_MACHINE",
-    "SETUP_MACHINE",
-    "TRANSFER",
-    "INSPECT_PRODUCT",
-    "PREVENTIVE_MAINTENANCE",
+AVAILABILITY_STATES = [
+    "AVAILABLE",
+    "ASSIGNED",
+    "EXECUTING",
+    "WAITING",
+    "BLOCKED",
+    "OFFLINE",
+    "DISABLED",
 ]
-
 
 def _details(event: dict[str, Any]) -> dict[str, Any]:
     data = event.get("details", {})
     return data if isinstance(data, dict) else {}
+
+
+def _humanoid_state(event: dict[str, Any]) -> dict[str, Any] | None:
+    state = _details(event).get("humanoid_state")
+    return state if isinstance(state, dict) else None
+
+
+def _is_worker_id(raw: Any) -> bool:
+    text = str(raw or "").strip()
+    return len(text) > 1 and text[0].upper() == "A" and text[1:].isdigit()
+
+
+def _worker_sort_key(raw: str) -> tuple[int, str]:
+    text = str(raw)
+    suffix = text[1:] if text.upper().startswith("A") else text
+    if suffix.isdigit():
+        return (0, f"{int(suffix):06d}")
+    return (1, text)
 
 
 def _entity_key(event: dict[str, Any]) -> tuple[str, str]:
@@ -87,6 +105,142 @@ def _pair_intervals(
                 "start_event": start_event,
                 "end_event": event,
             }
+        )
+
+    return intervals
+
+
+def _state_context(state: dict[str, Any]) -> dict[str, str]:
+    context = state.get("task_context")
+    context = context if isinstance(context, dict) else {}
+    reason = state.get("reason")
+    reason = reason if isinstance(reason, dict) else {}
+    metadata = state.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return {
+        "task_code": str(context.get("task_code") or ""),
+        "task_instance_id": str(context.get("task_instance_id") or ""),
+        "step_id": str(context.get("step_id") or ""),
+        "primitive_call_code": str(context.get("primitive_call_code") or ""),
+        "execution_status": str(context.get("execution_status") or ""),
+        "reason_code": str(reason.get("code") or ""),
+        "reason_message": str(reason.get("message") or ""),
+        "reason_source": str(reason.get("source") or ""),
+        "state_source": str(metadata.get("source") or ""),
+        "state_task_id": str(metadata.get("task_id") or ""),
+    }
+
+
+def _state_signature(state: dict[str, Any]) -> tuple[str, ...]:
+    # Gantt worker rows are intentionally availability-first.  Other axes and
+    # task context remain in hover metadata, but they should not fragment the
+    # lane into primitive-sized slices.
+    return (str(state.get("availability") or ""),)
+
+
+def _hover_line(label: str, value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return f"<br>{html.escape(label)}={html.escape(text)}"
+
+
+def _build_worker_availability(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build non-overlapping worker Gantt rows from HumanoidSim availability state.
+
+    Worker state is now a multi-axis HumanoidStateSnapshot.  The Gantt lane uses
+    only the availability axis for color/status and keeps task/primitive context
+    in hover metadata.
+    """
+
+    sim_end = max((float(event.get("t", 0.0) or 0.0) for event in events), default=0.0)
+    worker_ids = {
+        str(event.get("entity_id", "")).strip()
+        for event in events
+        if _is_worker_id(event.get("entity_id"))
+    }
+    current: dict[str, dict[str, Any]] = {
+        worker_id: {
+            "humanoid_id": worker_id,
+            "availability": "AVAILABLE",
+            "mobility": "STATIONARY",
+            "power": "POWER_NORMAL",
+            "manipulation": "FREE",
+            "task_context": None,
+            "reason": None,
+            "metadata": {},
+        }
+        for worker_id in sorted(worker_ids, key=_worker_sort_key)
+    }
+    last_t: dict[str, float] = {worker_id: 0.0 for worker_id in current}
+    last_event: dict[str, dict[str, Any]] = {
+        worker_id: {
+            "t": 0.0,
+            "day": 0,
+            "type": "HUMANOID_STATE_INITIAL",
+            "entity_id": worker_id,
+            "location": "",
+            "details": {"humanoid_state": current[worker_id]},
+        }
+        for worker_id in current
+    }
+    intervals: list[dict[str, Any]] = []
+
+    def add_interval(worker_id: str, end_t: float, end_event: dict[str, Any]) -> None:
+        start_t = float(last_t.get(worker_id, 0.0))
+        duration = max(0.0, float(end_t) - start_t)
+        if duration <= 0.0:
+            return
+        state = dict(current.get(worker_id, {}))
+        availability = str(state.get("availability") or "AVAILABLE").strip().upper() or "AVAILABLE"
+        if availability not in AVAILABILITY_STATES:
+            availability = "UNKNOWN"
+        details = dict(_details(last_event.get(worker_id, {})))
+        details["humanoid_state"] = state
+        start_event = dict(last_event.get(worker_id, {}))
+        start_event["details"] = details
+        intervals.append(
+            {
+                "lane": worker_id,
+                "entity_group": "Worker",
+                "status": availability,
+                "start": start_t,
+                "end": float(end_t),
+                "duration": duration,
+                "interval_type": availability,
+                "start_event": start_event,
+                "end_event": end_event,
+            }
+        )
+
+    for event in sorted(events, key=lambda item: float(item.get("t", 0.0) or 0.0)):
+        state = _humanoid_state(event)
+        if state is None:
+            continue
+        worker_id = str(event.get("entity_id", "")).strip()
+        if worker_id not in current:
+            continue
+        event_t = float(event.get("t", 0.0) or 0.0)
+        if _state_signature(state) == _state_signature(current.get(worker_id, {})):
+            current[worker_id] = dict(state)
+            continue
+        add_interval(worker_id, event_t, event)
+        current[worker_id] = dict(state)
+        last_t[worker_id] = event_t
+        last_event[worker_id] = event
+
+    for worker_id in sorted(current, key=_worker_sort_key):
+        add_interval(
+            worker_id,
+            sim_end,
+            {
+                "t": sim_end,
+                "day": 0,
+                "type": "HUMANOID_STATE_FINAL",
+                "entity_id": worker_id,
+                "location": "",
+                "details": {"humanoid_state": current[worker_id]},
+            },
         )
 
     return intervals
@@ -174,18 +328,16 @@ def _build_finished_wait_unload(events: list[dict[str, Any]]) -> list[dict[str, 
     return intervals
 
 
-def _agent_task_mix(events: list[dict[str, Any]]) -> dict[str, str]:
-    counts: dict[str, dict[str, int]] = defaultdict(lambda: {k: 0 for k in AGENT_TASK_TYPES_7})
+def _humanoid_task_mix(events: list[dict[str, Any]]) -> dict[str, str]:
+    counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for ev in events:
         if str(ev.get("type", "")) != "AGENT_TASK_END":
             continue
         agent = str(ev.get("entity_id", ""))
-        task_type = str(_details(ev).get("task_type", "")).upper()
-        if task_type in counts[agent]:
-            counts[agent][task_type] += 1
-    return {
-        agent: " | ".join(f"{task}:{vals.get(task, 0)}" for task in AGENT_TASK_TYPES_7) for agent, vals in counts.items()
-    }
+        task_code = str(_details(ev).get("task_code") or _details(ev).get("task_type") or "").upper()
+        if task_code and str(_details(ev).get("status", "")).strip().lower() == "completed":
+            counts[agent][task_code] += 1
+    return {agent: " | ".join(f"{task}:{count}" for task, count in sorted(vals.items())) for agent, vals in counts.items()}
 
 
 def export_gantt(
@@ -198,33 +350,7 @@ def export_gantt(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    agent_moving = _pair_intervals(
-        events,
-        "AGENT_MOVE_START",
-        {"AGENT_MOVE_END", "AGENT_MOVE_INTERRUPTED"},
-        _entity_key,
-        "MOVING",
-        lambda _s, _e: "MOVE",
-        "Agent",
-    )
-    agent_working = _pair_intervals(
-        events,
-        "AGENT_TASK_START",
-        "AGENT_TASK_END",
-        _task_key,
-        "WORKING",
-        lambda s, _e: str(_details(s).get("task_type", "AGENT_TASK")),
-        "Agent",
-    )
-    agent_discharged = _pair_intervals(
-        events,
-        "AGENT_DISCHARGED",
-        "AGENT_RECHARGED",
-        _entity_key,
-        "DISCHARGED",
-        lambda _s, _e: "BATTERY_EMPTY",
-        "Agent",
-    )
+    worker_availability = _build_worker_availability(events)
 
     machine_running = _pair_intervals(
         events,
@@ -256,9 +382,7 @@ def export_gantt(
     machine_wait_unload = _build_finished_wait_unload(events)
 
     rows = (
-        agent_moving
-        + agent_working
-        + agent_discharged
+        worker_availability
         + machine_running
         + machine_down_break
         + machine_down_pm
@@ -314,16 +438,20 @@ def export_gantt(
     try:
         import pandas as pd
         import plotly.express as px
+        import plotly.graph_objects as go
     except Exception:
         return
 
-    agent_mix = _agent_task_mix(events)
+    task_mix = _humanoid_task_mix(events)
     df_rows: list[dict[str, Any]] = []
     for r in rows:
         start_event = r["start_event"]
         end_event = r["end_event"]
         sd = _details(start_event)
         ed = _details(end_event)
+        state = sd.get("humanoid_state")
+        state = state if isinstance(state, dict) else {}
+        state_ctx = _state_context(state)
         payload = sd.get("payload", ed.get("payload", {}))
         payload_str = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
         lane = str(r["lane"])
@@ -338,9 +466,19 @@ def export_gantt(
                 "duration": float(r["duration"]),
                 "interval_type": str(r["interval_type"]),
                 "task_id": str(sd.get("task_id", ed.get("task_id", ""))),
-                "task_type": str(sd.get("task_type", "")),
+                "task_code": str(state_ctx["task_code"] or sd.get("task_code", "")),
+                "task_instance_id": str(state_ctx["task_instance_id"] or sd.get("instance_id", "")),
+                "step_id": str(state_ctx["step_id"] or sd.get("step_id", "")),
+                "primitive_call_code": str(state_ctx["primitive_call_code"] or sd.get("primitive_call_code", "")),
+                "execution_status": str(state_ctx["execution_status"]),
+                "availability": str(state.get("availability", "")),
+                "mobility": str(state.get("mobility", "")),
+                "power": str(state.get("power", "")),
+                "manipulation": str(state.get("manipulation", "")),
                 "priority_key": str(sd.get("priority_key", "")),
-                "reason": str(ed.get("reason", "")),
+                "reason": str(state_ctx["reason_code"] or ed.get("reason", "")),
+                "reason_message": str(state_ctx["reason_message"]),
+                "reason_source": str(state_ctx["reason_source"]),
                 "payload": payload_str,
                 "cycle_id": str(sd.get("cycle_id", ed.get("cycle_id", ""))),
                 "input_material": str(sd.get("input_material", "")),
@@ -348,7 +486,7 @@ def export_gantt(
                 "output_intermediate": str(ed.get("output_intermediate", "")),
                 "unload_agent": str(ed.get("unload_agent", "")),
                 "unload_task_id": str(ed.get("unload_task_id", "")),
-                "agent_task_mix": agent_mix.get(lane, " | ".join(f"{k}:0" for k in AGENT_TASK_TYPES_7)),
+                "humanoid_task_mix": task_mix.get(lane, ""),
                 "start_day": int(start_event.get("day", 0) or 0),
                 "end_day": int(end_event.get("day", 0) or 0),
                 "start_location": str(start_event.get("location", "")),
@@ -357,24 +495,49 @@ def export_gantt(
         )
 
     df = pd.DataFrame(df_rows)
+    hover_summaries: list[str] = []
+    for row in df_rows:
+        lines = [
+            f"<b>{html.escape(str(row['lane']))}</b>",
+            f"<br>Group={html.escape(str(row['entity_group']))}",
+            f"<br>Status={html.escape(str(row['status']))}",
+        ]
+        if row["entity_group"] == "Worker":
+            lines.append(_hover_line("Task", row.get("task_code", "")))
+            lines.append(_hover_line("Primitive", row.get("primitive_call_code", "")))
+            lines.append(_hover_line("Mobility", row.get("mobility", "")))
+            lines.append(_hover_line("Reason", row.get("reason", "")))
+        else:
+            lines.append(_hover_line("Cycle", row.get("cycle_id", "")))
+            lines.append(_hover_line("Unload agent", row.get("unload_agent", "")))
+        lines.extend(
+            [
+                f"<br>Start={float(row['start']):.2f} min",
+                f"<br>End={float(row['end']):.2f} min",
+                f"<br>Duration={float(row['duration']):.2f} min",
+            ]
+        )
+        hover_summaries.append("".join(lines))
+    df["hover_summary"] = hover_summaries
     base_time = datetime(2000, 1, 1, 0, 0, 0)
     df["start_dt"] = base_time + pd.to_timedelta(df["start"], unit="m")
     df["end_dt"] = base_time + pd.to_timedelta(df["end"], unit="m")
 
     color_map = {
-        # Match replay UI legend colors exactly
-        "MOVING": "#f5b041",
-        "WORKING": "#27ae60",
-        "DISCHARGED": "#e74c3c",
+        "AVAILABLE": "#d8dee9",
+        "ASSIGNED": "#90caf9",
+        "EXECUTING": "#27ae60",
+        "WAITING": "#f5b041",
+        "BLOCKED": "#e67e22",
+        "OFFLINE": "#95a5a6",
+        "DISABLED": "#e74c3c",
+        "UNKNOWN": "#6c757d",
         "RUNNING": "#27ae60",
         "DOWN": "#e74c3c",
         "FINISHED-WAIT-UNLOAD": "#f39c12",
     }
-    status_order = [
-        # Draw WORKING first and MOVING on top so the two are visually distinct.
-        "WORKING",
-        "MOVING",
-        "DISCHARGED",
+    status_order = AVAILABILITY_STATES + [
+        "UNKNOWN",
         "RUNNING",
         "DOWN",
         "FINISHED-WAIT-UNLOAD",
@@ -388,47 +551,42 @@ def export_gantt(
         color="status",
         color_discrete_map=color_map,
         category_orders={"status": status_order},
-        hover_data={
-            "entity_group": True,
-            "status": True,
-            "interval_type": True,
-            "task_id": True,
-            "task_type": True,
-            "priority_key": True,
-            "reason": True,
-            "payload": True,
-            "cycle_id": True,
-            "input_material": True,
-            "input_intermediate": True,
-            "output_intermediate": True,
-            "unload_agent": True,
-            "unload_task_id": True,
-            "agent_task_mix": True,
-            "start_day": True,
-            "end_day": True,
-            "start_location": True,
-            "end_location": True,
-            "start": ":.2f",
-            "end": ":.2f",
-            "duration": ":.2f",
-            "start_dt": False,
-            "end_dt": False,
-            "lane": False,
-        },
+        custom_data=["hover_summary"],
     )
 
-    agent_statuses = {"MOVING", "WORKING", "DISCHARGED"}
+    rendered_statuses = {str(status) for status in df["status"].dropna().unique()}
+    for state_name in AVAILABILITY_STATES:
+        if state_name in rendered_statuses:
+            continue
+        fig.add_trace(
+            go.Bar(
+                name=state_name,
+                x=[0],
+                y=[""],
+                orientation="h",
+                marker_color=color_map.get(state_name, "#6c757d"),
+                visible="legendonly",
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+
+    worker_statuses = set(AVAILABILITY_STATES) | {"UNKNOWN"}
     machine_statuses = {"RUNNING", "DOWN", "FINISHED-WAIT-UNLOAD"}
-    seen_agent_group = False
+    seen_worker_group = False
     seen_machine_group = False
     for trace in fig.data:
         status_name = str(getattr(trace, "name", ""))
-        if status_name in agent_statuses:
-            trace.legendgroup = "Agent"
-            if not seen_agent_group:
-                trace.legendgrouptitle = {"text": "Agent"}
-                seen_agent_group = True
+        if status_name in worker_statuses:
+            if str(getattr(trace, "hoverinfo", "")) != "skip":
+                trace.hovertemplate = "%{customdata[0]}<extra></extra>"
+            trace.legendgroup = "Worker Availability"
+            if not seen_worker_group:
+                trace.legendgrouptitle = {"text": "Worker Availability"}
+                seen_worker_group = True
         elif status_name in machine_statuses:
+            if str(getattr(trace, "hoverinfo", "")) != "skip":
+                trace.hovertemplate = "%{customdata[0]}<extra></extra>"
             trace.legendgroup = "Machine"
             if not seen_machine_group:
                 trace.legendgrouptitle = {"text": "Machine"}
@@ -447,7 +605,7 @@ def export_gantt(
         current_artifact="gantt.html",
         current_run_id=current_run_id,
         page_title="Gantt",
-        page_subtitle="Timeline view of worker tasks, machine states, and wait-unload windows.",
+        page_subtitle="Timeline view of worker Availability State, machine states, and wait-unload windows.",
         body_html=f"<section class='section'><div class='panel'>{fig.to_html(full_html=False, include_plotlyjs=True)}</div></section>",
     )
     gantt_path.write_text(html_text, encoding="utf-8")
