@@ -135,12 +135,10 @@ class HumanoidTaskRuntime:
         try:
             from humanoidsim import (
                 StateReason,
-                apply_primitive_state_hint,
-                build_state_snapshot_for_task_lifecycle,
                 default_humanoid_state,
                 load_task_catalog,
-                parse_humanoid_state_snapshot,
-                primitive_state_hint,
+                StateTransitionEvent,
+                transition_humanoid_state,
                 validate_state_snapshot,
                 validate_task_sequence,
                 HumanoidProfile,
@@ -163,12 +161,10 @@ class HumanoidTaskRuntime:
             "HumanoidProfile": HumanoidProfile,
             "StateReason": StateReason,
             "TaskInstance": TaskInstance,
-            "apply_primitive_state_hint": apply_primitive_state_hint,
-            "build_state_snapshot_for_task_lifecycle": build_state_snapshot_for_task_lifecycle,
             "default_humanoid_state": default_humanoid_state,
             "validate_task_sequence": validate_task_sequence,
-            "parse_humanoid_state_snapshot": parse_humanoid_state_snapshot,
-            "primitive_state_hint": primitive_state_hint,
+            "StateTransitionEvent": StateTransitionEvent,
+            "transition_humanoid_state": transition_humanoid_state,
             "validate_state_snapshot": validate_state_snapshot,
             "expand_task_steps": expand_task_steps,
         }
@@ -208,150 +204,94 @@ class HumanoidTaskRuntime:
     def state_payload(self, worker: Worker) -> dict[str, Any]:
         return self.ensure_humanoid_state(worker)
 
-    def set_axes(
+    def transition_state(
         self,
         worker: Worker,
+        event_type: str,
         *,
-        availability: str | None = None,
-        mobility: str | None = None,
-        power: str | None = None,
-        manipulation: str | None = None,
+        task: Task | None = None,
+        step: dict[str, Any] | None = None,
+        status: str = "",
         reason_code: str = "",
         reason_message: str = "",
         source: str = "mansim.state",
-        task_id: str | None = None,
-        clear_task_context: bool = False,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         if not self.enabled:
             return
-        payload = self.ensure_humanoid_state(worker)
-        payload["timestamp_s"] = round(float(self.world.env.now), 3)
-        payload["task_context"] = None if clear_task_context else self._task_context_from_worker(worker)
-        if availability:
-            payload["availability"] = str(availability)
-        if mobility:
-            payload["mobility"] = str(mobility)
-        if power:
-            payload["power"] = str(power)
-        if manipulation:
-            payload["manipulation"] = str(manipulation)
-        if reason_code:
-            payload["reason"] = self._reason(reason_code, source=source, message=reason_message)
-        elif payload.get("availability") not in {"WAITING", "BLOCKED", "DISABLED"}:
-            payload["reason"] = None
-        payload["metadata"] = self._state_metadata(worker, reason=reason_code, task_id=task_id, source=source)
-        worker.humanoid_state = self._normalize_state_payload(worker, payload)
+        current = self.ensure_humanoid_state(worker)
+        event_cls = self._imports["StateTransitionEvent"]
+        reason = self._reason(reason_code, source=source, message=reason_message) if reason_code else None
+        task_context = task or self._task_from_worker(worker)
+        event_metadata = self._state_metadata(worker, reason=reason_code, task_id=getattr(task_context, "task_id", None), source=source)
+        event_metadata["cargo_present"] = bool(worker.carrying_item_id or getattr(worker, "carrying_item_ids", []))
+        event_metadata.update(dict(metadata or {}))
+        transition_event = event_cls(
+            event_type=event_type,
+            task_code=str(getattr(task_context, "task_code", "") or ""),
+            task_instance_id=str(getattr(task_context, "instance_id", "") or ""),
+            step_id=str((step or {}).get("step_id", "") or worker.current_step_id or ""),
+            primitive_call_code=str((step or {}).get("call_code", "") or worker.current_primitive_call_code or ""),
+            execution_status=self._execution_status(status, default="RUNNING") if status else None,
+            reason=reason,
+            timestamp_s=round(float(self.world.env.now), 3),
+            metadata=event_metadata,
+        )
+        try:
+            snapshot = self._imports["transition_humanoid_state"](current, transition_event, strict=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"HumanoidSim state transition failed for worker={worker.agent_id} "
+                f"event={event_type} task={getattr(task_context, 'task_code', '')} "
+                f"primitive={transition_event.primitive_call_code}: {exc}"
+            ) from exc
+        worker.humanoid_state = self._normalize_state_payload(worker, snapshot.to_dict())
 
     def sync_worker_cargo_state(self, worker: Worker, *, destination: str = "") -> None:
-        if not self.enabled:
-            return
-        payload = self.ensure_humanoid_state(worker)
-        payload["timestamp_s"] = round(float(self.world.env.now), 3)
-        payload["manipulation"] = "HOLDING" if worker.carrying_item_id else "FREE"
-        payload["metadata"] = self._state_metadata(worker, reason="cargo_changed", destination=destination)
-        worker.humanoid_state = self._normalize_state_payload(worker, payload)
+        self.transition_state(
+            worker,
+            "cargo_changed",
+            reason_code="cargo_changed",
+            source="mansim.cargo",
+            metadata={"destination": destination, "cargo_present": bool(worker.carrying_item_id or getattr(worker, "carrying_item_ids", []))},
+        )
 
     def set_disabled_state(self, worker: Worker, *, reason: str = "battery_depleted") -> None:
-        if not self.enabled:
-            return
-        payload = self.ensure_humanoid_state(worker)
-        payload["timestamp_s"] = round(float(self.world.env.now), 3)
-        payload["availability"] = "DISABLED"
-        payload["power"] = "DEPLETED"
-        payload["mobility"] = "STATIONARY"
-        payload["reason"] = self._reason(reason, source="mansim.discharge")
-        payload["metadata"] = self._state_metadata(worker, reason=reason)
-        worker.humanoid_state = self._normalize_state_payload(worker, payload)
+        self.transition_state(worker, "disabled", reason_code=reason, source="mansim.discharge")
 
     def set_task_lifecycle_state(self, worker: Worker, task: Task, *, event_type: str, status: str = "") -> None:
-        if not self.enabled:
-            return
-        previous = self.ensure_humanoid_state(worker)
-        normalized_status = self._execution_status(status, default="RUNNING")
         if event_type == "HUMANOID_TASK_START":
-            payload = self._build_task_snapshot(worker, task, execution_status=normalized_status)
-            payload["availability"] = "EXECUTING"
-            payload = self._preserve_axes(previous, payload)
-        elif event_type == "HUMANOID_TASK_END":
-            if str(status).strip().lower() == "completed" and not worker.discharged:
-                payload = default_humanoid_state_payload(worker.agent_id)
-                payload["timestamp_s"] = round(float(self.world.env.now), 3)
-                payload["power"] = "POWER_NORMAL"
-                payload["manipulation"] = "HOLDING" if worker.carrying_item_id else "FREE"
-            elif worker.discharged:
-                payload = copy.deepcopy(previous)
-                payload["availability"] = "DISABLED"
-                payload["power"] = "DEPLETED"
-                payload["reason"] = self._reason("battery_depleted", source="mansim.task_end")
+            self.transition_state(worker, "task_started", task=task, status=status or "running", source="mansim.humanoid_task")
+            return
+        if event_type == "HUMANOID_TASK_END":
+            if worker.discharged:
+                self.transition_state(worker, "disabled", task=task, status=status, reason_code="battery_depleted", source="mansim.task_end")
+            elif str(status).strip().lower() == "completed":
+                self.transition_state(
+                    worker,
+                    "task_completed",
+                    task=task,
+                    status=status,
+                    reason_code="task_completed",
+                    source="mansim.task_end",
+                    metadata={"cargo_present": bool(worker.carrying_item_id or getattr(worker, "carrying_item_ids", []))},
+                )
+            elif str(status).strip().lower() == "failed":
+                self.transition_state(worker, "blocked", task=task, status=status, reason_code=status or "task_failed", source="mansim.task_end")
             else:
-                payload = self._build_task_snapshot(worker, task, execution_status=normalized_status)
-                payload = self._preserve_axes(previous, payload)
-                payload["availability"] = "BLOCKED" if str(status).strip().lower() == "failed" else "WAITING"
-                payload["reason"] = self._reason(status or "task_not_completed", source="mansim.task_end")
-        else:
-            payload = self._build_task_snapshot(worker, task, execution_status=normalized_status)
-            payload = self._preserve_axes(previous, payload)
-        payload["metadata"] = self._state_metadata(worker, reason=f"humanoid_task:{event_type}", task_id=task.task_id)
-        worker.humanoid_state = self._normalize_state_payload(worker, payload)
+                self.transition_state(worker, "waiting", task=task, status=status, reason_code=status or "task_waiting", source="mansim.task_end")
+            return
+        self.transition_state(worker, "task_started", task=task, status=status or "running", source="mansim.humanoid_task")
 
     def set_step_state(self, worker: Worker, task: Task, step: dict[str, Any], *, event_type: str, status: str) -> None:
-        if not self.enabled:
-            return
-        previous = self.ensure_humanoid_state(worker)
-        call_code = str(step.get("call_code", ""))
-        payload = self._build_task_snapshot(
+        self.transition_state(
             worker,
-            task,
-            step_id=str(step.get("step_id", "")),
-            primitive_call_code=call_code,
-            execution_status=self._execution_status(status, default="RUNNING"),
+            "primitive_finished" if event_type == "HUMANOID_STEP_END" else "primitive_started",
+            task=task,
+            step=step,
+            status=status,
+            source="mansim.humanoid_step",
         )
-        payload = self._preserve_axes(previous, payload, primitive_call_code=call_code, task_code=task.task_code, finished=event_type == "HUMANOID_STEP_END")
-        payload["availability"] = "EXECUTING"
-        payload["metadata"] = self._state_metadata(worker, reason=f"humanoid_step:{event_type}", task_id=task.task_id)
-        worker.humanoid_state = self._normalize_state_payload(worker, payload)
-
-    def _build_task_snapshot(
-        self,
-        worker: Worker,
-        task: Task,
-        *,
-        step_id: str | None = None,
-        primitive_call_code: str | None = None,
-        execution_status: str | None = None,
-    ) -> dict[str, Any]:
-        build_snapshot = self._imports["build_state_snapshot_for_task_lifecycle"]
-        snapshot = build_snapshot(
-            worker.agent_id,
-            task_code=task.task_code or "",
-            task_instance_id=task.instance_id or "",
-            step_id=step_id,
-            primitive_call_code=primitive_call_code,
-            execution_status=execution_status,
-            timestamp_s=round(float(self.world.env.now), 3),
-            metadata={"source": "mansim.humanoid_runtime", "task_id": task.task_id, "task_type": task.task_type},
-        )
-        return snapshot.to_dict()
-
-    def _preserve_axes(
-        self,
-        previous: dict[str, Any],
-        payload: dict[str, Any],
-        *,
-        primitive_call_code: str = "",
-        task_code: str = "",
-        finished: bool = False,
-    ) -> dict[str, Any]:
-        hint_payload: dict[str, Any] = {}
-        if primitive_call_code:
-            hint = self._imports["primitive_state_hint"](primitive_call_code, task_code=task_code, primitive_finished=finished)
-            hint_payload = hint.to_dict()
-        for axis in ("mobility", "power", "manipulation"):
-            if hint_payload.get(axis):
-                payload[axis] = hint_payload[axis]
-            else:
-                payload[axis] = previous.get(axis, payload.get(axis))
-        return payload
 
     def _normalize_state_payload(self, worker: Worker, payload: dict[str, Any]) -> dict[str, Any]:
         normalized = copy.deepcopy(payload)
@@ -366,15 +306,13 @@ class HumanoidTaskRuntime:
         try:
             issues = self._imports["validate_state_snapshot"](normalized)
         except Exception as exc:
-            normalized.setdefault("metadata", {})["state_validation_error"] = f"{type(exc).__name__}: {exc}"
-            return normalized
+            raise RuntimeError(f"HumanoidSim state validation failed for {worker.agent_id}: {type(exc).__name__}: {exc}") from exc
         if issues:
-            normalized.setdefault("metadata", {})["state_validation_issues"] = [
+            rendered = [
                 asdict(issue) if hasattr(issue, "__dataclass_fields__") else dict(issue)
                 for issue in issues
             ]
-        else:
-            normalized.get("metadata", {}).pop("state_validation_issues", None)
+            raise RuntimeError(f"HumanoidSim state validation issues for {worker.agent_id}: {rendered}")
         return normalized
 
     def _task_context_from_worker(self, worker: Worker) -> dict[str, Any] | None:
@@ -387,6 +325,19 @@ class HumanoidTaskRuntime:
             "primitive_call_code": worker.current_primitive_call_code or None,
             "execution_status": "RUNNING" if worker.current_step_id or worker.current_primitive_call_code else "PENDING",
         }
+
+    def _task_from_worker(self, worker: Worker) -> Task:
+        return Task(
+            task_id=str(worker.current_child_task_instance_id or worker.current_task_id or ""),
+            task_type=str(worker.current_child_task_code or worker.current_task_type or ""),
+            priority_key="",
+            priority=0.0,
+            location=str(getattr(worker, "location", "")),
+            task_code=str(worker.current_child_task_code or worker.current_task_code or ""),
+            instance_id=str(worker.current_child_task_instance_id or worker.current_task_instance_id or ""),
+            assigned_robot_id=worker.agent_id,
+            task_spec_name=str(worker.current_child_task_name or ""),
+        )
 
     def _reason(self, code: str, *, source: str, message: str = "") -> dict[str, Any]:
         reason_cls = self._imports.get("StateReason")

@@ -1346,48 +1346,32 @@ class ManufacturingWorld:
             }
         )
 
-    def _set_humanoid_axes(
+    def _transition_humanoid_state(
         self,
         worker: Worker,
+        event_type: str,
         *,
-        availability: str | None = None,
-        mobility: str | None = None,
-        power: str | None = None,
-        manipulation: str | None = None,
         reason: str = "",
         reason_message: str = "",
         source: str = "mansim.world",
-        task_id: str | None = None,
-        clear_task_context: bool = False,
+        task: Task | None = None,
+        step: dict[str, Any] | None = None,
+        status: str = "",
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         runtime = getattr(self, "humanoid_runtime", None)
-        if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "set_axes"):
-            runtime.set_axes(
+        if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "transition_state"):
+            runtime.transition_state(
                 worker,
-                availability=availability,
-                mobility=mobility,
-                power=power,
-                manipulation=manipulation,
+                event_type,
+                task=task,
+                step=step,
+                status=status,
                 reason_code=reason,
                 reason_message=reason_message,
                 source=source,
-                task_id=task_id,
-                clear_task_context=clear_task_context,
+                metadata=metadata,
             )
-        else:
-            payload = self._humanoid_state_payload(worker)
-            if availability:
-                payload["availability"] = availability
-            if mobility:
-                payload["mobility"] = mobility
-            if power:
-                payload["power"] = power
-            if manipulation:
-                payload["manipulation"] = manipulation
-            if clear_task_context:
-                payload["task_context"] = None
-            payload["timestamp_s"] = round(float(self.env.now), 3)
-            worker.humanoid_state = payload
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1405,38 +1389,40 @@ class ManufacturingWorld:
 
     def _set_humanoid_for_task(self, worker: Worker, task: Task | None, *, reason: str, task_id: str | None = None) -> None:
         if worker.discharged:
-            self._set_humanoid_axes(
+            self._transition_humanoid_state(
                 worker,
-                availability="DISABLED",
-                mobility="STATIONARY",
-                power="DEPLETED",
+                "disabled",
                 reason=reason or "battery_depleted",
                 source="mansim.discharge",
-                task_id=task_id,
             )
             return
-        if task is None:
-            self._set_humanoid_axes(
+        if worker.current_primitive_call_code == "NAVIGATE_TO":
+            self._transition_humanoid_state(
                 worker,
-                availability="AVAILABLE",
-                mobility="STATIONARY",
-                power="POWER_NORMAL",
-                manipulation="HOLDING" if worker.carrying_item_id else "FREE",
+                "primitive_finished",
+                step={"step_id": worker.current_step_id or "motion", "call_code": "NAVIGATE_TO"},
+                status="completed",
+                reason=reason,
+                source="mansim.motion",
+            )
+        if task is None:
+            self._transition_humanoid_state(
+                worker,
+                "task_completed",
+                status="completed",
                 reason=reason,
                 source="mansim.task",
-                task_id=task_id,
-                clear_task_context=True,
+                metadata={"cargo_present": bool(worker.carrying_item_id or worker.carrying_item_ids)},
             )
             return
-        self._set_humanoid_axes(
+        self._transition_humanoid_state(
             worker,
-            availability="EXECUTING",
-            mobility="STATIONARY",
-            power="CHARGING" if str(task.task_code).strip().upper() == "MANAGE_ROBOT_POWER" else None,
-            manipulation="HOLDING" if worker.carrying_item_id else None,
+            "task_started",
+            task=task,
+            status="running",
             reason=reason,
             source="mansim.task",
-            task_id=task_id or task.task_id,
+            metadata={"cargo_present": bool(worker.carrying_item_id or worker.carrying_item_ids)},
         )
 
     def _set_humanoid_primitive_hint(self, agent: Agent, primitive_call_code: str, *, reason: str = "primitive_hint") -> None:
@@ -1668,14 +1654,13 @@ class ManufacturingWorld:
                 "humanoid_state": self._humanoid_state_payload(helper),
             },
         )
-        self._set_humanoid_axes(
+        self._transition_humanoid_state(
             helper,
-            availability="EXECUTING",
-            mobility="STATIONARY",
-            manipulation="HOLDING",
+            "cargo_changed",
             reason="product_carry_joined",
             source="mansim.handover",
-            task_id=task.task_id,
+            task=task,
+            metadata={"cargo_present": True},
         )
         return True
 
@@ -1957,13 +1942,20 @@ class ManufacturingWorld:
             helper.current_move_segment_to_tile = None
             self._set_in_transit(helper, str(helper.location), logical_destination, 1.0, segment_duration)
             self._clear_in_transit(helper)
-            self._set_humanoid_axes(
+            self._transition_humanoid_state(
                 helper,
-                availability="EXECUTING",
-                mobility="STATIONARY",
-                manipulation="HOLDING",
+                "primitive_finished",
+                step={"step_id": helper.current_step_id or "motion", "call_code": "NAVIGATE_TO"},
+                status="completed",
                 reason="shared_product_carry",
                 source="mansim.transport",
+            )
+            self._transition_humanoid_state(
+                helper,
+                "cargo_changed",
+                reason="shared_product_carry",
+                source="mansim.transport",
+                metadata={"cargo_present": True},
             )
 
     def _set_worker_motion(
@@ -1983,10 +1975,11 @@ class ManufacturingWorld:
         worker.in_transit_total_min = max(0.0, float(total_min))
         worker.movement_path = list(path_tiles or [])
         worker.movement_target_tile = target_tile
-        self._set_humanoid_axes(
+        self._transition_humanoid_state(
             worker,
-            availability="EXECUTING" if worker.current_task_id else "AVAILABLE",
-            mobility="NAVIGATING",
+            "primitive_started",
+            step={"step_id": worker.current_step_id or "motion", "call_code": "NAVIGATE_TO"},
+            status="running",
             reason="motion",
             source="mansim.motion",
         )
@@ -4175,14 +4168,6 @@ class ManufacturingWorld:
             location=self.agent_display_location(agent),
             details=details,
         )
-        self._set_humanoid_axes(
-            agent,
-            availability="DISABLED",
-            mobility="STATIONARY",
-            power="DEPLETED",
-            reason=reason,
-            source="mansim.discharge",
-        )
         self.emit_incident(
             "worker_discharged",
             affected_entities=[agent.agent_id],
@@ -4297,13 +4282,13 @@ class ManufacturingWorld:
         agent.current_task_path = None
         agent.current_task_depth = 0
         agent.current_task_started_at = start_t
-        self._set_humanoid_axes(
+        self._transition_humanoid_state(
             agent,
-            availability="ASSIGNED",
-            mobility="STATIONARY",
+            "task_assigned",
             reason="task_selected",
             source="mansim.task_selection",
-            task_id=task.task_id,
+            task=task,
+            status="pending",
         )
         selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
         details: dict[str, Any] = {
@@ -4400,47 +4385,34 @@ class ManufacturingWorld:
             },
         )
         if agent.discharged:
-            self._set_humanoid_axes(
+            self._transition_humanoid_state(
                 agent,
-                availability="DISABLED",
-                mobility="STATIONARY",
-                power="DEPLETED",
+                "disabled",
+                task=task,
+                status=status,
                 reason=reason or status,
                 source="mansim.task_end",
-                task_id=task.task_id,
             )
         elif status == "completed":
-            self._set_humanoid_axes(
+            self._transition_humanoid_state(
                 agent,
-                availability="AVAILABLE",
-                mobility="STATIONARY",
-                power="POWER_NORMAL",
-                manipulation="HOLDING" if agent.carrying_item_id else "FREE",
+                "task_completed",
+                task=task,
+                status=status,
                 reason="task_completed",
                 source="mansim.task_end",
-                task_id=task.task_id,
-                clear_task_context=True,
-            )
-        elif not preserve_carrying:
-            availability = self._availability_after_incomplete_task(status, reason)
-            self._set_humanoid_axes(
-                agent,
-                availability=availability,
-                mobility="STATIONARY",
-                reason=reason or status,
-                source="mansim.task_end",
-                task_id=task.task_id,
+                metadata={"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))},
             )
         else:
             availability = self._availability_after_incomplete_task(status, reason)
-            self._set_humanoid_axes(
+            self._transition_humanoid_state(
                 agent,
-                availability=availability,
-                mobility="STATIONARY",
-                manipulation="HOLDING" if agent.carrying_item_id else "FREE",
+                "blocked" if availability == "BLOCKED" else "waiting",
+                task=task,
+                status=status,
                 reason=reason or status,
                 source="mansim.task_end",
-                task_id=task.task_id,
+                metadata={"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))},
             )
         selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
         self.task_records.append(
@@ -6388,7 +6360,13 @@ class ManufacturingWorld:
                 yield from self.move_agent(agent, "battery_rack", emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, "battery_rack", task, "battery_swap"):
                     return False
-                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", power="CHARGING", reason="battery_swap", source="mansim.power", task_id=task.task_id)
+                self._transition_humanoid_state(
+                    agent,
+                    "power_charging",
+                    task=task,
+                    reason="battery_swap",
+                    source="mansim.power",
+                )
                 yield self.env.timeout(float(self.agent_cfg["battery_pickup_time_min"]))
                 battery_item_id = str(task.payload.get("battery_item_id", ""))
                 if not battery_item_id:
@@ -6400,7 +6378,13 @@ class ManufacturingWorld:
                 agent.discharged = False
                 agent.discharged_since = None
                 agent.low_battery_alerted = False
-                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", power="CHARGING", reason="battery_recharged", source="mansim.power", task_id=task.task_id)
+                self._transition_humanoid_state(
+                    agent,
+                    "power_charging",
+                    task=task,
+                    reason="battery_recharged",
+                    source="mansim.power",
+                )
                 self._clear_agent_carrying(agent, destination="BatteryStation")
                 self.logger.log(
                     t=self.env.now,
@@ -6426,7 +6410,14 @@ class ManufacturingWorld:
             if not self._confirm_object_service_tile(agent, machine.machine_id, task, "repair_machine"):
                 return False
             self._set_humanoid_primitive_hint(agent, "INSPECT_OR_DIAGNOSE")
-            self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="repair_machine", source="mansim.maintenance", task_id=task.task_id)
+            self._transition_humanoid_state(
+                agent,
+                "task_started",
+                task=task,
+                status="running",
+                reason="repair_machine",
+                source="mansim.maintenance",
+            )
             try:
                 if not machine.broken:
                     return False
@@ -6462,7 +6453,14 @@ class ManufacturingWorld:
                     if not self._confirm_object_service_tile(agent, machine.machine_id, task, "unload_machine"):
                         return False
                     self._set_humanoid_primitive_hint(agent, "READ_MACHINE_STATE")
-                    self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="unload_machine", source="mansim.machine", task_id=task.task_id)
+                    self._transition_humanoid_state(
+                        agent,
+                        "task_started",
+                        task=task,
+                        status="running",
+                        reason="unload_machine",
+                        source="mansim.machine",
+                    )
                     if machine.broken:
                         return False
                     self._set_humanoid_primitive_hint(agent, "EXECUTE_MACHINE_ACTION")
@@ -6526,7 +6524,14 @@ class ManufacturingWorld:
                         if not self._confirm_object_service_tile(agent, "battery_rack", task, "battery_delivery_pickup"):
                             return False
                         self._set_humanoid_primitive_hint(agent, "GRASP")
-                        self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", manipulation="REACHING", reason="battery_delivery_pickup", source="mansim.power", task_id=task.task_id)
+                        self._transition_humanoid_state(
+                            agent,
+                            "task_started",
+                            task=task,
+                            status="running",
+                            reason="battery_delivery_pickup",
+                            source="mansim.power",
+                        )
                         yield self.env.timeout(float(self.agent_cfg["battery_pickup_time_min"]))
                         if not battery_item_id:
                             battery_item_id = self._next_item_id("BAT")
@@ -6591,7 +6596,13 @@ class ManufacturingWorld:
                     target_agent.discharged = False
                     target_agent.discharged_since = None
                     target_agent.low_battery_alerted = False
-                    self._set_humanoid_axes(target_agent, availability="AVAILABLE", mobility="STATIONARY", power="POWER_NORMAL", manipulation="FREE", reason="battery_delivered", source="mansim.power", clear_task_context=True)
+                    self._transition_humanoid_state(
+                        target_agent,
+                        "task_completed",
+                        reason="battery_delivered",
+                        source="mansim.power",
+                        metadata={"cargo_present": False},
+                    )
                     self._clear_agent_carrying(agent, destination=handover_location)
                     self._set_humanoid_primitive_hint(agent, "RELEASE")
                     spent_battery_id = str(task.payload.get("spent_battery_item_id", ""))
@@ -6665,7 +6676,14 @@ class ManufacturingWorld:
                     if not self._confirm_object_service_tile(agent, output_buffer_id, task, "inter_station_pickup"):
                         return False
                     self._set_humanoid_primitive_hint(agent, "LOCALIZE_OBJECT")
-                    self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="inter_station_pickup", source="mansim.transfer", task_id=task.task_id)
+                    self._transition_humanoid_state(
+                        agent,
+                        "task_started",
+                        task=task,
+                        status="running",
+                        reason="inter_station_pickup",
+                        source="mansim.transfer",
+                    )
                     if not self.output_buffers[from_station]:
                         return False
                     moved_item_id = self.output_buffers[from_station].popleft()
@@ -6763,7 +6781,14 @@ class ManufacturingWorld:
                             task.payload["failure_reason"] = "material_shelf_pickup_unreachable"
                             return False
                         self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
-                        self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="material_pickup", source="mansim.replenishment", task_id=task.task_id)
+                        self._transition_humanoid_state(
+                            agent,
+                            "task_started",
+                            task=task,
+                            status="running",
+                            reason="material_pickup",
+                            source="mansim.replenishment",
+                        )
                         picked = self._pop_material_shelf_item(slot_id)
                         if picked is None:
                             if self._material_shelf_count() <= 0:
@@ -6875,7 +6900,14 @@ class ManufacturingWorld:
                 if not self._confirm_object_service_tile(agent, machine.machine_id, task, "setup_machine"):
                     return False
                 self._set_humanoid_primitive_hint(agent, "READ_MACHINE_STATE")
-                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="setup_machine", source="mansim.machine", task_id=task.task_id)
+                self._transition_humanoid_state(
+                    agent,
+                    "task_started",
+                    task=task,
+                    status="running",
+                    reason="setup_machine",
+                    source="mansim.machine",
+                )
 
                 setup_step = float(self.movement_cfg["setup_min"])
                 self._set_machine_state(machine, MachineState.SETUP, reason="setup_started")
@@ -7009,7 +7041,14 @@ class ManufacturingWorld:
                     if not self._confirm_object_service_tile(agent, "intermediate_queue_4", task, "inspect_product_pickup"):
                         return False
                     self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
-                    self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="inspect_product_pickup", source="mansim.quality", task_id=task.task_id)
+                    self._transition_humanoid_state(
+                        agent,
+                        "task_started",
+                        task=task,
+                        status="running",
+                        reason="inspect_product_pickup",
+                        source="mansim.quality",
+                    )
                     if not product_id:
                         popped = self._pop_intermediate_queue(self.inspection_queue_station)
                         if popped is None:
@@ -7033,7 +7072,14 @@ class ManufacturingWorld:
                     outcome="arrived_for_inspection",
                 )
                 self._set_humanoid_primitive_hint(agent, "EXECUTE_QUALITY_ACTION")
-                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="inspect_product_at_table", source="mansim.quality", task_id=task.task_id)
+                self._transition_humanoid_state(
+                    agent,
+                    "task_started",
+                    task=task,
+                    status="running",
+                    reason="inspect_product_at_table",
+                    source="mansim.quality",
+                )
                 self.inspection_active_agents += 1
                 try:
                     yield self.env.timeout(max(self.inspection_min_time_min, self.inspection_base_time_min))
@@ -7127,7 +7173,14 @@ class ManufacturingWorld:
                 if not self._confirm_object_service_tile(agent, "inspection_scrap_queue", task, "scrap_batch_pickup"):
                     return False
                 self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
-                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="scrap_pickup", source="mansim.scrap", task_id=task.task_id)
+                self._transition_humanoid_state(
+                    agent,
+                    "task_started",
+                    task=task,
+                    status="running",
+                    reason="scrap_pickup",
+                    source="mansim.scrap",
+                )
                 item_ids = [str(item_id) for item_id in task.payload.get("item_ids", []) if str(item_id)] if isinstance(task.payload.get("item_ids"), list) else []
                 if not item_ids:
                     item_ids = self._pop_inspection_scrap_batch(max_count)
@@ -7212,7 +7265,14 @@ class ManufacturingWorld:
                 if not self._confirm_object_service_tile(agent, machine.machine_id, task, "preventive_maintenance"):
                     return False
                 self._set_humanoid_primitive_hint(agent, "INSPECT_OR_DIAGNOSE")
-                self._set_humanoid_axes(agent, availability="EXECUTING", mobility="STATIONARY", reason="preventive_maintenance", source="mansim.maintenance", task_id=task.task_id)
+                self._transition_humanoid_state(
+                    agent,
+                    "task_started",
+                    task=task,
+                    status="running",
+                    reason="preventive_maintenance",
+                    source="mansim.maintenance",
+                )
                 self._set_machine_state(machine, MachineState.UNDER_PM, reason="pm_started")
                 self._set_humanoid_primitive_hint(agent, "EXECUTE_MAINTENANCE_ACTION")
                 pm_start = self.env.now

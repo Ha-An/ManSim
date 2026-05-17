@@ -4,6 +4,18 @@ ManSim은 제조 라인의 discrete-event simulation을 실행하고, 결과를 
 
 ![Replay Studio factory replay 화면](docs/assets/replay-studio-worker-replay.png)
 
+
+
+### HumanoidSim Transition API
+
+ManSim은 Humanoid state 축의 의미를 직접 정의하지 않습니다. Worker에게 task가 할당되거나 primitive가 시작/종료되거나 cargo, battery, blocked/waiting 같은 상황이 발생하면, ManSim은 그 사실을 `HumanoidSim.transition_humanoid_state()`에 event로 전달합니다. 이벤트를 받은 HumanoidSim이 `HumanoidStateSnapshot`을 갱신하고, ManSim은 반환된 snapshot을 event, replay, KPI artifact에 그대로 기록합니다.
+
+- 정상적으로 실행 중인 모든 primitive는 HumanoidSim 규칙에 따라 `availability=EXECUTING`으로 표현됩니다.
+- `mobility`와 `manipulation`은 primitive JSON의 `metadata.state.allowed`와 `metadata.state.effects` 정의를 따릅니다.
+- ManSim은 배터리 방전, cargo 변경, resource 소실, traffic wait 같은 scenario fact만 판단합니다.
+- 축 값을 직접 꽂던 legacy `set_axes`/`_set_humanoid_axes` 경로는 제거했고, 남은 상태 변경은 semantic transition event를 통해 수행됩니다.
+- 잘못된 state transition은 strict fail로 처리되어 simulation 중 즉시 드러납니다.
+
 ## v0.4.3 업데이트
 
 v0.4.3은 v0.4.2의 tile 기반 factory map과 Replay Studio 개편 위에 Humanoid runtime을 본격 통합한 버전입니다.

@@ -188,7 +188,7 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         worker.current_task_code = task.task_code
         worker.current_task_instance_id = task.instance_id
 
-        runtime.set_axes(worker, availability="ASSIGNED", mobility="STATIONARY", reason_code="task_selected", source="test", task_id=task.task_id)
+        runtime.transition_state(worker, "task_assigned", task=task, reason_code="task_selected", source="test")
         self.assertEqual(worker.humanoid_state["availability"], "ASSIGNED")
         self.assertEqual(worker.humanoid_state["task_context"]["task_code"], "TRANSFER")
 
@@ -445,7 +445,6 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         world = ManufacturingWorld.__new__(ManufacturingWorld)
         world.env = SimpleNamespace(now=12.0)
         world.logger = SimpleNamespace(log=lambda **payload: events.append(payload))
-        world.humanoid_runtime = None
         world.task_records = []
         world.product_transport_session_by_worker = {}
         world.product_transport_sessions = {}
@@ -453,6 +452,8 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         world.worker_display_location = lambda worker: worker.location  # type: ignore[method-assign]
         world.battery_remaining = lambda _worker: 100.0  # type: ignore[method-assign]
         worker = Worker(worker_id="A2", location="warehouse_material_slot_01")
+        world.agents = {"A2": worker}
+        world.humanoid_runtime = HumanoidTaskRuntime(world, {"humanoidsim": {"enabled": True}})
         task = Task(
             task_id="MAT-1",
             task_type="TRANSFER",

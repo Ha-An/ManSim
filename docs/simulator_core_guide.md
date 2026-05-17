@@ -43,6 +43,24 @@ Simulator core가 담당하지 않는 것:
 - `manufacturing_sim/simulation/scenarios/manufacturing/run.py`
   - Scenario execution entrypoint.
 
+## HumanoidSim State Boundary
+
+ManSim은 Humanoid의 기본 state 의미를 소유하지 않습니다. Humanoid의 Availability, Mobility, Power, Manipulation 축과 primitive별 state effect는 `HumanoidSim`에서 정의합니다.
+
+ManSim이 담당하는 것은 scenario fact입니다.
+
+- task가 선택되었는지
+- task 또는 child task가 시작/종료되었는지
+- primitive가 시작/종료되었는지
+- cargo를 집거나 내려놓았는지
+- battery가 방전되었거나 충전 중인지
+- resource가 사라져 blocked가 되었는지
+- traffic wait 또는 conflict가 발생했는지
+
+이 사실들은 `HumanoidTaskRuntime.transition_state()`를 통해 HumanoidSim transition event로 전달됩니다. ManSim은 `availability`, `mobility`, `power`, `manipulation` 값을 직접 계산하거나 대입하지 않고, HumanoidSim이 반환한 `HumanoidStateSnapshot`을 event, minute snapshot, KPI, Replay Studio에 기록합니다.
+
+정상적으로 실행 중인 모든 primitive는 `availability=EXECUTING`입니다. Mobility와 Manipulation은 [HumanoidSim Primitive Reference](../../HumanoidSim/docs/primitives_reference.md)의 primitive별 state relation을 따릅니다.
+
 ## Time Model
 
 ManSim은 SimPy 기반 discrete-event simulation입니다.
@@ -307,3 +325,14 @@ Factory behavior가 이상하면 아래 순서로 확인합니다.
 5. `replay_studio_log.json`
 
 Replay Studio에서 이상해 보이면 먼저 `events.jsonl`의 core event가 같은 내용을 말하는지 확인합니다. Core event가 정상이고 Replay만 다르면 exporter/reducer/UI 문제일 가능성이 큽니다.
+
+
+### HumanoidSim transition API
+
+ManSim does not define the meaning of humanoid state axes itself. It sends task, primitive, cargo, power, waiting, blocked, and disabled events to `HumanoidSim.transition_humanoid_state()`, then records the returned `HumanoidStateSnapshot` in events, replay, and KPI artifacts.
+
+- Every running primitive is represented with `availability=EXECUTING` according to HumanoidSim.
+- Mobility and Manipulation are updated from the primitive profile `allowed` and `effects` definitions.
+- ManSim still decides scenario facts such as battery depletion, cargo changes, missing resources, and traffic waits.
+- Invalid transitions use strict fail so incorrect runtime/state definitions are caught during simulation.
+

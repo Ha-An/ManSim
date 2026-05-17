@@ -585,3 +585,15 @@ ManSim은 `WAITING`과 `BLOCKED`를 다음 기준으로 구분합니다.
 - `BLOCKED`: 현재 task의 전제가 깨졌거나 예상치 못한 외부 변화 때문에 같은 task를 더 진행할 수 없는 상태입니다. 예를 들어 material shelf slot을 목표로 이동했는데 다른 worker가 먼저 가져가 slot이 비었거나, 예약한 item/resource가 사라졌거나, precondition이 실패한 경우입니다.
 
 따라서 `REPLENISH_MATERIAL` 수행 중 목표 material slot이 비면 worker는 `WAITING`이 아니라 `BLOCKED`가 됩니다. 이후 scheduler가 새 task를 할당하면 `ASSIGNED -> EXECUTING`으로 다시 전환됩니다.
+
+
+### HumanoidSim Transition API
+
+ManSim은 Humanoid state 축의 의미를 직접 정의하지 않습니다. Task 할당, task/child task 시작과 종료, primitive 시작과 종료, cargo 변화, battery 방전/충전, waiting, blocked 같은 상황을 `HumanoidSim.transition_humanoid_state()`에 event로 전달합니다. HumanoidSim은 이 event와 primitive profile을 기준으로 다음 `HumanoidStateSnapshot`을 계산하고, ManSim은 그 결과를 event, replay, KPI artifact에 그대로 기록합니다.
+
+- 정상적으로 실행 중인 모든 primitive는 `availability=EXECUTING`입니다.
+- Mobility와 Manipulation은 HumanoidSim primitive JSON의 `metadata.state.allowed`와 `metadata.state.effects` 정의를 따릅니다.
+- ManSim은 battery depletion, cargo changes, missing resources, traffic waits 같은 scenario fact만 판단합니다.
+- 축 값을 직접 대입하던 legacy `set_axes`/`_set_humanoid_axes` 경로는 제거되었습니다.
+- Invalid transition은 strict fail로 처리하여 runtime/state 정의 오류를 simulation 중 즉시 드러냅니다.
+
