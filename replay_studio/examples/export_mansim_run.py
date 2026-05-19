@@ -712,6 +712,25 @@ def convert_events(
             if isinstance(reason, dict):
                 attrs["state_reason_code"] = reason.get("code")
                 attrs["state_reason_message"] = reason.get("message")
+                reason_meta = reason.get("metadata") if isinstance(reason.get("metadata"), dict) else {}
+                if reason_meta.get("incident_code"):
+                    incident_payload = {
+                        "code": reason_meta.get("incident_code"),
+                        "category": reason_meta.get("incident_category"),
+                        "severity": reason_meta.get("incident_severity") or reason_meta.get("severity"),
+                        "description": reason.get("message"),
+                        "recovery_protocol": reason_meta.get("recovery_protocol", []),
+                        "primitive_call_code": task_context.get("primitive_call_code") if isinstance(task_context, dict) else None,
+                        "task_code": task_context.get("task_code") if isinstance(task_context, dict) else None,
+                    }
+                    attrs["last_humanoid_incident"] = incident_payload
+                    attrs["incident_bubble"] = incident_payload
+                else:
+                    attrs["incident_bubble"] = None
+                    attrs["last_humanoid_incident"] = None
+            else:
+                attrs["incident_bubble"] = None
+                attrs["last_humanoid_incident"] = None
         resolved_motion = canonical_motion_attributes(details, event_index, worker_id)
         if resolved_motion:
             attrs["motion"] = resolved_motion
@@ -909,6 +928,33 @@ def convert_events(
                 }
             )
             push("state_changed", timestamp, {"primary": entity_id}, {"attributes": attrs})
+            continue
+
+        if raw_type == "HUMANOID_INCIDENT" and entity_id:
+            attrs = canonical_worker_attributes(details, index, entity_id)
+            incident_payload = {
+                "code": details.get("incident_code"),
+                "category": details.get("incident_category"),
+                "severity": details.get("incident_severity"),
+                "description": details.get("description"),
+                "recovery_protocol": details.get("recovery_protocol", []),
+                "primitive_call_code": details.get("primitive_call_code"),
+                "task_code": details.get("task_code"),
+            }
+            attrs["last_humanoid_incident"] = incident_payload
+            attrs["incident_bubble"] = incident_payload
+            push("state_changed", timestamp, {"primary": entity_id}, {"attributes": attrs})
+            event_type = "error_raised" if str(details.get("incident_severity", "")).lower() in {"error", "critical"} else "warning_raised"
+            push(
+                event_type,
+                timestamp,
+                {"primary": entity_id},
+                {
+                    "label": str(details.get("incident_code", "incident")).replace("_", " "),
+                    "incident": incident_payload,
+                },
+                suffix="incident",
+            )
             continue
 
         if raw_type == "MACHINE_STATE_CHANGED" and entity_id:

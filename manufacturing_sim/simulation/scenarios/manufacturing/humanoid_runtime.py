@@ -221,7 +221,7 @@ class HumanoidTaskRuntime:
             return
         current = self.ensure_humanoid_state(worker)
         event_cls = self._imports["StateTransitionEvent"]
-        reason = self._reason(reason_code, source=source, message=reason_message) if reason_code else None
+        reason = self._reason(reason_code, source=source, message=reason_message, metadata=metadata) if reason_code else None
         task_context = task or self._task_from_worker(worker)
         event_metadata = self._state_metadata(worker, reason=reason_code, task_id=getattr(task_context, "task_id", None), source=source)
         event_metadata["cargo_present"] = bool(worker.carrying_item_id or getattr(worker, "carrying_item_ids", []))
@@ -264,6 +264,9 @@ class HumanoidTaskRuntime:
             self.transition_state(worker, "task_started", task=task, status=status or "running", source="mansim.humanoid_task")
             return
         if event_type == "HUMANOID_TASK_END":
+            current_availability = str((worker.humanoid_state or {}).get("availability", "")).strip().upper()
+            if str(status).strip().lower() == "interrupted" and current_availability in {"BLOCKED", "DISABLED"}:
+                return
             if worker.discharged:
                 self.transition_state(worker, "disabled", task=task, status=status, reason_code="battery_depleted", source="mansim.task_end")
             elif str(status).strip().lower() == "completed":
@@ -339,11 +342,11 @@ class HumanoidTaskRuntime:
             task_spec_name=str(worker.current_child_task_name or ""),
         )
 
-    def _reason(self, code: str, *, source: str, message: str = "") -> dict[str, Any]:
+    def _reason(self, code: str, *, source: str, message: str = "", metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         reason_cls = self._imports.get("StateReason")
         if reason_cls is None:
-            return {"code": str(code), "message": str(message), "source": str(source), "metadata": {}}
-        return reason_cls(code=str(code), message=str(message), source=str(source)).to_dict()
+            return {"code": str(code), "message": str(message), "source": str(source), "metadata": dict(metadata or {})}
+        return reason_cls(code=str(code), message=str(message), source=str(source), metadata=dict(metadata or {})).to_dict()
 
     def _state_metadata(self, worker: Worker, **extra: Any) -> dict[str, Any]:
         metadata = {
@@ -677,7 +680,9 @@ class HumanoidTaskRuntime:
         elif call_code in {"CHECK_SAFETY_ZONE", "REACH_TO", "VERIFY_LOCKOUT_IF_REQUIRED"}:
             result = True
         elif call_code in {"LOCALIZE_OBJECT", "PRIMITIVE_IDENTIFY_ITEM"}:
-            result = True
+            result = not self.world._maybe_random_humanoid_step_incident(agent, task, step, call_code)
+        elif call_code in {"GRASP"}:
+            result = not self.world._maybe_random_humanoid_step_incident(agent, task, step, call_code)
         elif call_code in {"LOG_RESULT", "UPDATE_RECORD", "CREATE_OR_UPDATE_RECORD", "RECORD_RESULT"}:
             result = True
         elapsed = max(0.0, float(self.world.env.now) - start_t)
@@ -714,7 +719,8 @@ class HumanoidTaskRuntime:
         error: str = "",
         parent_task: Task | None = None,
     ) -> None:
-        self.set_step_state(agent, task, step, event_type=event_type, status=status)
+        if str(step.get("call_level", "PRIMITIVE_SKILL") or "PRIMITIVE_SKILL") == "PRIMITIVE_SKILL":
+            self.set_step_state(agent, task, step, event_type=event_type, status=status)
         details = self._task_event_details(agent, task, status=status)
         details.update(
             {

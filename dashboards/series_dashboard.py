@@ -54,7 +54,8 @@ def _shared_ratio(left: list[str], right: list[str]) -> float:
 
 def _stability_cost(row: dict[str, Any]) -> int:
     return (
-        _safe_int(row.get("coordination_incident_total"), 0)
+        _safe_int(row.get("humanoid_incident_total"), 0)
+        + _safe_int(row.get("coordination_incident_total"), 0)
         + _safe_int(row.get("physical_incident_total"), 0)
         + _safe_int(row.get("unique_replan_blocker_total"), 0)
         + _safe_int(row.get("planner_escalation_total"), 0)
@@ -113,6 +114,7 @@ def build_series_analysis(*, parent_output_dir: Path, summary_payload: dict[str,
                 "total_products": _safe_int(kpi.get("total_products"), _safe_int(row.get("total_products"), 0)),
                 "downstream_closure_ratio": _safe_float(kpi.get("downstream_closure_ratio"), _safe_float(row.get("downstream_closure_ratio"), 0.0)),
                 "wall_clock_sec": _safe_float(kpi.get("wall_clock_sec"), _safe_float(row.get("wall_clock_sec"), 0.0)),
+                "humanoid_incident_total": _safe_int(kpi.get("humanoid_incident_total"), 0),
                 "physical_incident_total": _safe_int(kpi.get("physical_incident_total"), 0),
                 "coordination_incident_total": _safe_int(kpi.get("coordination_incident_total"), 0),
                 "unique_replan_blocker_total": _safe_int(kpi.get("unique_replan_blocker_total"), 0),
@@ -341,6 +343,7 @@ def export_series_dashboard(
     run_labels = [str(row.get("id", "-")) for row in runs]
     products = [int(row.get("total_products", 0) or 0) for row in runs]
     closures = [float(row.get("downstream_closure_ratio", 0.0) or 0.0) for row in runs]
+    humanoid_incidents = [int(row.get("humanoid_incident_total", 0) or 0) for row in runs]
     incidents = [int(row.get("coordination_incident_total", 0) or 0) for row in runs]
     blockers = [int(row.get("unique_replan_blocker_total", 0) or 0) for row in runs]
     dispatch = [int(row.get("commitment_dispatch_total", 0) or 0) for row in runs]
@@ -352,7 +355,7 @@ def export_series_dashboard(
         cols=1,
         subplot_titles=(
             "Performance: Products and Closure",
-            "Operational Stability: Coordination / Blockers / Dispatch",
+            "Operational Stability: Humanoid Incidents / Coordination / Blockers / Dispatch",
             "Knowledge Pressure: Lead Time and Ending Backlog",
         ),
         specs=[[{"secondary_y": True}], [{"secondary_y": True}], [{"secondary_y": True}]],
@@ -360,6 +363,7 @@ def export_series_dashboard(
     )
     fig.add_trace(go.Bar(name="Products", x=run_labels, y=products, marker_color="#1d4e89"), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(name="Closure", x=run_labels, y=closures, mode="lines+markers", line=dict(color="#e76f51", width=3)), row=1, col=1, secondary_y=True)
+    fig.add_trace(go.Bar(name="Humanoid Incidents", x=run_labels, y=humanoid_incidents, marker_color="#9d4edd"), row=2, col=1, secondary_y=False)
     fig.add_trace(go.Bar(name="Coordination Incidents", x=run_labels, y=incidents, marker_color="#c0392b"), row=2, col=1, secondary_y=False)
     fig.add_trace(go.Bar(name="Unique Blockers", x=run_labels, y=blockers, marker_color="#f39c12"), row=2, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(name="Dispatch", x=run_labels, y=dispatch, mode="lines+markers", line=dict(color="#0f8c5b", width=3)), row=2, col=1, secondary_y=True)

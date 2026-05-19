@@ -62,6 +62,33 @@ movement:
     near_miss_headway_min: 0.05
     emit_tile_step_events: true
 
+humanoid_incidents:
+  # 휴머노이드 자체의 범용 incident taxonomy는 HumanoidSim이 소유한다.
+  # ManSim은 시뮬레이션 환경별 발생 확률과 조건만 정의한다.
+  enabled: true
+  random:
+    OBJECT_RECOGNITION_FAILED:
+      enabled: true
+      probability: 0.002
+      trigger_primitives: [LOCALIZE_OBJECT, PRIMITIVE_IDENTIFY_ITEM]
+    GRIP_FAILED:
+      enabled: true
+      probability: 0.002
+      trigger_primitives: [GRASP]
+    ITEM_DROPPED:
+      enabled: true
+      probability_per_tile: 0.001
+      trigger_primitives: [NAVIGATE_TO]
+    UNKNOWN:
+      enabled: true
+      probability: 0.0005
+      trigger_primitives: ["*"]
+  natural:
+    RESOURCE_PREEMPTED: true
+    TRAFFIC_WAIT: true
+    COLLISION: true
+    NEAR_MISS: true
+
 map:
   # Tile 기반 공간 모델. false로 두면 기존 zone-name 이동시간 모델로 fallback한다.
   enabled: true
@@ -130,3 +157,5 @@ dispatcher:
   urgent_chat_cooldown_min: 5
   # minute snapshot 기록 간격
   snapshot_interval_min: 1
+
+

@@ -159,6 +159,7 @@ def build_dashboard_manifest(
                     "downstream_closure_ratio": _safe_float(kpi.get("downstream_closure_ratio"), _safe_float(row.get("downstream_closure_ratio"))),
                     "machine_broken_ratio": _safe_float(kpi.get("machine_broken_ratio")),
                     "machine_pm_ratio": _safe_float(kpi.get("machine_pm_ratio")),
+                    "humanoid_incident_total": _safe_int(kpi.get("humanoid_incident_total")),
                     "physical_incident_total": _safe_int(kpi.get("physical_incident_total")),
                     "coordination_incident_total": _safe_int(kpi.get("coordination_incident_total")),
                     "unique_replan_blocker_total": _safe_int(kpi.get("unique_replan_blocker_total")),

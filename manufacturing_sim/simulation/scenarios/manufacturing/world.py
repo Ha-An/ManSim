@@ -204,6 +204,18 @@ class ManufacturingWorld:
         }
         self.incident_counter = itertools.count(1)
         self.incident_events: list[dict[str, Any]] = []
+        humanoid_incident_cfg = cfg.get("humanoid_incidents", {}) if isinstance(cfg.get("humanoid_incidents", {}), dict) else {}
+        self.humanoid_incident_cfg = humanoid_incident_cfg
+        self.humanoid_incidents_enabled = bool(humanoid_incident_cfg.get("enabled", True))
+        self.humanoid_incident_random_cfg = self._normalize_humanoid_incident_cfg_keys(
+            humanoid_incident_cfg.get("random", {}) if isinstance(humanoid_incident_cfg.get("random", {}), dict) else {}
+        )
+        self.humanoid_incident_natural_cfg = self._normalize_humanoid_incident_cfg_keys(
+            humanoid_incident_cfg.get("natural", {}) if isinstance(humanoid_incident_cfg.get("natural", {}), dict) else {}
+        )
+        self.humanoid_incident_schema: Any | None = None
+        self.humanoid_incident_events: list[dict[str, Any]] = []
+        self.humanoid_incident_retry_counts: dict[tuple[str, str], int] = defaultdict(int)
         self.commitment_claims: dict[str, dict[str, Any]] = {}
         self.selection_blocker_counter = itertools.count(1)
         self.selection_blockers: dict[str, dict[str, Any]] = {}
@@ -935,6 +947,276 @@ class ManufacturingWorld:
         )
         return event
 
+    def _load_humanoid_incident_schema(self) -> Any | None:
+        if not bool(getattr(self, "humanoid_incidents_enabled", True)):
+            return None
+        if getattr(self, "humanoid_incident_schema", None) is not None:
+            return self.humanoid_incident_schema
+        try:
+            from humanoidsim import load_incident_schema
+        except ModuleNotFoundError:
+            return None
+        self.humanoid_incident_schema = load_incident_schema()
+        return self.humanoid_incident_schema
+
+    def _humanoid_incident_profile(self, code: str) -> Any | None:
+        schema = self._load_humanoid_incident_schema()
+        if schema is None:
+            return None
+        try:
+            return schema.get(str(code))
+        except KeyError:
+            return None
+
+    @staticmethod
+    def _canonical_humanoid_incident_code(code: str) -> str:
+        return str(code or "").strip().upper()
+
+    @staticmethod
+    def _normalize_humanoid_incident_cfg_keys(raw: dict[str, Any]) -> dict[str, Any]:
+        normalized: dict[str, Any] = {}
+        for key, value in (raw or {}).items():
+            canonical_key = ManufacturingWorld._canonical_humanoid_incident_code(str(key))
+            if canonical_key:
+                normalized[canonical_key] = value
+        return normalized
+
+    @staticmethod
+    def _incident_default_event_type(profile: Any | None) -> str:
+        availability = str(getattr(profile, "default_availability", "BLOCKED"))
+        if "." in availability:
+            availability = availability.rsplit(".", 1)[-1]
+        availability = availability.strip().upper()
+        if availability == "WAITING":
+            return "waiting"
+        if availability == "DISABLED":
+            return "disabled"
+        if availability == "AVAILABLE":
+            return "task_completed"
+        return "blocked"
+
+    def _incident_recovery_payload(self, profile: Any | None) -> list[dict[str, Any]]:
+        if profile is None:
+            return []
+        rows = []
+        for step in getattr(profile, "recovery_protocol", []) or []:
+            if hasattr(step, "to_dict"):
+                rows.append(step.to_dict())
+            elif isinstance(step, dict):
+                rows.append(dict(step))
+        return rows
+
+    @staticmethod
+    def _humanoid_incident_code_for_failure_reason(reason: str) -> str:
+        normalized = str(reason or "").strip().lower()
+        mappings = {
+            "material_supply_owner_changed": "RESOURCE_PREEMPTED",
+            "material_shelf_slot_empty": "RESOURCE_PREEMPTED",
+            "material_shelf_empty": "RESOURCE_MISSING",
+            "material_shelf_pickup_unreachable": "PATH_BLOCKED",
+            "material_supply_dropoff_unreachable": "PATH_BLOCKED",
+            "material_carry_failed": "GRIP_FAILED",
+            "precondition_failed": "RESOURCE_MISSING",
+            "stale_precondition": "RESOURCE_PREEMPTED",
+        }
+        return mappings.get(normalized, ManufacturingWorld._canonical_humanoid_incident_code(reason))
+
+    def _humanoid_incident_metadata_for_reason(self, reason: str) -> tuple[str, dict[str, Any]]:
+        incident_code = self._humanoid_incident_code_for_failure_reason(reason)
+        profile = self._humanoid_incident_profile(incident_code)
+        if profile is None:
+            return str(reason or "").strip(), {}
+        recovery_protocol = self._incident_recovery_payload(profile)
+        retry_policy = getattr(getattr(profile, "retry_policy", None), "to_dict", lambda: {})()
+        canonical_code = str(getattr(profile, "code", "") or incident_code).strip().upper()
+        return canonical_code, {
+            "incident_code": canonical_code,
+            "incident_category": str(getattr(profile, "category", "") or "unknown"),
+            "incident_severity": str(getattr(profile, "severity", "warning") or "warning"),
+            "recovery_protocol": recovery_protocol,
+            "retry_policy": retry_policy,
+            "original_reason_code": str(reason or "").strip(),
+        }
+
+    def _humanoid_incident_random_options(self, code: str) -> dict[str, Any]:
+        options = self.humanoid_incident_random_cfg.get(self._canonical_humanoid_incident_code(code), {})
+        return options if isinstance(options, dict) else {}
+
+    def _humanoid_incident_enabled(self, code: str) -> bool:
+        if not self.humanoid_incidents_enabled:
+            return False
+        options = self._humanoid_incident_random_options(code)
+        return bool(options.get("enabled", False))
+
+    def _random_incident_probability(self, code: str, *, per_tile: bool = False) -> float:
+        options = self._humanoid_incident_random_options(code)
+        key = "probability_per_tile" if per_tile else "probability"
+        try:
+            probability = float(options.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(1.0, probability))
+
+    def _random_incident_triggers(self, code: str) -> set[str]:
+        options = self._humanoid_incident_random_options(code)
+        raw = options.get("trigger_primitives", [])
+        if not isinstance(raw, list):
+            return set()
+        return {str(value).strip().upper() for value in raw if str(value).strip()}
+
+    def _maybe_random_humanoid_step_incident(
+        self,
+        agent: Worker,
+        task: Task,
+        step: dict[str, Any],
+        primitive_call_code: str,
+    ) -> bool:
+        primitive = str(primitive_call_code or "").strip().upper()
+        if not primitive:
+            return False
+        for code in ("OBJECT_RECOGNITION_FAILED", "GRIP_FAILED", "UNKNOWN"):
+            if not self._humanoid_incident_enabled(code):
+                continue
+            triggers = self._random_incident_triggers(code)
+            if "*" not in triggers and primitive not in triggers:
+                continue
+            probability = self._random_incident_probability(code)
+            if probability <= 0.0 or self.rng.random() >= probability:
+                continue
+            self._emit_humanoid_incident(
+                agent,
+                code,
+                task=task,
+                step=step,
+                primitive_call_code=primitive,
+                source="mansim.random_incident",
+                context={"random_probability": probability, "trigger_primitive": primitive},
+            )
+            task.payload["failure_reason"] = code
+            return True
+        return False
+
+    def _maybe_item_drop_incident(self, agent: Worker, *, logical_destination: str, move_id: str) -> bool:
+        if not agent.carrying_item_id or not self._humanoid_incident_enabled("ITEM_DROPPED"):
+            return False
+        probability = self._random_incident_probability("ITEM_DROPPED", per_tile=True)
+        if probability <= 0.0 or self.rng.random() >= probability:
+            return False
+        self._drop_agent_cargo_due_to_incident(agent, logical_destination=logical_destination, move_id=move_id)
+        return True
+
+    def _drop_agent_cargo_due_to_incident(self, agent: Worker, *, logical_destination: str, move_id: str) -> None:
+        item_id = str(agent.carrying_item_id or "")
+        item_type = str(agent.carrying_item_type or "")
+        tile_payload = self._tile_payload(agent.tile)
+        self._emit_humanoid_incident(
+            agent,
+            "ITEM_DROPPED",
+            primitive_call_code=str(agent.current_primitive_call_code or "NAVIGATE_TO"),
+            source="mansim.random_incident",
+            context={
+                "item_id": item_id,
+                "item_type": item_type,
+                "move_id": move_id,
+                "logical_destination": logical_destination,
+                "tile": tile_payload,
+            },
+        )
+        if item_id:
+            self._set_item_state(
+                item_id,
+                ItemState.DROPPED,
+                location=self.agent_display_location(agent),
+                ref=f"dropped_by:{agent.agent_id}",
+                item_type=item_type or None,
+            )
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="AGENT_DROP_ITEM",
+            entity_id=agent.agent_id,
+            location=self.agent_display_location(agent),
+            details={
+                "item_id": item_id,
+                "item_type": item_type,
+                "reason": "ITEM_DROPPED",
+                "move_id": move_id,
+                "tile": tile_payload,
+                "humanoid_state": self._humanoid_state_payload(agent),
+            },
+        )
+        self._set_worker_cargo(agent, None, None, destination="dropped")
+
+    def _emit_humanoid_incident(
+        self,
+        agent: Worker,
+        code: str,
+        *,
+        task: Task | None = None,
+        step: dict[str, Any] | None = None,
+        primitive_call_code: str = "",
+        source: str = "mansim.humanoid_incident",
+        context: dict[str, Any] | None = None,
+        notify_worker: bool = True,
+    ) -> dict[str, Any]:
+        profile = self._humanoid_incident_profile(code)
+        canonical_code = str(getattr(profile, "code", "") or self._canonical_humanoid_incident_code(code))
+        recovery_protocol = self._incident_recovery_payload(profile)
+        retry_policy = getattr(getattr(profile, "retry_policy", None), "to_dict", lambda: {})()
+        category = str(getattr(profile, "category", "") or "unknown")
+        severity = str(getattr(profile, "severity", "warning") or "warning")
+        description = str(getattr(profile, "description", "") or canonical_code)
+        primitive = primitive_call_code or str((step or {}).get("call_code", "") or agent.current_primitive_call_code or "")
+        metadata = {
+            "incident_code": canonical_code,
+            "incident_category": category,
+            "incident_severity": severity,
+            "recovery_protocol": recovery_protocol,
+            "retry_policy": retry_policy,
+            "primitive_call_code": primitive,
+            "context": dict(context or {}),
+        }
+        self._transition_humanoid_state(
+            agent,
+            self._incident_default_event_type(profile),
+            task=task,
+            step=step,
+            status="failed" if self._incident_default_event_type(profile) == "blocked" else "running",
+            reason=canonical_code,
+            reason_message=description,
+            source=source,
+            metadata=metadata,
+        )
+        details = {
+            **metadata,
+            "description": description,
+            "default_availability": str(getattr(getattr(profile, "default_availability", None), "value", getattr(profile, "default_availability", "")) or ""),
+            "task_id": str(getattr(task, "task_id", "") or agent.current_task_id or ""),
+            "task_code": str(getattr(task, "task_code", "") or agent.current_task_code or ""),
+            "instance_id": str(getattr(task, "instance_id", "") or agent.current_task_instance_id or ""),
+            "step_id": str((step or {}).get("step_id", "") or agent.current_step_id or ""),
+            "humanoid_state": self._humanoid_state_payload(agent),
+            "cargo": self._worker_cargo_payload(agent),
+        }
+        self.humanoid_incident_events.append(copy.deepcopy(details))
+        self.humanoid_incident_events = self.humanoid_incident_events[-200:]
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="HUMANOID_INCIDENT",
+            entity_id=agent.agent_id,
+            location=self.agent_display_location(agent),
+            details=details,
+        )
+        self.emit_incident(
+            canonical_code,
+            affected_entities=[agent.agent_id],
+            escalation_level="worker_local",
+            details=details,
+            notify_workers=[agent.agent_id] if notify_worker else [],
+        )
+        return details
+
     def _recent_incidents_for_agent(self, agent: Agent) -> list[dict[str, Any]]:
         backlog = agent.incident_backlog if isinstance(agent.incident_backlog, list) else []
         if backlog:
@@ -1133,8 +1415,10 @@ class ManufacturingWorld:
 
     def _traffic_reason_code(self, conflict_type: str, *, collision: bool = False) -> str:
         if collision:
-            return "collision"
+            return "COLLISION"
         normalized = str(conflict_type or "").strip().lower()
+        if normalized == "near_miss":
+            return "NEAR_MISS"
         return normalized or "traffic_conflict"
 
     def _traffic_humanoid_state_payload(self, worker: Worker, conflict: TrafficConflict) -> dict[str, Any]:
@@ -1167,6 +1451,21 @@ class ManufacturingWorld:
                 location=self.agent_display_location(agent),
                 details=details,
             )
+            incident_code = ""
+            conflict_type = str(conflict.conflict_type or "").strip().upper()
+            if bool(conflict.collision):
+                incident_code = "COLLISION"
+            elif conflict_type == "NEAR_MISS":
+                incident_code = "NEAR_MISS"
+            if incident_code and bool(self.humanoid_incident_natural_cfg.get(incident_code, True)):
+                self._emit_humanoid_incident(
+                    agent,
+                    incident_code,
+                    primitive_call_code="NAVIGATE_TO",
+                    source="mansim.traffic",
+                    context={key: value for key, value in details.items() if key != "humanoid_state"},
+                    notify_worker=False,
+                )
 
     def _traffic_register_plan(self, agent: Worker, move_id: str, path: list[Tile], *, started_at: float, ended_at: float) -> None:
         if self.traffic_monitor is None or not self.traffic_enabled or len(path) < 2:
@@ -2162,6 +2461,22 @@ class ManufacturingWorld:
                 },
             )
             return False
+        if self._humanoid_incident_enabled("GRIP_FAILED"):
+            probability = self._random_incident_probability("GRIP_FAILED")
+            if probability > 0.0 and self.rng.random() < probability:
+                self._emit_humanoid_incident(
+                    agent,
+                    "GRIP_FAILED",
+                    task=self._current_task_stub(agent),
+                    primitive_call_code="GRASP",
+                    source="mansim.random_incident",
+                    context={
+                        "item_id": normalized_item_id,
+                        "item_type": normalized_type,
+                        "random_probability": probability,
+                    },
+                )
+                return False
         self._set_worker_cargo(agent, normalized_item_id, normalized_type)
         self._set_item_state(
             normalized_item_id,
@@ -2620,6 +2935,37 @@ class ManufacturingWorld:
             "edge_conflict_count": int(by_type.get("EDGE_CONFLICT", 0)),
             "tile_conflict_count": int(by_type.get("TILE_CONFLICT", 0)),
             "path_overlap_count": int(by_type.get("PATH_OVERLAP", 0)),
+        }
+
+    def _humanoid_incident_metrics(self) -> dict[str, Any]:
+        by_code: dict[str, int] = defaultdict(int)
+        by_category: dict[str, int] = defaultdict(int)
+        by_worker: dict[str, int] = defaultdict(int)
+        by_severity: dict[str, int] = defaultdict(int)
+        recovery_protocol_by_code: dict[str, list[dict[str, Any]]] = {}
+        for event in self.logger.events:
+            if str(event.get("type", "")).strip() != "HUMANOID_INCIDENT":
+                continue
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            code = str(details.get("incident_code", "") or details.get("reason_code", "") or "UNKNOWN")
+            category = str(details.get("incident_category", "") or "unknown")
+            severity = str(details.get("incident_severity", "") or "warning")
+            worker_id = str(event.get("entity_id", "") or "")
+            by_code[code] += 1
+            by_category[category] += 1
+            by_severity[severity] += 1
+            if worker_id:
+                by_worker[worker_id] += 1
+            recovery_protocol = details.get("recovery_protocol", [])
+            if isinstance(recovery_protocol, list) and code not in recovery_protocol_by_code:
+                recovery_protocol_by_code[code] = [dict(row) for row in recovery_protocol if isinstance(row, dict)]
+        return {
+            "humanoid_incident_total": int(sum(by_code.values())),
+            "humanoid_incidents_by_code": dict(sorted(by_code.items())),
+            "humanoid_incidents_by_category": dict(sorted(by_category.items())),
+            "humanoid_incidents_by_worker": dict(sorted(by_worker.items())),
+            "humanoid_incidents_by_severity": dict(sorted(by_severity.items())),
+            "humanoid_incident_recovery_protocol_by_code": recovery_protocol_by_code,
         }
 
     def _transport_metrics(self) -> dict[str, Any]:
@@ -4345,6 +4691,34 @@ class ManufacturingWorld:
         if normalized_status == "interrupted" and normalized_reason not in temporary_wait_reasons:
             return "BLOCKED"
         if normalized_reason in {
+            "object_recognition_failed",
+            "pose_estimation_failed",
+            "label_or_marker_unreadable",
+            "target_not_found",
+            "grip_failed",
+            "lift_failed",
+            "item_dropped",
+            "item_slipped",
+            "placement_failed",
+            "payload_over_limit",
+            "resource_preempted",
+            "resource_missing",
+            "path_blocked",
+            "workspace_obstructed",
+            "surface_or_area_contaminated",
+            "near_miss",
+            "collision",
+            "navigation_drift",
+            "docking_failed",
+            "power_low_unexpected",
+            "sensor_degraded",
+            "tool_or_end_effector_fault",
+            "actuator_fault",
+            "command_timeout",
+            "map_or_context_stale",
+            "safety_stop",
+            "handover_failed",
+            "unknown",
             "precondition_failed",
             "stale_precondition",
             "material_shelf_empty",
@@ -4405,14 +4779,21 @@ class ManufacturingWorld:
             )
         else:
             availability = self._availability_after_incomplete_task(status, reason)
+            state_reason, state_metadata = self._humanoid_incident_metadata_for_reason(reason)
+            if not state_reason:
+                state_reason = reason or status
+            if state_metadata:
+                state_metadata.update({"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))})
+            else:
+                state_metadata = {"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))}
             self._transition_humanoid_state(
                 agent,
                 "blocked" if availability == "BLOCKED" else "waiting",
                 task=task,
                 status=status,
-                reason=reason or status,
+                reason=state_reason,
                 source="mansim.task_end",
-                metadata={"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))},
+                metadata=state_metadata,
             )
         selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
         self.task_records.append(
@@ -5951,6 +6332,7 @@ class ManufacturingWorld:
 
             next_tile = path[1]
             if self._traffic_strict_reservation() and not grid.try_reserve(agent.agent_id, next_tile):
+                first_traffic_wait = blocked_started_at is None
                 if blocked_started_at is None:
                     blocked_started_at = float(self.env.now)
                 if self.traffic_enabled:
@@ -5979,6 +6361,15 @@ class ManufacturingWorld:
                         location=self.agent_display_location(agent),
                         details=details,
                     )
+                    if first_traffic_wait and bool(self.humanoid_incident_natural_cfg.get("TRAFFIC_WAIT", True)):
+                        self._emit_humanoid_incident(
+                            agent,
+                            "TRAFFIC_WAIT",
+                            primitive_call_code="NAVIGATE_TO",
+                            source="mansim.traffic",
+                            context={key: value for key, value in details.items() if key != "humanoid_state"},
+                            notify_worker=False,
+                        )
                 yield self.env.timeout(grid.tile_time_min)
                 continue
 
@@ -6073,6 +6464,15 @@ class ManufacturingWorld:
                 logical_destination=logical_dst,
                 segment_duration=segment_duration,
             )
+            if self._maybe_item_drop_incident(agent, logical_destination=logical_dst, move_id=move_id):
+                agent.current_move_segment_index = 0
+                agent.current_move_segment_from_tile = None
+                agent.current_move_segment_to_tile = None
+                if move_id:
+                    self._traffic_complete_plan(move_id)
+                self._log_interrupted_move(agent, reason="ITEM_DROPPED", logical_destination=logical_dst)
+                self._clear_current_move(agent)
+                raise simpy.Interrupt("ITEM_DROPPED")
             agent.current_move_segment_index = 0
             agent.current_move_segment_from_tile = None
             agent.current_move_segment_to_tile = None
@@ -6764,6 +7164,15 @@ class ManufacturingWorld:
                 owner = self.material_supply_owner.get(station)
                 if owner is not None and owner != agent.agent_id:
                     task.payload["failure_reason"] = "material_supply_owner_changed"
+                    if bool(self.humanoid_incident_natural_cfg.get("RESOURCE_PREEMPTED", True)):
+                        self._emit_humanoid_incident(
+                            agent,
+                            "RESOURCE_PREEMPTED",
+                            task=task,
+                            primitive_call_code="CHECK_REQUEST",
+                            source="mansim.resource_race",
+                            context={"station": station, "owner": owner, "resource": "material_supply"},
+                        )
                     return False
                 self.material_supply_owner[station] = agent.agent_id
                 try:
@@ -6773,6 +7182,14 @@ class ManufacturingWorld:
                         if slot is None:
                             self._log_material_shelf_empty_once()
                             task.payload["failure_reason"] = "material_shelf_empty"
+                            self._emit_humanoid_incident(
+                                agent,
+                                "RESOURCE_MISSING",
+                                task=task,
+                                primitive_call_code="CHECK_REQUEST",
+                                source="mansim.resource",
+                                context={"station": station, "resource": "warehouse_material_shelf"},
+                            )
                             return False
                         slot_id = str(slot.get("slot_id", ""))
                         self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
@@ -6794,6 +7211,15 @@ class ManufacturingWorld:
                             if self._material_shelf_count() <= 0:
                                 self._log_material_shelf_empty_once()
                             task.payload["failure_reason"] = "material_shelf_slot_empty"
+                            if bool(self.humanoid_incident_natural_cfg.get("RESOURCE_PREEMPTED", True)):
+                                self._emit_humanoid_incident(
+                                    agent,
+                                    "RESOURCE_PREEMPTED",
+                                    task=task,
+                                    primitive_call_code="PRIMITIVE_IDENTIFY_ITEM",
+                                    source="mansim.resource_race",
+                                    context={"station": station, "slot_id": slot_id, "resource": "material_shelf_slot"},
+                                )
                             return False
                         picked_slot_id, item_id = picked
                         task.payload["source_slot_id"] = picked_slot_id
@@ -7692,6 +8118,7 @@ class ManufacturingWorld:
         humanoid_primitive_minutes = self._humanoid_primitive_minutes()
         humanoid_task_taxonomy = self._humanoid_task_taxonomy_metrics(dict(humanoid_task_totals))
         traffic_metrics = self._traffic_metrics()
+        humanoid_incident_metrics = self._humanoid_incident_metrics()
         transport_metrics = self._transport_metrics()
         repair_collaboration_metrics = self._repair_collaboration_metrics()
         incident_event_total = sum(int(summary.get("incident_event_count", 0) or 0) for summary in self.daily_summaries)
@@ -7777,6 +8204,7 @@ class ManufacturingWorld:
             "humanoid_unavailable_ratio_avg": round(float(humanoid_unavailable_ratio_avg), 6),
             "humanoid_primitive_minutes": humanoid_primitive_minutes,
             "humanoid_task_taxonomy": humanoid_task_taxonomy,
+            **humanoid_incident_metrics,
             **traffic_metrics,
             **transport_metrics,
             **repair_collaboration_metrics,

@@ -20,6 +20,7 @@ PRIMARY_METRICS = [
     ("Humanoid Executing Ratio", "humanoid_execution_ratio_avg", "ratio", True, "Average share of worker-minutes with availability=EXECUTING."),
     ("Humanoid Blocked Ratio", "humanoid_blocked_ratio_avg", "ratio", False, "Average share of worker-minutes with availability=BLOCKED."),
     ("Humanoid Unavailable Ratio", "humanoid_unavailable_ratio_avg", "ratio", False, "Average share of worker-minutes with availability=DISABLED or OFFLINE."),
+    ("Humanoid Incidents", "humanoid_incident_total", "count", False, "HumanoidSim incident events emitted by workers."),
     ("Handover Items", "handover_item_count", "count", True, "HANDOVER_ITEM executions where a humanoid joined product transport."),
     ("Shared Carry Time", "shared_product_carry_time_min", "minutes", True, "Product carry minutes after a second carrier joined."),
     ("Shared Carry Ratio", "shared_product_carry_ratio", "ratio", True, "Share of product carry time performed with two active carriers."),
@@ -45,6 +46,7 @@ METRIC_GROUPS = {
     "item": ["total_products", "disposed_scrap_count", "warehouse_material_shelf_count", "downstream_closure_ratio", "throughput_per_sim_hour", "completed_product_lead_time_avg_min"],
     "machine": ["machine_utilization", "machine_broken_ratio", "machine_pm_ratio", "wall_clock_sec"],
     "worker": ["humanoid_execution_ratio_avg", "humanoid_blocked_ratio_avg", "humanoid_unavailable_ratio_avg", "worker_local_response_total", "commitment_dispatch_total"],
+    "incidents": ["humanoid_incident_total", "humanoid_blocked_ratio_avg", "worker_local_response_total", "coordination_incident_total"],
     "collaboration": ["handover_item_count", "shared_product_carry_time_min", "shared_product_carry_ratio", "repair_helper_join_count", "repair_collaboration_time_min", "repair_collaboration_ratio", "repair_team_size_avg"],
     "traffic": ["collision_count", "near_miss_count", "edge_conflict_count", "path_overlap_count"],
 }
@@ -317,6 +319,7 @@ def _series_snapshot(manifest: dict[str, Any] | None, current_run_id: str | None
 
 def _incident_table(kpi: dict[str, Any]) -> str:
     rows = [
+        ("Humanoid incidents", _safe_int(kpi.get("humanoid_incident_total")), "HumanoidSim incident taxonomy events from worker execution."),
         ("Physical incidents", _safe_int(kpi.get("physical_incident_total")), "Machine, worker, buffer, and supply-side events."),
         ("Coordination incidents", _safe_int(kpi.get("coordination_incident_total")), "Execution friction caused by planning continuity failures."),
         ("Unique replan blockers", _safe_int(kpi.get("unique_replan_blocker_total")), "Distinct blocker states after deduplication."),
@@ -378,6 +381,47 @@ def _traffic_table(kpi: dict[str, Any]) -> str:
     if not rows:
         rows = "<tr><td colspan='2'>No worker-pair traffic conflicts.</td></tr>"
     return "<div class='panel'><h2>Traffic Conflicts by Worker Pair</h2><p class='muted'>Pairs are recorded directly from AGENT_TRAFFIC_CONFLICT events.</p><table><thead><tr><th>Worker Pair</th><th>Conflicts</th></tr></thead><tbody>" + rows + "</tbody></table></div>"
+
+
+def _humanoid_incident_recovery_table(kpi: dict[str, Any]) -> str:
+    by_code = kpi.get("humanoid_incidents_by_code", {}) if isinstance(kpi.get("humanoid_incidents_by_code", {}), dict) else {}
+    protocols = (
+        kpi.get("humanoid_incident_recovery_protocol_by_code", {})
+        if isinstance(kpi.get("humanoid_incident_recovery_protocol_by_code", {}), dict)
+        else {}
+    )
+    rows: list[str] = []
+    for code, count in sorted(by_code.items(), key=lambda item: (-_safe_int(item[1]), str(item[0]))):
+        protocol = protocols.get(code, [])
+        if isinstance(protocol, list):
+            protocol_steps = []
+            for step in protocol:
+                if isinstance(step, dict):
+                    step_code = str(step.get("code", "")).strip()
+                    if step_code:
+                        protocol_steps.append(step_code)
+                elif str(step).strip():
+                    protocol_steps.append(str(step))
+            protocol_text = " -> ".join(protocol_steps) or "-"
+        else:
+            protocol_text = str(protocol or "-")
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(code))}</td>"
+            f"<td>{_safe_int(count)}</td>"
+            f"<td>{html.escape(protocol_text)}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='3'>No humanoid incidents were recorded.</td></tr>")
+    return (
+        "<div class='panel'>"
+        "<h2>Humanoid Incident Recovery Protocols</h2>"
+        "<p class='muted'>Recovery sequences come from HumanoidSim incident_schema_core.json and use existing task or primitive codes.</p>"
+        "<table><thead><tr><th>Incident Code</th><th>Count</th><th>Recovery Protocol</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
+    )
 
 
 def _repair_collaboration_episode_table(kpi: dict[str, Any]) -> str:
@@ -511,6 +555,18 @@ def export_kpi_dashboard(
     axis_defs = _humanoid_state_axis_defs()
     traffic_by_type = kpi.get("traffic_conflicts_by_type", {}) if isinstance(kpi.get("traffic_conflicts_by_type", {}), dict) else {}
     traffic_by_pair = kpi.get("traffic_conflicts_by_worker_pair", {}) if isinstance(kpi.get("traffic_conflicts_by_worker_pair", {}), dict) else {}
+    humanoid_incidents_by_category = (
+        kpi.get("humanoid_incidents_by_category", {}) if isinstance(kpi.get("humanoid_incidents_by_category", {}), dict) else {}
+    )
+    humanoid_incidents_by_code = (
+        kpi.get("humanoid_incidents_by_code", {}) if isinstance(kpi.get("humanoid_incidents_by_code", {}), dict) else {}
+    )
+    humanoid_incidents_by_worker = (
+        kpi.get("humanoid_incidents_by_worker", {}) if isinstance(kpi.get("humanoid_incidents_by_worker", {}), dict) else {}
+    )
+    humanoid_incidents_by_severity = (
+        kpi.get("humanoid_incidents_by_severity", {}) if isinstance(kpi.get("humanoid_incidents_by_severity", {}), dict) else {}
+    )
     item_transport_time = kpi.get("item_transport_time_by_type", {}) if isinstance(kpi.get("item_transport_time_by_type", {}), dict) else {}
     shared_carry_by_worker = kpi.get("shared_product_carry_time_by_worker", {}) if isinstance(kpi.get("shared_product_carry_time_by_worker", {}), dict) else {}
     shared_carry_by_pair = kpi.get("shared_product_carry_time_by_pair", {}) if isinstance(kpi.get("shared_product_carry_time_by_pair", {}), dict) else {}
@@ -865,6 +921,99 @@ def export_kpi_dashboard(
     _common_layout(traffic_pair_fig, y_title="Count", x_title="Worker pair", height=360)
     _add_panel("traffic_conflicts_by_pair", "Traffic Conflicts by Worker Pair", traffic_pair_fig, "Pairs are not grouped beyond the worker ids recorded by the simulator.")
 
+    incident_category_fig = go.Figure()
+    incident_category_pairs = sorted(
+        ((str(key), _safe_float(value)) for key, value in humanoid_incidents_by_category.items()),
+        key=lambda item: item[0],
+    )
+    incident_category_fig.add_trace(
+        go.Bar(
+            name="Incidents",
+            x=[key for key, _ in incident_category_pairs],
+            y=[value for _, value in incident_category_pairs],
+            text=[f"{value:.0f}" for _, value in incident_category_pairs],
+            textposition="outside",
+            marker_color="#9d4edd",
+        )
+    )
+    _common_layout(incident_category_fig, y_title="Count", x_title="HumanoidSim incident category", height=390)
+    _add_panel(
+        "humanoid_incidents_by_category",
+        "Humanoid Incidents by Category",
+        incident_category_fig,
+        "Categories are defined by HumanoidSim incident_schema_core.json; no dashboard-specific regrouping is applied.",
+    )
+
+    incident_code_fig = go.Figure()
+    incident_code_pairs = sorted(
+        ((str(key), _safe_float(value)) for key, value in humanoid_incidents_by_code.items()),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    incident_code_fig.add_trace(
+        go.Bar(
+            name="Incidents",
+            x=[key for key, _ in incident_code_pairs],
+            y=[value for _, value in incident_code_pairs],
+            text=[f"{value:.0f}" for _, value in incident_code_pairs],
+            textposition="outside",
+            marker_color="#e76f51",
+        )
+    )
+    _common_layout(incident_code_fig, y_title="Count", x_title="HumanoidSim incident code", height=430)
+    _add_panel(
+        "humanoid_incidents_by_code",
+        "Humanoid Incidents by Code",
+        incident_code_fig,
+        "Exact incident code counts emitted by HUMANOID_INCIDENT events.",
+    )
+
+    incident_worker_fig = go.Figure()
+    incident_worker_pairs = sorted(
+        ((str(key), _safe_float(value)) for key, value in humanoid_incidents_by_worker.items()),
+        key=lambda item: item[0],
+    )
+    incident_worker_fig.add_trace(
+        go.Bar(
+            name="Incidents",
+            x=[key for key, _ in incident_worker_pairs],
+            y=[value for _, value in incident_worker_pairs],
+            text=[f"{value:.0f}" for _, value in incident_worker_pairs],
+            textposition="outside",
+            marker_color="#f4a261",
+        )
+    )
+    _common_layout(incident_worker_fig, y_title="Count", x_title="Worker", height=340)
+    _add_panel(
+        "humanoid_incidents_by_worker",
+        "Humanoid Incidents by Worker",
+        incident_worker_fig,
+        "Worker-level incident counts use the event entity id recorded by ManSim.",
+    )
+
+    incident_severity_fig = go.Figure()
+    incident_severity_pairs = sorted(
+        ((str(key), _safe_float(value)) for key, value in humanoid_incidents_by_severity.items()),
+        key=lambda item: item[0],
+    )
+    incident_severity_fig.add_trace(
+        go.Bar(
+            name="Incidents",
+            x=[key for key, _ in incident_severity_pairs],
+            y=[value for _, value in incident_severity_pairs],
+            text=[f"{value:.0f}" for _, value in incident_severity_pairs],
+            textposition="outside",
+            marker_color="#577590",
+        )
+    )
+    _common_layout(incident_severity_fig, y_title="Count", x_title="Severity", height=340)
+    _add_panel(
+        "humanoid_incidents_by_severity",
+        "Humanoid Incidents by Severity",
+        incident_severity_fig,
+        "Severity labels come from HumanoidSim incident definitions.",
+    )
+
     for axis_id, axis_def in axis_defs.items():
         state_fig = go.Figure()
         rendered_states: set[str] = set()
@@ -948,6 +1097,18 @@ def export_kpi_dashboard(
         + panel_figures["humanoid_state_manipulation"]
         + "</div>",
     )
+    incident_section = _group_section(
+        "Humanoid Incidents",
+        "Humanoid incidents are generated from the HumanoidSim incident taxonomy and recorded as StateReason plus recovery protocol.",
+        _summary_cards(kpi, METRIC_GROUPS["incidents"]),
+        "<div class='grid cards-2'>"
+        + panel_figures["humanoid_incidents_by_category"]
+        + panel_figures["humanoid_incidents_by_code"]
+        + panel_figures["humanoid_incidents_by_worker"]
+        + panel_figures["humanoid_incidents_by_severity"]
+        + _humanoid_incident_recovery_table(kpi)
+        + "</div>",
+    )
     collaboration_section = _group_section(
         "Worker Collaboration",
         "Collaboration KPIs are derived from explicit handover/product-carry and repair-team events rather than inferred from proximity.",
@@ -978,6 +1139,7 @@ def export_kpi_dashboard(
         + item_section
         + machine_section
         + worker_section
+        + incident_section
         + collaboration_section
         + traffic_section
     )

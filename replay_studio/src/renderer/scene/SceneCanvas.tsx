@@ -598,7 +598,41 @@ function workerTaskCode(entity: { attributes: Record<string, unknown> }): string
   return typeof direct === "string" && direct.trim() ? direct.trim().toUpperCase() : "";
 }
 
+function workerHasHumanoidIncident(entity: { attributes: Record<string, unknown> }): boolean {
+  const incident = entity.attributes.incident_bubble ?? entity.attributes.last_humanoid_incident;
+  if (incident && typeof incident === "object") {
+    const code = (incident as Record<string, unknown>).code;
+    if (typeof code === "string" && code.trim()) return true;
+  }
+  const reason = humanoidStateRecord(entity).reason;
+  if (reason && typeof reason === "object") {
+    const metadata = (reason as Record<string, unknown>).metadata;
+    if (metadata && typeof metadata === "object") {
+      const code = (metadata as Record<string, unknown>).incident_code;
+      if (typeof code === "string" && code.trim()) return true;
+    }
+  }
+  return false;
+}
+
+function workerAvailabilityBadge(entity: { attributes: Record<string, unknown> }): { text: string; accent: string } | null {
+  switch (humanoidStateValue(entity, "availability")) {
+    case "BLOCKED":
+      return { text: "BLK", accent: "#ff6b6b" };
+    case "WAITING":
+      return { text: "WAIT", accent: "#f7b731" };
+    case "DISABLED":
+      return { text: "DIS", accent: "#ff7189" };
+    case "OFFLINE":
+      return { text: "OFF", accent: "#778ca3" };
+    default:
+      return null;
+  }
+}
+
 function workerTaskBadge(entity: { attributes: Record<string, unknown> }): { text: string; accent: string } {
+  const availabilityBadge = workerAvailabilityBadge(entity);
+  if (availabilityBadge) return availabilityBadge;
   switch (workerTaskCode(entity)) {
     case "REPLENISH_MATERIAL":
       return { text: "MAT", accent: "#62a9ff" };
@@ -623,9 +657,11 @@ function workerTaskBadge(entity: { attributes: Record<string, unknown> }): { tex
 }
 
 function shouldShowWorkerTaskBubble(entity: { state: string; attributes: Record<string, unknown> }, currentTime: number): boolean {
+  if (workerHasHumanoidIncident(entity) && workerAvailabilityBadge(entity)) return true;
   if (activeMotionWindow(entity, currentTime)) return false;
   const mobility = humanoidStateValue(entity, "mobility");
   if (mobility === "NAVIGATING" || mobility === "DOCKING") return false;
+  if (workerAvailabilityBadge(entity)) return true;
   if (humanoidStateValue(entity, "availability") !== "EXECUTING") return false;
   const primitive = workerPrimitiveCode(entity);
   const visiblePrimitive = new Set([

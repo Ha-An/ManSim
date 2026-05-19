@@ -1,100 +1,110 @@
 # ManSim v0.4.3
 
-ManSim은 제조 라인의 discrete-event simulation을 실행하고, 결과를 KPI dashboard와 Replay Studio로 관찰하는 실험 프레임워크입니다. v0.4.3의 중심 변화는 worker를 단순 작업자가 아니라 `HumanoidSim`에서 정의한 휴머노이드 로봇으로 다루고, 그 state/task/primitive를 Replay와 KPI에서 그대로 관찰할 수 있게 한 것입니다.
+ManSim은 제조 환경의 discrete-event simulation, KPI dashboard, Gantt chart, 2D/3D Replay Studio를 포함한 공장 운영 시뮬레이션 워크스페이스입니다. v0.4.3에서는 worker를 단순 agent가 아니라 `HumanoidSim`에서 정의한 task, primitive, state, incident 모델을 사용하는 휴머노이드 로봇으로 재구성했습니다.
 
-![Replay Studio factory replay 화면](docs/assets/replay-studio-worker-replay.png)
+![Replay Studio factory replay](docs/assets/replay-studio-worker-replay.png)
 
+## v0.4.3 주요 업데이트
 
+v0.4.3은 v0.4.2의 tile 기반 공장 layout과 Replay Studio 개편 위에 Humanoid runtime을 크게 확장한 버전입니다.
 
-### HumanoidSim Transition API
-
-ManSim은 Humanoid state 축의 의미를 직접 정의하지 않습니다. Worker에게 task가 할당되거나 primitive가 시작/종료되거나 cargo, battery, blocked/waiting 같은 상황이 발생하면, ManSim은 그 사실을 `HumanoidSim.transition_humanoid_state()`에 event로 전달합니다. 이벤트를 받은 HumanoidSim이 `HumanoidStateSnapshot`을 갱신하고, ManSim은 반환된 snapshot을 event, replay, KPI artifact에 그대로 기록합니다.
-
-- 정상적으로 실행 중인 모든 primitive는 HumanoidSim 규칙에 따라 `availability=EXECUTING`으로 표현됩니다.
-- `mobility`와 `manipulation`은 primitive JSON의 `metadata.state.allowed`와 `metadata.state.effects` 정의를 따릅니다.
-- ManSim은 배터리 방전, cargo 변경, resource 소실, traffic wait 같은 scenario fact만 판단합니다.
-- 축 값을 직접 꽂던 legacy `set_axes`/`_set_humanoid_axes` 경로는 제거했고, 남은 상태 변경은 semantic transition event를 통해 수행됩니다.
-- 잘못된 state transition은 strict fail로 처리되어 simulation 중 즉시 드러납니다.
-
-## v0.4.3 업데이트
-
-v0.4.3은 v0.4.2의 tile 기반 factory map과 Replay Studio 개편 위에 Humanoid runtime을 본격 통합한 버전입니다.
-
-- Worker/task 실행 엔진을 `HumanoidSim`의 `TaskSpec -> nested child Task -> Primitive` hierarchy 기반으로 전환했습니다.
-- `COMPOSITE_TASK`를 하나 이상의 child task call을 포함하는 workflow로 해석합니다. 예를 들어 `REPLENISH_MATERIAL -> TRANSFER`, `SETUP_MACHINE -> LOAD_MACHINE` 구조가 event와 Replay에 보존됩니다.
-- Worker state를 `HumanoidSim`의 `HumanoidStateSnapshot` 하나로 통일했습니다. State 축은 `availability`, `mobility`, `power`, `manipulation`입니다.
-- 현재 ManSim task subset은 `REPLENISH_MATERIAL`, `TRANSFER`, `MANAGE_ROBOT_POWER`, `SETUP_MACHINE`, `UNLOAD_MACHINE`, `INSPECT_PRODUCT`, `REPAIR_MACHINE`, `PREVENTIVE_MAINTENANCE`, `HANDOVER_ITEM`, `COLLECT_WASTE_OR_SCRAP`입니다.
-- Primitive별 최소 duration을 설정할 수 있습니다. 기본값은 `configs/humanoidsim/default.yaml`의 `primitive_timing.default_min: 0.1`분입니다.
-- Setup, unload, inspection은 queue와 machine/table/output buffer 사이의 실제 carry 이동을 포함합니다.
-- Inspection은 worker가 `inspection_table` service tile에 도착한 뒤 수행되며, 완료 후 output queue 또는 scrap queue로 직접 운반합니다.
-- Item weight 기반 이동 시간 multiplier를 추가했습니다. 기본값은 material `1.0`, intermediate `1.5`, product `2.0`입니다.
-- `HANDOVER_ITEM`은 product 공동 운반 합류 task로 지원됩니다. Product는 최대 2명의 Humanoid가 함께 운반할 수 있고, 합류 뒤 남은 tile 이동 시간은 carrier 수로 나뉩니다.
-- 이동 모델에 traffic layer를 추가했습니다. 기본값은 `strict_reservation`이며, 다음 tile 예약에 실패하면 worker가 대기하고 `TRAFFIC_WAIT`을 기록합니다.
-- `observe_conflicts` 모드에서는 동선 겹침, near miss, collision 가능 상황을 막지 않고 event/KPI/Replay overlay로 관찰할 수 있습니다.
-- Replay Studio는 worker 이동을 출발지와 목적지 직선이 아니라 simulator가 기록한 tile path 기준으로 보간합니다.
-- Replay Studio worker panel은 `Availability`, `Mobility`, `Manipulation`, `Task`, `Child Task`, `Primitive`, `Motion Path`, `Traffic`, carry item ID, shared carry 정보를 표시합니다.
-- Gantt chart의 worker lane은 `HumanoidSim` Availability State를 그대로 사용합니다. `MOVING`, `WORKING`, `DISCHARGED` 같은 legacy bucket은 worker Gantt status로 쓰지 않습니다.
-- KPI audit과 dashboard는 `humanoid_state_*`, `humanoid_task_minutes`, `humanoid_primitive_minutes`, `humanoid_task_taxonomy` 기준으로 정리했습니다.
-- KPI dashboard에는 worker collaboration 섹션이 있으며 product 공동 운반, handover, repair helper 합류, repair team size를 별도로 집계합니다.
-- 독립 실험 앱인 `replay_studio_3d/`를 추가했습니다. 기존 2D Replay Studio와 직접 import 관계가 없고, Results Hub에서 “Replay Studio 3D” 메뉴로 열 수 있습니다.
-- Warehouse material shelf를 실제 slot 재고로 바꾸었습니다. Worker는 개별 slot service tile까지 이동해 material을 집고, day boundary마다 빈 slot만 보충됩니다.
-- `CompletedProducts` zone과 `ScrapDisposal` zone을 추가했습니다. Accepted product는 `completed_product_buffer`, inspection fail product는 `inspection_scrap_queue`를 거쳐 `scrap_disposal_bin`으로 운반됩니다.
-- LLM Wiki, Curator, Graphify 기반 knowledge pipeline은 기존 기능으로 유지됩니다.
+- Worker/task 실행 단위를 `HumanoidSim`의 `TaskSpec -> nested child Task -> Primitive` hierarchy 기반으로 전환했습니다.
+- `COMPOSITE_TASK`는 하위 task call을 포함하는 workflow로 해석합니다. 예: `REPLENISH_MATERIAL -> TRANSFER`, `SETUP_MACHINE -> LOAD_MACHINE`
+- Worker state는 `HumanoidSim`의 `HumanoidStateSnapshot`을 기준으로 기록합니다.
+  - `availability`
+  - `mobility`
+  - `power`
+  - `manipulation`
+- 현재 ManSim에서 사용하는 task subset은 `REPLENISH_MATERIAL`, `TRANSFER`, `MANAGE_ROBOT_POWER`, `SETUP_MACHINE`, `UNLOAD_MACHINE`, `INSPECT_PRODUCT`, `REPAIR_MACHINE`, `PREVENTIVE_MAINTENANCE`, `HANDOVER_ITEM`, `COLLECT_WASTE_OR_SCRAP`입니다.
+- Primitive별 최소 duration 기본값을 `0.1`분으로 두어 Replay Studio에서 primitive 전환을 관찰할 수 있게 했습니다.
+- Setup, unload, inspection에서 queue와 machine/table/output buffer 사이의 실제 carry 이동을 추가했습니다.
+- Product 운반은 material보다 오래 걸리며, `HANDOVER_ITEM`으로 최대 2명의 공동 운반을 표현합니다.
+- 기본 traffic mode는 `strict_reservation`입니다. 다음 tile 예약에 실패하면 worker는 이동하지 않고 `TRAFFIC_WAIT`으로 대기합니다.
+- `observe_conflicts` 모드에서는 path overlap, near miss, collision 가능 상황을 차단하지 않고 event/KPI/Replay overlay로 관찰할 수 있습니다.
+- Replay Studio는 worker의 실제 tile path를 따라 이동을 보간하고, worker panel에 Task, Child Task, Primitive, Motion Path, Traffic, Incident, Carry 정보를 표시합니다.
+- Gantt chart는 worker lane을 `HumanoidSim` Availability State 기준으로 표시합니다.
+- KPI dashboard는 humanoid state, task, primitive, task taxonomy, worker collaboration, incident 통계를 포함합니다.
+- 독립 실험 앱인 `replay_studio_3d/`를 추가했습니다. 기존 2D Replay Studio와 직접 import 관계가 없습니다.
+- Warehouse material shelf, CompletedProducts zone, ScrapDisposal zone, inspection scrap queue를 추가했습니다.
+- LLM Wiki, Curator, Graphify 기반 knowledge pipeline은 기존 기능을 유지합니다.
 
 ## v0.4.2 주요 업데이트
 
-- 시뮬레이션 공간을 좌표 기반 배치에서 tile 기반 factory map으로 전환했습니다.
-- Replay Studio가 tile map, queue, machine, inspection 영역을 tile layout 기준으로 표시하도록 바뀌었습니다.
+- 시뮬레이션 환경을 좌표 기반이 아니라 tile 기반 factory map으로 전환했습니다.
+- Replay Studio를 tile map, queue, machine, inspection layout 기준으로 수정했습니다.
 - LLM Wiki, Curator, Graphify 기반 knowledge graph pipeline을 추가했습니다.
-
-기본 실행 경로는 OpenClaw를 쓰지 않는 scripted `adaptive_priority`입니다. 기본 horizon은 5일이며, primary objective는 accepted product를 `CompletedProducts` zone까지 운반한 `completed products` 최대화입니다.
 
 ## Architecture
 
-- `manufacturing_sim/` - factory simulator core, tile map, task execution, traffic observation, KPI source.
-- `configs/` - scenario, decision mode, humanoid profile, runtime 설정.
-- `runtime/` - Hydra entrypoint, artifact export, dashboard 생성.
-- `dashboards/` - results hub, KPI, Gantt, knowledge, series dashboard.
-- `replay_studio/` - 기존 2D React Replay Studio.
-- `replay_studio_3d/` - 독립 3D Replay Studio 실험 앱.
-- `agents/`, `openclaw/` - optional OpenClaw manager loop.
-- `knowledge/` - run-series knowledge, LLM Wiki, Graphify artifact.
-- `docs/` - simulator, humanoid runtime, movement, dashboard, LLM Wiki 문서.
-- `tests/` - Humanoid runtime, traffic, replay export, zone/scrap contract tests.
+- `manufacturing_sim/`: factory simulation core, tile map, humanoid task runtime, traffic monitor, KPI source
+- `configs/`: scenario, decision mode, humanoid profile, runtime 설정
+- `runtime/`: Hydra entrypoint, artifact export, dashboard 실행
+- `dashboards/`: results hub, KPI dashboard, Gantt chart, knowledge dashboard, series dashboard
+- `replay_studio/`: 기존 2D React Replay Studio
+- `replay_studio_3d/`: 독립형 3D Replay Studio 실험 앱
+- `agents/`, `openclaw/`: optional OpenClaw manager loop
+- `knowledge/`: run-series knowledge, LLM Wiki, Graphify artifact
+- `docs/`: simulator, humanoid runtime, movement, dashboard, LLM Wiki 문서
+- `tests/`: humanoid runtime, traffic, replay export, zone/scrap contract tests
 
 ## Humanoid Worker Model
 
-ManSim에서 worker는 `HumanoidSim` 라이브러리의 정의를 import해서 사용하는 Humanoid robot입니다. State, Task, Primitive의 정의 주체는 ManSim이 아니라 `HumanoidSim`입니다. ManSim은 특정 factory scenario에서 그 정의가 어떻게 실행되고 관찰되는지를 기록합니다.
+ManSim의 worker는 `HumanoidSim`에서 정의한 휴머노이드 모델을 import해 사용하는 runtime instance입니다. State, Task, Primitive, Incident의 기본 정의는 ManSim이 아니라 `HumanoidSim`이 소유합니다. ManSim은 factory scenario에서 어떤 task가 할당되고, 어떤 event가 발생했는지 판단해 HumanoidSim transition API에 전달합니다.
 
-Worker state는 다음 네 축으로만 표현합니다.
+Worker state는 다음 네 축으로 표현됩니다.
 
 - `availability`: `AVAILABLE`, `ASSIGNED`, `EXECUTING`, `WAITING`, `BLOCKED`, `OFFLINE`, `DISABLED`
 - `mobility`: `STATIONARY`, `NAVIGATING`, `DOCKING`
 - `power`: `POWER_NORMAL`, `POWER_LOW`, `POWER_CRITICAL`, `DEPLETED`, `CHARGING`
 - `manipulation`: `FREE`, `REACHING`, `HOLDING`, `PLACING`
 
-Task 자체는 state가 아닙니다. 예를 들어 `REPLENISH_MATERIAL` 수행 중인 worker는 `availability=EXECUTING`이고, task 정보는 `humanoid_state.task_context.task_code=REPLENISH_MATERIAL`로 기록됩니다.
+Task는 state가 아닙니다. 예를 들어 `REPLENISH_MATERIAL` 수행 중인 worker는 `availability=EXECUTING`이고, task 정보는 `humanoid_state.task_context.task_code=REPLENISH_MATERIAL`에 기록됩니다.
 
-자세한 내용은 [docs/humanoid_worker_model.md](docs/humanoid_worker_model.md)를 참고하세요.
+자세한 설명은 [docs/humanoid_worker_model.md](docs/humanoid_worker_model.md)를 참고하세요.
+
+## HumanoidSim Transition API
+
+ManSim은 state 축을 직접 임의 계산하지 않습니다. 다음과 같은 scenario fact를 event로 전달합니다.
+
+- task assigned/start/end
+- primitive start/end
+- cargo pickup/drop
+- battery/charging
+- waiting/blocked/disabled/offline
+- traffic wait/resource race/incident
+
+HumanoidSim은 이 event를 바탕으로 `HumanoidStateSnapshot`을 반환합니다. 잘못된 transition은 strict fail로 처리되어 simulation이 중단되고 worker id, event, previous snapshot, reason을 출력합니다.
 
 ## Movement
 
-Worker 이동은 tile map 위에서 이루어집니다. `TileGridMap.find_path()`가 A* search로 목적지 service tile까지의 4방향 path를 만들고, worker는 `map.tile_time_min` 단위로 한 tile씩 이동합니다.
+Worker 이동은 tile map 기반입니다. `TileGridMap.find_path()`가 A* search로 4방향 path를 찾고, worker는 `map.tile_time_min` 단위로 한 tile씩 이동합니다. Replay Studio는 simulation artifact에 기록된 `motion.path`를 사용해 출발지에서 목적지까지 부드럽게 보간합니다.
 
-기본 traffic mode는 `strict_reservation`입니다. Worker가 다음 tile을 예약하지 못하면 이동하지 않고 대기하며, `AGENT_TRAFFIC_CONFLICT` / `TRAFFIC_WAIT`이 event와 KPI에 기록됩니다. `observe_conflicts`로 바꾸면 동선 겹침과 near miss를 막지 않고 관찰할 수 있습니다.
+기본 traffic mode는 `strict_reservation`입니다. Worker가 다음 tile을 예약하지 못하면 이동하지 않고 `TRAFFIC_WAIT` reason을 남깁니다. `observe_conflicts` 모드에서는 path overlap, near miss, collision을 차단하지 않고 관찰 event로 기록합니다.
 
-자세한 내용은 [docs/humanoid_movement_model.md](docs/humanoid_movement_model.md)를 참고하세요.
+자세한 설명은 [docs/humanoid_movement_model.md](docs/humanoid_movement_model.md)를 참고하세요.
+
+## Humanoid Incident Model
+
+휴머노이드 돌발상황의 taxonomy와 recovery protocol은 `HumanoidSim`이 정의합니다. ManSim은 factory scenario에서 어떤 확률과 조건으로 incident가 발생하는지만 판단하고, 발생한 사건을 `HUMANOID_INCIDENT` event와 `StateReason`으로 기록합니다.
+
+- 확률 기반 incident는 `configs/scenario/mfg_basic.yaml`의 `humanoid_incidents.random`에서 조정합니다.
+- 기본 random incident는 `OBJECT_RECOGNITION_FAILED`, `GRIP_FAILED`, `ITEM_DROPPED`, `UNKNOWN`입니다.
+- `RESOURCE_PREEMPTED`, `TRAFFIC_WAIT`, `NEAR_MISS`, `COLLISION`은 ManSim의 resource race나 traffic model에서 자연 발생한 상황을 HumanoidSim incident code로 기록합니다.
+- Incident는 state가 아닙니다. 예를 들어 grip 실패나 item drop은 `availability=BLOCKED`가 되고, reason code가 `GRIP_FAILED` 또는 `ITEM_DROPPED`로 남습니다.
+- Replay Studio 말풍선은 incident code 전체를 쓰지 않고 Availability badge를 우선 표시합니다. 예: `BLK`, `WAIT`, `DIS`, `OFF`
+- Replay Studio worker panel에는 incident category/code를 표시합니다. Recovery protocol은 artifact metadata에는 남지만 worker panel에서는 표시하지 않습니다.
+- KPI에는 `humanoid_incident_total`, `humanoid_incidents_by_code`, `humanoid_incidents_by_category`, `humanoid_incidents_by_worker`, `humanoid_incident_recovery_protocol_by_code`가 추가됩니다.
+
+HumanoidSim 기준 문서는 `C:\Github\HumanoidSim\docs\incident_reference.md`를 참고하세요.
 
 ## Quick Start
 
-가상환경과 의존성 설치:
+의존성을 설치합니다.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pip install -e ..\HumanoidSim
 ```
-
-`HumanoidSim`은 ManSim과 같은 `C:\Github` 아래에 있는 독립 라이브러리입니다. 패키지가 설치되어 있지 않으면 Humanoid hierarchy runtime은 시작 시 명확한 에러를 냅니다.
 
 1일 smoke run:
 
@@ -108,95 +118,59 @@ Worker 이동은 tile map 위에서 이루어집니다. `TileGridMap.find_path()
 .\.venv\Scripts\python.exe main.py
 ```
 
-3일 run:
+최근 run hub 열기:
 
 ```powershell
-.\.venv\Scripts\python.exe main.py scenario.horizon.num_days=3
-```
-
-OpenClaw/LLM manager path:
-
-```powershell
-.\.venv\Scripts\python.exe main.py decision=openclaw_adaptive_priority
-```
-
-Replay Studio 개발 서버:
-
-```powershell
-cd replay_studio
-npm install
-npm run dev
-```
-
-3D Replay Studio 개발 서버:
-
-```powershell
-cd replay_studio_3d
-npm install
-npm run dev
+.\.venv\Scripts\python.exe -m dashboards.manifest --latest
 ```
 
 ## Outputs
 
-Run 결과는 `outputs/<date>/<run-id>/` 아래에 생성됩니다.
+Run artifact는 `outputs/` 아래에 생성됩니다. 주요 파일은 다음과 같습니다.
 
-- `results_dashboard.html` - run hub.
-- `kpi.json`, `daily_summary.json` - 운영 분석 artifact.
-- `kpi_dashboard.html` - KPI dashboard.
-- `gantt.html`, `gantt_segments.csv` - worker Availability State와 machine state timeline.
-- `events.jsonl` - simulator event stream.
-- `minute_snapshots.json` - queue, machine, worker `humanoid_states` snapshot.
-- `replay_studio_log.json`, `replay_studio_layout.json` - Replay Studio 입력.
-- `dashboard_manifest.json` - hub navigation manifest.
-- `run_series_summary.json`, `series_analysis.json` - multi-run 비교 데이터.
-- `llm_wiki_dashboard.html` - LLM Wiki 진입점.
-- `knowledge_graph_dashboard.html` - Graphify knowledge graph viewer.
-
-Worker 관련 event에는 `humanoid_state` 원본 snapshot이 들어갑니다. 주요 event는 `HUMANOID_TASK_*`, `HUMANOID_STEP_*`, `WORKER_STATE_CHANGED`, `WORKER_CARGO_CHANGED`, `AGENT_MOVE_TILE_*`, `AGENT_TRAFFIC_CONFLICT`입니다.
+- `events.jsonl`: simulation event log
+- `minute_snapshots.json`: minute-level factory snapshot
+- `daily_summary.json`: day별 생산/queue/incident summary
+- `kpi.json`: KPI dashboard source
+- `replay_studio_log.json`: 2D/3D Replay Studio 입력
+- `dashboard_manifest.json`: hub가 참조하는 artifact manifest
 
 ## Verification
 
-Python tests:
+주요 테스트:
 
 ```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_humanoid_runtime
+.\.venv\Scripts\python.exe -m unittest tests.test_traffic_monitor
 .\.venv\Scripts\python.exe -m unittest discover -s tests
-```
-
-KPI audit:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\audit_kpi.py outputs\YYYY-MM-DD\HH-MM-SS
 ```
 
 Replay Studio build:
 
 ```powershell
-$env:PATH = "C:\Github\ManSim\.tooling\node;$env:PATH"
 cd replay_studio
-npm.cmd run build
+npm run build
 ```
 
 3D Replay Studio build:
 
 ```powershell
-$env:PATH = "C:\Github\ManSim\.tooling\node;$env:PATH"
 cd replay_studio_3d
-npm.cmd run build
+npm run build
 ```
 
 ## Documents
 
-- [docs/README.md](docs/README.md)
-- [docs/simulator_core_guide.md](docs/simulator_core_guide.md)
-- [docs/humanoid_worker_model.md](docs/humanoid_worker_model.md)
-- [docs/humanoid_movement_model.md](docs/humanoid_movement_model.md)
-- [docs/replay_dashboards.md](docs/replay_dashboards.md)
-- [docs/decision_logic.md](docs/decision_logic.md)
-- [docs/llm_wiki_curator.md](docs/llm_wiki_curator.md)
-- [docs/openclaw_adaptive_priority_call_flow.md](docs/openclaw_adaptive_priority_call_flow.md)
+- [docs/README.md](docs/README.md): 문서 index
+- [docs/simulator_core_guide.md](docs/simulator_core_guide.md): simulation core 개요
+- [docs/humanoid_worker_model.md](docs/humanoid_worker_model.md): humanoid worker task/state/incident 모델
+- [docs/humanoid_movement_model.md](docs/humanoid_movement_model.md): tile movement, reservation, traffic model
+- [docs/dashboard_guide.md](docs/dashboard_guide.md): results hub와 KPI dashboard
+- [docs/llm_wiki_design.md](docs/llm_wiki_design.md): LLM Wiki / Curator / Graphify 설계
 
 ## Notes
 
-- ManSim과 HumanoidSim은 분리된 repository입니다. ManSim은 HumanoidSim을 editable install로 import합니다.
-- `llm_knowledge`, Graphify, Curator artifact는 simulation runtime의 optional knowledge layer입니다.
-- 기존 run artifact와 schema 호환이 깨질 수 있으므로 최신 dashboard/replay는 최신 run 산출물을 기준으로 봅니다.
+- 기본 decision mode는 `adaptive_priority`입니다.
+- 기본 horizon은 5일 run입니다.
+- OpenClaw mode는 optional입니다.
+- `HumanoidSim`은 ManSim과 같은 상위 폴더인 `C:\Github` 아래에 있다고 가정합니다.

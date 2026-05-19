@@ -12,6 +12,7 @@ METRIC_SPECS = [
     ("Closure", "downstream_closure_ratio", True, "ratio"),
     ("Lead Time", "completed_product_lead_time_avg_min", False, "minutes"),
     ("Product Input Wait", "product_input_wait_avg_min", False, "minutes"),
+    ("Humanoid Incidents", "humanoid_incident_total", False, "count"),
     ("Physical Incidents", "physical_incident_total", False, "count"),
     ("Coordination Incidents", "coordination_incident_total", False, "count"),
     ("Unique Blockers", "unique_replan_blocker_total", False, "count"),
@@ -140,6 +141,7 @@ def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) 
     cards = [
         ("Accepted Products", _format_value(_safe_float(kpi.get("total_products")), "count"), "Finished products accepted in this run."),
         ("Closure Ratio", _format_value(_safe_float(kpi.get("downstream_closure_ratio")), "ratio"), "How much downstream output was actually closed."),
+        ("Humanoid Incidents", _format_value(_safe_float(kpi.get("humanoid_incident_total")), "count"), "HumanoidSim incident events recorded during worker execution."),
         ("Coordination Incidents", _format_value(_safe_float(kpi.get("coordination_incident_total")), "count"), "Execution friction caused by planning/coordination mismatch."),
         ("Commitment Dispatches", _format_value(_safe_float(kpi.get("commitment_dispatch_total")), "count"), "Planner commitments that reached worker execution."),
         ("Product Lead Time", _format_value(_safe_float(kpi.get("completed_product_lead_time_avg_min")), "minutes"), "Average end-to-end product completion time."),
@@ -155,6 +157,43 @@ def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) 
         f"<div class='card'><div class='label'>{html.escape(label)}</div><div class='value'>{html.escape(value)}</div><div class='sub'>{html.escape(sub)}</div></div>"
         for label, value, sub in cards
     ) + "</div></section>"
+
+
+def _mapping_table(title: str, mapping: dict[str, Any], *, empty_text: str = "No data.") -> str:
+    if not isinstance(mapping, dict) or not mapping:
+        body = f"<tr><td colspan='2'>{html.escape(empty_text)}</td></tr>"
+    else:
+        body = "".join(
+            f"<tr><td>{html.escape(str(key))}</td><td>{_safe_int(value)}</td></tr>"
+            for key, value in sorted(mapping.items(), key=lambda item: (-_safe_int(item[1]), str(item[0])))
+        )
+    return (
+        f"<div class='panel'><h3>{html.escape(title)}</h3>"
+        "<table><thead><tr><th>Name</th><th>Count</th></tr></thead><tbody>"
+        + body
+        + "</tbody></table></div>"
+    )
+
+
+def _humanoid_incident_section(kpi: dict[str, Any]) -> str:
+    total = _safe_int(kpi.get("humanoid_incident_total"))
+    by_category = kpi.get("humanoid_incidents_by_category", {}) if isinstance(kpi.get("humanoid_incidents_by_category", {}), dict) else {}
+    by_code = kpi.get("humanoid_incidents_by_code", {}) if isinstance(kpi.get("humanoid_incidents_by_code", {}), dict) else {}
+    by_worker = kpi.get("humanoid_incidents_by_worker", {}) if isinstance(kpi.get("humanoid_incidents_by_worker", {}), dict) else {}
+    by_severity = kpi.get("humanoid_incidents_by_severity", {}) if isinstance(kpi.get("humanoid_incidents_by_severity", {}), dict) else {}
+    return (
+        "<section class='section'>"
+        "<div class='panel'><h2>Humanoid Incidents</h2>"
+        "<p class='sub'>These statistics are grouped only by the HumanoidSim incident taxonomy and the worker id recorded by ManSim.</p>"
+        f"<div class='grid cards-4'><div class='card'><div class='label'>Total</div><div class='value'>{total}</div><div class='sub'>HUMANOID_INCIDENT events</div></div></div>"
+        "</div>"
+        "<div class='grid cards-2'>"
+        + _mapping_table("By Category", by_category)
+        + _mapping_table("By Code", by_code)
+        + _mapping_table("By Worker", by_worker)
+        + _mapping_table("By Severity", by_severity)
+        + "</div></section>"
+    )
 
 
 def _task_assignment_section(run_meta: dict[str, Any] | None) -> str:
@@ -506,6 +545,7 @@ def export_results_dashboard(
         _summary_cards(current_kpi, run_meta)
         + _config_section(run_meta)
         + _task_assignment_section(run_meta)
+        + _humanoid_incident_section(current_kpi)
         + _artifact_cards(current_page_path=output_path, run=current_run, manifest=manifest, manifest_path=manifest_path)
         + _run_delta_table(current_kpi, baseline_kpi, prev_kpi)
         + _changes_section(current_kpi, baseline_kpi, prev_kpi)

@@ -349,6 +349,22 @@ function workerTrafficConflict(entity: BaseEntityState, currentTime: number): st
   return `${type}${suffix}`;
 }
 
+function workerHumanoidIncident(entity: BaseEntityState): string {
+  const incident = entity.attributes.last_humanoid_incident ?? entity.attributes.incident_bubble;
+  const reason = humanoidState(entity).reason;
+  const reasonMetadata = reason && typeof reason === "object" ? (reason as Record<string, unknown>).metadata : undefined;
+  const reasonIncidentCode =
+    reasonMetadata && typeof reasonMetadata === "object" && typeof (reasonMetadata as Record<string, unknown>).incident_code === "string"
+      ? String((reasonMetadata as Record<string, unknown>).incident_code)
+      : "";
+  if (!incident || typeof incident !== "object") {
+    return reasonIncidentCode ? reasonIncidentCode : "-";
+  }
+  const row = incident as Record<string, unknown>;
+  const code = typeof row.code === "string" && row.code.trim() ? row.code.trim() : reasonIncidentCode;
+  return code || "-";
+}
+
 function machineActiveWorkers(entity: BaseEntityState): string {
   const activeWorkerIds = Array.isArray(entity.attributes.active_worker_ids)
     ? entity.attributes.active_worker_ids.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
@@ -486,6 +502,7 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
             const motionPath = workerMotionPath(worker, currentTime, grid, viewport);
             const trafficConflict = workerTrafficConflict(worker, currentTime);
             const sharedCarry = cargoSharedCarry(worker);
+            const incident = workerHumanoidIncident(worker);
             return (
               <article className="worker-monitor-card" key={worker.entity_id}>
                 <div className="worker-monitor-header">
@@ -559,6 +576,10 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                   <div>
                     <span className="worker-monitor-key">Traffic</span>
                     <span className="worker-monitor-value">{trafficConflict}</span>
+                  </div>
+                  <div>
+                    <span className="worker-monitor-key">Incident</span>
+                    <span className="worker-monitor-value">{incident}</span>
                   </div>
                   <div>
                     <span className="worker-monitor-key">Carry</span>
