@@ -247,6 +247,22 @@ class HumanoidTaskRuntime:
             ) from exc
         worker.humanoid_state = self._normalize_state_payload(worker, snapshot.to_dict())
 
+    def apply_transition_event(self, worker: Worker, transition_event: Any) -> None:
+        if not self.enabled:
+            return
+        current = self.ensure_humanoid_state(worker)
+        try:
+            snapshot = self._imports["transition_humanoid_state"](current, transition_event, strict=True)
+        except Exception as exc:
+            event_type = getattr(transition_event, "event_type", "")
+            primitive = getattr(transition_event, "primitive_call_code", "")
+            task_code = getattr(transition_event, "task_code", "")
+            raise RuntimeError(
+                f"HumanoidSim state transition failed for worker={worker.agent_id} "
+                f"event={event_type} task={task_code} primitive={primitive}: {exc}"
+            ) from exc
+        worker.humanoid_state = self._normalize_state_payload(worker, snapshot.to_dict())
+
     def sync_worker_cargo_state(self, worker: Worker, *, destination: str = "") -> None:
         self.transition_state(
             worker,

@@ -228,6 +228,8 @@ Incident taxonomy는 HumanoidSim이 소유합니다. ManSim은 scenario-specific
 
 Incident는 state enum이 아닙니다. Availability가 보통 `BLOCKED`, `WAITING`, `DISABLED` 중 하나로 바뀌고, 원인은 `humanoid_state.reason.code`에 기록됩니다. Recovery protocol은 HumanoidSim incident schema에 정의된 task 또는 primitive code만 참조합니다.
 
+ManSim 내부에서 관찰되는 세부 실패 reason은 HumanoidSim의 incident alias로 resolve합니다. 예를 들어 `material_shelf_slot_empty`은 ManSim이 새 incident로 정의하는 것이 아니라 HumanoidSim schema의 alias를 통해 `RESOURCE_PREEMPTED`로 기록됩니다.
+
 Replay Studio의 worker bubble은 incident code를 모두 보여주지 않고 availability 축을 짧게 표시합니다. 예: `BLK`, `WAIT`, `DIS`.
 
 ## KPI and Replay

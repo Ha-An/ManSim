@@ -90,6 +90,7 @@ Worker 이동은 tile map 기반입니다. `TileGridMap.find_path()`가 A* searc
 - 확률 기반 incident는 `configs/scenario/mfg_basic.yaml`의 `humanoid_incidents.random`에서 조정합니다.
 - 기본 random incident는 `OBJECT_RECOGNITION_FAILED`, `GRIP_FAILED`, `ITEM_DROPPED`, `UNKNOWN`입니다.
 - `RESOURCE_PREEMPTED`, `TRAFFIC_WAIT`, `NEAR_MISS`, `COLLISION`은 ManSim의 resource race나 traffic model에서 자연 발생한 상황을 HumanoidSim incident code로 기록합니다.
+- `material_shelf_slot_empty` 같은 ManSim 내부 실패 reason은 ManSim에서 별도 taxonomy로 정의하지 않고, HumanoidSim의 incident alias를 통해 canonical incident code로 해석합니다.
 - Incident는 state가 아닙니다. 예를 들어 grip 실패나 item drop은 `availability=BLOCKED`가 되고, reason code가 `GRIP_FAILED` 또는 `ITEM_DROPPED`로 남습니다.
 - Replay Studio 말풍선은 incident code 전체를 쓰지 않고 Availability badge를 우선 표시합니다. 예: `BLK`, `WAIT`, `DIS`, `OFF`
 - Replay Studio worker panel에는 incident category/code를 표시합니다. Recovery protocol은 artifact metadata에는 남지만 worker panel에서는 표시하지 않습니다.

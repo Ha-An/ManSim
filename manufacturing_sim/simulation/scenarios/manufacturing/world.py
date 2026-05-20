@@ -959,6 +959,19 @@ class ManufacturingWorld:
         self.humanoid_incident_schema = load_incident_schema()
         return self.humanoid_incident_schema
 
+    def _build_humanoid_incident_transition_event(self, code: str, **kwargs: Any) -> Any | None:
+        schema = self._load_humanoid_incident_schema()
+        if schema is None:
+            return None
+        try:
+            from humanoidsim import build_incident_transition_event
+        except ModuleNotFoundError:
+            return None
+        try:
+            return build_incident_transition_event(code, schema=schema, **kwargs)
+        except KeyError:
+            return None
+
     def _humanoid_incident_profile(self, code: str) -> Any | None:
         schema = self._load_humanoid_incident_schema()
         if schema is None:
@@ -981,20 +994,6 @@ class ManufacturingWorld:
                 normalized[canonical_key] = value
         return normalized
 
-    @staticmethod
-    def _incident_default_event_type(profile: Any | None) -> str:
-        availability = str(getattr(profile, "default_availability", "BLOCKED"))
-        if "." in availability:
-            availability = availability.rsplit(".", 1)[-1]
-        availability = availability.strip().upper()
-        if availability == "WAITING":
-            return "waiting"
-        if availability == "DISABLED":
-            return "disabled"
-        if availability == "AVAILABLE":
-            return "task_completed"
-        return "blocked"
-
     def _incident_recovery_payload(self, profile: Any | None) -> list[dict[str, Any]]:
         if profile is None:
             return []
@@ -1006,20 +1005,12 @@ class ManufacturingWorld:
                 rows.append(dict(step))
         return rows
 
-    @staticmethod
-    def _humanoid_incident_code_for_failure_reason(reason: str) -> str:
-        normalized = str(reason or "").strip().lower()
-        mappings = {
-            "material_supply_owner_changed": "RESOURCE_PREEMPTED",
-            "material_shelf_slot_empty": "RESOURCE_PREEMPTED",
-            "material_shelf_empty": "RESOURCE_MISSING",
-            "material_shelf_pickup_unreachable": "PATH_BLOCKED",
-            "material_supply_dropoff_unreachable": "PATH_BLOCKED",
-            "material_carry_failed": "GRIP_FAILED",
-            "precondition_failed": "RESOURCE_MISSING",
-            "stale_precondition": "RESOURCE_PREEMPTED",
-        }
-        return mappings.get(normalized, ManufacturingWorld._canonical_humanoid_incident_code(reason))
+    def _humanoid_incident_code_for_failure_reason(self, reason: str) -> str:
+        raw_reason = str(reason or "").strip()
+        profile = self._humanoid_incident_profile(raw_reason)
+        if profile is not None:
+            return str(getattr(profile, "code", "") or raw_reason).strip().upper()
+        return self._canonical_humanoid_incident_code(raw_reason)
 
     def _humanoid_incident_metadata_for_reason(self, reason: str) -> tuple[str, dict[str, Any]]:
         incident_code = self._humanoid_incident_code_for_failure_reason(reason)
@@ -1060,9 +1051,12 @@ class ManufacturingWorld:
     def _random_incident_triggers(self, code: str) -> set[str]:
         options = self._humanoid_incident_random_options(code)
         raw = options.get("trigger_primitives", [])
-        if not isinstance(raw, list):
+        if isinstance(raw, list) and raw:
+            return {str(value).strip().upper() for value in raw if str(value).strip()}
+        profile = self._humanoid_incident_profile(code)
+        if profile is None:
             return set()
-        return {str(value).strip().upper() for value in raw if str(value).strip()}
+        return {str(value).strip().upper() for value in getattr(profile, "trigger_primitives", []) if str(value).strip()}
 
     def _maybe_random_humanoid_step_incident(
         self,
@@ -1074,7 +1068,9 @@ class ManufacturingWorld:
         primitive = str(primitive_call_code or "").strip().upper()
         if not primitive:
             return False
-        for code in ("OBJECT_RECOGNITION_FAILED", "GRIP_FAILED", "UNKNOWN"):
+        for code in sorted(self.humanoid_incident_random_cfg.keys()):
+            if code == "ITEM_DROPPED":
+                continue
             if not self._humanoid_incident_enabled(code):
                 continue
             triggers = self._random_incident_triggers(code)
@@ -1160,6 +1156,11 @@ class ManufacturingWorld:
         notify_worker: bool = True,
     ) -> dict[str, Any]:
         profile = self._humanoid_incident_profile(code)
+        if profile is None:
+            raise RuntimeError(
+                f"ManSim attempted to emit undefined HumanoidSim incident code or alias: {code!r}. "
+                "Add the incident or alias to HumanoidSim data/incident_schema_core.json."
+            )
         canonical_code = str(getattr(profile, "code", "") or self._canonical_humanoid_incident_code(code))
         recovery_protocol = self._incident_recovery_payload(profile)
         retry_policy = getattr(getattr(profile, "retry_policy", None), "to_dict", lambda: {})()
@@ -1167,34 +1168,47 @@ class ManufacturingWorld:
         severity = str(getattr(profile, "severity", "warning") or "warning")
         description = str(getattr(profile, "description", "") or canonical_code)
         primitive = primitive_call_code or str((step or {}).get("call_code", "") or agent.current_primitive_call_code or "")
+        task_code = str(getattr(task, "task_code", "") or agent.current_task_code or "")
+        task_instance_id = str(getattr(task, "instance_id", "") or agent.current_task_instance_id or "")
+        step_id = str((step or {}).get("step_id", "") or agent.current_step_id or "")
         metadata = {
+            "primitive_call_code": primitive,
+            "context": dict(context or {}),
+        }
+        transition_event = self._build_humanoid_incident_transition_event(
+            canonical_code,
+            task_code=task_code,
+            task_instance_id=task_instance_id,
+            step_id=step_id,
+            primitive_call_code=primitive,
+            timestamp_s=round(float(self.env.now), 3),
+            message=description,
+            source=source,
+            metadata=metadata,
+        )
+        if transition_event is None:
+            raise RuntimeError(f"HumanoidSim could not build a transition event for incident {canonical_code!r}.")
+        self._apply_humanoid_transition_event(agent, transition_event)
+        transition_metadata = dict(getattr(transition_event, "metadata", {}) or {})
+        reason_obj = transition_event.reason_obj() if hasattr(transition_event, "reason_obj") else getattr(transition_event, "reason", None)
+        reason_metadata = dict(getattr(reason_obj, "metadata", {}) or {}) if reason_obj is not None else {}
+        details = {
+            **transition_metadata,
+            **reason_metadata,
+            "primitive_call_code": primitive,
+            "context": dict(context or {}),
+            **metadata,
+            "description": description,
+            "default_availability": str(getattr(getattr(profile, "default_availability", None), "value", getattr(profile, "default_availability", "")) or ""),
             "incident_code": canonical_code,
             "incident_category": category,
             "incident_severity": severity,
             "recovery_protocol": recovery_protocol,
             "retry_policy": retry_policy,
-            "primitive_call_code": primitive,
-            "context": dict(context or {}),
-        }
-        self._transition_humanoid_state(
-            agent,
-            self._incident_default_event_type(profile),
-            task=task,
-            step=step,
-            status="failed" if self._incident_default_event_type(profile) == "blocked" else "running",
-            reason=canonical_code,
-            reason_message=description,
-            source=source,
-            metadata=metadata,
-        )
-        details = {
-            **metadata,
-            "description": description,
-            "default_availability": str(getattr(getattr(profile, "default_availability", None), "value", getattr(profile, "default_availability", "")) or ""),
             "task_id": str(getattr(task, "task_id", "") or agent.current_task_id or ""),
-            "task_code": str(getattr(task, "task_code", "") or agent.current_task_code or ""),
-            "instance_id": str(getattr(task, "instance_id", "") or agent.current_task_instance_id or ""),
-            "step_id": str((step or {}).get("step_id", "") or agent.current_step_id or ""),
+            "task_code": task_code,
+            "instance_id": task_instance_id,
+            "step_id": step_id,
             "humanoid_state": self._humanoid_state_payload(agent),
             "cargo": self._worker_cargo_payload(agent),
         }
@@ -1671,6 +1685,25 @@ class ManufacturingWorld:
                 source=source,
                 metadata=metadata,
             )
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="WORKER_STATE_CHANGED",
+            entity_id=worker.worker_id,
+            location=self.worker_display_location(worker),
+            details={
+                "humanoid_state": self._humanoid_state_payload(worker),
+                "cargo": self._worker_cargo_payload(worker),
+                "motion": self._worker_motion_payload(worker),
+                "tile": self._tile_payload(worker.tile),
+                "battery_remaining_min": round(float(self.battery_remaining(worker)), 3),
+            },
+        )
+
+    def _apply_humanoid_transition_event(self, worker: Worker, transition_event: Any) -> None:
+        runtime = getattr(self, "humanoid_runtime", None)
+        if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "apply_transition_event"):
+            runtime.apply_transition_event(worker, transition_event)
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -4675,8 +4708,7 @@ class ManufacturingWorld:
             details=details,
         )
 
-    @staticmethod
-    def _availability_after_incomplete_task(status: str, reason: str) -> str:
+    def _availability_after_incomplete_task(self, status: str, reason: str) -> str:
         normalized_status = str(status or "").strip().lower()
         normalized_reason = str(reason or "").strip().lower()
         temporary_wait_reasons = {
@@ -4686,48 +4718,14 @@ class ManufacturingWorld:
             "resource_wait",
             "task_suspended",
         }
+        profile = self._humanoid_incident_profile(reason)
+        if profile is not None:
+            availability = getattr(profile, "default_availability", "BLOCKED")
+            availability_value = str(getattr(availability, "value", availability) or "BLOCKED").strip().upper()
+            return availability_value or "BLOCKED"
         if normalized_status in {"failed", "skipped"}:
             return "BLOCKED"
         if normalized_status == "interrupted" and normalized_reason not in temporary_wait_reasons:
-            return "BLOCKED"
-        if normalized_reason in {
-            "object_recognition_failed",
-            "pose_estimation_failed",
-            "label_or_marker_unreadable",
-            "target_not_found",
-            "grip_failed",
-            "lift_failed",
-            "item_dropped",
-            "item_slipped",
-            "placement_failed",
-            "payload_over_limit",
-            "resource_preempted",
-            "resource_missing",
-            "path_blocked",
-            "workspace_obstructed",
-            "surface_or_area_contaminated",
-            "near_miss",
-            "collision",
-            "navigation_drift",
-            "docking_failed",
-            "power_low_unexpected",
-            "sensor_degraded",
-            "tool_or_end_effector_fault",
-            "actuator_fault",
-            "command_timeout",
-            "map_or_context_stale",
-            "safety_stop",
-            "handover_failed",
-            "unknown",
-            "precondition_failed",
-            "stale_precondition",
-            "material_shelf_empty",
-            "material_shelf_slot_empty",
-            "material_shelf_pickup_unreachable",
-            "material_supply_owner_changed",
-            "material_carry_failed",
-            "material_supply_dropoff_unreachable",
-        }:
             return "BLOCKED"
         return "WAITING"
 

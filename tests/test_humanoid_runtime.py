@@ -470,6 +470,8 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         world.finish_agent_task(worker, task, start_t=10.0, status="skipped", reason="material_shelf_slot_empty")
 
         self.assertEqual("BLOCKED", worker.humanoid_state["availability"])
+        self.assertEqual("RESOURCE_PREEMPTED", worker.humanoid_state["reason"]["code"])
+        self.assertEqual("material_shelf_slot_empty", worker.humanoid_state["reason"]["metadata"]["original_reason_code"])
         task_end = next(event for event in events if event["event_type"] == "AGENT_TASK_END")
         self.assertEqual("material_shelf_slot_empty", task_end["details"]["reason"])
         self.assertEqual("skipped", world.task_records[-1]["status"])
