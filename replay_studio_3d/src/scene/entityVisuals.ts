@@ -8,6 +8,8 @@ export function humanoidStateValue(entity: BaseEntityState, key: string): string
 }
 
 export function taskCode(entity: BaseEntityState): string {
+  const recoveryTask = recoveryStepCode(entity, "task");
+  if (recoveryTask) return `${recoveryTask} (RECOVERY)`;
   const active = humanoidStateValue(entity, "availability") !== "AVAILABLE";
   const parent = entity.attributes.current_parent_task_code;
   if (active && typeof parent === "string" && parent.trim()) return parent.trim().toUpperCase();
@@ -20,6 +22,7 @@ export function taskCode(entity: BaseEntityState): string {
 }
 
 export function childTaskCode(entity: BaseEntityState): string {
+  if (activeRecoveryContext(entity)) return "";
   if (humanoidStateValue(entity, "availability") === "AVAILABLE") return "";
   const child = entity.attributes.current_child_task_code;
   if (typeof child === "string" && child.trim()) return child.trim().toUpperCase();
@@ -27,6 +30,8 @@ export function childTaskCode(entity: BaseEntityState): string {
 }
 
 export function primitiveCode(entity: BaseEntityState): string {
+  const recoveryPrimitive = recoveryStepCode(entity, "primitive");
+  if (recoveryPrimitive) return `${recoveryPrimitive} (RECOVERY)`;
   const context = taskContext(entity);
   const value = context.primitive_call_code;
   if (typeof value === "string" && value.trim()) return value.trim().toUpperCase();
@@ -40,6 +45,19 @@ export function taskContext(entity: BaseEntityState): Record<string, unknown> {
   if (!humanoidState || typeof humanoidState !== "object") return {};
   const context = (humanoidState as Record<string, unknown>).task_context;
   return context && typeof context === "object" ? (context as Record<string, unknown>) : {};
+}
+
+function activeRecoveryContext(entity: BaseEntityState): Record<string, unknown> | null {
+  const value = entity.attributes.current_recovery_context;
+  if (!value || typeof value !== "object") return null;
+  const context = value as Record<string, unknown>;
+  return context.active === true ? context : null;
+}
+
+function recoveryStepCode(entity: BaseEntityState, kind: "task" | "primitive"): string {
+  const context = activeRecoveryContext(entity);
+  if (!context || String(context.step_kind || "").toLowerCase() !== kind) return "";
+  return String(context.step_code || "").trim().toUpperCase();
 }
 
 export function cargoItemId(entity: BaseEntityState): string {

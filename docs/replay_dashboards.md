@@ -159,6 +159,28 @@ Multi-run 실행이면 parent output directory에 `series_dashboard.html`이 생
   --output-layout outputs\YYYY-MM-DD\HH-MM-SS\replay_studio_layout.json
 ```
 
+## Artifact Audit
+
+Replay Studio, KPI, Gantt를 함께 확인할 때는 run directory 단위 감사 스크립트를 사용합니다.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\audit_run_artifacts.py outputs\YYYY-MM-DD\HH-MM-SS
+```
+
+감사 스크립트는 다음 항목을 자동으로 확인합니다.
+
+- 필수 dashboard/replay/KPI artifact가 모두 생성됐는지
+- `kpi.json`에 humanoid state, incident, collaboration, traffic, warehouse shelf, scrap metric이 들어 있는지
+- Gantt가 Worker/Machine lane만 사용하고 worker status를 Availability State로만 표시하는지
+- Gantt hover가 핵심 정보만 담고 payload 전체를 노출하지 않는지
+- Replay log에서 worker state event가 `humanoid_state`를 보존하는지
+- `WAIT_INPUT` machine 위에 stale item overlay가 남지 않는지
+- traffic conflict가 같은 worker 자신과 연결되지 않는지
+- 3D Replay가 legacy `warehouse_buffer` alias 대신 canonical `completed_product_buffer`를 쓰는지
+
+화면에서 보이는 현상이 버그인지 애매할 때는 이 감사 결과를 먼저 봅니다. 감사가 통과하면 대부분은
+렌더링/표현 문제이고, 감사가 실패하면 exporter 또는 simulation event 쪽을 먼저 확인합니다.
+
 ## 개발 검증
 
 ```powershell

@@ -119,6 +119,20 @@ function hasActiveHumanoidTask(entity: BaseEntityState): boolean {
   return availability !== "AVAILABLE" && typeof taskCode === "string" && taskCode.trim().length > 0;
 }
 
+function activeRecoveryContext(entity: BaseEntityState): Record<string, unknown> | null {
+  const value = entity.attributes.current_recovery_context;
+  if (!value || typeof value !== "object") return null;
+  const context = value as Record<string, unknown>;
+  return context.active === true ? context : null;
+}
+
+function recoveryStepLabel(entity: BaseEntityState, kind: "task" | "primitive"): string {
+  const context = activeRecoveryContext(entity);
+  if (!context || String(context.step_kind || "").toLowerCase() !== kind) return "";
+  const code = String(context.step_code || "").trim();
+  return code ? `${code} (RECOVERY)` : "";
+}
+
 function itemType(entity: BaseEntityState): string {
   return typeof entity.attributes.item_type === "string" ? entity.attributes.item_type.trim() : "";
 }
@@ -173,6 +187,8 @@ function statusLabel(entity: BaseEntityState): string {
 }
 
 function workerTaskCode(entity: BaseEntityState): string {
+  const recoveryTask = recoveryStepLabel(entity, "task");
+  if (recoveryTask) return recoveryTask;
   const activeTask = hasActiveHumanoidTask(entity);
   if (activeTask && typeof entity.attributes.current_parent_task_code === "string" && entity.attributes.current_parent_task_code.trim()) {
     return entity.attributes.current_parent_task_code.trim();
@@ -186,6 +202,7 @@ function workerTaskCode(entity: BaseEntityState): string {
 }
 
 function workerChildTask(entity: BaseEntityState): string {
+  if (activeRecoveryContext(entity)) return "-";
   if (!hasActiveHumanoidTask(entity)) return "-";
   const childCode =
     typeof entity.attributes.current_child_task_code === "string" ? entity.attributes.current_child_task_code.trim() : "";
@@ -194,6 +211,8 @@ function workerChildTask(entity: BaseEntityState): string {
 }
 
 function workerPrimitive(entity: BaseEntityState): string {
+  const recoveryPrimitive = recoveryStepLabel(entity, "primitive");
+  if (recoveryPrimitive) return recoveryPrimitive;
   const primitive = humanoidTaskContext(entity).primitive_call_code;
   if (typeof primitive === "string" && primitive.trim()) return primitive.trim();
   if (hasActiveHumanoidTask(entity) && typeof entity.attributes.current_primitive_call_code === "string" && entity.attributes.current_primitive_call_code.trim()) {
@@ -351,6 +370,11 @@ function workerTrafficConflict(entity: BaseEntityState, currentTime: number): st
 
 function workerHumanoidIncident(entity: BaseEntityState): string {
   const incident = entity.attributes.last_humanoid_incident ?? entity.attributes.incident_bubble;
+  const recoveryContext = activeRecoveryContext(entity);
+  const recoveryIncidentCode =
+    recoveryContext && typeof recoveryContext.incident_code === "string" && recoveryContext.incident_code.trim()
+      ? recoveryContext.incident_code.trim()
+      : "";
   const reason = humanoidState(entity).reason;
   const reasonMetadata = reason && typeof reason === "object" ? (reason as Record<string, unknown>).metadata : undefined;
   const reasonIncidentCode =
@@ -358,10 +382,10 @@ function workerHumanoidIncident(entity: BaseEntityState): string {
       ? String((reasonMetadata as Record<string, unknown>).incident_code)
       : "";
   if (!incident || typeof incident !== "object") {
-    return reasonIncidentCode ? reasonIncidentCode : "-";
+    return recoveryIncidentCode || reasonIncidentCode || "-";
   }
   const row = incident as Record<string, unknown>;
-  const code = typeof row.code === "string" && row.code.trim() ? row.code.trim() : reasonIncidentCode;
+  const code = typeof row.code === "string" && row.code.trim() ? row.code.trim() : recoveryIncidentCode || reasonIncidentCode;
   return code || "-";
 }
 

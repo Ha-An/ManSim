@@ -92,8 +92,9 @@ Worker 이동은 tile map 기반입니다. `TileGridMap.find_path()`가 A* searc
 - `RESOURCE_PREEMPTED`, `TRAFFIC_WAIT`, `NEAR_MISS`, `COLLISION`은 ManSim의 resource race나 traffic model에서 자연 발생한 상황을 HumanoidSim incident code로 기록합니다.
 - `material_shelf_slot_empty` 같은 ManSim 내부 실패 reason은 ManSim에서 별도 taxonomy로 정의하지 않고, HumanoidSim의 incident alias를 통해 canonical incident code로 해석합니다.
 - Incident는 state가 아닙니다. 예를 들어 grip 실패나 item drop은 `availability=BLOCKED`가 되고, reason code가 `GRIP_FAILED` 또는 `ITEM_DROPPED`로 남습니다.
+- Recovery protocol이 진행 중일 때도 availability는 `BLOCKED`를 유지합니다. 현재 복구 step은 기존 Task 또는 Primitive 필드에 `CODE (RECOVERY)`로 표시되며, 정상 task 실행 상태인 `EXECUTING`과 구분합니다.
 - Replay Studio 말풍선은 incident code 전체를 쓰지 않고 Availability badge를 우선 표시합니다. 예: `BLK`, `WAIT`, `DIS`, `OFF`
-- Replay Studio worker panel에는 incident category/code를 표시합니다. Recovery protocol은 artifact metadata에는 남지만 worker panel에서는 표시하지 않습니다.
+- Replay Studio worker panel에는 incident category/code를 표시합니다. Recovery protocol 전체 목록은 별도 패널로 만들지 않고, 현재 실행 중인 recovery step만 기존 Task 또는 Primitive 칸에 `CODE (RECOVERY)`로 표시합니다.
 - KPI에는 `humanoid_incident_total`, `humanoid_incidents_by_code`, `humanoid_incidents_by_category`, `humanoid_incidents_by_worker`, `humanoid_incident_recovery_protocol_by_code`가 추가됩니다.
 
 HumanoidSim 기준 문서는 `C:\Github\HumanoidSim\docs\incident_reference.md`를 참고하세요.
@@ -146,6 +147,16 @@ Run artifact는 `outputs/` 아래에 생성됩니다. 주요 파일은 다음과
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
+Run artifact 감사:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\audit_run_artifacts.py outputs\YYYY-MM-DD\HH-MM-SS
+```
+
+이 감사 스크립트는 KPI 필수 필드, Gantt lane/status, Replay log/layout, stale machine overlay,
+self traffic conflict, worker state payload를 한 번에 점검합니다. Replay Studio에서 이상한 장면이 보이면
+먼저 이 스크립트로 core artifact와 UI artifact 중 어디가 어긋났는지 확인합니다.
+
 Replay Studio build:
 
 ```powershell
@@ -157,6 +168,7 @@ npm run build
 
 ```powershell
 cd replay_studio_3d
+npm run test
 npm run build
 ```
 

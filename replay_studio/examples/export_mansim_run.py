@@ -713,9 +713,12 @@ def convert_events(
                 attrs["state_reason_code"] = reason.get("code")
                 attrs["state_reason_message"] = reason.get("message")
                 reason_meta = reason.get("metadata") if isinstance(reason.get("metadata"), dict) else {}
-                if reason_meta.get("incident_code"):
+                recovery_context = details.get("recovery_context") if isinstance(details.get("recovery_context"), dict) else {}
+                recovery_incident_code = recovery_context.get("incident_code") if isinstance(recovery_context, dict) else None
+                incident_code = reason_meta.get("incident_code") or recovery_incident_code
+                if incident_code:
                     incident_payload = {
-                        "code": reason_meta.get("incident_code"),
+                        "code": incident_code,
                         "category": reason_meta.get("incident_category"),
                         "severity": reason_meta.get("incident_severity") or reason_meta.get("severity"),
                         "description": reason.get("message"),
@@ -775,6 +778,8 @@ def convert_events(
             attrs["current_step_id"] = details.get("step_id")
         if "primitive_call_code" in details and has_active_task_context:
             attrs["current_primitive_call_code"] = details.get("primitive_call_code")
+        if "recovery_context" in details:
+            attrs["current_recovery_context"] = details.get("recovery_context")
         if "task_id" in details and has_active_task_context:
             attrs["active_task"] = details.get("task_id")
         if ("task_id" in details or "current_task_id" in details) and has_active_task_context:
@@ -975,6 +980,8 @@ def convert_events(
                 "repair_remaining_min": details.get("repair_remaining_min", 0.0),
                 "input_item_id": details.get("input_item_id"),
                 "output_item_id": details.get("output_item_id"),
+                "wait_visual": "completed_output" if machine_state == "DONE_WAIT_UNLOAD" else None,
+                "wait_item_kind": machine_output_item_kind(entity_id) if machine_state == "DONE_WAIT_UNLOAD" else None,
             }
             push("state_changed", timestamp, {"primary": entity_id}, {"state": state, "attributes": attrs})
             continue
@@ -1477,8 +1484,8 @@ def convert_events(
                         "setup_outcome": outcome,
                         "process_window": None,
                         "machine_state": "WAIT_INPUT" if outcome == "missing_material" else "IDLE",
-                        "wait_visual": "prep_wait" if outcome == "missing_material" else None,
-                        "wait_item_kind": machine_prep_item_kind(entity_id) if outcome == "missing_material" else None,
+                        "wait_visual": None,
+                        "wait_item_kind": None,
                     },
                 },
             )

@@ -59,7 +59,7 @@ ManSim이 담당하는 것은 scenario fact입니다.
 
 이 사실들은 `HumanoidTaskRuntime.transition_state()`를 통해 HumanoidSim transition event로 전달됩니다. ManSim은 `availability`, `mobility`, `power`, `manipulation` 값을 직접 계산하거나 대입하지 않고, HumanoidSim이 반환한 `HumanoidStateSnapshot`을 event, minute snapshot, KPI, Replay Studio에 기록합니다.
 
-정상적으로 실행 중인 모든 primitive는 `availability=EXECUTING`입니다. Mobility와 Manipulation은 [HumanoidSim Primitive Reference](../../HumanoidSim/docs/primitives_reference.md)의 primitive별 state relation을 따릅니다.
+정상적으로 실행 중인 모든 primitive는 `availability=EXECUTING`입니다. Mobility와 Manipulation은 [HumanoidSim Primitive Reference](../../HumanoidSim/docs/primitives_reference.md)의 primitive별 state relation을 따릅니다. 단, incident recovery protocol 안에서 실행되는 task/primitive는 정상 작업이 아니라 blocked 상태의 복구 절차이므로 availability를 `BLOCKED`로 유지하고, 현재 step만 Task 또는 Primitive context에 `CODE (RECOVERY)`로 기록합니다.
 
 ## Time Model
 

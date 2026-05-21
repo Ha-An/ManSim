@@ -148,11 +148,16 @@ export function buildRenderModel(
 ): ReplayRenderModel {
   // The render model reads reconstructed replay state without inventing entities or positions.
   const entities = Object.values(domainState.entities);
+  // `warehouse_buffer` is still emitted as a compatibility alias in some
+  // artifacts. 3D rendering should keep the canonical completed-product buffer
+  // only, otherwise the alias appears as a stray object in Station 1.
+  const hasCanonicalCompletedBuffer = entities.some((entity) => entity.entity_id === "completed_product_buffer");
   const resolvedLayout = resolveLayout(entities, options.logLayout, options.externalLayout);
   const focusedEntityIds = getFocusedEntityIds(domainState, options.selectedEntityId);
 
   const nodes: RenderNode[] = entities
     .filter((entity) => {
+      if (entity.entity_id === "warehouse_buffer" && hasCanonicalCompletedBuffer) return false;
       if (typeof entity.attributes.item_state === "string") return false;
       if (options.visibleEntityTypes?.length && !options.visibleEntityTypes.includes(entity.entity_type)) return false;
       if (options.entityIdFilter && entity.entity_id !== options.entityIdFilter) return false;

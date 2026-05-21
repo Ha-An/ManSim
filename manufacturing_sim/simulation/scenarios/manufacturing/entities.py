@@ -130,6 +130,9 @@ class Worker:
     claimed_commitments: list[str] = field(default_factory=list)
     incident_backlog: list[dict[str, Any]] = field(default_factory=list)
     local_response_attempts: dict[str, int] = field(default_factory=dict)
+    pending_recovery_incident: Optional[dict[str, Any]] = None
+    last_recovery_completed_task_id: Optional[str] = None
+    last_recovery_completed_at: Optional[float] = None
 
     @property
     def agent_id(self) -> str:

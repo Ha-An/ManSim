@@ -46,8 +46,9 @@ Humanoid incident taxonomy는 `HumanoidSim`이 소유합니다. ManSim은 factor
 - Random incident: `OBJECT_RECOGNITION_FAILED`, `GRIP_FAILED`, `ITEM_DROPPED`, `UNKNOWN`
 - Natural incident: `RESOURCE_PREEMPTED`, `RESOURCE_MISSING`, `TRAFFIC_WAIT`, `NEAR_MISS`, `COLLISION`
 - Incident code는 uppercase canonical code를 사용합니다.
+- Recovery protocol이 진행 중인 worker는 availability를 `BLOCKED`로 유지합니다. 현재 recovery step은 Task 또는 Primitive 칸에 `CODE (RECOVERY)`로 표시합니다.
 - Replay Studio 말풍선은 incident code 전체가 아니라 Availability badge를 우선 표시합니다. 예: `BLK`, `WAIT`, `DIS`, `OFF`
-- Worker panel에는 incident category/code를 표시하고 recovery protocol은 표시하지 않습니다.
+- Worker panel에는 incident category/code를 표시합니다. Recovery protocol 전체 목록은 표시하지 않고, 현재 실행 중인 recovery step만 기존 Task 또는 Primitive 칸에 `CODE (RECOVERY)`로 표시합니다.
 - KPI는 code/category/worker별 incident count와 recovery protocol metadata를 집계합니다.
 
 HumanoidSim 쪽 기준 문서는 `C:\Github\HumanoidSim\docs\incident_reference.md`를 참고합니다.
@@ -83,6 +84,28 @@ Run directory:
 KPI dashboard의 Worker Collaboration 섹션은 product 공동 운반, handover, repair helper 합류, repair team size를 명시적 event 기준으로 집계합니다.
 
 Gantt worker status는 `HumanoidSim` Availability State를 그대로 사용합니다. `MOVING`, `WORKING`, `DISCHARGED` 같은 legacy bucket은 worker Gantt status로 쓰지 않습니다.
+
+## Artifact 감사 기준
+
+새 run을 검증할 때는 아래 명령을 기본 체크로 사용합니다.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\audit_run_artifacts.py outputs\YYYY-MM-DD\HH-MM-SS
+```
+
+감사 대상은 다음과 같습니다.
+
+- Results Hub, KPI, Gantt, Replay 2D/3D 입력 artifact 존재 여부
+- `kpi.json`의 humanoid state, incident, collaboration, traffic, shelf/scrap 필수 집계
+- `gantt_segments.csv`의 Worker/Machine lane 구분과 Availability State status
+- product/item lane이 Gantt에 잘못 올라오지 않는지
+- Replay worker event의 `humanoid_state` 보존 여부
+- machine `WAIT_INPUT` 상태에서 완료품/준비품 overlay가 stale하게 남지 않는지
+- traffic conflict가 같은 worker 자신과 매칭되지 않는지
+- `completed_product_buffer`가 canonical completed-product object로 export되는지
+
+이 스크립트는 UI를 열기 전 산출물 구조를 먼저 확인하기 위한 안전망입니다. 화면에서 이상한 장면이 보이면,
+동일 run directory에 대해 감사 스크립트를 먼저 실행한 뒤 core event 문제인지 Replay reducer/export 문제인지 나눠 봅니다.
 
 ## 해석 기준
 

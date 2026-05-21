@@ -113,6 +113,20 @@ function mergePayloadAttributes(entity: BaseEntityState, payload: Record<string,
   Object.assign(entity.attributes, raw as Record<string, unknown>);
 }
 
+function clearStaleMachineWaitAttributes(entity: BaseEntityState, rawAttributes: unknown): void {
+  if (!rawAttributes || typeof rawAttributes !== "object") return;
+  if (entity.entity_type !== "machine" && entity.entity_type !== "workstation") return;
+  const raw = rawAttributes as Record<string, unknown>;
+  const machineState = typeof raw.machine_state === "string" ? raw.machine_state.toUpperCase() : "";
+  if (!machineState) return;
+  // Machine item overlays mean "finished output waiting for unload" only.
+  // WAIT_INPUT must not draw a pseudo item on the machine, because that looks
+  // like a loaded or completed item in Replay Studio.
+  if (machineState === "DONE_WAIT_UNLOAD") return;
+  delete entity.attributes.wait_visual;
+  delete entity.attributes.wait_item_kind;
+}
+
 function clearHumanoidTaskAttributes(entity: BaseEntityState): void {
   delete entity.attributes.active_task;
   delete entity.attributes.active_target_id;
@@ -229,6 +243,7 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       if (rawAttributes && typeof rawAttributes === "object" && (rawAttributes as Record<string, unknown>).task_window === null) {
         delete entity.attributes.task_window;
       }
+      clearStaleMachineWaitAttributes(entity, rawAttributes);
       const humanoidState = rawAttributes && typeof rawAttributes === "object" ? (rawAttributes as Record<string, unknown>).humanoid_state : undefined;
       if (
         humanoidState &&

@@ -14,6 +14,17 @@ primitive_timing:
   default_min: 0.1
   by_call_code: {}
 
+# Incident recovery protocol timing.
+# HumanoidSim owns the recovery protocol itself; ManSim only controls how long
+# each recovery step remains visible in the simulation timeline.
+recovery_protocol:
+  enabled: true
+  unit: min
+  default_step_min: 0.1
+  minimum_step_min: 0.1
+  max_steps_per_incident: 8
+  by_code: {}
+
 profiles:
   A1:
     humanoid_id: A1

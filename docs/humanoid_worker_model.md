@@ -228,6 +228,8 @@ Incident taxonomy는 HumanoidSim이 소유합니다. ManSim은 scenario-specific
 
 Incident는 state enum이 아닙니다. Availability가 보통 `BLOCKED`, `WAITING`, `DISABLED` 중 하나로 바뀌고, 원인은 `humanoid_state.reason.code`에 기록됩니다. Recovery protocol은 HumanoidSim incident schema에 정의된 task 또는 primitive code만 참조합니다.
 
+ManSim은 incident가 발생하면 HumanoidSim에서 받은 recovery protocol step을 실제 `HUMANOID_TASK_*` 또는 `HUMANOID_STEP_*` timeline event로 실행합니다. Recovery protocol이 진행 중인 동안 worker availability는 `BLOCKED`를 유지합니다. 현재 recovery step은 `task_context`에 기록되며, Replay Studio에는 recovery 전용 새 panel을 만들지 않고 기존 Task 또는 Primitive 필드에 `CODE (RECOVERY)` 형식으로 표시합니다. 각 recovery step의 최소 관측 시간은 `configs/humanoidsim/default.yaml`의 `recovery_protocol` 섹션에서 조정합니다.
+
 ManSim 내부에서 관찰되는 세부 실패 reason은 HumanoidSim의 incident alias로 resolve합니다. 예를 들어 `material_shelf_slot_empty`은 ManSim이 새 incident로 정의하는 것이 아니라 HumanoidSim schema의 alias를 통해 `RESOURCE_PREEMPTED`로 기록됩니다.
 
 Replay Studio의 worker bubble은 incident code를 모두 보여주지 않고 availability 축을 짧게 표시합니다. 예: `BLK`, `WAIT`, `DIS`.
@@ -260,6 +262,18 @@ Replay Studio worker panel은 다음 값을 `humanoid_state`에서 읽습니다.
 
 Power 값은 상세 panel에서 숨겨져 있지만, snapshot과 artifact에는 남습니다.
 
+### Replay 표시 계약
+
+Replay Studio는 simulation artifact를 보정하지 않고 표시합니다. 그래서 아래 규칙을 명시적으로 지킵니다.
+
+- Worker 위치는 `entity_moved.payload.motion.path`와 `started_at/ended_at`을 기준으로 보간합니다.
+- Worker task bubble은 이동 중에는 숨기고, 정지해서 task를 수행하는 구간에만 표시합니다.
+- Worker progress bar는 primitive가 아니라 parent task의 `task_window` 기준으로 채웁니다.
+- Traffic conflict는 worker끼리 직선을 연결하지 않고 tile/edge overlay와 오른쪽 panel text로만 표시합니다.
+- Machine 위 item overlay는 `DONE_WAIT_UNLOAD`일 때만 finished output을 뜻합니다.
+- `WAIT_INPUT`은 machine이 input을 기다리는 상태이므로 machine 위에 material/intermediate/product 이미지를 그리지 않습니다.
+- `warehouse_buffer`는 내부 호환 alias로 남을 수 있지만, visible completed product target은 `completed_product_buffer`입니다.
+
 ## Debugging Checklist
 
 Replay Studio에서 이상한 표시가 보이면 먼저 core artifact를 확인합니다.
@@ -283,3 +297,4 @@ Replay Studio에서 이상한 표시가 보이면 먼저 core artifact를 확인
 | `movement.traffic.mode` | `configs/scenario/mfg_basic.yaml` | `strict_reservation` 등 traffic mode |
 | `humanoid_incidents` | `configs/scenario/mfg_basic.yaml` | random incident 발생 확률과 trigger primitive |
 | `primitive_timing.default_min` | `configs/humanoidsim/default.yaml` | primitive 최소 표시 시간 |
+| `recovery_protocol.default_step_min` | `configs/humanoidsim/default.yaml` | recovery step 최소 표시 시간 |

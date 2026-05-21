@@ -258,6 +258,276 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         self.assertTrue(result_holder["ok"])
         self.assertAlmostEqual(env.now, 0.1)
 
+    def test_pending_recovery_protocol_emits_task_and_primitive_timeline(self) -> None:
+        env = simpy.Environment()
+        events: list[dict] = []
+        worker = Worker(worker_id="A1")
+        world = SimpleNamespace(
+            env=env,
+            agents={"A1": worker},
+            logger=SimpleNamespace(log=lambda **payload: events.append(payload)),
+            battery_remaining=lambda _worker: 100.0,
+            day_for_time=lambda _t: 1,
+            agent_display_location=lambda agent: agent.location,
+            _task_priority_key=lambda task: task.priority_key,
+        )
+        runtime = HumanoidTaskRuntime(
+            world,
+            {
+                "humanoidsim": {
+                    "enabled": True,
+                    "recovery_protocol": {
+                        "enabled": True,
+                        "unit": "min",
+                        "default_step_min": 0.1,
+                        "minimum_step_min": 0.1,
+                    },
+                }
+            },
+        )
+        parent_task = Task(
+            task_id="TASK-1",
+            task_type="REPLENISH_MATERIAL",
+            priority_key="material_supply",
+            priority=1.0,
+            location="Warehouse",
+            task_code="REPLENISH_MATERIAL",
+            instance_id="TASK-1:REPLENISH_MATERIAL",
+            assigned_robot_id="A1",
+        )
+        runtime.transition_state(
+            worker,
+            "blocked",
+            task=parent_task,
+            status="failed",
+            reason_code="OBJECT_RECOGNITION_FAILED",
+            source="test.incident",
+        )
+        worker.pending_recovery_incident = {
+            "incident_code": "OBJECT_RECOGNITION_FAILED",
+            "recovery_protocol": [
+                {"kind": "primitive", "code": "LOCALIZE_OBJECT"},
+                {"kind": "task", "code": "IDENTIFY_ITEM"},
+            ],
+        }
+
+        env.process(runtime._execute_pending_recovery_protocol(worker, parent_task))
+        env.run()
+
+        self.assertAlmostEqual(env.now, 0.2)
+        self.assertIsNone(worker.pending_recovery_incident)
+        event_types = [event["event_type"] for event in events]
+        self.assertIn("HUMANOID_RECOVERY_START", event_types)
+        self.assertIn("HUMANOID_RECOVERY_END", event_types)
+
+        recovery_step_starts = [
+            event for event in events
+            if event["event_type"] == "HUMANOID_STEP_START"
+            and event["details"].get("recovery_context", {}).get("active") is True
+        ]
+        self.assertEqual(1, len(recovery_step_starts))
+        self.assertEqual("LOCALIZE_OBJECT", recovery_step_starts[0]["details"]["primitive_call_code"])
+        self.assertEqual("primitive", recovery_step_starts[0]["details"]["recovery_context"]["step_kind"])
+        self.assertEqual("BLOCKED", recovery_step_starts[0]["details"]["humanoid_state"]["availability"])
+
+        recovery_task_starts = [
+            event for event in events
+            if event["event_type"] == "HUMANOID_TASK_START"
+            and event["details"].get("recovery_context", {}).get("active") is True
+            and event["details"].get("task_code") == "IDENTIFY_ITEM"
+        ]
+        self.assertEqual(1, len(recovery_task_starts))
+        self.assertEqual("task", recovery_task_starts[0]["details"]["recovery_context"]["step_kind"])
+        self.assertEqual("BLOCKED", recovery_task_starts[0]["details"]["humanoid_state"]["availability"])
+        recovery_end = next(event for event in events if event["event_type"] == "HUMANOID_RECOVERY_END")
+        self.assertEqual("AVAILABLE", recovery_end["details"]["humanoid_state"]["availability"])
+
+    def test_interrupt_incident_still_executes_recovery_timeline(self) -> None:
+        env = simpy.Environment()
+        events: list[dict] = []
+        worker = Worker(worker_id="A1")
+
+        def interrupted_domain_action(agent: Worker, _task: Task):
+            agent.pending_recovery_incident = {
+                "incident_code": "ITEM_DROPPED",
+                "recovery_protocol": [{"kind": "primitive", "code": "LOCALIZE_OBJECT"}],
+            }
+            if False:
+                yield env.timeout(0)
+            raise simpy.Interrupt("ITEM_DROPPED")
+
+        world = SimpleNamespace(
+            env=env,
+            agents={"A1": worker},
+            logger=SimpleNamespace(log=lambda **payload: events.append(payload)),
+            battery_remaining=lambda _worker: 100.0,
+            day_for_time=lambda _t: 1,
+            agent_display_location=lambda agent: agent.location,
+            _task_priority_key=lambda task: task.priority_key,
+            _execute_task_domain_action=interrupted_domain_action,
+        )
+        runtime = HumanoidTaskRuntime(
+            world,
+            {
+                "humanoidsim": {
+                    "enabled": True,
+                    "recovery_protocol": {
+                        "enabled": True,
+                        "unit": "min",
+                        "default_step_min": 0.1,
+                        "minimum_step_min": 0.1,
+                    },
+                }
+            },
+        )
+        task = Task(
+            task_id="TASK-DROP",
+            task_type="TRANSFER",
+            priority_key="inter_station_transfer",
+            priority=1.0,
+            location="Warehouse",
+            task_code="TRANSFER",
+            instance_id="TASK-DROP:TRANSFER",
+            assigned_robot_id="A1",
+        )
+
+        interrupted: dict[str, str] = {}
+
+        def run_task():
+            try:
+                yield from runtime.execute(worker, task)
+            except simpy.Interrupt as intr:
+                interrupted["reason"] = str(intr.cause)
+
+        env.process(run_task())
+        env.run()
+
+        self.assertEqual("ITEM_DROPPED", interrupted["reason"])
+        self.assertAlmostEqual(env.now, 0.1)
+        self.assertIsNone(worker.pending_recovery_incident)
+        self.assertTrue(any(event["event_type"] == "HUMANOID_RECOVERY_START" for event in events))
+        self.assertTrue(
+            any(
+                event["event_type"] == "HUMANOID_STEP_START"
+                and event["details"].get("primitive_call_code") == "LOCALIZE_OBJECT"
+                and event["details"].get("recovery_context", {}).get("active") is True
+                for event in events
+            )
+        )
+
+    def test_domain_failure_reason_is_converted_to_recovery_timeline(self) -> None:
+        env = simpy.Environment()
+        events: list[dict] = []
+        worker = Worker(worker_id="A3")
+
+        def failing_domain_action(_agent: Worker, task: Task):
+            task.payload["failure_reason"] = "precondition_failed"
+            if False:
+                yield env.timeout(0)
+            return False
+
+        def emit_incident(agent: Worker, code: str, **_kwargs):
+            self.assertEqual("precondition_failed", code)
+            agent.pending_recovery_incident = {
+                "incident_code": "RESOURCE_MISSING",
+                "recovery_protocol": [{"kind": "primitive", "code": "CHECK_REQUEST"}],
+            }
+            return {}
+
+        world = SimpleNamespace(
+            env=env,
+            agents={"A3": worker},
+            logger=SimpleNamespace(log=lambda **payload: events.append(payload)),
+            battery_remaining=lambda _worker: 100.0,
+            day_for_time=lambda _t: 1,
+            agent_display_location=lambda agent: agent.location,
+            _task_priority_key=lambda task: task.priority_key,
+            _execute_task_domain_action=failing_domain_action,
+            _emit_humanoid_incident=emit_incident,
+        )
+        runtime = HumanoidTaskRuntime(
+            world,
+            {
+                "humanoidsim": {
+                    "enabled": True,
+                    "recovery_protocol": {
+                        "enabled": True,
+                        "unit": "min",
+                        "default_step_min": 0.1,
+                        "minimum_step_min": 0.1,
+                    },
+                }
+            },
+        )
+        task = Task(
+            task_id="TASK-MISSING",
+            task_type="SETUP_MACHINE",
+            priority_key="setup_machine",
+            priority=1.0,
+            location="Station1",
+            task_code="SETUP_MACHINE",
+            instance_id="TASK-MISSING:SETUP_MACHINE",
+            assigned_robot_id="A3",
+        )
+
+        result: dict[str, bool] = {}
+
+        def run_task():
+            result["ok"] = yield from runtime.execute(worker, task)
+
+        env.process(run_task())
+        env.run()
+
+        self.assertFalse(result["ok"])
+        self.assertIsNone(worker.pending_recovery_incident)
+        self.assertTrue(any(event["event_type"] == "HUMANOID_RECOVERY_START" for event in events))
+        self.assertTrue(
+            any(
+                event["event_type"] == "HUMANOID_STEP_START"
+                and event["details"].get("primitive_call_code") == "CHECK_REQUEST"
+                and event["details"].get("recovery_context", {}).get("incident_code") == "RESOURCE_MISSING"
+                and event["details"].get("humanoid_state", {}).get("availability") == "BLOCKED"
+                for event in events
+            )
+        )
+
+    def test_log_only_incident_keeps_worker_availability_unchanged(self) -> None:
+        env = simpy.Environment()
+        events: list[dict] = []
+        worker = Worker(worker_id="A1")
+        worker.humanoid_state["availability"] = "EXECUTING"
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.env = env
+        world.agents = {"A1": worker}
+        world.logger = SimpleNamespace(log=lambda **payload: events.append(payload))
+        world.incident_counter = itertools.count(1)
+        world.incident_events = []
+        world.humanoid_incident_events = []
+        world.humanoid_incidents_enabled = True
+        world.humanoid_incident_schema = None
+        world.product_transport_session_by_worker = {}
+        world.product_transport_sessions = {}
+        world.humanoid_runtime = SimpleNamespace(
+            enabled=True,
+            apply_transition_event=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("state should not be applied")),
+        )
+        world.day_for_time = lambda _t: 1
+
+        details = world._emit_humanoid_incident(
+            worker,
+            "NEAR_MISS",
+            primitive_call_code="NAVIGATE_TO",
+            source="test.traffic",
+            context={"traffic_mode": "strict_reservation", "collision_effect": "log_only"},
+            notify_worker=False,
+            apply_state=False,
+        )
+
+        self.assertEqual("EXECUTING", worker.humanoid_state["availability"])
+        self.assertEqual("EXECUTING", details["humanoid_state"]["availability"])
+        self.assertEqual("NEAR_MISS", details["humanoid_state"]["reason"]["code"])
+        self.assertIsNone(worker.pending_recovery_incident)
+
     def test_product_transport_multiplier_divides_after_helper_join(self) -> None:
         world = ManufacturingWorld.__new__(ManufacturingWorld)
         world.item_transport_weight_multiplier = {

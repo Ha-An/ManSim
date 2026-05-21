@@ -52,6 +52,7 @@ SUPPORTED_PRIMITIVE_CALLS: set[str] = {
     "CHECK_SAFETY_ZONE",
     "CLASSIFY_RESULT",
     "ANNOUNCE_INTENT",
+    "ALIGN",
     "CONFIRM_OPERATOR_STATE",
     "CREATE_OR_UPDATE_RECORD",
     "EXECUTE_HUMAN_COLLABORATION_ACTION",
@@ -108,6 +109,24 @@ class HumanoidTaskRuntime:
             str(call_code): self._duration_to_minutes(value)
             for call_code, value in by_call_code.items()
         }
+        recovery_cfg = humanoidsim_cfg.get("recovery_protocol", {}) if isinstance(humanoidsim_cfg.get("recovery_protocol", {}), dict) else {}
+        self.recovery_protocol_enabled = bool(recovery_cfg.get("enabled", True))
+        self.recovery_timing_unit = str(recovery_cfg.get("unit", self.primitive_timing_unit)).strip().lower() or self.primitive_timing_unit
+        self.default_recovery_step_duration = self._duration_to_minutes_with_unit(
+            recovery_cfg.get("default_step_min", self.default_primitive_min_duration),
+            self.recovery_timing_unit,
+        )
+        self.minimum_recovery_step_duration = self._duration_to_minutes_with_unit(
+            recovery_cfg.get("minimum_step_min", self.default_recovery_step_duration),
+            self.recovery_timing_unit,
+        )
+        by_recovery_code = recovery_cfg.get("by_code", {}) if isinstance(recovery_cfg.get("by_code", {}), dict) else {}
+        self.recovery_duration_by_code = {
+            str(code).strip().upper(): self._duration_to_minutes_with_unit(value, self.recovery_timing_unit)
+            for code, value in by_recovery_code.items()
+            if str(code).strip()
+        }
+        self.max_recovery_steps_per_incident = max(1, int(recovery_cfg.get("max_steps_per_incident", 8) or 8))
         if not self.enabled:
             return
         self._load_humanoidsim(humanoidsim_cfg)
@@ -117,11 +136,15 @@ class HumanoidTaskRuntime:
         return set(SUPPORTED_PRIMITIVE_CALLS)
 
     def _duration_to_minutes(self, value: Any) -> float:
+        return self._duration_to_minutes_with_unit(value, self.primitive_timing_unit)
+
+    @staticmethod
+    def _duration_to_minutes_with_unit(value: Any, unit: str) -> float:
         try:
             duration = float(value or 0.0)
         except (TypeError, ValueError):
             return 0.0
-        if self.primitive_timing_unit in {"s", "sec", "secs", "second", "seconds"}:
+        if str(unit).strip().lower() in {"s", "sec", "secs", "second", "seconds"}:
             duration /= 60.0
         return max(0.0, duration)
 
@@ -130,6 +153,10 @@ class HumanoidTaskRuntime:
             0.0,
             float(self.primitive_min_duration_by_call_code.get(str(call_code), self.default_primitive_min_duration) or 0.0),
         )
+
+    def _recovery_step_duration(self, code: str) -> float:
+        configured = float(self.recovery_duration_by_code.get(str(code).strip().upper(), self.default_recovery_step_duration) or 0.0)
+        return max(float(self.minimum_recovery_step_duration or 0.0), configured)
 
     def _load_humanoidsim(self, humanoidsim_cfg: dict[str, Any]) -> None:
         try:
@@ -276,10 +303,46 @@ class HumanoidTaskRuntime:
         self.transition_state(worker, "disabled", reason_code=reason, source="mansim.discharge")
 
     def set_task_lifecycle_state(self, worker: Worker, task: Task, *, event_type: str, status: str = "") -> None:
+        recovery_context = self._recovery_context(task)
+        if recovery_context is not None:
+            incident_code = str(recovery_context.get("incident_code", "RECOVERY") or "RECOVERY").strip().upper()
+            step_code = str(recovery_context.get("step_code", "") or "").strip().upper()
+            if event_type == "HUMANOID_TASK_START":
+                self.transition_state(
+                    worker,
+                    "blocked",
+                    task=task,
+                    status=status or "running",
+                    reason_code=incident_code,
+                    reason_message=f"Recovery step is running: {step_code}" if step_code else "Recovery step is running.",
+                    source="mansim.recovery",
+                    metadata={
+                        "incident_code": incident_code,
+                        "recovery_context": dict(recovery_context),
+                    },
+                )
+                return
+            if event_type == "HUMANOID_TASK_END":
+                self.transition_state(
+                    worker,
+                    "blocked",
+                    task=task,
+                    status=status or "completed",
+                    reason_code=incident_code,
+                    reason_message=f"Recovery step completed: {step_code}" if step_code else "Recovery step completed.",
+                    source="mansim.recovery",
+                    metadata={
+                        "incident_code": incident_code,
+                        "recovery_context": dict(recovery_context),
+                    },
+                )
+                return
         if event_type == "HUMANOID_TASK_START":
             self.transition_state(worker, "task_started", task=task, status=status or "running", source="mansim.humanoid_task")
             return
         if event_type == "HUMANOID_TASK_END":
+            if str(status).strip().lower() in {"failed", "skipped", "interrupted"} and self._task_recovered_before_incomplete_end(worker, task):
+                return
             current_availability = str((worker.humanoid_state or {}).get("availability", "")).strip().upper()
             if str(status).strip().lower() == "interrupted" and current_availability in {"BLOCKED", "DISABLED"}:
                 return
@@ -311,6 +374,24 @@ class HumanoidTaskRuntime:
             status=status,
             source="mansim.humanoid_step",
         )
+
+    @staticmethod
+    def _recovery_context(task: Task) -> dict[str, Any] | None:
+        context = (task.humanoid or {}).get("recovery_context")
+        return dict(context) if isinstance(context, dict) else None
+
+    @staticmethod
+    def _task_recovered_before_incomplete_end(worker: Worker, task: Task) -> bool:
+        recovered_attr = str(getattr(worker, "last_recovery_completed_task_id", "") or "").strip()
+        if recovered_attr and recovered_attr == str(task.task_id or "").strip():
+            return True
+        state = worker.humanoid_state if isinstance(worker.humanoid_state, dict) else {}
+        metadata = state.get("metadata")
+        if not isinstance(metadata, dict) or str(metadata.get("source", "")).strip() != "mansim.recovery_end":
+            return False
+        task_id = str(task.task_id or "").strip()
+        recovered_task_id = str(metadata.get("task_id", "") or "").strip()
+        return bool(task_id and task_id == recovered_task_id)
 
     def _normalize_state_payload(self, worker: Worker, payload: dict[str, Any]) -> dict[str, Any]:
         normalized = copy.deepcopy(payload)
@@ -592,6 +673,8 @@ class HumanoidTaskRuntime:
             if not steps:
                 success = bool((yield from self.world._execute_task_domain_action(agent, task)))
                 executed_domain_action = True
+                if not success:
+                    yield from self._execute_recovery_after_failure(agent, task)
             for step in steps:
                 path = str(step.get("path", step.get("step_id", "")) or "")
                 if self._path_is_skipped(path, skipped_prefixes):
@@ -622,6 +705,7 @@ class HumanoidTaskRuntime:
                         )
                         skipped_prefixes.add(path)
                         if not step_ok:
+                            yield from self._execute_recovery_after_failure(agent, task, step)
                             success = False
                             break
                     continue
@@ -640,6 +724,7 @@ class HumanoidTaskRuntime:
                 self._log_step_event("HUMANOID_STEP_END", agent, context_task, step, status="completed" if step_ok else "failed", parent_task=task)
                 active_step = None
                 if not step_ok:
+                    yield from self._execute_recovery_after_failure(agent, task, step)
                     success = False
                     break
             while active_children:
@@ -647,19 +732,24 @@ class HumanoidTaskRuntime:
                 self._log_child_task_event("HUMANOID_TASK_END", agent, task, child_task, {}, status="completed" if success else "failed")
             if success and not executed_domain_action:
                 success = bool((yield from self.world._execute_task_domain_action(agent, task)))
+                if not success:
+                    yield from self._execute_recovery_after_failure(agent, task)
             end_status = "completed" if success else "failed"
             return bool(success)
         except simpy.Interrupt as intr:
             if active_step is not None:
+                interrupted_step = self._interrupted_step_for_agent(agent, active_step)
                 self._log_step_event(
                     "HUMANOID_STEP_END",
                     agent,
                     task,
-                    active_step,
+                    interrupted_step,
                     status="interrupted",
                     error=str(intr.cause or "interrupted"),
                 )
                 active_step = None
+            if getattr(agent, "pending_recovery_incident", None) is not None:
+                yield from self._execute_pending_recovery_protocol(agent, task)
             self._log_task_event("HUMANOID_TASK_END", agent, task, status="interrupted")
             end_logged = True
             raise
@@ -707,6 +797,234 @@ class HumanoidTaskRuntime:
             yield self.world.env.timeout(remaining)
         return bool(result)
 
+    @staticmethod
+    def _interrupted_step_for_agent(agent: Worker, active_step: dict[str, Any]) -> dict[str, Any]:
+        """Use the current domain-internal primitive when an interrupt happens mid-action."""
+        step = dict(active_step)
+        current_primitive = str(agent.current_primitive_call_code or "").strip()
+        active_primitive = str(step.get("call_code", "") or "").strip()
+        mobility = str((agent.humanoid_state or {}).get("mobility", "")).strip().upper()
+        if mobility == "NAVIGATING" and active_primitive != "NAVIGATE_TO":
+            current_primitive = "NAVIGATE_TO"
+        elif mobility == "DOCKING" and active_primitive != "ALIGN":
+            current_primitive = "ALIGN"
+        if current_primitive and current_primitive != active_primitive:
+            step["call_code"] = current_primitive
+            if agent.current_step_id:
+                step["step_id"] = str(agent.current_step_id)
+        return step
+
+    def _ensure_pending_recovery_incident_for_failure(
+        self,
+        agent: Worker,
+        task: Task,
+        step: dict[str, Any] | None = None,
+    ) -> bool:
+        """Convert a failed domain action reason into a HumanoidSim incident.
+
+        Some domain helpers return ``False`` with ``task.payload["failure_reason"]``
+        instead of emitting ``HUMANOID_INCIDENT`` directly. Recovery must still use
+        the HumanoidSim incident taxonomy, so synthesize the canonical incident here
+        before the pending recovery runner is invoked.
+        """
+        if isinstance(getattr(agent, "pending_recovery_incident", None), dict):
+            return True
+        emit_incident = getattr(self.world, "_emit_humanoid_incident", None)
+        if not callable(emit_incident):
+            return False
+        failure_reason = str((task.payload or {}).get("failure_reason", "") or "").strip()
+        if not failure_reason:
+            failure_reason = "precondition_failed"
+        primitive = str((step or {}).get("call_code", "") or agent.current_primitive_call_code or "").strip().upper()
+        context = {
+            "failure_reason": failure_reason,
+            "task_id": task.task_id,
+            "task_code": task.task_code or task.task_type,
+        }
+        try:
+            emit_incident(
+                agent,
+                failure_reason,
+                task=task,
+                step=step,
+                primitive_call_code=primitive,
+                source="mansim.task_failure",
+                context=context,
+                notify_worker=True,
+            )
+        except RuntimeError:
+            emit_incident(
+                agent,
+                "UNKNOWN",
+                task=task,
+                step=step,
+                primitive_call_code=primitive,
+                source="mansim.task_failure",
+                context=context,
+                notify_worker=True,
+            )
+        return isinstance(getattr(agent, "pending_recovery_incident", None), dict)
+
+    def _execute_recovery_after_failure(self, agent: Worker, task: Task, step: dict[str, Any] | None = None):
+        self._ensure_pending_recovery_incident_for_failure(agent, task, step)
+        result = yield from self._execute_pending_recovery_protocol(agent, task)
+        return result
+
+    def _execute_pending_recovery_protocol(self, agent: Worker, parent_task: Task):
+        if not self.recovery_protocol_enabled:
+            agent.pending_recovery_incident = None
+            return False
+        incident = agent.pending_recovery_incident if isinstance(agent.pending_recovery_incident, dict) else None
+        if not incident:
+            return False
+        agent.pending_recovery_incident = None
+        protocol = incident.get("recovery_protocol", [])
+        if not isinstance(protocol, list) or not protocol:
+            return False
+
+        steps = [dict(step) for step in protocol if isinstance(step, dict) and str(step.get("code", "")).strip()]
+        if not steps:
+            return False
+        steps = steps[: self.max_recovery_steps_per_incident]
+        incident_code = str(incident.get("incident_code", "UNKNOWN") or "UNKNOWN").strip().upper()
+        recovery_id = f"{parent_task.instance_id or parent_task.task_id}:recovery:{incident_code}:{int(float(self.world.env.now) * 1000):08d}"
+        self.transition_state(
+            agent,
+            "blocked",
+            task=parent_task,
+            status="failed",
+            reason_code=incident_code,
+            source="mansim.recovery_start",
+            metadata={"incident_code": incident_code, "recovery_id": recovery_id},
+        )
+        self.world.logger.log(
+            t=self.world.env.now,
+            day=self.world.day_for_time(self.world.env.now),
+            event_type="HUMANOID_RECOVERY_START",
+            entity_id=agent.agent_id,
+            location=self.world.agent_display_location(agent),
+            details={
+                "recovery_id": recovery_id,
+                "incident_code": incident_code,
+                "parent_task_id": parent_task.task_id,
+                "parent_task_code": parent_task.task_code,
+                "recovery_protocol": copy.deepcopy(steps),
+                "humanoid_state": self.state_payload(agent),
+            },
+        )
+        try:
+            for index, step in enumerate(steps, start=1):
+                kind = str(step.get("kind", "") or "").strip().lower()
+                code = str(step.get("code", "") or "").strip().upper()
+                if not code:
+                    continue
+                recovery_context = {
+                    "active": True,
+                    "recovery_id": recovery_id,
+                    "incident_code": incident_code,
+                    "step_index": index,
+                    "step_count": len(steps),
+                    "step_kind": kind,
+                    "step_code": code,
+                    "optional": bool(step.get("optional", False)),
+                }
+                if kind == "primitive":
+                    yield from self._execute_recovery_primitive_step(agent, parent_task, step, recovery_context)
+                elif kind == "task":
+                    yield from self._execute_recovery_task_step(agent, parent_task, step, recovery_context)
+        finally:
+            if not agent.discharged:
+                self.transition_state(
+                    agent,
+                    "task_completed",
+                    task=parent_task,
+                    status="completed",
+                    reason_code="recovery_completed",
+                    source="mansim.recovery_end",
+                    metadata={"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))},
+                )
+                agent.last_recovery_completed_task_id = str(parent_task.task_id or "")
+                agent.last_recovery_completed_at = float(self.world.env.now)
+            self.world.logger.log(
+                t=self.world.env.now,
+                day=self.world.day_for_time(self.world.env.now),
+                event_type="HUMANOID_RECOVERY_END",
+                entity_id=agent.agent_id,
+                location=self.world.agent_display_location(agent),
+                details={
+                    "recovery_id": recovery_id,
+                    "incident_code": incident_code,
+                    "parent_task_id": parent_task.task_id,
+                    "parent_task_code": parent_task.task_code,
+                    "humanoid_state": self.state_payload(agent),
+                },
+            )
+        return True
+
+    def _execute_recovery_task_step(self, agent: Worker, parent_task: Task, step: dict[str, Any], recovery_context: dict[str, Any]):
+        code = str(step.get("code", "") or "").strip().upper()
+        recovery_task = self._recovery_task_from_step(parent_task, code, recovery_context)
+        self._log_task_event("HUMANOID_TASK_START", agent, recovery_task, status="running")
+        yield self.world.env.timeout(self._recovery_step_duration(code))
+        inactive_context = dict(recovery_context)
+        inactive_context["active"] = False
+        recovery_task.humanoid["recovery_context"] = inactive_context
+        self._log_task_event("HUMANOID_TASK_END", agent, recovery_task, status="completed")
+
+    def _execute_recovery_primitive_step(self, agent: Worker, parent_task: Task, step: dict[str, Any], recovery_context: dict[str, Any]):
+        code = str(step.get("code", "") or "").strip().upper()
+        recovery_task = self._recovery_task_from_step(parent_task, parent_task.task_code or parent_task.task_type, recovery_context)
+        step_row = {
+            "path": f"recovery/{recovery_context['incident_code']}/{recovery_context['step_index']:02d}_{code.lower()}",
+            "depth": 1,
+            "parent_task_code": str(parent_task.task_code or parent_task.task_type or ""),
+            "step_id": f"recovery_{recovery_context['step_index']:02d}_{code.lower()}",
+            "call_code": code,
+            "call_level": "PRIMITIVE_SKILL",
+            "args": {},
+            "depends_on": [],
+            "optional": bool(step.get("optional", False)),
+        }
+        previous_step_id = agent.current_step_id
+        previous_primitive = agent.current_primitive_call_code
+        self._log_task_event("HUMANOID_TASK_START", agent, recovery_task, status="running")
+        agent.current_step_id = str(step_row["step_id"])
+        agent.current_primitive_call_code = code
+        self._log_step_event("HUMANOID_STEP_START", agent, recovery_task, step_row, status="running", parent_task=parent_task)
+        yield self.world.env.timeout(self._recovery_step_duration(code))
+        inactive_context = dict(recovery_context)
+        inactive_context["active"] = False
+        recovery_task.humanoid["recovery_context"] = inactive_context
+        self._log_step_event("HUMANOID_STEP_END", agent, recovery_task, step_row, status="completed", parent_task=parent_task)
+        self._log_task_event("HUMANOID_TASK_END", agent, recovery_task, status="completed")
+        agent.current_step_id = previous_step_id
+        agent.current_primitive_call_code = previous_primitive
+
+    def _recovery_task_from_step(self, parent_task: Task, task_code: str, recovery_context: dict[str, Any]) -> Task:
+        code = str(task_code or "RECOVERY").strip().upper()
+        recovery_id = str(recovery_context.get("recovery_id", "recovery"))
+        step_index = int(recovery_context.get("step_index", 0) or 0)
+        return Task(
+            task_id=f"{parent_task.task_id}:{recovery_id}:step{step_index:02d}:{code}",
+            task_type=code,
+            priority_key=parent_task.priority_key,
+            priority=parent_task.priority,
+            location=parent_task.location,
+            payload=dict(parent_task.payload),
+            selection_meta=dict(parent_task.selection_meta),
+            task_code=code,
+            instance_id=f"{parent_task.instance_id or parent_task.task_id}/{recovery_id}/step{step_index:02d}:{code}",
+            assigned_robot_id=parent_task.assigned_robot_id or "",
+            args={},
+            task_spec_name=f"{code} (RECOVERY)",
+            step_plan=[],
+            humanoid={
+                "recovery_context": dict(recovery_context),
+                "parent_task_code": parent_task.task_code,
+                "parent_instance_id": parent_task.instance_id,
+            },
+        )
+
     def _is_domain_action_step(self, task: Task, call_code: str) -> bool:
         return str(call_code) in DOMAIN_ACTION_CALLS.get(str(task.task_code), set())
 
@@ -735,6 +1053,8 @@ class HumanoidTaskRuntime:
         error: str = "",
         parent_task: Task | None = None,
     ) -> None:
+        if event_type == "HUMANOID_STEP_END" and str(status).strip().lower() == "interrupted":
+            step = self._interrupted_step_for_agent(agent, step)
         if str(step.get("call_level", "PRIMITIVE_SKILL") or "PRIMITIVE_SKILL") == "PRIMITIVE_SKILL":
             self.set_step_state(agent, task, step, event_type=event_type, status=status)
         details = self._task_event_details(agent, task, status=status)
@@ -811,7 +1131,7 @@ class HumanoidTaskRuntime:
             self.set_task_lifecycle_state(agent, parent_task, event_type="HUMANOID_TASK_START", status="running")
 
     def _task_event_details(self, agent: Worker, task: Task, *, status: str) -> dict[str, Any]:
-        return {
+        details = {
             "task_id": task.task_id,
             "task_type": task.task_type,
             "priority_key": self.world._task_priority_key(task),
@@ -830,6 +1150,10 @@ class HumanoidTaskRuntime:
             "animation_frames": list((task.humanoid or {}).get("animation_frames", [])),
             "humanoid_state": self.state_payload(agent),
         }
+        recovery_context = (task.humanoid or {}).get("recovery_context")
+        if isinstance(recovery_context, dict):
+            details["recovery_context"] = dict(recovery_context)
+        return details
 
     def _log_rejected(self, agent: Worker, task: Task, task_code: str, issues: list[dict[str, Any]]) -> None:
         self.world.logger.log(

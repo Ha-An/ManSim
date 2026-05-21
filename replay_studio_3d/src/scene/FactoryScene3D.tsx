@@ -159,6 +159,68 @@ function Label({ text, position }: { text: string; position: WorldPoint }) {
   );
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function workerBatteryProgress(entity: RenderNode["entity"]): number | undefined {
+  const batteryPct = Number(entity.attributes.battery_pct);
+  if (!Number.isFinite(batteryPct)) return undefined;
+  return clamp(batteryPct / 100, 0, 1);
+}
+
+function taskBubbleText(entity: RenderNode["entity"]): string {
+  const availability = humanoidStateValue(entity, "availability");
+  if (availability === "BLOCKED") return "BLK";
+  if (availability === "WAITING") return "WAIT";
+  if (availability === "DISABLED") return "DIS";
+  const task = taskCode(entity);
+  if (!task) return "";
+  if (task === "REPLENISH_MATERIAL") return "MAT";
+  if (task === "TRANSFER") return "MOVE";
+  if (task === "SETUP_MACHINE") return "SET";
+  if (task === "LOAD_MACHINE") return "LOAD";
+  if (task === "UNLOAD_MACHINE") return "UNLD";
+  if (task === "INSPECT_PRODUCT") return "INSP";
+  if (task === "REPAIR_MACHINE") return "FIX";
+  if (task === "PREVENTIVE_MAINTENANCE") return "PM";
+  if (task === "HANDOVER_ITEM") return "HAND";
+  if (task === "COLLECT_WASTE_OR_SCRAP") return "SCRP";
+  return task.replace(/_/g, "").slice(0, 4);
+}
+
+function WorkerBatteryHud({ entity }: { entity: RenderNode["entity"] }) {
+  const battery = workerBatteryProgress(entity);
+  return (
+    <Html position={[0.72, 1.1, 0]} center transform={false} className="worker-world-battery-hud">
+      <div className="worker-world-battery" aria-label="Battery">
+        <span style={{ height: `${Math.round((battery ?? 0) * 100)}%` }} />
+      </div>
+    </Html>
+  );
+}
+
+function WorkerHud({ entity, currentTime, moving }: { entity: RenderNode["entity"]; currentTime: number; moving: boolean }) {
+  const progress = taskWindowProgress(entity, currentTime);
+  const bubble = taskBubbleText(entity);
+  const showTaskHud = !moving && Boolean(bubble) && humanoidStateValue(entity, "availability") !== "AVAILABLE";
+  if (!showTaskHud) return null;
+  return (
+    <Html position={[0, 2.72, 0]} center transform={false} className="worker-world-hud">
+      <div className="worker-world-hud-inner">
+        <div className="worker-world-task">
+          <div className="worker-world-bubble">{bubble}</div>
+          {progress !== undefined && (
+            <div className="worker-world-progress">
+              <span style={{ width: `${Math.round(progress * 100)}%` }} />
+            </div>
+          )}
+        </div>
+      </div>
+    </Html>
+  );
+}
+
 function SelectionRing({ selected, width, depth }: { selected: boolean; width: number; depth: number }) {
   if (!selected) return null;
   return <Block position={[0, 0.08, 0]} size={[width + 0.35, 0.06, depth + 0.35]} color="#22d3ee" opacity={0.24} />;
@@ -193,9 +255,6 @@ function WorkerModel({
   }, [currentTime, motion, moving, path]);
   const color = workerColor(entity);
   const cargoId = cargoItemId(entity);
-  const progress = taskWindowProgress(entity, currentTime);
-  const mobility = humanoidStateValue(entity, "mobility");
-
   return (
     <group position={[position.x, 0, position.z]} rotation={[0, rotationY, 0]} onClick={(event) => stopSelect(event, entity.entity_id, onSelect)}>
       <SelectionRing selected={selected} width={1.4} depth={1.4} />
@@ -208,13 +267,30 @@ function WorkerModel({
       <Block position={[0.5, 1.08, 0.04]} size={[0.18, 0.72, 0.18]} color="#8ea6c0" />
       {cargoId && <Block position={[0.76, 1.02, 0.22]} size={[0.35, 0.35, 0.35]} color="#ffd166" />}
       <Label text={entity.label || entity.entity_id} position={{ x: 0, y: 2.35, z: 0 }} />
-      {!moving && mobility !== "NAVIGATING" && progress !== undefined && (
-        <group position={[0, 2.13, 0]}>
-          <Block position={[0, 0, 0]} size={[1.05, 0.08, 0.08]} color="#203047" />
-          <Block position={[-0.525 + 0.525 * progress, 0.03, 0]} size={[Math.max(0.02, 1.05 * progress), 0.09, 0.1]} color="#5ee08e" />
-        </group>
-      )}
+      <WorkerBatteryHud entity={entity} />
+      <WorkerHud entity={entity} currentTime={currentTime} moving={moving} />
     </group>
+  );
+}
+
+function machineStateText(entity: RenderNode["entity"]): string {
+  const raw = typeof entity.attributes.machine_state === "string" ? entity.attributes.machine_state.toUpperCase() : entity.state.toUpperCase();
+  if (raw.includes("BROKEN")) return "BROK";
+  if (raw.includes("REPAIR")) return "FIX";
+  if (raw.includes("PROCESS")) return "RUN";
+  if (raw.includes("SETUP")) return "SET";
+  if (raw.includes("BLOCK")) return "BLK";
+  if (raw.includes("WAIT")) return "WAIT";
+  if (raw.includes("IDLE") || raw.includes("READY")) return "IDLE";
+  return raw.replace(/[^A-Z0-9]/g, "").slice(0, 4) || "STAT";
+}
+
+function MachineStatusBubble({ entity, height }: { entity: RenderNode["entity"]; height: number }) {
+  const label = machineStateText(entity);
+  return (
+    <Html position={[0, height, 0]} center transform={false} className="machine-world-hud">
+      <div className="machine-world-bubble">{label}</div>
+    </Html>
   );
 }
 
@@ -252,6 +328,7 @@ function MachineModel({
         </group>
       )}
       <Label text={entity.label || entity.entity_id} position={{ x: 0, y: 1.65, z: 0 }} />
+      <MachineStatusBubble entity={entity} height={1.92} />
     </group>
   );
 }
@@ -421,22 +498,6 @@ function TrafficConflictOverlay({ currentEvent, mapper }: { currentEvent?: Repla
   );
 }
 
-function SceneStats({ renderModel }: { renderModel: ReplayRenderModel }) {
-  const counts = useMemo(() => {
-    const summary = new Map<string, number>();
-    for (const node of renderModel.nodes) summary.set(node.entity.entity_type, (summary.get(node.entity.entity_type) ?? 0) + 1);
-    return Array.from(summary.entries())
-      .sort((left, right) => left[0].localeCompare(right[0]))
-      .map(([key, value]) => `${key}:${value}`)
-      .join(" / ");
-  }, [renderModel.nodes]);
-  return (
-    <Html position={[0, 5, 0]} transform={false}>
-      <div className="scene-stats">{counts}</div>
-    </Html>
-  );
-}
-
 export function FactoryScene3D({
   renderModel,
   currentEvent,
@@ -457,7 +518,6 @@ export function FactoryScene3D({
       <MotionPathOverlay renderModel={renderModel} mapper={mapper} currentTime={currentTime} />
       <TrafficConflictOverlay currentEvent={currentEvent} mapper={mapper} />
       <EntityModels renderModel={renderModel} mapper={mapper} currentTime={currentTime} selectedEntityId={selectedEntityId} onSelectEntity={onSelectEntity} />
-      <SceneStats renderModel={renderModel} />
     </Canvas>
   );
 }

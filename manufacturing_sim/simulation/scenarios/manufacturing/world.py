@@ -1154,6 +1154,7 @@ class ManufacturingWorld:
         source: str = "mansim.humanoid_incident",
         context: dict[str, Any] | None = None,
         notify_worker: bool = True,
+        apply_state: bool = True,
     ) -> dict[str, Any]:
         profile = self._humanoid_incident_profile(code)
         if profile is None:
@@ -1188,10 +1189,16 @@ class ManufacturingWorld:
         )
         if transition_event is None:
             raise RuntimeError(f"HumanoidSim could not build a transition event for incident {canonical_code!r}.")
-        self._apply_humanoid_transition_event(agent, transition_event)
         transition_metadata = dict(getattr(transition_event, "metadata", {}) or {})
         reason_obj = transition_event.reason_obj() if hasattr(transition_event, "reason_obj") else getattr(transition_event, "reason", None)
         reason_metadata = dict(getattr(reason_obj, "metadata", {}) or {}) if reason_obj is not None else {}
+        if apply_state:
+            self._apply_humanoid_transition_event(agent, transition_event)
+            state_payload = self._humanoid_state_payload(agent)
+        else:
+            state_payload = self._humanoid_state_payload(agent)
+            if reason_obj is not None and hasattr(reason_obj, "to_dict"):
+                state_payload["reason"] = reason_obj.to_dict()
         details = {
             **transition_metadata,
             **reason_metadata,
@@ -1209,7 +1216,7 @@ class ManufacturingWorld:
             "task_code": task_code,
             "instance_id": task_instance_id,
             "step_id": step_id,
-            "humanoid_state": self._humanoid_state_payload(agent),
+            "humanoid_state": state_payload,
             "cargo": self._worker_cargo_payload(agent),
         }
         self.humanoid_incident_events.append(copy.deepcopy(details))
@@ -1222,6 +1229,21 @@ class ManufacturingWorld:
             location=self.agent_display_location(agent),
             details=details,
         )
+        if notify_worker and recovery_protocol:
+            agent.pending_recovery_incident = {
+                "incident_code": canonical_code,
+                "incident_category": category,
+                "incident_severity": severity,
+                "description": description,
+                "source": source,
+                "occurred_at": round(float(self.env.now), 3),
+                "task_code": task_code,
+                "instance_id": task_instance_id,
+                "step_id": step_id,
+                "primitive_call_code": primitive,
+                "recovery_protocol": copy.deepcopy(recovery_protocol),
+                "context": dict(context or {}),
+            }
         self.emit_incident(
             canonical_code,
             affected_entities=[agent.agent_id],
@@ -1479,6 +1501,7 @@ class ManufacturingWorld:
                     source="mansim.traffic",
                     context={key: value for key, value in details.items() if key != "humanoid_state"},
                     notify_worker=False,
+                    apply_state=str(self.traffic_collision_effect).strip().lower() != "log_only",
                 )
 
     def _traffic_register_plan(self, agent: Worker, move_id: str, path: list[Tile], *, started_at: float, ended_at: float) -> None:
@@ -4729,12 +4752,43 @@ class ManufacturingWorld:
             return "BLOCKED"
         return "WAITING"
 
+    @staticmethod
+    def _task_recovered_before_incomplete_end(agent: Agent, task: Task) -> bool:
+        recovered_attr = str(getattr(agent, "last_recovery_completed_task_id", "") or "").strip()
+        if recovered_attr and recovered_attr == str(getattr(task, "task_id", "") or "").strip():
+            return True
+        state = getattr(agent, "humanoid_state", None)
+        if not isinstance(state, dict):
+            return False
+        metadata = state.get("metadata")
+        if not isinstance(metadata, dict) or str(metadata.get("source", "")).strip() != "mansim.recovery_end":
+            return False
+        task_id = str(getattr(task, "task_id", "") or "").strip()
+        instance_id = str(getattr(task, "instance_id", "") or "").strip()
+        recovered_task_id = str(metadata.get("task_id", "") or "").strip()
+        recovered_instance_id = str(metadata.get("task_instance_id", "") or "").strip()
+        return bool(
+            (task_id and task_id == recovered_task_id)
+            or (instance_id and instance_id == recovered_instance_id)
+        )
+
     def finish_agent_task(self, agent: Agent, task: Task, start_t: float, status: str, reason: str = "") -> None:
         end_t = self.env.now
         duration = max(0.0, end_t - start_t)
         preserve_carrying = status == "interrupted" and reason in {"battery_depleted", "battery_swap_wait", "horizon_reached"}
         if (not preserve_carrying) and (agent.carrying_item_id is not None or agent.carrying_item_type is not None):
             self._clear_agent_carrying(agent, destination=agent.location, emit_event=True)
+        recovered_before_incomplete_end = status != "completed" and self._task_recovered_before_incomplete_end(agent, task)
+        if recovered_before_incomplete_end:
+            self._transition_humanoid_state(
+                agent,
+                "task_completed",
+                task=task,
+                status="completed",
+                reason="recovery_completed",
+                source="mansim.recovery_end",
+                metadata={"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))},
+            )
         self.logger.log(
             t=end_t,
             day=self.day_for_time(end_t),
@@ -4776,23 +4830,27 @@ class ManufacturingWorld:
                 metadata={"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))},
             )
         else:
-            availability = self._availability_after_incomplete_task(status, reason)
-            state_reason, state_metadata = self._humanoid_incident_metadata_for_reason(reason)
-            if not state_reason:
-                state_reason = reason or status
-            if state_metadata:
-                state_metadata.update({"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))})
+            if not recovered_before_incomplete_end:
+                availability = self._availability_after_incomplete_task(status, reason)
+                state_reason, state_metadata = self._humanoid_incident_metadata_for_reason(reason)
+                if not state_reason:
+                    state_reason = reason or status
+                if state_metadata:
+                    state_metadata.update({"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))})
+                else:
+                    state_metadata = {"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))}
+                self._transition_humanoid_state(
+                    agent,
+                    "blocked" if availability == "BLOCKED" else "waiting",
+                    task=task,
+                    status=status,
+                    reason=state_reason,
+                    source="mansim.task_end",
+                    metadata=state_metadata,
+                )
             else:
-                state_metadata = {"cargo_present": bool(agent.carrying_item_id or getattr(agent, "carrying_item_ids", []))}
-            self._transition_humanoid_state(
-                agent,
-                "blocked" if availability == "BLOCKED" else "waiting",
-                task=task,
-                status=status,
-                reason=state_reason,
-                source="mansim.task_end",
-                metadata=state_metadata,
-            )
+                agent.last_recovery_completed_task_id = None
+                agent.last_recovery_completed_at = None
         selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
         self.task_records.append(
             {
