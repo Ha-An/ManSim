@@ -424,53 +424,6 @@ def _humanoid_incident_recovery_table(kpi: dict[str, Any]) -> str:
     )
 
 
-def _repair_collaboration_episode_table(kpi: dict[str, Any]) -> str:
-    raw_episodes = kpi.get("repair_collaboration_episodes", [])
-    episodes = raw_episodes if isinstance(raw_episodes, list) else []
-
-    def _team_time_label(value: Any) -> str:
-        if not isinstance(value, dict):
-            return "-"
-        parts = []
-        for size, minutes in sorted(value.items(), key=lambda item: int(str(item[0])) if str(item[0]).isdigit() else 999):
-            parts.append(f"{html.escape(str(size))}w {_safe_float(minutes):.1f}m")
-        return ", ".join(parts) or "-"
-
-    rows = []
-    for raw in sorted(
-        (row for row in episodes if isinstance(row, dict)),
-        key=lambda row: (_safe_float(row.get("started_at")), str(row.get("machine_id", ""))),
-    ):
-        final_team = raw.get("final_team", [])
-        team_label = ", ".join(str(worker_id) for worker_id in final_team) if isinstance(final_team, list) else str(final_team or "")
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(raw.get('machine_id', '-')))}</td>"
-            f"<td>{_safe_float(raw.get('started_at')):.2f}</td>"
-            f"<td>{_safe_float(raw.get('ended_at')):.2f}</td>"
-            f"<td>{_safe_int(raw.get('max_team_size'))}</td>"
-            f"<td>{_safe_int(raw.get('helper_join_count'))}</td>"
-            f"<td>{_safe_float(raw.get('collaboration_time_min')):.1f}m</td>"
-            f"<td>{_team_time_label(raw.get('team_time_by_size'))}</td>"
-            f"<td>{html.escape(team_label or '-')}</td>"
-            f"<td>{html.escape(str(raw.get('status', '-')))}</td>"
-            "</tr>"
-        )
-    body = "".join(rows)
-    if not body:
-        body = "<tr><td colspan='9'>No repair episodes were recorded.</td></tr>"
-    return (
-        "<div class='panel'>"
-        "<h2>Repair Collaboration Episodes</h2>"
-        "<p class='muted'>Each row is one machine repair window. Collaboration minutes count only intervals with team size above one.</p>"
-        "<table><thead><tr>"
-        "<th>Machine</th><th>Start</th><th>End</th><th>Max Team</th><th>Helper Joins</th><th>Collab</th><th>Team Time</th><th>Final Team</th><th>Status</th>"
-        "</tr></thead><tbody>"
-        + body
-        + "</tbody></table></div>"
-    )
-
-
 def _figure_html(fig: Any, *, include_plotlyjs: bool) -> str:
     return fig.to_html(full_html=False, include_plotlyjs=include_plotlyjs, config={"displaylogo": False, "responsive": True})
 
@@ -1120,8 +1073,7 @@ def export_kpi_dashboard(
         + panel_figures["shared_carry_time_by_pair"]
         + panel_figures["repair_team_time_by_size"]
         + panel_figures["repair_collaboration_by_machine"]
-        + "</div>"
-        + _repair_collaboration_episode_table(kpi),
+        + "</div>",
     )
     traffic_section = _group_section(
         "Movement / Traffic Safety",

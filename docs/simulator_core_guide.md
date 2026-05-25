@@ -222,7 +222,7 @@ Product transport session이 active이고 carrier가 1명일 때, 다른 availab
 
 Worker 이동은 tile map 기반입니다. Core는 `move_agent(agent, dst)`를 통해 logical destination을 service tile 후보로 바꾸고, A* path를 따라 한 tile씩 이동합니다.
 
-기본 traffic mode는 `strict_reservation`입니다. Worker가 다음 tile을 예약하지 못하면 이동하지 않고 대기하며 `AGENT_TRAFFIC_CONFLICT` / `TRAFFIC_WAIT`을 기록합니다. `observe_conflicts` 모드는 충돌 가능 상황을 막지 않고 관찰하기 위한 실험 모드입니다.
+기본 traffic mode는 `strict_reservation`입니다. Worker가 다음 tile을 예약하지 못하면 이동하지 않고 `AGENT_TRAFFIC_CONFLICT`와 `TRAFFIC_WAIT` HumanoidSim incident를 기록한 뒤, HumanoidSim에 정의된 recovery protocol을 실행합니다. 장시간 path를 찾지 못해 `AGENT_TILE_BLOCKED`가 발생하면 `PATH_BLOCKED` incident와 recovery protocol로 연결됩니다. `observe_conflicts` 모드는 충돌 가능 상황을 막지 않고 관찰하기 위한 실험 모드입니다.
 
 자세한 pathfinding, reservation, traffic conflict 정의는 [humanoid_movement_model.md](humanoid_movement_model.md)를 보세요.
 

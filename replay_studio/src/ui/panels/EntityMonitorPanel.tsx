@@ -307,6 +307,9 @@ function currentWorkerPoint(entity: BaseEntityState, currentTime: number): XY | 
   const fallback = entity.position;
   if (!motion || typeof motion !== "object") return fallback;
   const payload = motion as Record<string, unknown>;
+  if (payload.paused === true) {
+    return asXY(payload.from) ?? fallback;
+  }
   const startedAt = Number(payload.started_at);
   const endedAt = Number(payload.ended_at);
   const isMoving =
@@ -332,6 +335,7 @@ function workerMotionPath(
   const motion = entity.attributes.motion;
   if (!motion || typeof motion !== "object") return `0 tiles ${coord}`;
   const payload = motion as Record<string, unknown>;
+  if (payload.paused === true) return `0 tiles ${coord}`;
   const startedAt = Number(payload.started_at);
   const endedAt = Number(payload.ended_at);
   const isMoving =

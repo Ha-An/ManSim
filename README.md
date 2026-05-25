@@ -19,11 +19,13 @@ v0.4.3은 v0.4.2의 tile 기반 공장 layout과 Replay Studio 개편 위에 Hum
 - Primitive별 최소 duration 기본값을 `0.1`분으로 두어 Replay Studio에서 primitive 전환을 관찰할 수 있게 했습니다.
 - Setup, unload, inspection에서 queue와 machine/table/output buffer 사이의 실제 carry 이동을 추가했습니다.
 - Product 운반은 material보다 오래 걸리며, `HANDOVER_ITEM`으로 최대 2명의 공동 운반을 표현합니다.
-- 기본 traffic mode는 `strict_reservation`입니다. 다음 tile 예약에 실패하면 worker는 이동하지 않고 `TRAFFIC_WAIT`으로 대기합니다.
+- Worker 시작 위치는 Warehouse 내부가 아니라 Warehouse와 Station 2 사이의 복도입니다. 기본 100x70 map에서는 `A1=(50,19)`, `A2=(49,19)`, `A3=(51,19)` 부근에서 시작합니다.
+- 기본 traffic mode는 `strict_reservation`입니다. 다음 tile 예약에 실패하면 worker는 이동하지 않고 `TRAFFIC_WAIT` HumanoidSim incident를 남긴 뒤 HumanoidSim recovery protocol을 실행합니다.
 - `observe_conflicts` 모드에서는 path overlap, near miss, collision 가능 상황을 차단하지 않고 event/KPI/Replay overlay로 관찰할 수 있습니다.
 - Replay Studio는 worker의 실제 tile path를 따라 이동을 보간하고, worker panel에 Task, Child Task, Primitive, Motion Path, Traffic, Incident, Carry 정보를 표시합니다.
 - Gantt chart는 worker lane을 `HumanoidSim` Availability State 기준으로 표시합니다.
 - KPI dashboard는 humanoid state, task, primitive, task taxonomy, worker collaboration, incident 통계를 포함합니다.
+- State KPI는 `HumanoidSim` schema의 모든 state를 포함하며, 해당 run에서 발생하지 않은 state도 0으로 표시합니다.
 - 독립 실험 앱인 `replay_studio_3d/`를 추가했습니다. 기존 2D Replay Studio와 직접 import 관계가 없습니다.
 - Warehouse material shelf, CompletedProducts zone, ScrapDisposal zone, inspection scrap queue를 추가했습니다.
 - LLM Wiki, Curator, Graphify 기반 knowledge pipeline은 기존 기능을 유지합니다.
@@ -79,6 +81,8 @@ HumanoidSim은 이 event를 바탕으로 `HumanoidStateSnapshot`을 반환합니
 
 Worker 이동은 tile map 기반입니다. `TileGridMap.find_path()`가 A* search로 4방향 path를 찾고, worker는 `map.tile_time_min` 단위로 한 tile씩 이동합니다. Replay Studio는 simulation artifact에 기록된 `motion.path`를 사용해 출발지에서 목적지까지 부드럽게 보간합니다.
 
+`path_wait`처럼 실제로는 멈춰 있지만 기존 계획 경로를 계속 관찰해야 하는 경우, Replay artifact는 `motion.paused=true`를 남깁니다. Replay Studio는 worker를 현재 tile에 고정하고, 전체 계획 경로는 `display_path` 점선으로만 보여줍니다.
+
 기본 traffic mode는 `strict_reservation`입니다. Worker가 다음 tile을 예약하지 못하면 이동하지 않고 `TRAFFIC_WAIT` reason을 남깁니다. `observe_conflicts` 모드에서는 path overlap, near miss, collision을 차단하지 않고 관찰 event로 기록합니다.
 
 자세한 설명은 [docs/humanoid_movement_model.md](docs/humanoid_movement_model.md)를 참고하세요.
@@ -89,7 +93,7 @@ Worker 이동은 tile map 기반입니다. `TileGridMap.find_path()`가 A* searc
 
 - 확률 기반 incident는 `configs/scenario/mfg_basic.yaml`의 `humanoid_incidents.random`에서 조정합니다.
 - 기본 random incident는 `OBJECT_RECOGNITION_FAILED`, `GRIP_FAILED`, `ITEM_DROPPED`, `UNKNOWN`입니다.
-- `RESOURCE_PREEMPTED`, `TRAFFIC_WAIT`, `NEAR_MISS`, `COLLISION`은 ManSim의 resource race나 traffic model에서 자연 발생한 상황을 HumanoidSim incident code로 기록합니다.
+- `RESOURCE_PREEMPTED`, `PATH_BLOCKED`, `TRAFFIC_WAIT`, `NEAR_MISS`, `COLLISION`은 ManSim의 resource race나 traffic model에서 자연 발생한 상황을 HumanoidSim incident code로 기록하고, 해당 incident profile의 recovery protocol을 실행합니다.
 - `material_shelf_slot_empty` 같은 ManSim 내부 실패 reason은 ManSim에서 별도 taxonomy로 정의하지 않고, HumanoidSim의 incident alias를 통해 canonical incident code로 해석합니다.
 - Incident는 state가 아닙니다. 예를 들어 grip 실패나 item drop은 `availability=BLOCKED`가 되고, reason code가 `GRIP_FAILED` 또는 `ITEM_DROPPED`로 남습니다.
 - Recovery protocol이 진행 중일 때도 availability는 `BLOCKED`를 유지합니다. 현재 복구 step은 기존 Task 또는 Primitive 필드에 `CODE (RECOVERY)`로 표시되며, 정상 task 실행 상태인 `EXECUTING`과 구분합니다.

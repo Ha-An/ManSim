@@ -33,11 +33,39 @@ class ZoneInventoryScrapTests(unittest.TestCase):
         self.assertIn("scrap_disposal_bin", grid.objects)
         self.assertIn("warehouse_material_shelf", grid.objects)
         slot_ids = [object_id for object_id in grid.objects if object_id.startswith("warehouse_material_slot_")]
-        self.assertEqual(10, len(slot_ids))
+        self.assertEqual(cfg["warehouse"]["material_shelf"]["capacity"], len(slot_ids))
+        row_ids = sorted(object_id for object_id in grid.objects if object_id.startswith("warehouse_material_shelf_row_"))
+        wall_ids = sorted(object_id for object_id in grid.objects if object_id.startswith("warehouse_material_shelf_wall_"))
+        self.assertEqual(3, len(row_ids))
+        self.assertEqual(3, len(wall_ids))
+        for row_id, wall_id in zip(row_ids, wall_ids):
+            row = grid.objects[row_id]
+            wall = grid.objects[wall_id]
+            self.assertEqual(1, row.height)
+            self.assertEqual(1, wall.height)
+            self.assertEqual(row.y - 1, wall.y)
+            self.assertEqual(row.x, wall.x)
+            self.assertEqual(row.width, wall.width)
+            self.assertEqual(grid.zones["Warehouse"].x1 - 1, row.x + row.width - 1)
+            for x in range(row.x, row.x + row.width):
+                self.assertFalse(grid.is_passable_static((x, wall.y)))
+                self.assertFalse(grid.is_passable_static((x, row.y)))
+                self.assertTrue(grid.is_passable_static((x, row.y + 1)))
+        self.assertEqual(grid.zones["Warehouse"].y + 2, grid.objects["warehouse_material_shelf_row_01"].y)
+        self.assertEqual(grid.zones["Warehouse"].x1 - 1, grid.objects["warehouse_material_slot_01"].x)
+        self.assertEqual(grid.objects["warehouse_material_shelf_row_01"].x, grid.objects["warehouse_material_slot_10"].x)
         for slot_id in slot_ids:
             self.assertTrue(grid.service_tiles.get(slot_id), slot_id)
+            self.assertTrue(
+                grid.destination_tiles(slot_id, worker_id="A1", from_tile=grid.initial_worker_tile("A1")),
+                slot_id,
+            )
             slot = grid.objects[slot_id]
-            self.assertIn((slot.x, slot.y + slot.height), grid.service_tiles[slot_id])
+            self.assertEqual([(slot.x, slot.y + 1)], grid.service_tiles[slot_id])
+            self.assertTrue(
+                all(abs(tile[0] - slot.x) + abs(tile[1] - slot.y) == 1 for tile in grid.service_tiles[slot_id]),
+                slot_id,
+            )
 
         station2_material = grid.objects["material_queue_2"]
         station2_intermediate = grid.objects["intermediate_queue_2"]
@@ -66,12 +94,12 @@ class ZoneInventoryScrapTests(unittest.TestCase):
                 world = ManufacturingWorld(simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=4))
                 world._ensure_material_shelf_slots()
                 world._restock_material_shelf(reason="initial_fill", target_fill=world.material_shelf_initial_fill)
-                self.assertEqual(10, world._material_shelf_count())
+                self.assertEqual(world.material_shelf_initial_fill, world._material_shelf_count())
                 picked = world._pop_material_shelf_item("warehouse_material_slot_01")
                 self.assertIsNotNone(picked)
-                self.assertEqual(9, world._material_shelf_count())
+                self.assertEqual(world.material_shelf_initial_fill - 1, world._material_shelf_count())
                 world._restock_material_shelf(reason="day_boundary")
-                self.assertEqual(10, world._material_shelf_count())
+                self.assertEqual(world.material_shelf_capacity, world._material_shelf_count())
                 self.assertTrue(any(event["type"] == "WAREHOUSE_MATERIAL_RESTOCK" for event in logger.events))
                 self.assertTrue(any(event["type"] == "WAREHOUSE_MATERIAL_PICKED" for event in logger.events))
             finally:

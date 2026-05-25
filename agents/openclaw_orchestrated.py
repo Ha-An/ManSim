@@ -2957,14 +2957,66 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
     def _call_run_reflector(self, run_packet: dict[str, Any]) -> dict[str, Any]:
         runtime_agent_id, system_prompt, prompt, required_keys = self._reflector_turn_bundle(run_packet)
         self._assert_native_workspace_inputs_ready(runtime_agent_id, "manager_run_reflector")
-        llm_obj = self._call_llm_json(
-            prompt,
-            system_prompt,
-            call_name="manager_run_reflector",
-            context={"phase": "manager_run_reflector", "run_index": self.run_series_index},
-            required_keys=required_keys,
-        )
+        try:
+            llm_obj = self._call_llm_json(
+                prompt,
+                system_prompt,
+                call_name="manager_run_reflector",
+                context={"phase": "manager_run_reflector", "run_index": self.run_series_index},
+                required_keys=required_keys,
+            )
+        except RuntimeError as exc:
+            llm_obj = self._fallback_run_reflection(run_packet, reason=f"{type(exc).__name__}: {exc}")
         return self._sanitize_reflector_output(llm_obj)
+
+    def _fallback_run_reflection(self, run_packet: dict[str, Any], *, reason: str = "") -> dict[str, Any]:
+        """Keep multi-run experiments alive if the LLM reflector emits invalid JSON."""
+        context = run_packet.get("run_context", {}) if isinstance(run_packet.get("run_context", {}), dict) else {}
+        performance = run_packet.get("performance_summary", {}) if isinstance(run_packet.get("performance_summary", {}), dict) else {}
+        kpi = performance.get("kpi_snapshot", {}) if isinstance(performance.get("kpi_snapshot", {}), dict) else {}
+        failures = run_packet.get("notable_failures", {}) if isinstance(run_packet.get("notable_failures", {}), dict) else {}
+        blocker = failures.get("blocker_profile", {}) if isinstance(failures.get("blocker_profile", {}), dict) else {}
+        run_index = int(context.get("run_index", self.run_series_index) or self.run_series_index)
+        products = int(kpi.get("total_products", 0) or 0)
+        avg_daily = float(kpi.get("avg_daily_products", 0.0) or 0.0)
+        coordination = int(blocker.get("coordination_incident_total", 0) or 0)
+        physical = int(blocker.get("physical_incident_total", 0) or 0)
+        reason_text = self._truncate_prompt_text(reason, max_len=180)
+        summary = (
+            f"Run {run_index} completed with {products} products and {avg_daily:.2f} average daily products. "
+            "A deterministic fallback reflection was used because the LLM reflector returned invalid JSON."
+        )
+        run_problems = [
+            f"Coordination incidents remained high ({coordination}) and should be diagnosed before the next run.",
+            f"Physical incidents totaled {physical}; maintenance and recovery policies should remain visible.",
+        ]
+        if reason_text:
+            run_problems.append(f"Reflector fallback reason: {reason_text}")
+        return {
+            "summary": summary,
+            "run_problems": run_problems[:3],
+            "detector_should_have_done": [
+                "Rank recurring coordination blockers separately from one-off physical incidents.",
+                "Compare throughput loss against incident frequency before selecting prevention targets.",
+            ],
+            "planner_should_have_done": [
+                "Favor compact stabilizing constraints when coordination incidents dominate the run.",
+                "Preserve closeout capacity for inspection and completed-product transfer near horizon end.",
+            ],
+            "carry_forward_lessons": [
+                "If reflector JSON fails, keep series learning alive with deterministic KPI-grounded reflection.",
+                "High coordination incidents require explicit prevention targets in the next strategy turn.",
+            ],
+            "detector_guidance": [
+                "Report coordination, physical, and queue bottlenecks as separate evidence groups.",
+            ],
+            "planner_guidance": [
+                "Allocate at least one worker role to the dominant blocker category identified by detector evidence.",
+            ],
+            "open_watchouts": [
+                "Watch whether coordination incident counts continue to exceed physical incident counts.",
+            ],
+        }
 
     def _run_reviewed_detector_cycle(self, observation: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         detector_drafts: list[dict[str, Any]] = []

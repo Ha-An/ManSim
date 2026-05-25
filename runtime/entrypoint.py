@@ -204,8 +204,9 @@ def _build_replay_streamlit_url(
 
 def _export_replay_studio_assets(output_dir: Path) -> tuple[Path, Path]:
     script_path = Path(__file__).resolve().parents[1] / "replay_studio" / "examples" / "export_mansim_run.py"
-    output_log = output_dir / "replay_studio_log.json"
-    output_layout = output_dir / "replay_studio_layout.json"
+    output_dir = Path(output_dir).resolve()
+    output_log = (output_dir / "replay_studio_log.json").resolve()
+    output_layout = (output_dir / "replay_studio_layout.json").resolve()
     subprocess.run(
         [
             sys.executable,
@@ -338,6 +339,55 @@ def _export_series_artifacts_if_needed(runtime_output_dir: Path, run_count: int,
         str(dashboard_path.resolve()) if dashboard_path is not None else "",
         str(analysis_path.resolve()),
     )
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _bool_cfg(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _apply_series_run_seed(
+    *,
+    child_cfg: dict[str, Any],
+    orchestration_cfg: dict[str, Any],
+    run_index: int,
+) -> dict[str, int | bool]:
+    """Assign a deterministic but distinct seed to each run in a series."""
+
+    base_seed = _coerce_int(child_cfg.get("seed", 7), 7)
+    vary_seed = _bool_cfg(orchestration_cfg.get("vary_seed_by_run", False), False)
+    seed_stride = max(1, _coerce_int(orchestration_cfg.get("seed_stride", 1), 1))
+    run_seed = base_seed + ((max(1, int(run_index)) - 1) * seed_stride) if vary_seed else base_seed
+    child_cfg["seed"] = int(run_seed)
+
+    decision_cfg = child_cfg.get("decision", {}) if isinstance(child_cfg.get("decision", {}), dict) else {}
+    llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
+    sync_llm_seed = _bool_cfg(orchestration_cfg.get("sync_llm_seed_with_run_seed", True), True)
+    if sync_llm_seed and isinstance(llm_cfg, dict) and "seed" in llm_cfg:
+        llm_cfg["seed"] = int(run_seed)
+
+    return {
+        "base_seed": int(base_seed),
+        "run_seed": int(run_seed),
+        "vary_seed_by_run": bool(vary_seed),
+        "seed_stride": int(seed_stride),
+        "sync_llm_seed_with_run_seed": bool(sync_llm_seed),
+    }
 
 
 def _refresh_dashboard_suite(
@@ -489,6 +539,11 @@ def main(cfg: DictConfig) -> None:
         child_output_dir = runtime_output_dir if run_count == 1 else (runtime_output_dir / f"run_{run_index:02d}")
         child_output_dir.mkdir(parents=True, exist_ok=True)
         child_cfg = copy.deepcopy(experiment_cfg)
+        seed_info = _apply_series_run_seed(
+            child_cfg=child_cfg,
+            orchestration_cfg=orchestration_cfg,
+            run_index=run_index,
+        )
         if orchestration_active:
             child_cfg["_run_series"] = {
                 "run_index": run_index,
@@ -496,6 +551,11 @@ def main(cfg: DictConfig) -> None:
                 "parent_output_dir": str(runtime_output_dir.resolve()),
                 "knowledge_path": str(knowledge_store.markdown_path.resolve()),
                 "knowledge_history_dir": str(knowledge_history_dir.resolve()),
+                "base_seed": int(seed_info["base_seed"]),
+                "run_seed": int(seed_info["run_seed"]),
+                "vary_seed_by_run": bool(seed_info["vary_seed_by_run"]),
+                "seed_stride": int(seed_info["seed_stride"]),
+                "sync_llm_seed_with_run_seed": bool(seed_info["sync_llm_seed_with_run_seed"]),
             }
         result = _run_once(child_cfg, child_output_dir)
         last_result = result

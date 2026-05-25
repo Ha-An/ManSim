@@ -74,7 +74,6 @@ SUPPORTED_PRIMITIVE_CALLS: set[str] = {
     "RECORD_RESULT",
     "RELEASE",
     "UPDATE_RECORD",
-    "UPDATE_INVENTORY_RECORD",
     "VERIFY_TRANSACTION",
     "VERIFY_LEVEL_OR_QUANTITY",
     "VERIFY_LOCKOUT_IF_REQUIRED",
@@ -101,6 +100,12 @@ class HumanoidTaskRuntime:
         self._imports: dict[str, Any] = {}
         self.catalog: Any | None = None
         self.profiles: dict[str, Any] = {}
+        lifecycle_cfg = humanoidsim_cfg.get("task_lifecycle", {}) if isinstance(humanoidsim_cfg.get("task_lifecycle", {}), dict) else {}
+        self.lifecycle_timing_unit = str(lifecycle_cfg.get("unit", "min")).strip().lower() or "min"
+        self.assignment_min_duration = self._duration_to_minutes_with_unit(
+            lifecycle_cfg.get("assignment_min_duration", 0.0),
+            self.lifecycle_timing_unit,
+        )
         timing_cfg = humanoidsim_cfg.get("primitive_timing", {}) if isinstance(humanoidsim_cfg.get("primitive_timing", {}), dict) else {}
         self.primitive_timing_unit = str(timing_cfg.get("unit", "min")).strip().lower() or "min"
         self.default_primitive_min_duration = self._duration_to_minutes(timing_cfg.get("default_min", 0.0))
@@ -458,6 +463,8 @@ class HumanoidTaskRuntime:
         normalized = str(status or "").strip().lower()
         if normalized in {"running", "start", "started"}:
             return "RUNNING"
+        if normalized in {"pending", "assigned", "selected"}:
+            return "PENDING"
         if normalized in {"completed", "success", "succeeded"}:
             return "SUCCESS"
         if normalized in {"failed", "error"}:
@@ -666,7 +673,8 @@ class HumanoidTaskRuntime:
         end_status = "failed"
         end_logged = False
         active_step: dict[str, Any] | None = None
-        active_children: list[tuple[str, Task]] = []
+        active_context_task: Task | None = None
+        active_children: list[tuple[str, Task, int]] = []
         skipped_prefixes: set[str] = set()
         try:
             steps = list(task.step_plan or [])
@@ -680,21 +688,28 @@ class HumanoidTaskRuntime:
                 if self._path_is_skipped(path, skipped_prefixes):
                     continue
                 while active_children and not self._path_is_descendant(path, active_children[-1][0]):
-                    _, child_task = active_children.pop()
-                    self._log_child_task_event("HUMANOID_TASK_END", agent, task, child_task, step, status="completed")
+                    child_path, child_task, child_depth = active_children.pop()
+                    self._log_child_task_event(
+                        "HUMANOID_TASK_END",
+                        agent,
+                        task,
+                        child_task,
+                        {"path": child_path, "depth": child_depth},
+                        status="completed",
+                    )
 
                 call_level = str(step.get("call_level", "PRIMITIVE_SKILL") or "PRIMITIVE_SKILL")
                 call_code = str(step.get("call_code", ""))
                 if call_level != "PRIMITIVE_SKILL":
                     child_task = self._child_task_from_step(task, step)
-                    active_children.append((path, child_task))
+                    active_children.append((path, child_task, int(step.get("depth", 0) or 0)))
                     self._log_child_task_event("HUMANOID_TASK_START", agent, task, child_task, step, status="running")
                     if self._is_nested_domain_action_step(task, step) and not executed_domain_action:
                         active_step = step
                         step_ok = bool((yield from self.world._execute_task_domain_action(agent, task)))
                         executed_domain_action = True
                         active_step = None
-                        _, finished_child = active_children.pop()
+                        _, finished_child, _ = active_children.pop()
                         self._log_child_task_event(
                             "HUMANOID_TASK_END",
                             agent,
@@ -715,21 +730,36 @@ class HumanoidTaskRuntime:
                     return False
                 context_task = active_children[-1][1] if active_children else task
                 agent.current_step_id = str(step.get("step_id", ""))
+                agent.current_step_call_code = call_code
+                agent.current_step_path = str(step.get("path", ""))
+                agent.current_step_depth = int(step.get("depth", 0) or 0)
                 agent.current_primitive_call_code = call_code
                 active_step = step
+                active_context_task = context_task
                 self._log_step_event("HUMANOID_STEP_START", agent, context_task, step, status="running", parent_task=task)
                 step_ok = yield from self._execute_step(agent, task, step, executed_domain_action, allow_domain_action=not bool(active_children))
                 if not active_children and self._is_domain_action_step(task, call_code):
                     executed_domain_action = True
                 self._log_step_event("HUMANOID_STEP_END", agent, context_task, step, status="completed" if step_ok else "failed", parent_task=task)
                 active_step = None
+                active_context_task = None
+                agent.current_step_call_code = None
+                agent.current_step_path = None
+                agent.current_step_depth = 0
                 if not step_ok:
                     yield from self._execute_recovery_after_failure(agent, task, step)
                     success = False
                     break
             while active_children:
-                _, child_task = active_children.pop()
-                self._log_child_task_event("HUMANOID_TASK_END", agent, task, child_task, {}, status="completed" if success else "failed")
+                child_path, child_task, child_depth = active_children.pop()
+                self._log_child_task_event(
+                    "HUMANOID_TASK_END",
+                    agent,
+                    task,
+                    child_task,
+                    {"path": child_path, "depth": child_depth},
+                    status="completed" if success else "failed",
+                )
             if success and not executed_domain_action:
                 success = bool((yield from self.world._execute_task_domain_action(agent, task)))
                 if not success:
@@ -737,17 +767,28 @@ class HumanoidTaskRuntime:
             end_status = "completed" if success else "failed"
             return bool(success)
         except simpy.Interrupt as intr:
-            if active_step is not None:
-                interrupted_step = self._interrupted_step_for_agent(agent, active_step)
+            if (
+                active_step is not None
+                and str(active_step.get("call_level", "PRIMITIVE_SKILL") or "PRIMITIVE_SKILL") == "PRIMITIVE_SKILL"
+            ):
+                # Domain helpers may temporarily expose finer-grained motion
+                # primitives (for example NAVIGATE_TO while a GRASP domain action
+                # is moving to a shelf). Close that transient state before closing
+                # the catalog step so task/step logs stay faithful to HumanoidSim's
+                # task hierarchy.
+                event_task = active_context_task or task
+                self._finish_internal_primitive_before_interrupted_step(agent, event_task, active_step, status="interrupted")
                 self._log_step_event(
                     "HUMANOID_STEP_END",
                     agent,
-                    task,
-                    interrupted_step,
+                    event_task,
+                    active_step,
                     status="interrupted",
                     error=str(intr.cause or "interrupted"),
+                    parent_task=task,
                 )
-                active_step = None
+            active_step = None
+            active_context_task = None
             if getattr(agent, "pending_recovery_incident", None) is not None:
                 yield from self._execute_pending_recovery_protocol(agent, task)
             self._log_task_event("HUMANOID_TASK_END", agent, task, status="interrupted")
@@ -755,9 +796,19 @@ class HumanoidTaskRuntime:
             raise
         finally:
             while active_children:
-                _, child_task = active_children.pop()
-                self._log_child_task_event("HUMANOID_TASK_END", agent, task, child_task, {}, status="interrupted")
+                child_path, child_task, child_depth = active_children.pop()
+                self._log_child_task_event(
+                    "HUMANOID_TASK_END",
+                    agent,
+                    task,
+                    child_task,
+                    {"path": child_path, "depth": child_depth},
+                    status="interrupted",
+                )
             agent.current_step_id = None
+            agent.current_step_call_code = None
+            agent.current_step_path = None
+            agent.current_step_depth = 0
             agent.current_primitive_call_code = None
             agent.current_child_task_code = None
             agent.current_child_task_name = None
@@ -797,22 +848,41 @@ class HumanoidTaskRuntime:
             yield self.world.env.timeout(remaining)
         return bool(result)
 
-    @staticmethod
-    def _interrupted_step_for_agent(agent: Worker, active_step: dict[str, Any]) -> dict[str, Any]:
-        """Use the current domain-internal primitive when an interrupt happens mid-action."""
-        step = dict(active_step)
+    def _finish_internal_primitive_before_interrupted_step(
+        self,
+        agent: Worker,
+        task: Task,
+        active_step: dict[str, Any],
+        *,
+        status: str,
+    ) -> None:
+        """Close a transient domain primitive without rewriting the catalog step.
+
+        Replay gets motion from AGENT_MOVE_* events. HUMANOID_STEP_* should keep
+        the TaskSpec step that was actually started, even if a domain helper
+        exposed an internal NAVIGATE_TO/ALIGN hint while doing the side effect.
+        """
         current_primitive = str(agent.current_primitive_call_code or "").strip()
-        active_primitive = str(step.get("call_code", "") or "").strip()
+        active_primitive = str(active_step.get("call_code", "") or "").strip()
         mobility = str((agent.humanoid_state or {}).get("mobility", "")).strip().upper()
+        internal_primitive = ""
         if mobility == "NAVIGATING" and active_primitive != "NAVIGATE_TO":
-            current_primitive = "NAVIGATE_TO"
+            internal_primitive = "NAVIGATE_TO"
         elif mobility == "DOCKING" and active_primitive != "ALIGN":
-            current_primitive = "ALIGN"
-        if current_primitive and current_primitive != active_primitive:
-            step["call_code"] = current_primitive
-            if agent.current_step_id:
-                step["step_id"] = str(agent.current_step_id)
-        return step
+            internal_primitive = "ALIGN"
+        if not internal_primitive:
+            return
+        self.transition_state(
+            agent,
+            "primitive_finished",
+            task=task,
+            step={
+                "step_id": str(agent.current_step_id or active_step.get("step_id", "") or "internal_primitive"),
+                "call_code": internal_primitive,
+            },
+            status=status,
+            source="mansim.internal_primitive",
+        )
 
     def _ensure_pending_recovery_incident_for_failure(
         self,
@@ -870,7 +940,13 @@ class HumanoidTaskRuntime:
         result = yield from self._execute_pending_recovery_protocol(agent, task)
         return result
 
-    def _execute_pending_recovery_protocol(self, agent: Worker, parent_task: Task):
+    def _execute_pending_recovery_protocol(
+        self,
+        agent: Worker,
+        parent_task: Task,
+        *,
+        complete_parent_on_success: bool = True,
+    ):
         if not self.recovery_protocol_enabled:
             agent.pending_recovery_incident = None
             return False
@@ -912,6 +988,8 @@ class HumanoidTaskRuntime:
                 "humanoid_state": self.state_payload(agent),
             },
         )
+        completed = False
+        interrupted = False
         try:
             for index, step in enumerate(steps, start=1):
                 kind = str(step.get("kind", "") or "").strip().lower()
@@ -932,8 +1010,12 @@ class HumanoidTaskRuntime:
                     yield from self._execute_recovery_primitive_step(agent, parent_task, step, recovery_context)
                 elif kind == "task":
                     yield from self._execute_recovery_task_step(agent, parent_task, step, recovery_context)
+            completed = True
+        except simpy.Interrupt:
+            interrupted = True
+            raise
         finally:
-            if not agent.discharged:
+            if completed and complete_parent_on_success and not agent.discharged:
                 self.transition_state(
                     agent,
                     "task_completed",
@@ -956,6 +1038,7 @@ class HumanoidTaskRuntime:
                     "incident_code": incident_code,
                     "parent_task_id": parent_task.task_id,
                     "parent_task_code": parent_task.task_code,
+                    "status": "interrupted" if interrupted else ("completed" if completed else "skipped"),
                     "humanoid_state": self.state_payload(agent),
                 },
             )
@@ -965,11 +1048,19 @@ class HumanoidTaskRuntime:
         code = str(step.get("code", "") or "").strip().upper()
         recovery_task = self._recovery_task_from_step(parent_task, code, recovery_context)
         self._log_task_event("HUMANOID_TASK_START", agent, recovery_task, status="running")
-        yield self.world.env.timeout(self._recovery_step_duration(code))
-        inactive_context = dict(recovery_context)
-        inactive_context["active"] = False
-        recovery_task.humanoid["recovery_context"] = inactive_context
-        self._log_task_event("HUMANOID_TASK_END", agent, recovery_task, status="completed")
+        try:
+            yield self.world.env.timeout(self._recovery_step_duration(code))
+        except simpy.Interrupt:
+            inactive_context = dict(recovery_context)
+            inactive_context["active"] = False
+            recovery_task.humanoid["recovery_context"] = inactive_context
+            self._log_task_event("HUMANOID_TASK_END", agent, recovery_task, status="interrupted")
+            raise
+        else:
+            inactive_context = dict(recovery_context)
+            inactive_context["active"] = False
+            recovery_task.humanoid["recovery_context"] = inactive_context
+            self._log_task_event("HUMANOID_TASK_END", agent, recovery_task, status="completed")
 
     def _execute_recovery_primitive_step(self, agent: Worker, parent_task: Task, step: dict[str, Any], recovery_context: dict[str, Any]):
         code = str(step.get("code", "") or "").strip().upper()
@@ -986,19 +1077,32 @@ class HumanoidTaskRuntime:
             "optional": bool(step.get("optional", False)),
         }
         previous_step_id = agent.current_step_id
+        previous_step_call_code = agent.current_step_call_code
         previous_primitive = agent.current_primitive_call_code
         self._log_task_event("HUMANOID_TASK_START", agent, recovery_task, status="running")
         agent.current_step_id = str(step_row["step_id"])
+        agent.current_step_call_code = code
         agent.current_primitive_call_code = code
         self._log_step_event("HUMANOID_STEP_START", agent, recovery_task, step_row, status="running", parent_task=parent_task)
-        yield self.world.env.timeout(self._recovery_step_duration(code))
-        inactive_context = dict(recovery_context)
-        inactive_context["active"] = False
-        recovery_task.humanoid["recovery_context"] = inactive_context
-        self._log_step_event("HUMANOID_STEP_END", agent, recovery_task, step_row, status="completed", parent_task=parent_task)
-        self._log_task_event("HUMANOID_TASK_END", agent, recovery_task, status="completed")
-        agent.current_step_id = previous_step_id
-        agent.current_primitive_call_code = previous_primitive
+        try:
+            yield self.world.env.timeout(self._recovery_step_duration(code))
+        except simpy.Interrupt:
+            inactive_context = dict(recovery_context)
+            inactive_context["active"] = False
+            recovery_task.humanoid["recovery_context"] = inactive_context
+            self._log_step_event("HUMANOID_STEP_END", agent, recovery_task, step_row, status="interrupted", parent_task=parent_task)
+            self._log_task_event("HUMANOID_TASK_END", agent, recovery_task, status="interrupted")
+            raise
+        else:
+            inactive_context = dict(recovery_context)
+            inactive_context["active"] = False
+            recovery_task.humanoid["recovery_context"] = inactive_context
+            self._log_step_event("HUMANOID_STEP_END", agent, recovery_task, step_row, status="completed", parent_task=parent_task)
+            self._log_task_event("HUMANOID_TASK_END", agent, recovery_task, status="completed")
+        finally:
+            agent.current_step_id = previous_step_id
+            agent.current_step_call_code = previous_step_call_code
+            agent.current_primitive_call_code = previous_primitive
 
     def _recovery_task_from_step(self, parent_task: Task, task_code: str, recovery_context: dict[str, Any]) -> Task:
         code = str(task_code or "RECOVERY").strip().upper()
@@ -1033,13 +1137,19 @@ class HumanoidTaskRuntime:
 
     def _log_task_event(self, event_type: str, agent: Worker, task: Task, *, status: str) -> None:
         self.set_task_lifecycle_state(agent, task, event_type=event_type, status=status)
+        details = self._task_event_details(agent, task, status=status)
+        # Top-level task events must not inherit an active child step path.
+        # Child task boundaries are emitted by _log_child_task_event with their
+        # own explicit path, while parent/recovery tasks are paired by instance.
+        details["task_path"] = ""
+        details["depth"] = 0
         self.world.logger.log(
             t=self.world.env.now,
             day=self.world.day_for_time(self.world.env.now),
             event_type=event_type,
             entity_id=agent.agent_id,
             location=self.world.agent_display_location(agent),
-            details=self._task_event_details(agent, task, status=status),
+            details=details,
         )
 
     def _log_step_event(
@@ -1054,7 +1164,7 @@ class HumanoidTaskRuntime:
         parent_task: Task | None = None,
     ) -> None:
         if event_type == "HUMANOID_STEP_END" and str(status).strip().lower() == "interrupted":
-            step = self._interrupted_step_for_agent(agent, step)
+            self._finish_internal_primitive_before_interrupted_step(agent, task, step, status=status)
         if str(step.get("call_level", "PRIMITIVE_SKILL") or "PRIMITIVE_SKILL") == "PRIMITIVE_SKILL":
             self.set_step_state(agent, task, step, event_type=event_type, status=status)
         details = self._task_event_details(agent, task, status=status)

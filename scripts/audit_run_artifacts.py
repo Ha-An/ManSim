@@ -57,6 +57,24 @@ AVAILABILITY_STATES = {
 }
 
 
+def _humanoid_state_axis_values() -> dict[str, list[str]]:
+    try:
+        from humanoidsim import load_state_schema
+
+        schema = load_state_schema()
+        return {
+            str(axis): [str(value) for value in getattr(definition, "states", {}).keys()]
+            for axis, definition in getattr(schema, "axes", {}).items()
+        }
+    except Exception:
+        return {
+            "availability": ["AVAILABLE", "ASSIGNED", "EXECUTING", "WAITING", "BLOCKED", "OFFLINE", "DISABLED"],
+            "mobility": ["STATIONARY", "NAVIGATING", "DOCKING"],
+            "power": ["POWER_NORMAL", "POWER_LOW", "POWER_CRITICAL", "DEPLETED", "CHARGING"],
+            "manipulation": ["FREE", "REACHING", "HOLDING", "PLACING"],
+        }
+
+
 class Audit:
     def __init__(self) -> None:
         self.errors: list[str] = []
@@ -134,6 +152,22 @@ def check_kpi(run_dir: Path, audit: Audit) -> None:
         for axis in ["availability", "mobility", "power", "manipulation"]:
             if axis not in state_axis:
                 audit.error(f"kpi humanoid_state_time_by_axis missing axis: {axis}")
+        for axis, states in _humanoid_state_axis_values().items():
+            rows = state_axis.get(axis, {}) if isinstance(state_axis.get(axis, {}), dict) else {}
+            for state in states:
+                if state not in rows:
+                    audit.error(f"kpi humanoid_state_time_by_axis[{axis}] missing state: {state}")
+    state_by_worker = kpi.get("humanoid_state_time_by_worker")
+    if isinstance(state_by_worker, dict):
+        for worker_id, worker_rows in state_by_worker.items():
+            if not isinstance(worker_rows, dict):
+                audit.error(f"kpi humanoid_state_time_by_worker[{worker_id}] is not an object")
+                continue
+            for axis, states in _humanoid_state_axis_values().items():
+                rows = worker_rows.get(axis, {}) if isinstance(worker_rows.get(axis, {}), dict) else {}
+                for state in states:
+                    if state not in rows:
+                        audit.error(f"kpi humanoid_state_time_by_worker[{worker_id}][{axis}] missing state: {state}")
     if int(kpi.get("repair_collaboration_time_min", 0) or 0) < 0:
         audit.error("repair_collaboration_time_min is negative")
     audit.note(
@@ -200,6 +234,92 @@ def check_gantt(run_dir: Path, events: list[dict[str, Any]], audit: Audit) -> No
     if "payload=" in html:
         audit.warn("gantt hover still contains payload=; tooltip may be too noisy")
     audit.note(f"gantt rows={len(rows)} worker_statuses={sorted(worker_statuses)}")
+
+
+def check_event_log_consistency(events: list[dict[str, Any]], audit: Audit) -> None:
+    task_starts: dict[tuple[Any, Any, Any, Any], int] = defaultdict(int)
+    task_ends: dict[tuple[Any, Any, Any, Any], int] = defaultdict(int)
+    step_starts: dict[tuple[Any, Any, Any, Any, Any], int] = defaultdict(int)
+    step_ends: dict[tuple[Any, Any, Any, Any, Any], int] = defaultdict(int)
+    available_with_task_context = 0
+    blocked_without_reason = 0
+    recovery_active_nonblocked = 0
+    self_traffic_conflicts = 0
+    non_upper_incident_codes: set[str] = set()
+
+    for event in events:
+        event_type = str(event.get("type") or event.get("event_type") or "")
+        details = event.get("details", {})
+        details = details if isinstance(details, dict) else {}
+        state = details.get("humanoid_state")
+        if isinstance(state, dict):
+            if state.get("availability") == "AVAILABLE" and state.get("task_context"):
+                available_with_task_context += 1
+            if state.get("availability") == "BLOCKED" and not state.get("reason"):
+                blocked_without_reason += 1
+
+        if event_type == "HUMANOID_TASK_START":
+            task_starts[(event.get("entity_id"), details.get("instance_id"), details.get("task_code"), details.get("task_path") or "")] += 1
+        elif event_type == "HUMANOID_TASK_END":
+            task_ends[(event.get("entity_id"), details.get("instance_id"), details.get("task_code"), details.get("task_path") or "")] += 1
+        elif event_type == "HUMANOID_STEP_START":
+            if str(details.get("call_level") or "PRIMITIVE_SKILL") == "PRIMITIVE_SKILL":
+                step_starts[
+                    (
+                        event.get("entity_id"),
+                        details.get("instance_id"),
+                        details.get("step_id"),
+                        details.get("primitive_call_code"),
+                        details.get("task_path") or "",
+                    )
+                ] += 1
+        elif event_type == "HUMANOID_STEP_END":
+            if str(details.get("call_level") or "PRIMITIVE_SKILL") == "PRIMITIVE_SKILL":
+                step_ends[
+                    (
+                        event.get("entity_id"),
+                        details.get("instance_id"),
+                        details.get("step_id"),
+                        details.get("primitive_call_code"),
+                        details.get("task_path") or "",
+                    )
+                ] += 1
+        elif event_type == "AGENT_TRAFFIC_CONFLICT":
+            primary = str(details.get("primary_worker_id") or "")
+            other = str(details.get("other_worker_id") or "")
+            worker_ids = [str(item) for item in details.get("worker_ids", []) if str(item)]
+            if (primary and primary == other) or len(worker_ids) != len(set(worker_ids)):
+                self_traffic_conflicts += 1
+        elif event_type == "HUMANOID_INCIDENT":
+            incident_code = str(details.get("incident_code") or "")
+            if incident_code and incident_code != incident_code.upper():
+                non_upper_incident_codes.add(incident_code)
+
+        recovery_context = details.get("recovery_context")
+        if isinstance(recovery_context, dict) and recovery_context.get("active") is True:
+            if not isinstance(state, dict) or state.get("availability") != "BLOCKED":
+                recovery_active_nonblocked += 1
+
+    def _diff_count(left: dict[tuple[Any, ...], int], right: dict[tuple[Any, ...], int]) -> int:
+        keys = set(left) | set(right)
+        return sum(abs(int(left.get(key, 0)) - int(right.get(key, 0))) for key in keys)
+
+    task_mismatch = _diff_count(task_starts, task_ends)
+    step_mismatch = _diff_count(step_starts, step_ends)
+    if task_mismatch:
+        audit.error(f"humanoid task start/end mismatch count: {task_mismatch}")
+    if step_mismatch:
+        audit.error(f"humanoid primitive step start/end mismatch count: {step_mismatch}")
+    if available_with_task_context:
+        audit.error(f"worker state AVAILABLE retains task_context: {available_with_task_context}")
+    if blocked_without_reason:
+        audit.error(f"worker state BLOCKED without reason: {blocked_without_reason}")
+    if recovery_active_nonblocked:
+        audit.error(f"active recovery events not BLOCKED: {recovery_active_nonblocked}")
+    if self_traffic_conflicts:
+        audit.error(f"event log has self traffic conflicts: {self_traffic_conflicts}")
+    if non_upper_incident_codes:
+        audit.error(f"incident codes are not uppercase: {sorted(non_upper_incident_codes)}")
 
 
 def check_replay_log(run_dir: Path, audit: Audit) -> None:
@@ -275,6 +395,7 @@ def audit_run(run_dir: Path) -> Audit:
     check_required_files(run_dir, audit)
     events = _iter_events(run_dir / "events.jsonl", audit)
     check_kpi(run_dir, audit)
+    check_event_log_consistency(events, audit)
     check_gantt(run_dir, events, audit)
     check_replay_log(run_dir, audit)
     check_layout(run_dir, audit)

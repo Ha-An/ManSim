@@ -6,17 +6,14 @@ from typing import Any, Optional
 
 
 def default_humanoid_state_payload(humanoid_id: str = "") -> dict[str, Any]:
-    return {
-        "humanoid_id": humanoid_id or "",
-        "availability": "AVAILABLE",
-        "mobility": "STATIONARY",
-        "power": "POWER_NORMAL",
-        "manipulation": "FREE",
-        "task_context": None,
-        "reason": None,
-        "timestamp_s": None,
-        "metadata": {},
-    }
+    try:
+        from humanoidsim import default_humanoid_state
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "HumanoidSim is required to create ManSim worker state. "
+            "Install it with: .\\.venv\\Scripts\\python.exe -m pip install -e ..\\HumanoidSim"
+        ) from exc
+    return default_humanoid_state(humanoid_id or "").to_dict()
 
 
 class MachineState(str, Enum):
@@ -104,6 +101,9 @@ class Worker:
     current_task_path: Optional[str] = None
     current_task_depth: int = 0
     current_step_id: Optional[str] = None
+    current_step_call_code: Optional[str] = None
+    current_step_path: Optional[str] = None
+    current_step_depth: int = 0
     current_primitive_call_code: Optional[str] = None
     current_task_started_at: Optional[float] = None
     humanoid_state: dict[str, Any] = field(default_factory=default_humanoid_state_payload)

@@ -677,8 +677,15 @@ def convert_events(
         path_positions = path_tiles_to_positions(layout, motion.get("path_tiles"))
         from_tile_position = tile_to_position(layout, motion.get("from_tile"))
         to_tile_position = tile_to_position(layout, motion.get("to_tile"))
+        paused = str(details.get("observation_reason", "") or "").strip() == "path_wait" or bool(motion.get("paused", False))
         from_position = from_tile_position
         to_position = to_tile_position
+        if paused:
+            # Path-wait observations preserve the planned route for context,
+            # but the worker must stay fixed on its current tile.
+            hold_position = tile_to_position(layout, details.get("tile")) or from_tile_position
+            from_position = hold_position
+            to_position = hold_position
         if not from_position or not to_position:
             return None
         started_at = float(motion.get("started_at", 0.0) or 0.0)
@@ -689,8 +696,10 @@ def convert_events(
             "started_at": started_at,
             "ended_at": ended_at,
         }
+        if paused:
+            payload["paused"] = True
         if path_positions:
-            payload["path"] = path_positions
+            payload["path"] = [from_position, to_position] if paused else path_positions
             payload["display_path"] = path_positions
         return payload
 

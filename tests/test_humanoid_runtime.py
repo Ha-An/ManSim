@@ -96,6 +96,41 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
             with self.subTest(task_code=task_code):
                 self.assertIsNotNone(self.catalog.get(task_code))
 
+    def test_default_config_sets_assignment_min_duration(self) -> None:
+        cfg_path = Path(__file__).resolve().parents[1] / "configs" / "humanoidsim" / "default.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        worker = Worker(worker_id="A1")
+        world = SimpleNamespace(
+            env=SimpleNamespace(now=0.0),
+            agents={"A1": worker},
+            battery_remaining=lambda _worker: 100.0,
+        )
+        runtime = HumanoidTaskRuntime(world, {"humanoidsim": cfg})
+
+        self.assertEqual(0.1, runtime.assignment_min_duration)
+
+    def test_stale_interrupted_tile_motion_is_not_exported(self) -> None:
+        worker = Worker(worker_id="A2", tile=(43, 11))
+        worker.in_transit_from = "Warehouse"
+        worker.in_transit_to = "Station2"
+        worker.in_transit_progress = 0.5
+        worker.in_transit_total_min = 2.6
+        worker.movement_path = [(43, 9), (43, 10), (43, 11), (44, 11)]
+        worker.movement_target_tile = (44, 11)
+        worker.current_move_id = None
+        worker.current_move_segment_index = 0
+
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.env = SimpleNamespace(now=9.1)
+
+        self.assertIsNone(world._worker_motion_payload(worker))
+
+        worker.current_move_id = "A2-move-000007"
+        payload = world._worker_motion_payload(worker)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual("A2-move-000007", payload["move_id"])
+
     def test_selected_primitives_are_supported(self) -> None:
         for task_code in sorted(set(TASK_CODE_BY_PRIORITY_KEY.values())):
             with self.subTest(task_code=task_code):
@@ -191,6 +226,7 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         runtime.transition_state(worker, "task_assigned", task=task, reason_code="task_selected", source="test")
         self.assertEqual(worker.humanoid_state["availability"], "ASSIGNED")
         self.assertEqual(worker.humanoid_state["task_context"]["task_code"], "TRANSFER")
+        self.assertEqual(worker.humanoid_state["task_context"]["execution_status"], "PENDING")
 
         runtime.set_step_state(worker, task, {"step_id": "s1", "call_code": "NAVIGATE_TO"}, event_type="HUMANOID_STEP_START", status="running")
         self.assertEqual(worker.humanoid_state["availability"], "EXECUTING")
@@ -746,6 +782,115 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         self.assertEqual("material_shelf_slot_empty", task_end["details"]["reason"])
         self.assertEqual("skipped", world.task_records[-1]["status"])
         self.assertEqual("material_supply", world.task_records[-1]["priority_key"])
+
+    def test_battery_swap_receiver_wait_sets_waiting_availability(self) -> None:
+        events: list[dict] = []
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.env = SimpleNamespace(now=25.0)
+        world.logger = SimpleNamespace(log=lambda **payload: events.append(payload))
+        world.day_for_time = lambda _t: 1  # type: ignore[method-assign]
+        world.worker_display_location = lambda worker: worker.location  # type: ignore[method-assign]
+        world.agent_display_location = lambda worker: worker.location  # type: ignore[method-assign]
+        world.battery_remaining = lambda _worker: 42.0  # type: ignore[method-assign]
+        world.product_transport_session_by_worker = {}
+        world.product_transport_sessions = {}
+        worker = Worker(worker_id="A3", location="Station2")
+        world.agents = {"A3": worker}
+        world.humanoid_runtime = HumanoidTaskRuntime(world, {"humanoidsim": {"enabled": True}})
+
+        world._start_battery_swap_wait(worker, "A1")
+
+        self.assertEqual("A1", worker.awaiting_battery_from)
+        self.assertEqual("WAITING", worker.humanoid_state["availability"])
+        self.assertEqual("battery_swap_wait", worker.humanoid_state["reason"]["code"])
+        wait_start = next(event for event in events if event["event_type"] == "BATTERY_SWAP_WAIT_START")
+        self.assertEqual("WAITING", wait_start["details"]["humanoid_state"]["availability"])
+
+        world.env.now = 31.0
+        world._end_battery_swap_wait(worker, "A1")
+
+        self.assertIsNone(worker.awaiting_battery_from)
+        self.assertEqual("AVAILABLE", worker.humanoid_state["availability"])
+        wait_end = next(event for event in events if event["event_type"] == "BATTERY_SWAP_WAIT_END")
+        self.assertEqual("AVAILABLE", wait_end["details"]["humanoid_state"]["availability"])
+
+    def test_battery_swap_wait_does_not_downgrade_blocked_worker(self) -> None:
+        events: list[dict] = []
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.env = SimpleNamespace(now=25.0)
+        world.logger = SimpleNamespace(log=lambda **payload: events.append(payload))
+        world.day_for_time = lambda _t: 1  # type: ignore[method-assign]
+        world.worker_display_location = lambda worker: worker.location  # type: ignore[method-assign]
+        world.agent_display_location = lambda worker: worker.location  # type: ignore[method-assign]
+        world.battery_remaining = lambda _worker: 42.0  # type: ignore[method-assign]
+        world.product_transport_session_by_worker = {}
+        world.product_transport_sessions = {}
+        worker = Worker(worker_id="A3", location="Station2")
+        world.agents = {"A3": worker}
+        world.humanoid_runtime = HumanoidTaskRuntime(world, {"humanoidsim": {"enabled": True}})
+        world._transition_humanoid_state(worker, "blocked", reason="RESOURCE_PREEMPTED", source="test")
+
+        world._start_battery_swap_wait(worker, "A1")
+
+        self.assertEqual("A1", worker.awaiting_battery_from)
+        self.assertEqual("BLOCKED", worker.humanoid_state["availability"])
+        self.assertEqual("RESOURCE_PREEMPTED", worker.humanoid_state["reason"]["code"])
+        wait_start = next(event for event in events if event["event_type"] == "BATTERY_SWAP_WAIT_START")
+        self.assertEqual("BLOCKED", wait_start["details"]["humanoid_state"]["availability"])
+
+    def test_battery_thresholds_drive_power_axis(self) -> None:
+        events: list[dict] = []
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.env = SimpleNamespace(now=0.0)
+        world.logger = SimpleNamespace(log=lambda **payload: events.append(payload))
+        world.day_for_time = lambda _t: 1  # type: ignore[method-assign]
+        world.worker_display_location = lambda worker: worker.location  # type: ignore[method-assign]
+        world.battery_remaining = lambda worker: float(getattr(worker, "battery_probe", 100.0))  # type: ignore[method-assign]
+        world._battery_low_alert_threshold = lambda _worker: 30.0  # type: ignore[method-assign]
+        world._battery_mandatory_threshold = lambda _worker: 12.0  # type: ignore[method-assign]
+        world.product_transport_session_by_worker = {}
+        world.product_transport_sessions = {}
+        worker = Worker(worker_id="A1", location="Warehouse")
+        world.agents = {"A1": worker}
+        world.humanoid_runtime = HumanoidTaskRuntime(world, {"humanoidsim": {"enabled": True}})
+
+        worker.battery_probe = 20.0
+        world._sync_humanoid_power_state(worker)
+        self.assertEqual("POWER_LOW", worker.humanoid_state["power"])
+
+        worker.battery_probe = 8.0
+        world._sync_humanoid_power_state(worker)
+        self.assertEqual("POWER_CRITICAL", worker.humanoid_state["power"])
+
+        worker.battery_probe = 80.0
+        world._sync_humanoid_power_state(worker)
+        self.assertEqual("POWER_NORMAL", worker.humanoid_state["power"])
+
+        powers = [
+            event["details"]["humanoid_state"]["power"]
+            for event in events
+            if event["event_type"] == "WORKER_STATE_CHANGED"
+        ]
+        self.assertIn("POWER_LOW", powers)
+        self.assertIn("POWER_CRITICAL", powers)
+
+    def test_humanoid_state_kpi_includes_zero_states_from_schema(self) -> None:
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.env = SimpleNamespace(now=10.0)
+        world.logger = SimpleNamespace(events=[])
+        world.agents = {"A1": Worker(worker_id="A1")}
+
+        by_worker = world._humanoid_state_time_metrics()
+        by_axis = world._humanoid_state_axis_totals(by_worker)
+        ratios = world._humanoid_state_ratios(by_worker)
+
+        self.assertIn("OFFLINE", by_worker["A1"]["availability"])
+        self.assertEqual(0.0, by_worker["A1"]["availability"]["OFFLINE"])
+        self.assertIn("DOCKING", by_worker["A1"]["mobility"])
+        self.assertEqual(0.0, by_worker["A1"]["mobility"]["DOCKING"])
+        self.assertIn("POWER_CRITICAL", by_axis["power"])
+        self.assertEqual(0.0, by_axis["power"]["POWER_CRITICAL"])
+        self.assertIn("PLACING", ratios["A1"]["manipulation"])
 
     def test_legacy_state_contract_removed(self) -> None:
         root = Path(__file__).resolve().parents[1]

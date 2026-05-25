@@ -60,10 +60,10 @@ function Ensure-DockerBinOnPath() {
     }
 }
 
-function Invoke-Docker([string[]]$Args) {
-    & $script:DockerExe @Args
+function Invoke-Docker([string[]]$DockerArgs) {
+    & $script:DockerExe @DockerArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "docker command failed: docker $($Args -join ' ')"
+        throw "docker command failed: docker $($DockerArgs -join ' ')"
     }
 }
 

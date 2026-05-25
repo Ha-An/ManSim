@@ -6,6 +6,12 @@ missing_package_policy: error
 catalog_root: null
 validation_mode: filter
 
+# ManSim owns scenario-specific lifecycle timing. The assignment dwell keeps
+# ASSIGNED visible in KPI/Gantt before task execution starts.
+task_lifecycle:
+  unit: min
+  assignment_min_duration: 0.1
+
 # ManSim owns environment-specific primitive timing.
 # Unit is simulation minutes; non-domain primitives use this minimum so Replay
 # can show the TaskSpec primitive sequence instead of collapsing zero-time steps.

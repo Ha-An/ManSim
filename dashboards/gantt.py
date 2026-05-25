@@ -45,6 +45,22 @@ def _worker_sort_key(raw: str) -> tuple[int, str]:
     return (1, text)
 
 
+def _machine_sort_key(raw: str) -> tuple[int, int, str]:
+    text = str(raw).upper()
+    if text.startswith("S") and "M" in text:
+        station, _, machine = text[1:].partition("M")
+        if station.isdigit() and machine.isdigit():
+            return (int(station), int(machine), text)
+    return (999, 999, text)
+
+
+def _lane_sort_key(raw: str) -> tuple[int, tuple[int, str] | tuple[int, int, str]]:
+    text = str(raw)
+    if _is_worker_id(text):
+        return (0, _worker_sort_key(text))
+    return (1, _machine_sort_key(text))
+
+
 def _entity_key(event: dict[str, Any]) -> tuple[str, str]:
     return (str(event.get("entity_id", "")), "default")
 
@@ -388,6 +404,7 @@ def export_gantt(
         + machine_down_pm
         + machine_wait_unload
     )
+    rows.sort(key=lambda row: (_lane_sort_key(str(row.get("lane", ""))), float(row.get("start", 0.0) or 0.0), str(row.get("status", ""))))
 
     csv_path = output_dir / "gantt_segments.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as fp:
@@ -495,6 +512,7 @@ def export_gantt(
         )
 
     df = pd.DataFrame(df_rows)
+    lane_order = sorted({str(row["lane"]) for row in df_rows}, key=_lane_sort_key)
     hover_summaries: list[str] = []
     for row in df_rows:
         lines = [
@@ -550,7 +568,7 @@ def export_gantt(
         y="lane",
         color="status",
         color_discrete_map=color_map,
-        category_orders={"status": status_order},
+        category_orders={"lane": lane_order, "status": status_order},
         custom_data=["hover_summary"],
     )
 
@@ -592,7 +610,12 @@ def export_gantt(
                 trace.legendgrouptitle = {"text": "Machine"}
                 seen_machine_group = True
 
-    fig.update_yaxes(autorange="reversed", title_text="Resource")
+    fig.update_yaxes(
+        autorange="reversed",
+        title_text="Resource",
+        categoryorder="array",
+        categoryarray=lane_order,
+    )
     fig.update_xaxes(title_text="Simulation Time", tickformat="%Y-%m-%d %H:%M")
     add_plotly_meta_header(fig, output_dir=output_dir, y_top=1.12)
     fig.update_layout(height=980, legend_title_text="", legend_traceorder="grouped", margin=dict(l=40, r=40, t=140, b=40))

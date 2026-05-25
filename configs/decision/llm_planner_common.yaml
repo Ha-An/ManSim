@@ -59,6 +59,11 @@ llm:
     enabled: true
     # cross-run learning 반복 횟수. 1이면 single run, 3 이상이면 series run.
     run_count: 1
+    # series run마다 seed + (run_index - 1) * seed_stride를 사용한다.
+    # 동일 정책 반복 실험에서 scrap/incident 같은 확률 사건이 같은 난수열을 재사용하지 않게 한다.
+    vary_seed_by_run: true
+    seed_stride: 1
+    sync_llm_seed_with_run_seed: true
     detector:
       max_top_bottlenecks: 3
     evaluator:

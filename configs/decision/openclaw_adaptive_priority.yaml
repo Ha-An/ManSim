@@ -61,6 +61,12 @@ llm:
     enabled: true
     # If run_count >= 2, runtime creates run_01, run_02... under a series directory.
     run_count: 1
+    # When running a series, assign seed + (run_index - 1) * seed_stride to each run.
+    # This keeps cross-run learning deterministic while making stochastic shop-floor
+    # outcomes, such as inspection scrap, independent across runs.
+    vary_seed_by_run: true
+    seed_stride: 1
+    sync_llm_seed_with_run_seed: true
     strategy:
       # Blend between scripted fallback weights and strategist intent.
       priority_blend_alpha: 0.45

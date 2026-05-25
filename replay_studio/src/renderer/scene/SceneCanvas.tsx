@@ -585,6 +585,7 @@ function workerPrimitiveCode(entity: { attributes: Record<string, unknown> }): s
 function activeMotionWindow(entity: { attributes: Record<string, unknown> }, currentTime: number): boolean {
   const motion = entity.attributes.motion;
   if (!motion || typeof motion !== "object") return false;
+  if ((motion as Record<string, unknown>).paused === true) return false;
   const startedAt = Number((motion as Record<string, unknown>).started_at);
   const endedAt = Number((motion as Record<string, unknown>).ended_at);
   return Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt > startedAt && currentTime >= startedAt && currentTime < endedAt;

@@ -69,6 +69,12 @@ def worker_work_loop(env: simpy.Environment, world: ManufacturingWorld, worker_i
                 # Assisted battery swap in progress: receiver must stay paused.
                 yield env.timeout(1)
                 continue
+            transport_session_for_worker = getattr(world, "_transport_session_for_worker", None)
+            if callable(transport_session_for_worker) and transport_session_for_worker(agent) is not None:
+                # Shared product transport is still active even when the helper's
+                # HANDOVER_ITEM task has already synchronized with the carrier.
+                yield env.timeout(0.1)
+                continue
 
             resumed_task = False
             if agent.suspended_task is not None:
@@ -85,6 +91,9 @@ def worker_work_loop(env: simpy.Environment, world: ManufacturingWorld, worker_i
             status = "completed"
             reason = ""
             try:
+                assignment_min = float(getattr(getattr(world, "humanoid_runtime", None), "assignment_min_duration", 0.0) or 0.0)
+                if assignment_min > 0.0:
+                    yield env.timeout(assignment_min)
                 completed = yield from world.execute_task(agent, task)
                 if not completed:
                     status = "skipped"
@@ -136,13 +145,14 @@ def worker_battery_monitor(env: simpy.Environment, world: ManufacturingWorld, wo
             continue
 
         remaining = world.battery_remaining(agent)
+        world._sync_humanoid_power_state(agent)
         world._emit_low_battery_alert_if_needed(agent)
         if remaining <= eps:
             world.discharge_agent(agent, reason="battery_depleted")
             yield env.timeout(0)
             continue
 
-        yield env.timeout(max(remaining, eps))
+        yield env.timeout(world._battery_monitor_sleep_min(agent, eps))
         if not agent.discharged and world.battery_remaining(agent) <= eps:
             world.discharge_agent(agent, reason="battery_depleted")
 

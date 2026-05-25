@@ -11,6 +11,7 @@ interface MotionMeta {
   path?: Array<{ x: number; y: number }>;
   started_at?: number;
   ended_at?: number;
+  paused?: boolean;
 }
 
 export interface BuildRenderModelOptions {
@@ -29,6 +30,7 @@ function interpolatePosition(entity: BaseEntityState, basePosition: { x: number;
   if (!motion?.from || !motion?.to || motion.started_at === undefined || motion.ended_at === undefined) {
     return basePosition;
   }
+  if (motion.paused) return motion.from;
   if (currentTime <= motion.started_at) return motion.from;
   if (currentTime >= motion.ended_at) return motion.to;
   const span = Math.max(0.0001, motion.ended_at - motion.started_at);

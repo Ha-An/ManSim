@@ -103,6 +103,7 @@ export function motionDisplayPathPoints(motion: unknown): XY[] {
 export function isMotionActive(motion: unknown, currentTime: number): boolean {
   if (!motion || typeof motion !== "object") return false;
   const payload = motion as Record<string, unknown>;
+  if (payload.paused === true) return false;
   const startedAt = Number(payload.started_at);
   const endedAt = Number(payload.ended_at);
   return Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt > startedAt && currentTime >= startedAt && currentTime <= endedAt;

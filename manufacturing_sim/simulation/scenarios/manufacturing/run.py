@@ -294,11 +294,18 @@ def run(
     run_index = max(1, int(series_cfg.get("run_index", 1) or 1))
     total_runs = max(run_index, int(series_cfg.get("total_runs", 1) or 1))
     knowledge_in_path = str(series_cfg.get("knowledge_path", str((output_root / "knowledge.md").resolve()))).strip()
+    run_seed = int(experiment_cfg.get("seed", 7))
+    base_seed = int(series_cfg.get("base_seed", run_seed) or run_seed)
 
     run_meta: dict[str, Any] = {
         "decision_mode": decision_mode,
         "run_index": run_index,
         "total_runs": total_runs,
+        "seed": run_seed,
+        "base_seed": base_seed,
+        "vary_seed_by_run": bool(series_cfg.get("vary_seed_by_run", False)),
+        "seed_stride": int(series_cfg.get("seed_stride", 1) or 1),
+        "sync_llm_seed_with_run_seed": bool(series_cfg.get("sync_llm_seed_with_run_seed", True)),
         "total_days": total_days,
         "minutes_per_day": float(experiment_cfg["horizon"].get("minutes_per_day", 0)),
         "sim_total_min": round(sim_total_min, 3),
@@ -803,7 +810,6 @@ def run(
         "llm_graph_path": str(run_meta.get("llm_graph_path", "")).strip(),
         "llm_wiki_dashboard_path": str(run_meta.get("llm_wiki_dashboard_path", "")).strip(),
     }
-
 
 
 

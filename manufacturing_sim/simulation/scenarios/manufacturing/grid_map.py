@@ -303,14 +303,43 @@ class TileGridMap:
         shelf_capacity = max(0, int(material_shelf_capacity or 0))
         slots_per_row = max(1, min(10, shelf_capacity or 1))
         shelf_rows = max(1, (shelf_capacity + slots_per_row - 1) // slots_per_row)
-        shelf_width = max(4, min(22, slots_per_row * 2))
-        shelf_height = max(2, min(8, shelf_rows * 2))
-        add("warehouse_material_shelf", "shelf", "Warehouse", 2, 3, shelf_width, shelf_height)
+        shelf_width = max(1, min(21, slots_per_row * 2 - 1))
+        warehouse = zones["Warehouse"]
+        shelf_rel_x = max(1, warehouse.width - 1 - shelf_width)
+        shelf_slot_start_rel_y = 2
+        shelf_row_pitch = 3
+        # Shelf rows are right-aligned against the warehouse inner wall.
+        # Each row is exactly wide enough for ten alternating material spots.
+        shelf_wall_width = shelf_width
+        shelf_height = max(1, (shelf_rows - 1) * shelf_row_pitch + 3)
+        add("warehouse_material_shelf", "shelf", "Warehouse", shelf_rel_x, shelf_slot_start_rel_y - 1, shelf_wall_width, shelf_height, blocking=False)
+        for row in range(shelf_rows):
+            slot_rel_y = shelf_slot_start_rel_y + row * shelf_row_pitch
+            add(
+                f"warehouse_material_shelf_wall_{row + 1:02d}",
+                "shelf_wall",
+                "Warehouse",
+                shelf_rel_x,
+                slot_rel_y - 1,
+                shelf_wall_width,
+                1,
+                blocking=True,
+            )
+            add(
+                f"warehouse_material_shelf_row_{row + 1:02d}",
+                "shelf_blocker",
+                "Warehouse",
+                shelf_rel_x,
+                slot_rel_y,
+                shelf_wall_width,
+                1,
+                blocking=True,
+            )
         for index in range(1, shelf_capacity + 1):
             row = (index - 1) // slots_per_row
             col = (index - 1) % slots_per_row
-            rel_x = 2 + min(shelf_width - 1, col * 2)
-            rel_y = 3 + min(shelf_height - 1, row * 2 + 1)
+            rel_x = shelf_rel_x + max(0, shelf_width - 1 - col * 2)
+            rel_y = shelf_slot_start_rel_y + row * shelf_row_pitch
             add(f"warehouse_material_slot_{index:02d}", "material_slot", "Warehouse", rel_x, rel_y, 1, 1, blocking=False)
         add("completed_product_buffer", "buffer", "CompletedProducts", 9, 5, queue_width, queue_height)
         add("scrap_disposal_bin", "scrap_bin", "ScrapDisposal", 9, 4, queue_width, queue_height)
@@ -355,12 +384,14 @@ class TileGridMap:
                 out[obj.object_id] = [center] if 0 <= center[0] < width and 0 <= center[1] < height and center not in walls else []
                 continue
             if obj.object_type == "material_slot":
-                south = (obj.x, obj.y + obj.height)
-                out[obj.object_id] = (
-                    [south]
-                    if 0 <= south[0] < width and 0 <= south[1] < height and south not in blocked
-                    else []
-                )
+                # Pickup is allowed only from a tile directly adjacent to the
+                # item on the open aisle side. The back side is a wall.
+                candidates: list[Tile] = [(obj.x, obj.y + obj.height)]
+                out[obj.object_id] = [
+                    tile
+                    for tile in candidates
+                    if 0 <= tile[0] < width and 0 <= tile[1] < height and tile not in blocked
+                ]
                 continue
             candidates: set[Tile] = set()
             for x in range(obj.x, obj.x + obj.width):
@@ -423,12 +454,29 @@ class TileGridMap:
         return normalized
 
     def initial_worker_tile(self, worker_id: str) -> Tile:
-        slots = self.zone_service_tiles.get("Warehouse") or [self.zones["Warehouse"].center()]
         index = 0
         try:
             index = max(0, int(str(worker_id).lstrip("A")) - 1)
         except ValueError:
             index = 0
+        warehouse = self.zones.get("Warehouse")
+        station2 = self.zones.get("Station2")
+        if warehouse is not None and station2 is not None:
+            # Start humanoids in the open corridor instead of inside Warehouse.
+            # This keeps initial dispatch visible and avoids a first-frame
+            # warehouse-to-corridor jump in Replay Studio.
+            corridor_y = max(0, min(self.height_tiles - 1, (warehouse.y1 + station2.y) // 2))
+            center_x = warehouse.x + warehouse.width // 2
+            offsets = [0, -1, 1, -2, 2, -3, 3]
+            corridor_slots = [
+                (center_x + offset, corridor_y)
+                for offset in offsets
+                if 0 <= center_x + offset < self.width_tiles
+                and self.is_passable_static((center_x + offset, corridor_y))
+            ]
+            if corridor_slots:
+                return corridor_slots[index % len(corridor_slots)]
+        slots = self.zone_service_tiles.get("Warehouse") or [self.zones["Warehouse"].center()]
         return slots[index % len(slots)]
 
     def register_worker(self, worker_id: str, tile: Tile) -> Tile:
@@ -694,6 +742,8 @@ class TileGridMap:
             "scrap_bin": "buffer",
         }
         for obj in self.objects.values():
+            if obj.object_type in {"shelf_blocker", "shelf_wall"}:
+                continue
             nodes.append(
                 {
                     "entity_id": obj.object_id,

@@ -15,6 +15,17 @@ Humanoid State/Task/Primitive 전체 설명은 [humanoid_worker_model.md](humano
 
 `movement.warehouse_to_station_min` 같은 zone 기반 이동 시간은 tile map이 꺼졌을 때 쓰는 fallback 값입니다. 기본값은 `map.enabled=true`이므로 실제 worker 이동은 tile path를 따릅니다.
 
+## Initial Worker Placement
+
+기본 worker 시작 위치는 Warehouse 내부가 아니라 Warehouse와 Station 2 사이의 복도입니다. 이 위치는 `TileGridMap.initial_worker_tile()`에서 계산합니다.
+
+- 기준 y좌표: Warehouse 하단과 Station 2 상단 사이의 중간 복도.
+- 기준 x좌표: Warehouse 중앙 x좌표.
+- 여러 worker는 중앙을 기준으로 좌우 한 칸씩 벌려 배치합니다.
+- 기본 100x70 map에서는 보통 `A1=(50,19)`, `A2=(49,19)`, `A3=(51,19)`에서 시작합니다.
+
+이렇게 시작시키는 이유는 worker가 Warehouse 내부에서 첫 dispatch를 받을 때 Replay Studio에서 복도까지 순간 이동한 것처럼 보이는 상황을 줄이고, 선반/복도 congestion을 시작 직후부터 관찰하기 위해서입니다.
+
 ## Destination Tile
 
 이동 요청은 `move_agent(agent, dst)`로 시작합니다. `dst`는 `"S1M1"`, `"material_queue_1"`, `"inspection_table"`, `"Warehouse"` 같은 logical destination입니다.
@@ -100,9 +111,11 @@ movement:
 `strict_reservation`에서는 worker가 다음 tile로 들어가기 전에 `grid.try_reserve(worker_id, next_tile)`을 호출합니다.
 
 - 예약 성공: 한 tile 이동 시간만큼 진행한 뒤 worker occupancy를 next tile로 옮깁니다.
-- 예약 실패: 이동하지 않고 `map.tile_time_min`만큼 대기합니다.
+- 예약 실패: 이동하지 않고 `TRAFFIC_WAIT` HumanoidSim incident를 기록합니다.
 - 예약 실패 event: `AGENT_TRAFFIC_CONFLICT` with `conflict_type=TRAFFIC_WAIT`.
-- 대기 중에도 worker state는 `HumanoidStateSnapshot`에 기록됩니다.
+- 대응: ManSim은 자체 traffic 해결 정책을 실행하지 않고, HumanoidSim에 정의된 `TRAFFIC_WAIT` recovery protocol을 실행한 뒤 같은 path/reservation 루프를 다시 시도합니다.
+- 장시간 path를 찾지 못하면 `AGENT_TILE_BLOCKED`를 기록하고 `PATH_BLOCKED` HumanoidSim incident 및 recovery protocol로 연결합니다.
+- 대기와 복구 중에도 worker state는 `HumanoidStateSnapshot`에 기록됩니다.
 
 이 모드는 동적 충돌을 줄이는 보수적인 실행 방식입니다. 더 정교한 교차로 정책이나 우선순위 정책은 별도 traffic policy layer에서 확장할 수 있습니다.
 
@@ -124,6 +137,7 @@ movement:
 - `NEAR_MISS`: 설정된 headway보다 짧은 간격으로 근접 통과.
 - `COLLISION`: tile/edge conflict가 실제 이동 구간에서 겹침.
 - `TRAFFIC_WAIT`: strict reservation에서 다음 tile 예약 실패로 대기.
+- `PATH_BLOCKED`: threshold 이상 path를 찾지 못해 현재 task를 그대로 진행할 수 없는 상태.
 
 ## Replay 표시
 
@@ -133,6 +147,7 @@ Replay Studio는 시뮬레이션 위치를 임의로 보정하지 않습니다.
 - Worker path overlay: 실제 tile path polyline.
 - Traffic overlay: 현재 conflict tile 또는 edge.
 - Worker panel의 `Motion Path`: 현재 active motion의 path tile 수.
+- `path_wait` 관찰 event: worker 위치는 현재 tile에 고정하고 `Motion Path`는 `0 tiles`로 표시합니다. 계획되어 있던 전체 route는 `display_path`로만 보존해서 점선 경로를 볼 수 있게 합니다.
 
 Traffic conflict는 worker 사이 직선 연결로 표시하지 않고 tile/edge overlay로만 표시합니다. 그래서 실제 이동 경로와 충돌 지점이 섞여 보이지 않습니다.
 

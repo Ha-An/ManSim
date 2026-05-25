@@ -50,15 +50,15 @@ Worker의 상태는 `HumanoidStateSnapshot` 하나로 기록합니다. 예전의
 | --- | --- | --- |
 | `STATIONARY` | 멈춰 있음 | 이동 primitive가 끝났거나 작업 위치에 정지 |
 | `NAVIGATING` | 목적지로 이동 중 | `NAVIGATE_TO`, `move_agent()` 실행 중 |
-| `DOCKING` | charger, workbench, equipment에 정렬 중 | schema에는 있으나 현재 기본 flow에서는 별도 docking primitive로 세분화하지 않음 |
+| `DOCKING` | charger, workbench, equipment에 정렬 중 | 이동이 끝난 뒤 작업대, 설비, 충전 랙, queue service tile에 정렬하는 `ALIGN` 단계에서 사용 |
 
 ### Power State
 
 | State | 의미 | ManSim에서의 예 |
 | --- | --- | --- |
 | `POWER_NORMAL` | 작업 가능한 정상 전원 | 기본 상태 |
-| `POWER_LOW` | 낮은 전원 | 향후 policy threshold에서 사용 가능 |
-| `POWER_CRITICAL` | 위험 수준 전원 | 향후 policy threshold에서 사용 가능 |
+| `POWER_LOW` | 낮은 전원 | `movement`/battery monitor가 low threshold 이하를 감지하면 전이 |
+| `POWER_CRITICAL` | 위험 수준 전원 | mandatory/critical threshold 이하를 감지하면 전이 |
 | `DEPLETED` | 방전 | worker가 `DISABLED`로 전환 |
 | `CHARGING` | 충전 중 | `MANAGE_ROBOT_POWER` 또는 충전 처리 |
 
@@ -296,5 +296,6 @@ Replay Studio에서 이상한 표시가 보이면 먼저 core artifact를 확인
 | `warehouse.material_shelf.capacity` | `configs/scenario/mfg_basic.yaml` | warehouse shelf slot 개수 |
 | `movement.traffic.mode` | `configs/scenario/mfg_basic.yaml` | `strict_reservation` 등 traffic mode |
 | `humanoid_incidents` | `configs/scenario/mfg_basic.yaml` | random incident 발생 확률과 trigger primitive |
+| `task_lifecycle.assignment_min_duration` | `configs/humanoidsim/default.yaml` | `ASSIGNED` 상태가 KPI/Gantt에서 관측되도록 보장하는 최소 체류 시간 |
 | `primitive_timing.default_min` | `configs/humanoidsim/default.yaml` | primitive 최소 표시 시간 |
 | `recovery_protocol.default_step_min` | `configs/humanoidsim/default.yaml` | recovery step 최소 표시 시간 |

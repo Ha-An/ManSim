@@ -1126,6 +1126,7 @@ class ManufacturingWorld:
                 ref=f"dropped_by:{agent.agent_id}",
                 item_type=item_type or None,
             )
+            self._abort_product_transport_session_for_item(item_id, reason="ITEM_DROPPED", destination="dropped")
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1252,6 +1253,101 @@ class ManufacturingWorld:
             notify_workers=[agent.agent_id] if notify_worker else [],
         )
         return details
+
+    def _execute_active_humanoid_incident_recovery(
+        self,
+        agent: Worker,
+        code: str,
+        *,
+        primitive_call_code: str = "NAVIGATE_TO",
+        source: str,
+        context: dict[str, Any] | None = None,
+    ):
+        """Run the HumanoidSim recovery protocol without adding local policy.
+
+        ManSim decides only that an environment incident occurred. The incident
+        profile, state reason, and recovery steps come from HumanoidSim.
+        Movement can then retry with the same normal path/reservation logic.
+        """
+        runtime = getattr(self, "humanoid_runtime", None)
+        task = self._current_parent_task_stub(agent)
+        step = {
+            "step_id": str(agent.current_step_id or "motion"),
+            "call_code": str(primitive_call_code or agent.current_primitive_call_code or "NAVIGATE_TO"),
+        }
+        self._emit_humanoid_incident(
+            agent,
+            code,
+            task=task,
+            step=step,
+            primitive_call_code=str(step["call_code"]),
+            source=source,
+            context=dict(context or {}),
+            notify_worker=True,
+        )
+        if runtime is not None and getattr(runtime, "enabled", False):
+            yield from runtime._execute_pending_recovery_protocol(
+                agent,
+                task,
+                complete_parent_on_success=False,
+            )
+
+    def _start_battery_swap_wait(self, target_agent: Agent, from_agent_id: str) -> None:
+        """Mark the battery receiver as waiting for an already-dispatched helper."""
+        target_agent.awaiting_battery_from = str(from_agent_id)
+        current_availability = str(self._humanoid_state_payload(target_agent).get("availability", "")).upper()
+        # WAITING is for expected short waits. BLOCKED/DISABLED/OFFLINE carry stronger
+        # operational meaning, so battery helper dispatch must not downgrade them.
+        if current_availability not in {"BLOCKED", "DISABLED", "OFFLINE"}:
+            self._transition_humanoid_state(
+                target_agent,
+                "waiting",
+                reason="battery_swap_wait",
+                reason_message=f"Waiting for battery delivery from {from_agent_id}.",
+                source="mansim.power",
+                metadata={"from_agent_id": str(from_agent_id)},
+            )
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="BATTERY_SWAP_WAIT_START",
+            entity_id=target_agent.agent_id,
+            location=self.agent_display_location(target_agent),
+            details={
+                "from_agent_id": str(from_agent_id),
+                "humanoid_state": self._humanoid_state_payload(target_agent),
+            },
+        )
+
+    def _end_battery_swap_wait(self, target_agent: Agent, from_agent_id: str) -> None:
+        """Clear the receiver-side wait marker after delivery, cancel, or retry."""
+        if target_agent.awaiting_battery_from == str(from_agent_id):
+            target_agent.awaiting_battery_from = None
+        current_state = self._humanoid_state_payload(target_agent)
+        current_reason = current_state.get("reason") if isinstance(current_state.get("reason"), dict) else {}
+        if (
+            str(current_state.get("availability", "")).upper() == "WAITING"
+            and str(current_reason.get("code", "")).lower() == "battery_swap_wait"
+            and not target_agent.discharged
+        ):
+            self._transition_humanoid_state(
+                target_agent,
+                "task_completed",
+                reason="battery_swap_wait_end",
+                source="mansim.power",
+                metadata={"cargo_present": False, "from_agent_id": str(from_agent_id)},
+            )
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="BATTERY_SWAP_WAIT_END",
+            entity_id=target_agent.agent_id,
+            location=self.agent_display_location(target_agent),
+            details={
+                "from_agent_id": str(from_agent_id),
+                "humanoid_state": self._humanoid_state_payload(target_agent),
+            },
+        )
 
     def _recent_incidents_for_agent(self, agent: Agent) -> list[dict[str, Any]]:
         backlog = agent.incident_backlog if isinstance(agent.incident_backlog, list) else []
@@ -1471,7 +1567,8 @@ class ManufacturingWorld:
         }
         return payload
 
-    def _log_traffic_conflicts(self, agent: Worker, conflicts: list[TrafficConflict]) -> None:
+    def _log_traffic_conflicts(self, agent: Worker, conflicts: list[TrafficConflict]) -> bool:
+        recovery_requested = False
         for conflict in conflicts:
             details = conflict.to_dict()
             details["humanoid_state"] = self._traffic_humanoid_state_payload(agent, conflict)
@@ -1500,9 +1597,11 @@ class ManufacturingWorld:
                     primitive_call_code="NAVIGATE_TO",
                     source="mansim.traffic",
                     context={key: value for key, value in details.items() if key != "humanoid_state"},
-                    notify_worker=False,
-                    apply_state=str(self.traffic_collision_effect).strip().lower() != "log_only",
+                    notify_worker=True,
+                    apply_state=True,
                 )
+                recovery_requested = recovery_requested or isinstance(getattr(agent, "pending_recovery_incident", None), dict)
+        return recovery_requested
 
     def _traffic_register_plan(self, agent: Worker, move_id: str, path: list[Tile], *, started_at: float, ended_at: float) -> None:
         if self.traffic_monitor is None or not self.traffic_enabled or len(path) < 2:
@@ -1533,9 +1632,9 @@ class ManufacturingWorld:
         started_at: float,
         ended_at: float,
         logical_destination: str,
-    ) -> None:
+    ) -> bool:
         if self.traffic_monitor is None or not self.traffic_enabled:
-            return
+            return False
         segment = TrafficSegment(
             move_id=move_id,
             worker_id=agent.agent_id,
@@ -1546,7 +1645,7 @@ class ManufacturingWorld:
             ended_at=float(ended_at),
         )
         conflicts = self.traffic_monitor.begin_segment(segment)
-        self._log_traffic_conflicts(agent, conflicts)
+        recovery_requested = self._log_traffic_conflicts(agent, conflicts)
         if self.traffic_emit_tile_step_events:
             self.logger.log(
                 t=started_at,
@@ -1565,6 +1664,7 @@ class ManufacturingWorld:
                     "humanoid_state": self._humanoid_state_payload(agent),
                 },
             )
+        return recovery_requested
 
     def _traffic_end_segment(
         self,
@@ -1742,6 +1842,30 @@ class ManufacturingWorld:
             },
         )
 
+    def _log_worker_state_observation(self, worker: Worker, *, reason: str = "") -> None:
+        """Log the current HumanoidSim snapshot without applying a state transition.
+
+        This is used for passive observations such as a blocked movement wait. It
+        keeps Replay motion windows fresh without inventing a local ManSim state.
+        """
+        details = {
+            "humanoid_state": self._humanoid_state_payload(worker),
+            "cargo": self._worker_cargo_payload(worker),
+            "motion": self._worker_motion_payload(worker),
+            "tile": self._tile_payload(worker.tile),
+            "battery_remaining_min": round(float(self.battery_remaining(worker)), 3),
+        }
+        if reason:
+            details["observation_reason"] = str(reason)
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="WORKER_STATE_CHANGED",
+            entity_id=worker.worker_id,
+            location=self.worker_display_location(worker),
+            details=details,
+        )
+
     def _set_humanoid_for_task(self, worker: Worker, task: Task | None, *, reason: str, task_id: str | None = None) -> None:
         if worker.discharged:
             self._transition_humanoid_state(
@@ -1803,8 +1927,38 @@ class ManufacturingWorld:
                     "tile": self._tile_payload(agent.tile),
                     "battery_remaining_min": round(float(self.battery_remaining(agent)), 3),
                 },
-            )
+        )
         return
+
+    def _resume_humanoid_task_after_recovery(self, agent: Agent, *, reason: str, source: str) -> None:
+        """Return a worker from incident recovery back to its active task context."""
+        current_availability = str(self._humanoid_state_payload(agent).get("availability", "")).upper()
+        if current_availability not in {"BLOCKED", "WAITING"}:
+            return
+        self._transition_humanoid_state(
+            agent,
+            "task_started",
+            task=self._current_parent_task_stub(agent),
+            status="running",
+            reason=reason,
+            source=source,
+            metadata={"resume_after_recovery": True},
+        )
+
+    def _dock_agent_at_target(self, agent: Agent, task: Task | None = None, *, reason: str = "align_target"):
+        """Represent precise local alignment after path travel and before work."""
+        self._set_humanoid_primitive_hint(agent, "ALIGN", reason=reason)
+        duration = max(0.0, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.0) or 0.0))
+        if duration > 1e-9:
+            yield self.env.timeout(duration)
+        self._transition_humanoid_state(
+            agent,
+            "primitive_finished",
+            step={"step_id": agent.current_step_id or "align_target", "call_code": "ALIGN"},
+            status="completed",
+            reason=reason,
+            source="mansim.alignment",
+        )
 
     def _current_task_stub(self, worker: Worker) -> Task:
         task_code = str(worker.current_child_task_code or worker.current_task_code or "")
@@ -1821,6 +1975,39 @@ class ManufacturingWorld:
             instance_id=task_instance_id,
             assigned_robot_id=worker.worker_id,
             task_spec_name=task_name,
+        )
+
+    def _current_parent_task_stub(self, worker: Worker) -> Task:
+        task_code = str(worker.current_task_code or "")
+        task_instance_id = str(worker.current_task_instance_id or "")
+        return Task(
+            task_id=str(worker.current_task_id or ""),
+            task_type=task_code or str(worker.current_task_type or ""),
+            priority_key="",
+            priority=0.0,
+            location=str(worker.location),
+            payload={},
+            task_code=task_code,
+            instance_id=task_instance_id,
+            assigned_robot_id=worker.worker_id,
+            task_spec_name=task_code.replace("_", " ").title() if task_code else "",
+        )
+
+    def _current_child_task_stub(self, worker: Worker) -> Task | None:
+        if not worker.current_child_task_code and not worker.current_child_task_instance_id:
+            return None
+        task_code = str(worker.current_child_task_code or "")
+        return Task(
+            task_id=str(worker.current_child_task_instance_id or ""),
+            task_type=task_code,
+            priority_key="",
+            priority=0.0,
+            location=str(worker.location),
+            payload={},
+            task_code=task_code,
+            instance_id=str(worker.current_child_task_instance_id or ""),
+            assigned_robot_id=worker.worker_id,
+            task_spec_name=str(worker.current_child_task_name or task_code.replace("_", " ").title()),
         )
 
     def _sync_humanoid_cargo_state(self, worker: Worker, *, destination: str = "") -> None:
@@ -2036,6 +2223,40 @@ class ManufacturingWorld:
         self.product_transport_session_by_worker.pop(worker.worker_id, None)
         worker.transport_session_id = None
         worker.shared_carry_role = None
+        if not worker.current_task_id and not worker.discharged:
+            self._set_humanoid_for_task(worker, None, reason=reason)
+
+    def _abort_product_transport_session_for_item(self, item_id: str, *, reason: str, destination: str = "dropped") -> None:
+        session_id = str(self.product_transport_session_by_item.get(str(item_id), "") or "")
+        session = self.product_transport_sessions.get(session_id)
+        if not isinstance(session, dict) or str(session.get("status", "active")) != "active":
+            return
+        session["status"] = "aborted"
+        session["completed_at"] = float(self.env.now)
+        carrier_ids = [str(worker_id) for worker_id in session.get("carrier_ids", []) if str(worker_id)]
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="PRODUCT_CARRY_ABORTED",
+            entity_id=str(item_id),
+            location=str(destination),
+            details=self._transport_session_event_details(session, destination=destination, outcome="aborted", reason=reason),
+        )
+        done_event = session.get("done_event")
+        if done_event is not None and hasattr(done_event, "triggered") and not done_event.triggered:
+            done_event.succeed(str(reason or "aborted"))
+        for worker_id in carrier_ids:
+            worker = self.workers.get(worker_id)
+            if worker is None:
+                continue
+            self.product_transport_session_by_worker.pop(worker_id, None)
+            worker.transport_session_id = None
+            worker.shared_carry_role = None
+            if worker.carrying_item_id == item_id:
+                self._set_worker_cargo(worker, None, None, destination=destination)
+            if not worker.current_task_id and not worker.discharged:
+                self._set_humanoid_for_task(worker, None, reason=reason)
+        self.product_transport_session_by_item.pop(str(item_id), None)
 
     def _complete_product_transport_session(self, session: dict[str, Any], *, destination: str, outcome: str = "completed") -> None:
         if not isinstance(session, dict) or str(session.get("status", "active")) != "active":
@@ -2093,6 +2314,8 @@ class ManufacturingWorld:
                     },
                 )
                 self._set_worker_cargo(worker, None, None, destination=destination)
+            if not worker.current_task_id and not worker.discharged:
+                self._set_humanoid_for_task(worker, None, reason="shared_product_carry_completed")
         if item_id:
             self.product_transport_session_by_item.pop(item_id, None)
 
@@ -2136,6 +2359,8 @@ class ManufacturingWorld:
             worker.shared_carry_role = None
             if worker.worker_id == primary.worker_id:
                 self._set_worker_cargo(worker, item_id, "product", destination=destination)
+                if not worker.current_task_id and not worker.discharged:
+                    self._set_humanoid_for_task(worker, None, reason="shared_product_carry_completed")
                 continue
             if worker.carrying_item_id == item_id:
                 self.logger.log(
@@ -2155,6 +2380,8 @@ class ManufacturingWorld:
                     },
                 )
                 self._set_worker_cargo(worker, None, None, destination=destination)
+            if not worker.current_task_id and not worker.discharged:
+                self._set_humanoid_for_task(worker, None, reason="shared_product_carry_completed")
         self.product_transport_session_by_item.pop(item_id, None)
 
     def _product_session_has_remaining_path(self, session: dict[str, Any]) -> bool:
@@ -2342,7 +2569,14 @@ class ManufacturingWorld:
     def _worker_motion_payload(self, worker: Worker) -> dict[str, Any] | None:
         if not worker.in_transit_from or not worker.in_transit_to:
             return None
+        if worker.movement_path and not worker.current_move_id and int(worker.current_move_segment_index or 0) <= 0:
+            # Tile-path motion without either an active move id or an active shared-carry
+            # segment is stale state left after an interrupted move; do not let Replay
+            # interpolate from it and visually teleport the worker.
+            return None
         total_min = max(0.0, float(worker.in_transit_total_min))
+        if total_min <= 1e-9:
+            return None
         progress = min(1.0, max(0.0, float(worker.in_transit_progress)))
         started_at = float(self.env.now) - (progress * total_min)
         return {
@@ -2793,7 +3027,8 @@ class ManufacturingWorld:
         return {agent_id: self._merge_intervals(rows) for agent_id, rows in intervals.items()}
 
     def _humanoid_state_time_metrics(self) -> dict[str, Any]:
-        axes = ("availability", "mobility", "power", "manipulation")
+        axis_values = self._humanoid_state_axis_values()
+        axes = tuple(axis_values.keys())
         sim_end = max(0.0, float(self.env.now))
         current: dict[str, dict[str, Any]] = {
             agent_id: default_humanoid_state_payload(agent_id)
@@ -2833,16 +3068,47 @@ class ManufacturingWorld:
 
         return {
             agent_id: {
-                axis: {state: round(duration, 3) for state, duration in sorted(axis_totals.items())}
+                axis: {
+                    state: round(float(axis_totals.get(state, 0.0) or 0.0), 3)
+                    for state in axis_values.get(axis, sorted(axis_totals.keys()))
+                }
                 for axis, axis_totals in axis_map.items()
             }
             for agent_id, axis_map in totals.items()
         }
 
+    def _humanoid_state_axis_values(self) -> dict[str, list[str]]:
+        """Return HumanoidSim state-axis order so KPI artifacts include zero states."""
+        cached = getattr(self, "_humanoid_state_axis_values_cache", None)
+        if isinstance(cached, dict) and cached:
+            return cached
+        fallback = {
+            "availability": ["AVAILABLE", "ASSIGNED", "EXECUTING", "WAITING", "BLOCKED", "OFFLINE", "DISABLED"],
+            "mobility": ["STATIONARY", "NAVIGATING", "DOCKING"],
+            "power": ["POWER_NORMAL", "POWER_LOW", "POWER_CRITICAL", "DEPLETED", "CHARGING"],
+            "manipulation": ["FREE", "REACHING", "HOLDING", "PLACING"],
+        }
+        try:
+            from humanoidsim import load_state_schema
+
+            schema = load_state_schema()
+            axis_values = {
+                str(axis): [str(value) for value in getattr(definition, "states", {}).keys()]
+                for axis, definition in getattr(schema, "axes", {}).items()
+            }
+            if axis_values:
+                self._humanoid_state_axis_values_cache = axis_values
+                return axis_values
+        except Exception:
+            pass
+        self._humanoid_state_axis_values_cache = fallback
+        return fallback
+
     def _humanoid_state_axis_totals(self, by_worker: dict[str, Any]) -> dict[str, dict[str, float]]:
+        axis_values = self._humanoid_state_axis_values()
         axis_totals: dict[str, dict[str, float]] = {
             axis: defaultdict(float)
-            for axis in ("availability", "mobility", "power", "manipulation")
+            for axis in axis_values
         }
         for worker_rows in by_worker.values():
             if not isinstance(worker_rows, dict):
@@ -2853,11 +3119,15 @@ class ManufacturingWorld:
                 for state, minutes in state_rows.items():
                     axis_totals[axis][str(state)] += float(minutes or 0.0)
         return {
-            axis: {state: round(minutes, 3) for state, minutes in sorted(rows.items())}
+            axis: {
+                state: round(float(rows.get(state, 0.0) or 0.0), 3)
+                for state in axis_values.get(axis, sorted(rows.keys()))
+            }
             for axis, rows in axis_totals.items()
         }
 
     def _humanoid_state_ratios(self, by_worker: dict[str, Any]) -> dict[str, dict[str, dict[str, float]]]:
+        axis_values = self._humanoid_state_axis_values()
         ratios: dict[str, dict[str, dict[str, float]]] = {}
         for worker_id, worker_rows in by_worker.items():
             if not isinstance(worker_rows, dict):
@@ -2868,8 +3138,8 @@ class ManufacturingWorld:
                     continue
                 total = sum(float(value or 0.0) for value in state_rows.values())
                 ratios[str(worker_id)][str(axis)] = {
-                    str(state): round((float(minutes or 0.0) / total) if total > 0 else 0.0, 6)
-                    for state, minutes in sorted(state_rows.items())
+                    str(state): round((float(state_rows.get(state, 0.0) or 0.0) / total) if total > 0 else 0.0, 6)
+                    for state in axis_values.get(str(axis), sorted(state_rows.keys()))
                 }
         return ratios
 
@@ -4169,6 +4439,51 @@ class ManufacturingWorld:
     def _battery_delivery_trigger_threshold(self, agent: Agent) -> float:
         return self._battery_mandatory_threshold(agent) + 2.0
 
+    def _humanoid_power_event_for_battery(self, agent: Agent) -> str:
+        remaining = float(self.battery_remaining(agent))
+        if agent.discharged or remaining <= 1e-6:
+            return "disabled"
+        if remaining <= self._battery_mandatory_threshold(agent):
+            return "power_critical"
+        if remaining <= self._battery_low_alert_threshold(agent):
+            return "power_low"
+        return "power_normal"
+
+    def _sync_humanoid_power_state(self, agent: Agent) -> None:
+        event_type = self._humanoid_power_event_for_battery(agent)
+        target_power = {
+            "power_normal": "POWER_NORMAL",
+            "power_low": "POWER_LOW",
+            "power_critical": "POWER_CRITICAL",
+            "disabled": "DEPLETED",
+        }[event_type]
+        current_power = str((agent.humanoid_state or {}).get("power", "")).strip().upper()
+        if current_power == target_power:
+            return
+        if event_type == "disabled":
+            self._set_humanoid_disabled_state(agent, reason="battery_depleted")
+            return
+        self._transition_humanoid_state(
+            agent,
+            event_type,
+            source="mansim.power",
+            metadata={
+                "battery_remaining_min": round(float(self.battery_remaining(agent)), 3),
+                "low_threshold_min": round(float(self._battery_low_alert_threshold(agent)), 3),
+                "critical_threshold_min": round(float(self._battery_mandatory_threshold(agent)), 3),
+            },
+        )
+
+    def _battery_monitor_sleep_min(self, agent: Agent, eps: float = 1e-6) -> float:
+        remaining = max(0.0, float(self.battery_remaining(agent)))
+        critical = max(0.0, float(self._battery_mandatory_threshold(agent)))
+        low = max(critical, float(self._battery_low_alert_threshold(agent)))
+        if remaining > low + eps:
+            return max(eps, remaining - low)
+        if remaining > critical + eps:
+            return max(eps, remaining - critical)
+        return max(eps, remaining)
+
     def _task_estimated_duration(self, agent: Agent, task: Task) -> float:
         task_type = str(task.task_type).strip().upper()
         if task_type == "BATTERY_SWAP":
@@ -4832,6 +5147,12 @@ class ManufacturingWorld:
         else:
             if not recovered_before_incomplete_end:
                 availability = self._availability_after_incomplete_task(status, reason)
+                current_availability = str((agent.humanoid_state or {}).get("availability", "")).strip().upper()
+                if current_availability == "BLOCKED" and availability == "WAITING":
+                    # Do not erase an unresolved incident with a temporary wait
+                    # reason. HumanoidSim intentionally forbids BLOCKED->WAITING;
+                    # the recovery/replan path must resolve BLOCKED first.
+                    availability = "BLOCKED"
                 state_reason, state_metadata = self._humanoid_incident_metadata_for_reason(reason)
                 if not state_reason:
                     state_reason = reason or status
@@ -4906,6 +5227,9 @@ class ManufacturingWorld:
         agent.current_task_path = None
         agent.current_task_depth = 0
         agent.current_step_id = None
+        agent.current_step_call_code = None
+        agent.current_step_path = None
+        agent.current_step_depth = 0
         agent.current_primitive_call_code = None
         agent.current_task_started_at = None
         agent.current_commitment_id = None
@@ -6302,6 +6626,9 @@ class ManufacturingWorld:
         planned_duration = 0.0
         move_id = ""
         segment_index = 0
+        path_wait_incident_emitted = False
+        last_path_wait_motion_refresh_at: float | None = None
+        path_wait_motion_refresh_interval = max(float(grid.tile_time_min), 0.5)
         ignore_dynamic = self._traffic_observe_conflicts()
         self._ensure_product_transport_session(agent, destination=dst)
 
@@ -6318,21 +6645,82 @@ class ManufacturingWorld:
                 if blocked_started_at is None:
                     blocked_started_at = float(self.env.now)
                 blocked_for = float(self.env.now) - blocked_started_at
+                details = {
+                    "conflict_type": "TRAFFIC_WAIT",
+                    "severity": "warning",
+                    "collision": False,
+                    "primary_worker_id": agent.agent_id,
+                    "worker_ids": [agent.agent_id],
+                    "move_id": move_id,
+                    "wait_kind": "path_unavailable",
+                    "destination": str(dst),
+                    "logical_destination": logical_dst,
+                    "from_tile": self._tile_payload(current_tile),
+                    "destination_tiles": [self._tile_payload(tile) for tile in sorted(destination_tiles)],
+                    "time_window": {
+                        "started_at": round(float(self.env.now), 3),
+                        "ended_at": round(float(self.env.now + grid.tile_time_min), 3),
+                    },
+                    "blocked_for_min": round(blocked_for, 3),
+                    "humanoid_state": self._humanoid_state_payload(agent),
+                    "traffic_mode": self.traffic_mode,
+                    "collision_effect": self.traffic_collision_effect,
+                }
+                if not path_wait_incident_emitted and self.traffic_enabled:
+                    path_wait_incident_emitted = True
+                    self.traffic_conflicts.append(copy.deepcopy(details))
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type="AGENT_TRAFFIC_CONFLICT",
+                        entity_id=agent.agent_id,
+                        location=self.agent_display_location(agent),
+                        details=details,
+                    )
+                    current_availability = str(self._humanoid_state_payload(agent).get("availability", "")).upper()
+                    wait_can_change_state = current_availability not in {"BLOCKED", "DISABLED", "OFFLINE"}
+                    if wait_can_change_state and bool(self.humanoid_incident_natural_cfg.get("TRAFFIC_WAIT", True)):
+                        yield from self._execute_active_humanoid_incident_recovery(
+                            agent,
+                            "TRAFFIC_WAIT",
+                            primitive_call_code="NAVIGATE_TO",
+                            source="mansim.traffic",
+                            context={key: value for key, value in details.items() if key != "humanoid_state"},
+                        )
+                if movement_started and (
+                    last_path_wait_motion_refresh_at is None
+                    or float(self.env.now) - last_path_wait_motion_refresh_at >= path_wait_motion_refresh_interval
+                ):
+                    last_path_wait_motion_refresh_at = float(self.env.now)
+                    current_availability = str(self._humanoid_state_payload(agent).get("availability", "")).upper()
+                    if current_availability in {"BLOCKED", "DISABLED", "OFFLINE"}:
+                        self._log_worker_state_observation(agent, reason="path_wait")
+                    else:
+                        self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO", reason="path_wait")
                 if blocked_for >= grid.blocked_replan_threshold_min and not blocked_event_emitted:
                     blocked_event_emitted = True
+                    blocked_details = {
+                        "destination": str(dst),
+                        "logical_destination": logical_dst,
+                        "from_tile": self._tile_payload(current_tile),
+                        "blocked_for_min": round(blocked_for, 3),
+                    }
                     self.logger.log(
                         t=self.env.now,
                         day=self.day_for_time(self.env.now),
                         event_type="AGENT_TILE_BLOCKED",
                         entity_id=agent.agent_id,
                         location=self.agent_display_location(agent),
-                        details={
-                            "destination": str(dst),
-                            "logical_destination": logical_dst,
-                            "from_tile": self._tile_payload(current_tile),
-                            "blocked_for_min": round(blocked_for, 3),
-                        },
+                        details=blocked_details,
                     )
+                    if bool(self.humanoid_incident_natural_cfg.get("PATH_BLOCKED", True)):
+                        yield from self._execute_active_humanoid_incident_recovery(
+                            agent,
+                            "PATH_BLOCKED",
+                            primitive_call_code="NAVIGATE_TO",
+                            source="mansim.traffic",
+                            context=blocked_details,
+                        )
                 yield self.env.timeout(grid.tile_time_min)
                 continue
 
@@ -6417,19 +6805,29 @@ class ManufacturingWorld:
                         location=self.agent_display_location(agent),
                         details=details,
                     )
-                    if first_traffic_wait and bool(self.humanoid_incident_natural_cfg.get("TRAFFIC_WAIT", True)):
-                        self._emit_humanoid_incident(
+                    current_availability = str(self._humanoid_state_payload(agent).get("availability", "")).upper()
+                    wait_can_change_state = current_availability not in {"BLOCKED", "DISABLED", "OFFLINE"}
+                    if first_traffic_wait and wait_can_change_state and bool(self.humanoid_incident_natural_cfg.get("TRAFFIC_WAIT", True)):
+                        yield from self._execute_active_humanoid_incident_recovery(
                             agent,
                             "TRAFFIC_WAIT",
                             primitive_call_code="NAVIGATE_TO",
                             source="mansim.traffic",
                             context={key: value for key, value in details.items() if key != "humanoid_state"},
-                            notify_worker=False,
                         )
                 yield self.env.timeout(grid.tile_time_min)
                 continue
 
+            if blocked_started_at is not None:
+                self._resume_humanoid_task_after_recovery(
+                    agent,
+                    reason="traffic_recovered",
+                    source="mansim.traffic",
+                )
+                self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO", reason="traffic_recovered")
             blocked_started_at = None
+            path_wait_incident_emitted = False
+            last_path_wait_motion_refresh_at = None
             agent.reserved_tile = next_tile
             segment_index += 1
             segment_started_at = float(self.env.now)
@@ -6439,7 +6837,7 @@ class ManufacturingWorld:
             agent.current_move_segment_from_tile = current_tile
             agent.current_move_segment_to_tile = next_tile
             agent.current_move_logical_destination = logical_dst
-            self._traffic_begin_segment(
+            traffic_recovery_requested = self._traffic_begin_segment(
                 agent,
                 move_id=move_id,
                 segment_index=segment_index,
@@ -6449,6 +6847,19 @@ class ManufacturingWorld:
                 ended_at=segment_ended_at,
                 logical_destination=logical_dst,
             )
+            if traffic_recovery_requested and isinstance(getattr(agent, "pending_recovery_incident", None), dict):
+                grid.release_reservation(agent.agent_id, next_tile)
+                agent.reserved_tile = None
+                self._close_current_move_segment(agent, logical_destination=logical_dst)
+                runtime = getattr(self, "humanoid_runtime", None)
+                if runtime is not None and getattr(runtime, "enabled", False):
+                    yield from runtime._execute_pending_recovery_protocol(
+                        agent,
+                        self._current_parent_task_stub(agent),
+                        complete_parent_on_success=False,
+                    )
+                blocked_started_at = float(self.env.now)
+                continue
             self._start_shared_transport_segment(
                 agent,
                 from_tile=current_tile,
@@ -6466,6 +6877,7 @@ class ManufacturingWorld:
                     self._traffic_complete_plan(move_id)
                 self._log_interrupted_move(agent, reason="battery_depleted", logical_destination=logical_dst)
                 self._clear_current_move(agent)
+                self._clear_in_transit(agent)
                 if not agent.discharged:
                     self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
                 raise simpy.Interrupt("battery_depleted")
@@ -6482,6 +6894,7 @@ class ManufacturingWorld:
                         self._traffic_complete_plan(move_id)
                     self._log_interrupted_move(agent, reason="battery_depleted", logical_destination=logical_dst)
                     self._clear_current_move(agent)
+                    self._clear_in_transit(agent)
                 if not agent.discharged:
                     self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
                 raise simpy.Interrupt("battery_depleted")
@@ -6496,6 +6909,7 @@ class ManufacturingWorld:
                     self._traffic_complete_plan(move_id)
                 self._log_interrupted_move(agent, reason=str(intr.cause or "interrupted"), logical_destination=logical_dst)
                 self._clear_current_move(agent)
+                self._clear_in_transit(agent)
                 raise
 
             if self._traffic_strict_reservation():
@@ -6528,6 +6942,7 @@ class ManufacturingWorld:
                     self._traffic_complete_plan(move_id)
                 self._log_interrupted_move(agent, reason="ITEM_DROPPED", logical_destination=logical_dst)
                 self._clear_current_move(agent)
+                self._clear_in_transit(agent)
                 raise simpy.Interrupt("ITEM_DROPPED")
             agent.current_move_segment_index = 0
             agent.current_move_segment_from_tile = None
@@ -6816,6 +7231,7 @@ class ManufacturingWorld:
                 yield from self.move_agent(agent, "battery_rack", emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, "battery_rack", task, "battery_swap"):
                     return False
+                yield from self._dock_agent_at_target(agent, task, reason="battery_rack_alignment")
                 self._transition_humanoid_state(
                     agent,
                     "power_charging",
@@ -6865,6 +7281,7 @@ class ManufacturingWorld:
             yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
             if not self._confirm_object_service_tile(agent, machine.machine_id, task, "repair_machine"):
                 return False
+            yield from self._dock_agent_at_target(agent, task, reason="repair_machine_alignment")
             self._set_humanoid_primitive_hint(agent, "INSPECT_OR_DIAGNOSE")
             self._transition_humanoid_state(
                 agent,
@@ -6908,6 +7325,7 @@ class ManufacturingWorld:
                     yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, machine.machine_id, task, "unload_machine"):
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="unload_machine_alignment")
                     self._set_humanoid_primitive_hint(agent, "READ_MACHINE_STATE")
                     self._transition_humanoid_state(
                         agent,
@@ -6938,6 +7356,7 @@ class ManufacturingWorld:
                     yield from self.move_agent(agent, output_buffer_id, emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, output_buffer_id, task, "unload_output_dropoff"):
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="unload_output_alignment")
                     self._set_humanoid_primitive_hint(agent, "PLACE")
                     self.output_buffers[machine.station].append(output_id)
                     self._clear_agent_carrying(agent, destination=f"output_buffer_station_{machine.station}")
@@ -7016,15 +7435,7 @@ class ManufacturingWorld:
                         return False
 
                     if not target_agent.discharged and target_agent.awaiting_battery_from is None:
-                        target_agent.awaiting_battery_from = agent.agent_id
-                        self.logger.log(
-                            t=self.env.now,
-                            day=self.day_for_time(self.env.now),
-                            event_type="BATTERY_SWAP_WAIT_START",
-                            entity_id=target_agent.agent_id,
-                            location=self.agent_display_location(target_agent),
-                            details={"from_agent_id": agent.agent_id},
-                        )
+                        self._start_battery_swap_wait(target_agent, agent.agent_id)
                         if target_agent.process_ref is not None and target_agent.process_ref.is_alive:
                             target_agent.process_ref.interrupt("battery_swap_wait")
 
@@ -7109,15 +7520,7 @@ class ManufacturingWorld:
                     if self.active_battery_delivery_owner == agent.agent_id:
                         self.active_battery_delivery_owner = None
                     if target_agent.awaiting_battery_from == agent.agent_id:
-                        target_agent.awaiting_battery_from = None
-                        self.logger.log(
-                            t=self.env.now,
-                            day=self.day_for_time(self.env.now),
-                            event_type="BATTERY_SWAP_WAIT_END",
-                            entity_id=target_agent.agent_id,
-                            location=self.agent_display_location(target_agent),
-                            details={"from_agent_id": agent.agent_id},
-                        )
+                        self._end_battery_swap_wait(target_agent, agent.agent_id)
                     if target_agent.battery_service_owner == agent.agent_id:
                         target_agent.battery_service_owner = None
 
@@ -7131,6 +7534,7 @@ class ManufacturingWorld:
                     yield from self.move_agent(agent, output_buffer_id, emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, output_buffer_id, task, "inter_station_pickup"):
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="inter_station_pickup_alignment")
                     self._set_humanoid_primitive_hint(agent, "LOCALIZE_OBJECT")
                     self._transition_humanoid_state(
                         agent,
@@ -7164,6 +7568,7 @@ class ManufacturingWorld:
                     yield from self.move_agent(agent, "completed_product_buffer", emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, "completed_product_buffer", task, "completed_product_dropoff"):
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="completed_product_alignment")
                     self._set_humanoid_primitive_hint(agent, "PLACE")
                     self.product_count += 1
                     if moved_item_id in self.items:
@@ -7177,6 +7582,7 @@ class ManufacturingWorld:
                     yield from self.move_agent(agent, target_queue_id, emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, target_queue_id, task, "inter_station_dropoff"):
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="inter_station_dropoff_alignment")
                     self._set_humanoid_primitive_hint(agent, "PLACE")
                     self._push_intermediate_queue(target_queue_station, moved_item_id)
                 task.payload.pop("transfer_item_id", None)
@@ -7253,6 +7659,7 @@ class ManufacturingWorld:
                         if not self._confirm_object_service_tile(agent, slot_id, task, "material_shelf_pickup"):
                             task.payload["failure_reason"] = "material_shelf_pickup_unreachable"
                             return False
+                        yield from self._dock_agent_at_target(agent, task, reason="material_shelf_alignment")
                         self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
                         self._transition_humanoid_state(
                             agent,
@@ -7306,6 +7713,7 @@ class ManufacturingWorld:
                     if not self._confirm_object_service_tile(agent, material_queue_id, task, "material_supply_dropoff"):
                         task.payload["failure_reason"] = "material_supply_dropoff_unreachable"
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="material_supply_dropoff_alignment")
                     self._push_material_queue(station, item_id)
                     self._clear_agent_carrying(agent, destination=f"Station{station}")
                     self._set_humanoid_primitive_hint(agent, "VERIFY_LEVEL_OR_QUANTITY")
@@ -7381,6 +7789,7 @@ class ManufacturingWorld:
                 yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, machine.machine_id, task, "setup_machine"):
                     return False
+                yield from self._dock_agent_at_target(agent, task, reason="setup_machine_alignment")
                 self._set_humanoid_primitive_hint(agent, "READ_MACHINE_STATE")
                 self._transition_humanoid_state(
                     agent,
@@ -7415,6 +7824,7 @@ class ManufacturingWorld:
                             self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="material_queue_unreachable")
                             _close_setup_event("material_queue_unreachable")
                             return False
+                        yield from self._dock_agent_at_target(agent, task, reason="setup_material_pickup_alignment")
                         popped_material = self._pop_material_queue(station)
                         if popped_material is None:
                             self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="missing_material")
@@ -7437,6 +7847,7 @@ class ManufacturingWorld:
                         self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="machine_unreachable_material")
                         _close_setup_event("machine_unreachable_material")
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="setup_material_load_alignment")
                     self._set_humanoid_primitive_hint(agent, "PLACE")
                     yield self.env.timeout(setup_step)
                     machine.input_material = material_id
@@ -7455,6 +7866,7 @@ class ManufacturingWorld:
                             self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="intermediate_queue_unreachable")
                             _close_setup_event("intermediate_queue_unreachable")
                             return False
+                        yield from self._dock_agent_at_target(agent, task, reason="setup_intermediate_pickup_alignment")
                         popped_intermediate = self._pop_intermediate_queue(station)
                         if popped_intermediate is None:
                             self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="missing_intermediate")
@@ -7477,6 +7889,7 @@ class ManufacturingWorld:
                         self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="machine_unreachable_intermediate")
                         _close_setup_event("machine_unreachable_intermediate")
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="setup_intermediate_load_alignment")
                     self._set_humanoid_primitive_hint(agent, "PLACE")
                     yield self.env.timeout(setup_step)
                     machine.input_intermediate = intermediate_id
@@ -7522,6 +7935,7 @@ class ManufacturingWorld:
                     yield from self.move_agent(agent, "intermediate_queue_4", emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, "intermediate_queue_4", task, "inspect_product_pickup"):
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="inspect_pickup_alignment")
                     self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
                     self._transition_humanoid_state(
                         agent,
@@ -7548,6 +7962,7 @@ class ManufacturingWorld:
                 yield from self.move_agent(agent, "inspection_table", emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, "inspection_table", task, "inspect_product_table"):
                     return False
+                yield from self._dock_agent_at_target(agent, task, reason="inspection_table_alignment")
                 self._complete_product_transport_session_keep_primary_cargo(
                     agent,
                     destination="inspection_table",
@@ -7591,6 +8006,7 @@ class ManufacturingWorld:
                     yield from self.move_agent(agent, "inspection_scrap_queue", emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, "inspection_scrap_queue", task, "inspect_product_scrap_dropoff"):
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="inspection_scrap_alignment")
                     self._set_humanoid_primitive_hint(agent, "PLACE")
                     self._push_inspection_scrap_queue(product_id)
                     self._clear_agent_carrying(agent, destination="inspection_scrap_queue")
@@ -7601,6 +8017,7 @@ class ManufacturingWorld:
                     yield from self.move_agent(agent, "inspection_output_queue", emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, "inspection_output_queue", task, "inspect_product_output_dropoff"):
                         return False
+                    yield from self._dock_agent_at_target(agent, task, reason="inspection_output_alignment")
                     self._set_humanoid_primitive_hint(agent, "PLACE")
                     self.logger.log(
                         t=self.env.now,
@@ -7654,6 +8071,7 @@ class ManufacturingWorld:
                 yield from self.move_agent(agent, "inspection_scrap_queue", emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, "inspection_scrap_queue", task, "scrap_batch_pickup"):
                     return False
+                yield from self._dock_agent_at_target(agent, task, reason="scrap_pickup_alignment")
                 self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
                 self._transition_humanoid_state(
                     agent,
@@ -7701,6 +8119,7 @@ class ManufacturingWorld:
                 yield from self.move_agent(agent, "scrap_disposal_bin", emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, "scrap_disposal_bin", task, "scrap_disposal_dropoff"):
                     return False
+                yield from self._dock_agent_at_target(agent, task, reason="scrap_disposal_alignment")
                 self._set_humanoid_primitive_hint(agent, "PLACE")
                 for item_id in item_ids:
                     self._set_item_state(
@@ -7746,6 +8165,7 @@ class ManufacturingWorld:
                 yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, machine.machine_id, task, "preventive_maintenance"):
                     return False
+                yield from self._dock_agent_at_target(agent, task, reason="preventive_maintenance_alignment")
                 self._set_humanoid_primitive_hint(agent, "INSPECT_OR_DIAGNOSE")
                 self._transition_humanoid_state(
                     agent,
@@ -7953,22 +8373,44 @@ class ManufacturingWorld:
                     self._set_humanoid_for_task(agent, None, reason=reason)
                 continue
 
-            task = self._current_task_stub(agent)
+            task = self._current_parent_task_stub(agent)
             runtime = getattr(self, "humanoid_runtime", None)
             if runtime is not None and getattr(runtime, "enabled", False):
-                if agent.current_step_id or agent.current_primitive_call_code:
+                step_path = str(agent.current_step_path or "")
+                # Only close catalog steps that were actually started by
+                # HumanoidTaskRuntime. Domain-internal hints like NAVIGATE_TO may
+                # exist during a nested child task, but they do not have matching
+                # HUMANOID_STEP_START rows and should not be emitted as step ends.
+                if step_path and (agent.current_step_id or agent.current_step_call_code):
+                    step_task = self._current_child_task_stub(agent) or task
                     step = {
                         "step_id": str(agent.current_step_id or ""),
-                        "call_code": str(agent.current_primitive_call_code or ""),
+                        "call_code": str(agent.current_step_call_code or agent.current_primitive_call_code or ""),
+                        "path": step_path,
+                        "depth": int(agent.current_step_depth or 0),
                         "depends_on": [],
                     }
                     runtime._log_step_event(
                         "HUMANOID_STEP_END",
                         agent,
-                        task,
+                        step_task,
                         step,
                         status="interrupted",
                         error=reason,
+                        parent_task=task,
+                    )
+                child_task = self._current_child_task_stub(agent)
+                if child_task is not None:
+                    runtime._log_child_task_event(
+                        "HUMANOID_TASK_END",
+                        agent,
+                        task,
+                        child_task,
+                        {
+                            "path": str(agent.current_task_path or ""),
+                            "depth": int(agent.current_task_depth or 0),
+                        },
+                        status="interrupted",
                     )
                 runtime._log_task_event("HUMANOID_TASK_END", agent, task, status="interrupted")
 

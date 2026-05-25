@@ -85,6 +85,7 @@ humanoid_incidents:
       trigger_primitives: ["*"]
   natural:
     RESOURCE_PREEMPTED: true
+    PATH_BLOCKED: true
     TRAFFIC_WAIT: true
     COLLISION: true
     NEAR_MISS: true
@@ -107,11 +108,11 @@ quality:
 warehouse:
   material_shelf:
     # Warehouse 선반에 놓일 수 있는 material slot 수
-    capacity: 10
+    capacity: 30
     # 매 day boundary마다 빈 slot만 capacity까지 보충한다.
     restock_policy: day_boundary
     # 시뮬레이션 시작 시 채워둘 material 수
-    initial_fill: 10
+    initial_fill: 30
 
 machine_failure:
   # 평균 고장 간격(분). exponential 분포 기반
