@@ -1,10 +1,10 @@
-﻿# Replay와 Dashboard Artifact
+# Replay와 Dashboard Artifact
 
-ManSim은 정적 HTML dashboard와 Replay Studio용 구조화 JSON payload를 함께 export합니다.
+ManSim은 정적 HTML dashboard와 Replay Studio용 구조화 JSON payload를 함께 export합니다. Replay와 dashboard는 simulation core가 남긴 artifact를 읽어 표시하는 관찰 계층이며, worker 위치나 state를 임의로 보정하지 않는 것을 원칙으로 합니다.
 
 ## Results Hub
 
-`results_dashboard.html`은 run별 메인 진입점입니다. 내부적으로 `dashboard_manifest.json`을 사용하며, 이 manifest에는 run metadata와 artifact path가 들어 있습니다.
+`results_dashboard.html`은 run별 메인 진입점입니다. 내부적으로 `dashboard_manifest.json`을 사용하며, manifest에는 run metadata와 artifact path가 들어 있습니다.
 
 Hub는 아래 view로 연결됩니다.
 
@@ -20,17 +20,13 @@ Hub는 아래 view로 연결됩니다.
 
 ## KPI Dashboard
 
-`kpi_dashboard.html`은 생산, 설비, worker, worker collaboration, movement/traffic safety를 분리해서 보여줍니다.
+`kpi_dashboard.html`은 생산, 설비, worker, worker collaboration, movement/traffic safety, incident, shelf/scrap 지표를 분리해서 보여줍니다.
+
+Worker Metrics 섹션은 `HumanoidSim` Availability State를 기준으로 `EXECUTING`, `BLOCKED`, `DISABLED/OFFLINE` 비율을 분리해서 보여줍니다. `BLOCKED`는 예상치 못한 외부 요인이나 stale precondition 때문에 현재 task를 그대로 속행하기 어려운 시간입니다.
+
+State 축별 차트와 `kpi.json`의 `humanoid_state_time_by_worker`, `humanoid_state_time_by_axis`, `humanoid_state_ratio_by_worker`는 `HumanoidSim` state schema에 정의된 모든 state를 포함합니다. 현재 run에서 발생하지 않은 state도 0으로 남겨, "상태가 없었던 것"과 "집계가 누락된 것"을 구분합니다.
 
 Worker collaboration 섹션은 worker가 같은 작업을 실제로 함께 수행했는지 확인하기 위한 영역입니다. 단순히 같은 장소에 있거나 경로가 가까운 것만으로 협업으로 추정하지 않고, simulator가 남긴 명시적 event만 사용합니다.
-
-Worker Metrics 섹션은 `HumanoidSim` Availability State를 기준으로 `EXECUTING`, `BLOCKED`, `DISABLED/OFFLINE` 비율을 분리해서 보여줍니다. `BLOCKED`는 예상치 못한 외부 요인이나 stale precondition 때문에 현재 task를 속행하기 어려운 시간입니다.
-
-State 축별 차트와 `kpi.json`의 `humanoid_state_time_by_worker`, `humanoid_state_time_by_axis`, `humanoid_state_ratio_by_worker`는 `HumanoidSim` state schema에 정의된 모든 state를 포함합니다. 현재 run에서 발생하지 않은 state도 0으로 남겨, “상태가 없었던 것”과 “집계가 누락된 것”을 구분합니다.
-
-- `HANDOVER_ITEM` / `PRODUCT_CARRY_JOINED`: product 공동 운반에 helper가 합류한 횟수입니다.
-- `PRODUCT_CARRY_COMPLETED`: product 운반 완료 시점에 전체 product 운반 시간, 공동 운반 시간, worker/pair별 공동 운반 시간을 집계합니다.
-- `MACHINE_REPAIR_START`, `MACHINE_REPAIR_HELPER_JOIN`, `MACHINE_REPAIR_HELPER_LEAVE`, `MACHINE_REPAIRED`: repair team size를 시간 구간으로 적분해서 solo repair와 collaboration repair를 나눕니다.
 
 주요 collaboration KPI는 다음과 같습니다.
 
@@ -42,6 +38,14 @@ State 축별 차트와 `kpi.json`의 `humanoid_state_time_by_worker`, `humanoid_
 - `repair_collaboration_ratio`: active repair time 중 team size가 2 이상인 비율.
 - `repair_team_size_avg`: active repair 중 시간 가중 평균 팀 크기.
 
+Incident KPI는 `HumanoidSim` incident taxonomy를 기준으로 집계합니다.
+
+- `humanoid_incident_total`
+- `humanoid_incidents_by_code`
+- `humanoid_incidents_by_category`
+- `humanoid_incidents_by_worker`
+- `humanoid_incident_recovery_protocol_by_code`
+
 ## Factory Replay Studio
 
 Factory replay는 아래 파일을 사용합니다.
@@ -49,7 +53,7 @@ Factory replay는 아래 파일을 사용합니다.
 - `replay_studio_log.json`
 - `replay_studio_layout.json`
 
-로그는 event-sourced 방식이며 deterministic replay를 목표로 합니다. Factory replay는 기본적으로 strict mode로 export됩니다. 이 모드에서는 Replay Studio가 worker 위치를 임의 보정하거나 inspection workbench로 강제 이동시키지 않고, simulator가 남긴 tile/motion/event payload를 기준으로만 상태를 복원합니다.
+로그는 event-sourced 방식이며 deterministic replay를 목표로 합니다.
 
 1. initial state
 2. `timestamp`, `sequence_index`, `event_id` 기준으로 stable sort된 event stream
@@ -59,19 +63,49 @@ Renderer는 worker, machine, queue, battery station, inspection, material flow, 
 
 `path_wait`처럼 대기 관찰을 위해 반복 export되는 motion은 `motion.paused=true`로 표시합니다. 이때 Replay Studio는 worker 위치를 현재 tile에 고정하고, 실제 이동 경로 보간에는 짧은 고정 path만 사용합니다. 계획된 전체 route는 `display_path`에 남겨 점선 overlay로만 표시합니다.
 
-Traffic conflict는 simulator의 `AGENT_TRAFFIC_CONFLICT` event에서 생성됩니다. Replay Studio에서는 `traffic_conflict_detected` event로 변환되며, 현재 conflict tile 또는 edge를 overlay로 표시합니다. 이 표시는 정책 보정이 아니라 simulator가 기록한 이동 사건을 그대로 관찰하기 위한 것입니다.
+Traffic conflict는 simulator의 `AGENT_TRAFFIC_CONFLICT` event에서 생성됩니다. Replay Studio에서는 `traffic_conflict_detected` event로 변환되며, 현재 conflict tile 또는 edge를 overlay로 표시합니다. Worker 사이를 임의 직선으로 연결하지 않습니다.
 
 Worker monitor는 compact 운영 패널입니다.
 
 - `Task`: 현재 Humanoid task code를 표시합니다.
 - `Child Task`: 현재 nested child task code를 표시합니다.
-- `Primitive`: 현재 `HUMANOID_STEP_START`/`HUMANOID_STEP_END` 또는 `WORKER_STATE_CHANGED`에 기록된 primitive를 표시합니다. Simulation-side presentation hint는 더 이상 생성하지 않습니다.
-- `Motion Path`: 이동 중이면 현재 motion payload의 path 길이를 tile 단위로 표시하고, 괄호 안에 현재 tile 좌표를 표시합니다. 정지 중이면 `0 tiles`로 표시합니다.
+- `Primitive`: 현재 `HUMANOID_STEP_START`/`HUMANOID_STEP_END` 또는 `WORKER_STATE_CHANGED`에 기록된 primitive를 표시합니다.
+- `Motion Path`: 이동 중이면 현재 motion payload의 path 길이를 tile 단위로 표시하고 괄호 안에 현재 tile 좌표를 표시합니다. 정지 중이면 `0 tiles`로 표시합니다.
 - `Traffic`: 최근 traffic conflict type과 상대 worker를 표시합니다.
+- `Incident`: 최근 incident category/code를 표시합니다.
 - `Carry`: item image 대신 현재 들고 있는 item ID와 type을 표시합니다.
 - `Shared Carry`: product 공동 운반 세션의 carrier 수와 역할을 표시합니다.
 
-`Power`와 `Updated`는 worker monitor에서 제거했습니다. Worker의 배터리 상태는 상단 battery meter로 확인하고, 의미 상태는 `HumanoidStateSnapshot`의 네 축 중 현재 UI에 필요한 축만 표시합니다.
+`Power`와 `Updated`는 worker monitor에서 제거했습니다. Worker의 배터리 상태는 상단 battery meter로 확인하고, 의미 상태는 `HumanoidStateSnapshot`의 필요한 축만 표시합니다.
+
+## 2D Replay 표시 규칙
+
+- Worker 머리 위 label은 `Worker A1`이 아니라 `A1`처럼 worker id만 표시합니다.
+- Worker 말풍선은 이동 중에는 숨기고, 정지 상태에서 task/recovery/blocked 상태를 표시합니다.
+- Worker progress bar는 primitive가 아니라 parent task window 기준으로 채워집니다.
+- Input queue는 노랑, output/completed queue는 파랑, scrap queue는 붉은색 계열로 표시합니다.
+- Queue 위 item stack은 `item_type`을 기준으로 material, intermediate, product, scrap을 구분합니다.
+- Machine `WAIT_INPUT` 상태에서 stale item overlay가 남지 않아야 합니다. Machine 위 item overlay는 실제로 machine에 item이 있거나 unload 대기 중일 때만 보입니다.
+
+## Replay Studio 3D
+
+`replay_studio_3d/`는 기존 2D 앱과 직접 import 관계가 없는 독립 Vite + React + Three.js 앱입니다. Results Hub의 "Replay Studio 3D" 메뉴는 기본 포트 `5174`의 3D 앱으로 현재 run의 `replay_studio_log.json`을 전달합니다.
+
+3D 앱은 replay schema v1.0을 읽고, factory layout과 object footprint를 block model로 표현합니다. Worker 위치는 2D 앱과 동일하게 simulator가 기록한 motion path와 durative window를 기준으로 보간합니다. 실패하거나 방향을 바꾸고 싶으면 `replay_studio_3d/` 폴더만 분리해서 제거할 수 있도록 기존 2D 앱과 코드를 공유하지 않습니다.
+
+3D 표시 규칙:
+
+- Worker는 procedural block humanoid model로 표시합니다.
+- Worker 머리 위 label은 `A1`처럼 id만 표시합니다.
+- Worker가 이동 중이면 다리가 걷는 것처럼 움직입니다.
+- Worker가 멈춰서 task를 수행 중이면 팔을 흔들어 작업 중임을 표시합니다.
+- Worker가 item을 들고 있으면 단일 item과 batch cargo 모두 몸 앞쪽에 표시합니다.
+- Worker panel의 초상화는 별도 그림이 아니라 맵에서 쓰는 같은 3D humanoid model을 정면 mini-view로 표시합니다.
+- Humanoid 옆 배터리 bar는 맵에서 제거했습니다. 배터리는 오른쪽 panel의 meter로 확인합니다.
+- Queue는 현재 item 개수를 `xN` 형태로 표시합니다.
+- Queue 색상은 2D와 동일하게 input=노랑, output/completed=파랑, scrap=붉은색 계열입니다.
+- Inspection table은 replay entity가 없어도 `layout.grid.object_footprints`의 `inspection_table`을 읽어 렌더링합니다. 오래된 log처럼 footprint가 없으면 Inspection region 안에 fallback 검사대를 표시합니다.
+- Shelf 뒤 벽과 aisle 구조는 `grid.walls`와 object footprint를 기준으로 block wall로 표시합니다.
 
 ## Gantt
 
@@ -85,15 +119,9 @@ Worker monitor는 compact 운영 패널입니다.
 - `OFFLINE`
 - `DISABLED`
 
-이전의 `MOVING`, `WORKING`, `DISCHARGED` bucket은 worker Gantt status로 사용하지 않습니다. 이동 여부는 Gantt hover의 `mobility`, `primitive_call_code`, 그리고 Replay Studio의 motion path에서 확인합니다. Machine lane은 기존처럼 `RUNNING`, `DOWN`, `FINISHED-WAIT-UNLOAD`를 표시합니다.
+이전의 `MOVING`, `WORKING`, `DISCHARGED` 요약 상태는 worker Gantt status로 사용하지 않습니다. 이동 여부는 Gantt hover의 `mobility`, `primitive_call_code`, 그리고 Replay Studio의 motion path에서 확인합니다. Machine lane은 기존처럼 machine domain state를 표시합니다.
 
 Gantt는 worker id가 `A1`, `A2`처럼 worker 형식인 lane만 Worker로 취급합니다. Product/item id는 Gantt resource lane에 올리지 않습니다. `ASSIGNED`는 `configs/humanoidsim/default.yaml`의 `task_lifecycle.assignment_min_duration`만큼 최소 체류 시간을 갖기 때문에 worker lane과 KPI에서 관측됩니다. Hover 창은 resource, status, task/primitive 또는 machine cycle, time range 정도만 표시합니다.
-
-## Replay Studio 3D
-
-`replay_studio_3d/`는 기존 2D 앱과 직접 import 관계가 없는 독립 Vite + React + Three.js 앱입니다. Results Hub의 “Replay Studio 3D” 메뉴는 기본 포트 `5174`의 3D 앱으로 현재 run의 `replay_studio_log.json`을 전달합니다.
-
-3D 앱은 기존 replay schema v1.0을 읽고, factory layout과 object footprint를 block model로 표현합니다. Worker 위치는 2D 앱과 동일하게 simulator가 기록한 motion path와 durative window를 기준으로 보간합니다. 실패하거나 방향을 바꾸고 싶으면 `replay_studio_3d/` 폴더만 분리해서 제거할 수 있도록 기존 2D 앱과 코드를 공유하지 않습니다.
 
 ## Manager Replay
 
@@ -136,21 +164,6 @@ Wiki는 raw JSON viewer가 아닙니다. Raw artifact는 `raw/`에 보관하고,
 
 Graph 원본은 `knowledge/llm_knowledge/experiments/<id>/graph/` 아래에 저장됩니다.
 
-## Shared Repair 시각화
-
-협동 수리 event는 아래 형태로 export됩니다.
-
-- `MACHINE_REPAIR_START`
-- `MACHINE_REPAIR_HELPER_JOIN`
-- `MACHINE_REPAIR_HELPER_LEAVE`
-- `MACHINE_REPAIRED`
-
-Replay Studio는 repair team size, repair progress, machine 주변에 배치된 참여 worker를 표시합니다.
-
-## Series Dashboard
-
-Multi-run 실행이면 parent output directory에 `series_dashboard.html`이 생성됩니다. 이 dashboard는 completed products를 primary metric으로 사용합니다. Closure ratio와 backlog가 개선되어도 completed products가 감소하면 knowledge impact를 positive로 보지 않습니다.
-
 ## Replay Studio Asset 재생성
 
 기존 run directory에서 Replay Studio 입력을 다시 만들려면 아래 명령을 사용합니다.
@@ -180,14 +193,18 @@ Replay Studio, KPI, Gantt를 함께 확인할 때는 run directory 단위 감사
 - `WAIT_INPUT` machine 위에 stale item overlay가 남지 않는지
 - traffic conflict가 같은 worker 자신과 연결되지 않는지
 - 3D Replay가 legacy `warehouse_buffer` alias 대신 canonical `completed_product_buffer`를 쓰는지
-
-화면에서 보이는 현상이 버그인지 애매할 때는 이 감사 결과를 먼저 봅니다. 감사가 통과하면 대부분은
-렌더링/표현 문제이고, 감사가 실패하면 exporter 또는 simulation event 쪽을 먼저 확인합니다.
+- 3D Replay가 `inspection_table` footprint를 검사 테이블로 렌더링할 수 있는지
 
 ## 개발 검증
 
 ```powershell
 cd replay_studio
+npm run build
+```
+
+```powershell
+cd replay_studio_3d
+npm run test
 npm run build
 ```
 

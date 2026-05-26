@@ -160,7 +160,8 @@ export function buildRenderModel(
   const nodes: RenderNode[] = entities
     .filter((entity) => {
       if (entity.entity_id === "warehouse_buffer" && hasCanonicalCompletedBuffer) return false;
-      if (typeof entity.attributes.item_state === "string") return false;
+      const itemState = typeof entity.attributes.item_state === "string" ? entity.attributes.item_state.trim().toUpperCase() : "";
+      if (itemState && itemState !== "DROPPED") return false;
       if (options.visibleEntityTypes?.length && !options.visibleEntityTypes.includes(entity.entity_type)) return false;
       if (options.entityIdFilter && entity.entity_id !== options.entityIdFilter) return false;
       if (!matchesSearch(entity, options.searchQuery ?? "")) return false;

@@ -256,7 +256,7 @@
         "entity_id": "intermediate_queue_2",
         "entity_type": "buffer",
         "state": "waiting",
-        "label": "S2 Transfer Queue",
+        "label": "S2 Intermediate Queue",
         "position": {
           "x": 641.0,
           "y": 514.0

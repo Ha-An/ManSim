@@ -774,6 +774,7 @@ function machineWaitOverlay(
 
 function queueKind(label: string, entityId: string) {
   const merged = `${label} ${entityId}`.toLowerCase();
+  if (merged.includes("scrap")) return "scrap";
   if (merged.includes("output")) return "output";
   if (merged.includes("inspect")) return "inspection";
   if (merged.includes("transfer") || merged.includes("intermediate")) return "transfer";
@@ -784,10 +785,41 @@ function queueKind(label: string, entityId: string) {
 
 function queueDisplayLabel(label: string, entityId: string) {
   const merged = `${label} ${entityId}`.toLowerCase();
+  if (entityId === "intermediate_queue_2") return "S2 Intermediate Queue";
   if (merged.includes("material_queue")) return "Material Queue";
   if (merged.includes("transfer") || merged.includes("intermediate_queue_2")) return "Intermediate Queue";
   if (merged.includes("inspection queue") || merged.includes("intermediate_queue_4")) return "Inspection Queue";
   return labelText(label);
+}
+
+function queueSurfaceColor(kind: string, entityId = ""): string {
+  const id = entityId.toLowerCase();
+  if (kind === "scrap" || id.includes("scrap")) return "#e56b6f";
+  if (kind === "output" || kind === "completed" || id.includes("output_queue") || id.includes("completed_product_buffer")) return "#75a7ff";
+  if (kind === "material" || kind === "transfer" || kind === "inspection" || id.includes("material_queue") || id.includes("intermediate_queue")) return "#f4b642";
+  return "#d5e1ef";
+}
+
+function drawQueueTintedFrame(
+  ctx: CanvasRenderingContext2D,
+  frame: SceneIconFrame,
+  x: number,
+  y: number,
+  targetWidth: number,
+  targetHeight: number,
+  color: string,
+) {
+  ctx.save();
+  roundedRectPath(ctx, x, y, targetWidth, targetHeight, Math.min(8, targetHeight * 0.22));
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.94;
+  ctx.fill();
+  ctx.strokeStyle = "rgba(23, 49, 77, 0.32)";
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.globalAlpha = 0.42;
+  drawSceneIconFrameRect(ctx, frame, x, y, targetWidth, targetHeight);
+  ctx.restore();
 }
 
 function queueItemFrame(kind: string, entityId: string, sceneIcons: SceneIconSet | null): SceneIconFrame | null {
@@ -986,45 +1018,53 @@ function drawQueueSpriteByKind(
   scale: number,
   kind: string,
   sceneIcons: SceneIconSet | null,
+  entityId = "",
 ) {
   if (sceneIcons) {
     const baseHeight = clamp(scale * 9 * 1.7, 28, 48);
-    drawSceneIconFrame(ctx, sceneIcons.queue, x, y + 2, baseHeight);
+    drawQueueTintedFrame(ctx, sceneIcons.queue, x, y + 2, baseHeight, baseHeight, queueSurfaceColor(kind, entityId));
     return { width: baseHeight, height: baseHeight };
   }
   if (kind === "output") {
     const box = [[0, 0], [1, 0], [0, 1], [1, 1]];
-    drawPattern(ctx, x, y, scale, box, "#f0b45b");
-    drawPattern(ctx, x + scale * 4, y, scale, box, "#f0b45b");
-    drawPattern(ctx, x + scale * 8, y, scale, box, "#f0b45b");
+    drawPattern(ctx, x, y, scale, box, "#75a7ff");
+    drawPattern(ctx, x + scale * 4, y, scale, box, "#75a7ff");
+    drawPattern(ctx, x + scale * 8, y, scale, box, "#75a7ff");
     return { width: scale * 11, height: scale * 3 };
   }
   if (kind === "inspection") {
     const diamond = [[1, 0], [0, 1], [2, 1], [1, 2]];
-    drawPattern(ctx, x, y, scale, diamond, "#f3a53c");
-    drawPattern(ctx, x + scale * 4, y, scale, diamond, "#f3a53c");
-    drawPattern(ctx, x + scale * 8, y, scale, diamond, "#f3a53c");
+    drawPattern(ctx, x, y, scale, diamond, "#f4b642");
+    drawPattern(ctx, x + scale * 4, y, scale, diamond, "#f4b642");
+    drawPattern(ctx, x + scale * 8, y, scale, diamond, "#f4b642");
     return { width: scale * 11, height: scale * 3 };
   }
   if (kind === "material") {
     const box = [[0, 0], [1, 0], [0, 1], [1, 1]];
-    drawPattern(ctx, x, y, scale, box, "#62a9ff");
-    drawPattern(ctx, x + scale * 4, y + scale, scale, box, "#62a9ff");
-    drawPattern(ctx, x + scale * 8, y, scale, box, "#62a9ff");
+    drawPattern(ctx, x, y, scale, box, "#f4b642");
+    drawPattern(ctx, x + scale * 4, y + scale, scale, box, "#f4b642");
+    drawPattern(ctx, x + scale * 8, y, scale, box, "#f4b642");
     return { width: scale * 11, height: scale * 3 };
   }
   if (kind === "transfer") {
     const box = [[0, 0], [1, 0], [0, 1], [1, 1]];
-    drawPattern(ctx, x, y, scale, box, "#7f75e6");
-    drawPattern(ctx, x + scale * 4, y, scale, box, "#39c4ab");
-    drawPattern(ctx, x + scale * 8, y, scale, box, "#7f75e6");
+    drawPattern(ctx, x, y, scale, box, "#f4b642");
+    drawPattern(ctx, x + scale * 4, y, scale, box, "#f4b642");
+    drawPattern(ctx, x + scale * 8, y, scale, box, "#f4b642");
     return { width: scale * 11, height: scale * 3 };
   }
   if (kind === "completed") {
     const box = [[0, 0], [1, 0], [0, 1], [1, 1]];
-    drawPattern(ctx, x, y, scale, box, "#2db36a");
-    drawPattern(ctx, x + scale * 4, y, scale, box, "#2db36a");
-    drawPattern(ctx, x + scale * 8, y, scale, box, "#2db36a");
+    drawPattern(ctx, x, y, scale, box, "#75a7ff");
+    drawPattern(ctx, x + scale * 4, y, scale, box, "#75a7ff");
+    drawPattern(ctx, x + scale * 8, y, scale, box, "#75a7ff");
+    return { width: scale * 11, height: scale * 3 };
+  }
+  if (kind === "scrap") {
+    const box = [[0, 0], [1, 0], [0, 1], [1, 1]];
+    drawPattern(ctx, x, y, scale, box, "#e56b6f");
+    drawPattern(ctx, x + scale * 4, y, scale, box, "#e56b6f");
+    drawPattern(ctx, x + scale * 8, y, scale, box, "#e56b6f");
     return { width: scale * 11, height: scale * 3 };
   }
   drawQueueSprite(ctx, x, y, scale);
@@ -1064,13 +1104,14 @@ function drawQueueFootprintSprite(
   targetHeight: number,
   kind: string,
   sceneIcons: SceneIconSet | null,
+  entityId = "",
 ) {
   ctx.save();
   if (sceneIcons) {
-    drawSceneIconFrameRect(ctx, sceneIcons.queue, x, y, targetWidth, targetHeight);
+    drawQueueTintedFrame(ctx, sceneIcons.queue, x, y, targetWidth, targetHeight, queueSurfaceColor(kind, entityId));
   } else {
     const scale = Math.max(1, Math.floor(Math.min(targetWidth / 12, targetHeight / 4)));
-    drawQueueSprite(ctx, x + (targetWidth - scale * 11) / 2, y + (targetHeight - scale * 3) / 2, scale);
+    drawQueueSpriteByKind(ctx, x + (targetWidth - scale * 11) / 2, y + (targetHeight - scale * 3) / 2, scale, kind, null);
   }
   ctx.restore();
   return { width: targetWidth, height: targetHeight };
@@ -1337,7 +1378,25 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
         ctx.shadowColor = style.glow;
       }
 
-      if (node.entity.entity_type === "material_slot") {
+      if (node.entity.entity_type === "item") {
+        const itemType = String(node.entity.attributes.item_type ?? "").toLowerCase();
+        const itemKind = itemType.includes("material")
+          ? "material"
+          : itemType.includes("intermediate")
+            ? "transfer"
+            : itemType.includes("product")
+              ? "completed"
+              : "generic";
+        const iconFrame = queueItemFrame(itemKind, node.entity.entity_id, sceneIconSet);
+        const iconHeight = Math.max(18, Math.min(nodeWidth, nodeHeight) - 8);
+        if (iconFrame) {
+          const iconWidth = iconHeight * (iconFrame.width / Math.max(1, iconFrame.height));
+          drawSceneIconFrame(ctx, iconFrame, x + (nodeWidth - iconWidth) / 2, y + (nodeHeight - iconHeight) / 2 + 4, iconHeight);
+        } else {
+          drawQueueSpriteByKind(ctx, x + 8, y + 12, spriteScale, itemKind, sceneIconSet);
+        }
+        drawPlainLabel(ctx, x + nodeWidth / 2, Math.max(10, y - 4), labelText(node.entity.entity_id), "#274b74");
+      } else if (node.entity.entity_type === "material_slot") {
         const occupied = Boolean(node.entity.attributes.occupied || node.entity.attributes.material_item_id);
         drawMaterialSlot(ctx, x, y, nodeWidth, nodeHeight, occupied, sceneIconSet);
       } else if (node.entity.entity_type === "worker" || node.entity.entity_type === "robot" || node.entity.entity_type === "transporter") {
@@ -1380,7 +1439,7 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
             { vertical: true },
           );
         }
-        drawPlainLabel(ctx, headCenterX, Math.max(10, spriteY - 6), labelText(node.entity.label), "#274b74");
+        drawPlainLabel(ctx, headCenterX, Math.max(10, spriteY - 6), labelText(node.entity.entity_id), "#274b74");
         if (showTaskBubble) {
           const workerBubble = drawSpeechBubble(
             ctx,
@@ -1507,8 +1566,8 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
           "#274b74",
         );
         const queueSprite = useFootprintRect
-          ? drawQueueFootprintSprite(ctx, queueX, queueY, nodeWidth, nodeHeight, kind, sceneIconSet)
-          : drawQueueSpriteByKind(ctx, queueX, queueY, spriteScale, kind, sceneIconSet);
+          ? drawQueueFootprintSprite(ctx, queueX, queueY, nodeWidth, nodeHeight, kind, sceneIconSet, node.entity.entity_id)
+          : drawQueueSpriteByKind(ctx, queueX, queueY, spriteScale, kind, sceneIconSet, node.entity.entity_id);
         drawQueueItemStack(
           ctx,
           queueX + Math.max(2, queueSprite.width * 0.08),

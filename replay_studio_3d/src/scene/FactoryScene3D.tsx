@@ -3,7 +3,7 @@ import { Billboard, Html, Line, OrbitControls, OrthographicCamera, Text } from "
 import { useEffect, useMemo } from "react";
 import type { ThreeEvent } from "@react-three/fiber";
 import type { ReplayEvent } from "../replay-core/types/event";
-import type { LayoutGridConfig } from "../replay-core/types/layout";
+import type { LayoutGridConfig, LayoutGridObjectFootprint } from "../replay-core/types/layout";
 import type { RenderNode, RenderRegion, ReplayRenderModel } from "../replay-core/types/replay";
 import {
   createCoordinateMapper,
@@ -14,11 +14,13 @@ import {
   samplePath,
   type CoordinateMapper,
   type WorldPoint,
+  type WorldRect,
 } from "./coordinates";
+import { Block, HumanoidBlockModel, ItemShape } from "./blockModels";
 import {
   cargoItemId,
+  cargoItemType,
   humanoidStateValue,
-  itemColor,
   machineColor,
   machineProcessProgress,
   primitiveCode,
@@ -41,27 +43,6 @@ type SelectHandler = (entityId: string | undefined) => void;
 function stopSelect(event: ThreeEvent<MouseEvent>, entityId: string, onSelect?: SelectHandler): void {
   event.stopPropagation();
   onSelect?.(entityId);
-}
-
-function Block({
-  position,
-  size,
-  color,
-  opacity = 1,
-  wireframe = false,
-}: {
-  position: [number, number, number];
-  size: [number, number, number];
-  color: string;
-  opacity?: number;
-  wireframe?: boolean;
-}) {
-  return (
-    <mesh position={position} scale={size} castShadow receiveShadow>
-      <boxGeometry args={[1, 1, 1]} />
-      <meshStandardMaterial color={color} transparent={opacity < 1} opacity={opacity} wireframe={wireframe} roughness={0.78} metalness={0.05} />
-    </mesh>
-  );
 }
 
 function CameraRig({ gridWidth, gridHeight }: { gridWidth: number; gridHeight: number }) {
@@ -159,16 +140,6 @@ function Label({ text, position }: { text: string; position: WorldPoint }) {
   );
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function workerBatteryProgress(entity: RenderNode["entity"]): number | undefined {
-  const batteryPct = Number(entity.attributes.battery_pct);
-  if (!Number.isFinite(batteryPct)) return undefined;
-  return clamp(batteryPct / 100, 0, 1);
-}
-
 function taskBubbleText(entity: RenderNode["entity"]): string {
   const availability = humanoidStateValue(entity, "availability");
   if (availability === "BLOCKED") return "BLK";
@@ -187,17 +158,6 @@ function taskBubbleText(entity: RenderNode["entity"]): string {
   if (task === "HANDOVER_ITEM") return "HAND";
   if (task === "COLLECT_WASTE_OR_SCRAP") return "SCRP";
   return task.replace(/_/g, "").slice(0, 4);
-}
-
-function WorkerBatteryHud({ entity }: { entity: RenderNode["entity"] }) {
-  const battery = workerBatteryProgress(entity);
-  return (
-    <Html position={[0.72, 1.1, 0]} center transform={false} className="worker-world-battery-hud">
-      <div className="worker-world-battery" aria-label="Battery">
-        <span style={{ height: `${Math.round((battery ?? 0) * 100)}%` }} />
-      </div>
-    </Html>
-  );
 }
 
 function WorkerHud({ entity, currentTime, moving }: { entity: RenderNode["entity"]; currentTime: number; moving: boolean }) {
@@ -255,19 +215,15 @@ function WorkerModel({
   }, [currentTime, motion, moving, path]);
   const color = workerColor(entity);
   const cargoId = cargoItemId(entity);
+  const cargoType = cargoItemType(entity) || cargoId;
+  const availability = humanoidStateValue(entity, "availability");
+  const walkSwing = moving ? Math.sin(currentTime * 9.5) * 0.42 : 0;
+  const workSwing = !moving && availability === "EXECUTING" ? Math.sin(currentTime * 8.5) * 0.34 : 0;
   return (
     <group position={[position.x, 0, position.z]} rotation={[0, rotationY, 0]} onClick={(event) => stopSelect(event, entity.entity_id, onSelect)}>
       <SelectionRing selected={selected} width={1.4} depth={1.4} />
-      <Block position={[0, 0.35, -0.18]} size={[0.25, 0.7, 0.25]} color="#263b54" />
-      <Block position={[0, 0.35, 0.18]} size={[0.25, 0.7, 0.25]} color="#263b54" />
-      <Block position={[0, 1.05, 0]} size={[0.72, 0.85, 0.46]} color={color} />
-      <Block position={[0, 1.73, 0]} size={[0.58, 0.48, 0.52]} color="#eff7ff" />
-      <Block position={[0, 1.76, 0.28]} size={[0.4, 0.12, 0.04]} color="#29a8ff" />
-      <Block position={[-0.5, 1.08, 0.04]} size={[0.18, 0.72, 0.18]} color="#8ea6c0" />
-      <Block position={[0.5, 1.08, 0.04]} size={[0.18, 0.72, 0.18]} color="#8ea6c0" />
-      {cargoId && <Block position={[0.76, 1.02, 0.22]} size={[0.35, 0.35, 0.35]} color="#ffd166" />}
-      <Label text={entity.label || entity.entity_id} position={{ x: 0, y: 2.35, z: 0 }} />
-      <WorkerBatteryHud entity={entity} />
+      <HumanoidBlockModel color={color} cargoId={cargoId} cargoType={cargoType} walkSwing={walkSwing} workSwing={workSwing} />
+      <Label text={entity.entity_id} position={{ x: 0, y: 2.35, z: 0 }} />
       <WorkerHud entity={entity} currentTime={currentTime} moving={moving} />
     </group>
   );
@@ -292,6 +248,164 @@ function MachineStatusBubble({ entity, height }: { entity: RenderNode["entity"];
       <div className="machine-world-bubble">{label}</div>
     </Html>
   );
+}
+
+function InspectionTableVisual({
+  entityId,
+  label,
+  rect,
+  selected,
+  onSelect,
+}: {
+  entityId: string;
+  label: string;
+  rect: WorldRect;
+  selected: boolean;
+  onSelect?: SelectHandler;
+}) {
+  const topWidth = rect.width * 0.92;
+  const topDepth = rect.depth * 0.78;
+  return (
+    <group position={[rect.center.x, 0, rect.center.z]} onClick={(event) => stopSelect(event, entityId, onSelect)}>
+      <SelectionRing selected={selected} width={rect.width} depth={rect.depth} />
+      <Block position={[0, 0.48, 0]} size={[topWidth, 0.18, topDepth]} color="#31445e" />
+      <Block position={[0, 0.62, 0]} size={[topWidth * 0.92, 0.08, topDepth * 0.84]} color="#dce8f5" />
+      <Block position={[-topWidth * 0.38, 0.22, -topDepth * 0.32]} size={[0.18, 0.44, 0.18]} color="#26364b" />
+      <Block position={[topWidth * 0.38, 0.22, -topDepth * 0.32]} size={[0.18, 0.44, 0.18]} color="#26364b" />
+      <Block position={[-topWidth * 0.38, 0.22, topDepth * 0.32]} size={[0.18, 0.44, 0.18]} color="#26364b" />
+      <Block position={[topWidth * 0.38, 0.22, topDepth * 0.32]} size={[0.18, 0.44, 0.18]} color="#26364b" />
+      <Block position={[0, 0.9, -topDepth * 0.22]} size={[topWidth * 0.58, 0.12, 0.12]} color="#2c5b83" />
+      <Block position={[0, 1.1, -topDepth * 0.22]} size={[topWidth * 0.58, 0.08, 0.08]} color="#5ee08e" />
+      <Block position={[topWidth * 0.34, 0.98, topDepth * 0.16]} size={[0.18, 0.62, 0.18]} color="#22324a" />
+      <Block position={[topWidth * 0.2, 1.27, topDepth * 0.16]} rotation={[0, 0, 0.35]} size={[0.44, 0.1, 0.1]} color="#22324a" />
+      <Block position={[topWidth * 0.02, 1.2, topDepth * 0.16]} size={[0.18, 0.12, 0.18]} color="#ffcf63" />
+      <Block position={[0, 0.72, topDepth * 0.22]} size={[topWidth * 0.46, 0.05, 0.18]} color="#29a8ff" opacity={0.72} />
+      <Label text={label} position={{ x: 0, y: 1.65, z: 0 }} />
+    </group>
+  );
+}
+
+function InspectionTableModel({
+  node,
+  grid,
+  mapper,
+  selected,
+  onSelect,
+}: {
+  node: RenderNode;
+  grid?: LayoutGridConfig;
+  mapper: CoordinateMapper;
+  selected: boolean;
+  onSelect?: SelectHandler;
+}) {
+  const entity = node.entity;
+  const footprint = footprintForEntity(grid, entity.entity_id);
+  const rect = footprint ? mapper.footprintToWorldRect(footprint) : { center: mapper.pointToWorld(node.position), width: 5, depth: 3 };
+  return (
+    <InspectionTableVisual
+      entityId={entity.entity_id}
+      label={entity.label || "Inspection Table"}
+      rect={rect}
+      selected={selected}
+      onSelect={onSelect}
+    />
+  );
+}
+
+function StaticInspectionTables({
+  grid,
+  regions,
+  mapper,
+  renderedIds,
+  selectedEntityId,
+  onSelect,
+}: {
+  grid?: LayoutGridConfig;
+  regions: RenderRegion[];
+  mapper: CoordinateMapper;
+  renderedIds: Set<string>;
+  selectedEntityId?: string;
+  onSelect?: SelectHandler;
+}) {
+  const footprints = (grid?.object_footprints ?? []).filter(
+    (footprint): footprint is LayoutGridObjectFootprint =>
+      footprint.object_type === "inspection_table" && !renderedIds.has(footprint.object_id),
+  );
+  const fallbackRegion = footprints.length === 0 && !renderedIds.has("inspection_table")
+    ? regions.find((region) => region.kind === "inspection" || region.region_id.includes("inspection"))
+    : undefined;
+  return (
+    <>
+      {footprints.map((footprint) => (
+        <InspectionTableVisual
+          key={`static:${footprint.object_id}`}
+          entityId={footprint.object_id}
+          label="Inspection Table"
+          rect={mapper.footprintToWorldRect(footprint)}
+          selected={selectedEntityId === footprint.object_id}
+          onSelect={onSelect}
+        />
+      ))}
+      {fallbackRegion && (
+        <InspectionTableVisual
+          entityId="inspection_table"
+          label="Inspection Table"
+          rect={{
+            center: mapper.pointToWorld(
+              {
+                x: fallbackRegion.position.x + fallbackRegion.size.width * 0.5,
+                y: fallbackRegion.position.y + fallbackRegion.size.height * 0.68,
+              },
+              0,
+            ),
+            width: 6,
+            depth: 4,
+          }}
+          selected={selectedEntityId === "inspection_table"}
+          onSelect={onSelect}
+        />
+      )}
+    </>
+  );
+}
+
+function queueItemCount(entity: RenderNode["entity"]): number {
+  const attrs = entity.attributes;
+  const explicitCount = attrs.queue_size ?? attrs.item_count ?? attrs.count ?? attrs.completed_count;
+  const numericCount = Number(explicitCount);
+  if (Number.isFinite(numericCount)) return Math.max(0, Math.round(numericCount));
+
+  for (const key of ["item_ids", "items"]) {
+    const value = attrs[key];
+    if (Array.isArray(value)) return value.length;
+  }
+
+  return 0;
+}
+
+function queueItemType(entity: RenderNode["entity"]): string {
+  const explicitType = entity.attributes.item_type;
+  if (typeof explicitType === "string" && explicitType.trim()) return explicitType;
+
+  const id = entity.entity_id.toLowerCase();
+  if (id.includes("scrap")) return "scrap";
+  if (id.includes("material_queue")) return "material";
+  if (id.includes("intermediate_queue_4")) return "product";
+  if (id.includes("intermediate_queue")) return "intermediate";
+  if (id.includes("station_1_output")) return "intermediate";
+  if (id.includes("station_2_output") || id.includes("inspection_output") || id.includes("completed")) return "product";
+  return entity.entity_type;
+}
+
+function platformSurfaceColor(entity: RenderNode["entity"]): string {
+  const id = entity.entity_id.toLowerCase();
+  if (entity.entity_type === "charger") return "#4fcf8b";
+  if (entity.entity_type === "shelf") return "#52657d";
+  if (entity.entity_type === "material_slot") return "#30435c";
+  if (id.includes("scrap")) return "#e56b6f";
+  if (id.includes("material_queue") || id.includes("intermediate_queue")) return "#f4b642";
+  if (id.includes("output_queue") || id.includes("completed_product_buffer") || id.includes("warehouse_buffer")) return "#75a7ff";
+  return entity.entity_type === "buffer" ? "#75a7ff" : "#f4b642";
 }
 
 function MachineModel({
@@ -349,25 +463,32 @@ function PlatformModel({
   const entity = node.entity;
   const footprint = footprintForEntity(grid, entity.entity_id);
   const rect = footprint ? mapper.footprintToWorldRect(footprint) : { center: mapper.pointToWorld(node.position), width: 4, depth: 2 };
-  const queueSize = Number(entity.attributes.queue_size ?? entity.attributes.item_count ?? 0);
+  const queueSize = queueItemCount(entity);
+  const displayItemType = queueItemType(entity);
   const isMaterialSlot = entity.entity_type === "material_slot";
   const isShelf = entity.entity_type === "shelf";
+  const showQueueCount = entity.entity_type === "queue" || entity.entity_type === "buffer";
   const occupied = Boolean(entity.attributes.occupied || entity.attributes.material_item_id);
-  const baseColor = entity.entity_type === "charger" ? "#4fcf8b" : entity.entity_type === "buffer" ? "#75a7ff" : "#f4b642";
+  const baseColor = platformSurfaceColor(entity);
   return (
     <group position={[rect.center.x, 0, rect.center.z]} onClick={(event) => stopSelect(event, entity.entity_id, onSelect)}>
       <SelectionRing selected={selected} width={rect.width} depth={rect.depth} />
       <Block position={[0, isMaterialSlot ? 0.04 : 0.18, 0]} size={[rect.width, isMaterialSlot ? 0.08 : 0.36, rect.depth]} color={isMaterialSlot ? "#30435c" : "#2c3f58"} />
-      {!isMaterialSlot && <Block position={[0, 0.42, 0]} size={[rect.width * 0.88, 0.1, rect.depth * 0.72]} color={isShelf ? "#52657d" : baseColor} />}
-      {isMaterialSlot && occupied && (
-        <Block position={[0, 0.32, 0]} size={[Math.max(0.24, rect.width * 0.78), 0.42, Math.max(0.24, rect.depth * 0.78)]} color={itemColor("material")} />
-      )}
+      {!isMaterialSlot && <Block position={[0, 0.42, 0]} size={[rect.width * 0.88, 0.1, rect.depth * 0.72]} color={baseColor} />}
+      {isMaterialSlot && occupied && <ItemShape itemType="material" position={[0, 0.34, 0]} scale={Math.max(0.62, Math.min(rect.width, rect.depth))} />}
       {!isMaterialSlot && Array.from({ length: Math.min(8, Math.max(0, queueSize)) }).map((_, index) => {
         const x = -rect.width * 0.36 + (index % 4) * 0.55;
         const z = -rect.depth * 0.18 + Math.floor(index / 4) * 0.55;
-        return <Block key={index} position={[x, 0.75, z]} size={[0.36, 0.36, 0.36]} color={itemColor(String(entity.attributes.item_type ?? entity.entity_type))} />;
+        return <ItemShape key={index} itemType={displayItemType} position={[x, 0.75, z]} scale={0.68} />;
       })}
       {!isMaterialSlot && !isShelf && <Label text={entity.label || entity.entity_id} position={{ x: 0, y: 1.05, z: 0 }} />}
+      {showQueueCount && (
+        <Billboard position={[rect.width * 0.43, 1.18, -rect.depth * 0.34]}>
+          <Text fontSize={0.56} color="#10233f" anchorX="center" anchorY="middle" outlineWidth={0.035} outlineColor="#ffffff">
+            {`x${queueSize}`}
+          </Text>
+        </Billboard>
+      )}
     </group>
   );
 }
@@ -385,11 +506,10 @@ function ItemModel({
 }) {
   const entity = node.entity;
   const position = mapper.pointToWorld(node.position);
-  const color = itemColor(String(entity.attributes.item_type ?? entity.label));
   return (
     <group position={[position.x, 0, position.z]} onClick={(event) => stopSelect(event, entity.entity_id, onSelect)}>
       <SelectionRing selected={selected} width={0.8} depth={0.8} />
-      <Block position={[0, 0.34, 0]} size={[0.58, 0.58, 0.58]} color={color} />
+      <ItemShape itemType={entity.attributes.item_type ?? entity.label} position={[0, 0.36, 0]} />
       <Label text={entity.label || entity.entity_id} position={{ x: 0, y: 0.92, z: 0 }} />
     </group>
   );
@@ -410,6 +530,7 @@ function EntityModels({
 }) {
   const grid = renderModel.grid;
   const nodes = renderModel.nodes;
+  const renderedIds = useMemo(() => new Set(nodes.map((node) => node.entity.entity_id)), [nodes]);
 
   return (
     <group>
@@ -420,6 +541,9 @@ function EntityModels({
         }
         if (node.entity.entity_type === "machine" || node.entity.entity_type === "workstation") {
           return <MachineModel key={node.entity.entity_id} node={node} grid={grid} mapper={mapper} currentTime={currentTime} selected={selected} onSelect={onSelectEntity} />;
+        }
+        if (node.entity.entity_type === "inspection_table") {
+          return <InspectionTableModel key={node.entity.entity_id} node={node} grid={grid} mapper={mapper} selected={selected} onSelect={onSelectEntity} />;
         }
         if (
           node.entity.entity_type === "queue" ||
@@ -433,6 +557,14 @@ function EntityModels({
         }
         return <ItemModel key={node.entity.entity_id} node={node} mapper={mapper} selected={selected} onSelect={onSelectEntity} />;
       })}
+      <StaticInspectionTables
+        grid={grid}
+        regions={renderModel.regions}
+        mapper={mapper}
+        renderedIds={renderedIds}
+        selectedEntityId={selectedEntityId}
+        onSelect={onSelectEntity}
+      />
     </group>
   );
 }

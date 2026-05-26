@@ -33,7 +33,7 @@ REGION_ID = {
 QUEUE_META = {
     "material_queue_1": ("queue", "S1 Material Queue"),
     "material_queue_2": ("queue", "S2 Material Queue"),
-    "intermediate_queue_2": ("buffer", "S2 Transfer Queue"),
+    "intermediate_queue_2": ("buffer", "S2 Intermediate Queue"),
     "intermediate_queue_4": ("queue", "Inspection Queue"),
     "completed_product_buffer": ("buffer", "Completed Products"),
     "warehouse_buffer": ("buffer", "Completed Buffer"),
@@ -108,6 +108,19 @@ LAYOUT_TEMPLATE: Dict[str, Any] = {
         {"entity_id": "inspection_output_queue", "entity_type": "buffer", "region_id": "inspection_region", "anchor": {"x": 0.82, "y": 0.30}},
         {"entity_id": "inspection_scrap_queue", "entity_type": "queue", "region_id": "inspection_region", "anchor": {"x": 0.82, "y": 0.60}},
     ],
+}
+
+QUEUE_ITEM_TYPE = {
+    "material_queue_1": "material",
+    "material_queue_2": "material",
+    "intermediate_queue_2": "intermediate",
+    "intermediate_queue_4": "product",
+    "station_1_output_queue": "intermediate",
+    "station_2_output_queue": "product",
+    "inspection_output_queue": "product",
+    "inspection_scrap_queue": "scrap",
+    "completed_product_buffer": "product",
+    "warehouse_buffer": "product",
 }
 
 
@@ -306,10 +319,12 @@ def build_initial_state(
 
     for queue_id, (entity_type, label) in QUEUE_META.items():
         attributes = {"queue_size": 0}
+        if queue_id in QUEUE_ITEM_TYPE:
+            attributes["item_type"] = QUEUE_ITEM_TYPE[queue_id]
         if queue_id in {"completed_product_buffer", "warehouse_buffer"}:
-            attributes = {"completed_count": 0}
+            attributes = {"completed_count": 0, "item_type": QUEUE_ITEM_TYPE.get(queue_id, "product")}
         if queue_id == "inspection_scrap_queue":
-            attributes = {"queue_size": 0, "queue_kind": "scrap"}
+            attributes = {"queue_size": 0, "queue_kind": "scrap", "item_type": "scrap"}
         if queue_id == "scrap_disposal_bin":
             attributes = {"disposed_scrap_count": 0}
         if queue_id == "warehouse_material_shelf":
@@ -345,7 +360,12 @@ def build_initial_state(
             entity_type,
             label,
             "waiting",
-            attributes={"queue_size": 0, "queue_kind": "output", "source_ref": source_ref},
+            attributes={
+                "queue_size": 0,
+                "queue_kind": "output",
+                "source_ref": source_ref,
+                "item_type": QUEUE_ITEM_TYPE.get(queue_id, "product"),
+            },
         )
 
     for machine_id in machine_ids:
@@ -677,12 +697,22 @@ def convert_events(
         path_positions = path_tiles_to_positions(layout, motion.get("path_tiles"))
         from_tile_position = tile_to_position(layout, motion.get("from_tile"))
         to_tile_position = tile_to_position(layout, motion.get("to_tile"))
-        paused = str(details.get("observation_reason", "") or "").strip() == "path_wait" or bool(motion.get("paused", False))
+        humanoid_state = details.get("humanoid_state")
+        availability = ""
+        if isinstance(humanoid_state, dict):
+            availability = str(humanoid_state.get("availability") or "").strip().upper()
+        non_motion_availability = {"AVAILABLE", "ASSIGNED", "WAITING", "BLOCKED", "OFFLINE", "DISABLED"}
+        paused = (
+            str(details.get("observation_reason", "") or "").strip() == "path_wait"
+            or bool(motion.get("paused", False))
+            or availability in non_motion_availability
+        )
         from_position = from_tile_position
         to_position = to_tile_position
         if paused:
-            # Path-wait observations preserve the planned route for context,
-            # but the worker must stay fixed on its current tile.
+            # Path-wait and incident/block observations preserve the planned
+            # route for context, but the worker must stay fixed on its current
+            # tile until a fresh AGENT_MOVE_START resumes motion.
             hold_position = tile_to_position(layout, details.get("tile")) or from_tile_position
             from_position = hold_position
             to_position = hold_position
@@ -996,18 +1026,32 @@ def convert_events(
             continue
 
         if raw_type == "ITEM_STATE_CHANGED" and entity_id:
+            item_state = str(details.get("item_state", "CREATED") or "CREATED").upper()
+            item_tile = details.get("tile") if isinstance(details.get("tile"), dict) else None
+            item_position = tile_to_position(layout, item_tile)
+            item_attributes = {
+                "item_state": item_state,
+                "item_type": details.get("item_type"),
+                "ref": details.get("ref"),
+            }
+            if item_tile is not None:
+                item_attributes["tile"] = item_tile
+            payload: Dict[str, Any] = {
+                "entity_type": "item",
+                "label": entity_id,
+                # Dropped floor items are rendered as visible waiting entities.
+                # Other item lifecycle states stay in attributes and are hidden
+                # by the render model unless they are physically on the floor.
+                "state": "waiting" if item_state == "DROPPED" else item_state.lower(),
+                "attributes": item_attributes,
+            }
+            if item_position is not None:
+                payload["position"] = item_position
             push(
                 "state_changed",
                 timestamp,
                 {"primary": entity_id, "target": details.get("ref")},
-                {
-                    "state": str(details.get("item_state", "CREATED")).lower(),
-                    "attributes": {
-                        "item_state": details.get("item_state"),
-                        "item_type": details.get("item_type"),
-                        "ref": details.get("ref"),
-                    },
-                },
+                payload,
             )
             continue
 
@@ -1266,22 +1310,24 @@ def convert_events(
         if raw_type == "QUEUE_PUSH":
             queue_id = entity_id
             if queue_id in QUEUE_META:
+                item_type = details.get("queue") or QUEUE_ITEM_TYPE.get(queue_id)
                 push(
                     "queue_entered",
                     timestamp,
                     {"primary": details.get("item_id"), "source": resolve_region_id(location), "target": queue_id},
-                    {"item_id": details.get("item_id"), "queue_id": queue_id},
+                    {"item_id": details.get("item_id"), "queue_id": queue_id, "item_type": item_type},
                 )
             continue
 
         if raw_type == "QUEUE_POP":
             queue_id = entity_id
             if queue_id in QUEUE_META:
+                item_type = details.get("queue") or QUEUE_ITEM_TYPE.get(queue_id)
                 push(
                     "queue_exited",
                     timestamp,
                     {"primary": details.get("item_id"), "source": queue_id, "target": resolve_region_id(location)},
-                    {"item_id": details.get("item_id"), "queue_id": queue_id},
+                    {"item_id": details.get("item_id"), "queue_id": queue_id, "item_type": item_type},
                 )
             continue
 
@@ -1353,7 +1399,7 @@ def convert_events(
                 "queue_entered",
                 timestamp,
                 {"primary": entity_id, "source": "inspection_table", "target": "inspection_scrap_queue"},
-                {"item_id": entity_id, "queue_id": "inspection_scrap_queue", "queue_size": details.get("queue_length", 0)},
+                {"item_id": entity_id, "queue_id": "inspection_scrap_queue", "queue_size": details.get("queue_length", 0), "item_type": "scrap"},
             )
             continue
 
@@ -1363,7 +1409,7 @@ def convert_events(
                     "queue_exited",
                     timestamp,
                     {"primary": item_id, "source": "inspection_scrap_queue", "target": entity_id},
-                    {"item_id": item_id, "queue_id": "inspection_scrap_queue", "queue_size": details.get("queue_length", 0)},
+                    {"item_id": item_id, "queue_id": "inspection_scrap_queue", "queue_size": details.get("queue_length", 0), "item_type": "scrap"},
                     suffix=f"scrap-pick-{index_item}",
                 )
             continue

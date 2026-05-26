@@ -63,10 +63,35 @@ function recoveryStepCode(entity: BaseEntityState, kind: "task" | "primitive"): 
 export function cargoItemId(entity: BaseEntityState): string {
   const cargo = entity.attributes.cargo;
   if (cargo && typeof cargo === "object") {
-    const itemId = (cargo as Record<string, unknown>).item_id;
-    if (typeof itemId === "string") return itemId;
+    const row = cargo as Record<string, unknown>;
+    const itemId = row.item_id;
+    if (typeof itemId === "string" && itemId.trim()) return itemId.trim();
+    const itemIds = row.item_ids;
+    if (Array.isArray(itemIds)) {
+      const firstId = itemIds.map(String).find((candidate) => candidate.trim());
+      if (firstId) return firstId.trim();
+    }
+    const itemCount = Number(row.item_count);
+    if (Number.isFinite(itemCount) && itemCount > 0) return `CARGO-${Math.round(itemCount)}`;
   }
-  return typeof entity.attributes.carrying_item_id === "string" ? entity.attributes.carrying_item_id : "";
+  if (typeof entity.attributes.carrying_item_id === "string" && entity.attributes.carrying_item_id.trim()) {
+    return entity.attributes.carrying_item_id.trim();
+  }
+  const carryingItemIds = entity.attributes.carrying_item_ids;
+  if (Array.isArray(carryingItemIds)) {
+    const firstId = carryingItemIds.map(String).find((candidate) => candidate.trim());
+    if (firstId) return firstId.trim();
+  }
+  return "";
+}
+
+export function cargoItemType(entity: BaseEntityState): string {
+  const cargo = entity.attributes.cargo;
+  if (cargo && typeof cargo === "object") {
+    const itemType = (cargo as Record<string, unknown>).item_type;
+    if (typeof itemType === "string") return itemType.trim();
+  }
+  return typeof entity.attributes.carrying_item_type === "string" ? entity.attributes.carrying_item_type.trim() : "";
 }
 
 export function taskWindowProgress(entity: BaseEntityState, currentTime: number): number | undefined {

@@ -233,6 +233,8 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
     case "state_changed": {
       if (!primaryId) return next;
       const entity = upsertEntity(next, primaryId);
+      if (typeof event.payload.entity_type === "string") entity.entity_type = event.payload.entity_type as BaseEntityState["entity_type"];
+      if (typeof event.payload.label === "string") entity.label = event.payload.label;
       if (typeof event.payload.state === "string") entity.state = event.payload.state as BaseEntityState["state"];
       entity.position = asXY(event.payload.position) ?? entity.position;
       mergePayloadAttributes(entity, event.payload);
@@ -355,6 +357,9 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       queue.updated_at = event.timestamp;
       const queueEntity = next.entities[queueId];
       if (queueEntity) {
+        if (typeof event.payload.item_type === "string" && event.payload.item_type.trim()) {
+          queueEntity.attributes.item_type = event.payload.item_type.trim();
+        }
         queueEntity.attributes.queue_size = queue.item_ids.length;
         queueEntity.updated_at = event.timestamp;
       }
@@ -382,6 +387,9 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       queue.updated_at = event.timestamp;
       const queueEntity = next.entities[queueId];
       if (queueEntity) {
+        if (typeof event.payload.item_type === "string" && event.payload.item_type.trim()) {
+          queueEntity.attributes.item_type = event.payload.item_type.trim();
+        }
         queueEntity.attributes.queue_size = queue.item_ids.length;
         queueEntity.updated_at = event.timestamp;
       }

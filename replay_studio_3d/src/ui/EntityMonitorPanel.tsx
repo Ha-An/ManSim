@@ -1,7 +1,10 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type CSSProperties } from "react";
+import { Canvas } from "@react-three/fiber";
+import { OrthographicCamera } from "@react-three/drei";
 import type { BaseEntityState, XY } from "../replay-core/types/entity";
 import type { LayoutGridConfig } from "../replay-core/types/layout";
 import type { RenderRegion } from "../replay-core/types/replay";
+import { HumanoidBlockModel } from "../scene/blockModels";
 import {
   cargoItemId,
   childTaskCode,
@@ -9,6 +12,7 @@ import {
   primitiveCode,
   taskCode,
   taskWindowProgress,
+  workerColor,
 } from "../scene/entityVisuals";
 import { DEFAULT_GRID, DEFAULT_VIEWPORT, isMotionActive, motionDisplayPathPoints, motionPathPoints, samplePath } from "../scene/coordinates";
 
@@ -252,6 +256,56 @@ function itemStageTitle(stage: "queue" | "carried" | "loaded" | "completed"): st
   }
 }
 
+function workerPortraitAccent(entity: BaseEntityState): string {
+  const palette = ["#7fd4ff", "#8e7dff", "#57d49b", "#ffcf63", "#ff9bc8", "#64e5d0"];
+  const suffix = entity.entity_id.match(/\d+$/)?.[0];
+  if (suffix) return palette[(Number(suffix) - 1) % palette.length];
+  const hash = Array.from(entity.entity_id).reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  return palette[hash % palette.length];
+}
+
+function workerPortraitTone(entity: BaseEntityState): string {
+  const availability = humanoidStateValue(entity, "availability");
+  const power = humanoidStateValue(entity, "power");
+  if (availability === "DISABLED" || power === "DEPLETED") return "disabled";
+  if (availability === "BLOCKED") return "blocked";
+  if (availability === "WAITING") return "waiting";
+  if (availability === "EXECUTING") return "executing";
+  if (availability === "ASSIGNED") return "assigned";
+  return "available";
+}
+
+function WorkerPortraitModel({ worker, currentTime }: { worker: BaseEntityState; currentTime: number }) {
+  const moving = isMotionActive(worker.attributes.motion, currentTime);
+  const cargoId = cargoItemId(worker);
+  const cargoType = cargoItemType(worker) || cargoId;
+  const availability = humanoidStateValue(worker, "availability");
+  const walkSwing = moving ? Math.sin(currentTime * 9.5) * 0.42 : 0;
+  const workSwing = !moving && availability === "EXECUTING" ? Math.sin(currentTime * 8.5) * 0.34 : 0;
+  const color = workerColor(worker);
+
+  return (
+    <group position={[0, -0.08, 0]} rotation={[0, 0, 0]}>
+      <HumanoidBlockModel color={color} cargoId={cargoId} cargoType={cargoType} walkSwing={walkSwing} workSwing={workSwing} />
+    </group>
+  );
+}
+
+function WorkerPortrait({ worker, currentTime }: { worker: BaseEntityState; currentTime: number }) {
+  const style = { "--portrait-accent": workerPortraitAccent(worker) } as CSSProperties;
+  return (
+    <div className={`worker-monitor-portrait ${workerPortraitTone(worker)}`} style={style} aria-label={`${worker.label} portrait`}>
+      <Canvas className="worker-monitor-portrait-canvas" gl={{ antialias: true, alpha: true }} dpr={[1, 2]}>
+        <ambientLight intensity={0.84} />
+        <directionalLight position={[2.5, 4, 5]} intensity={1.2} />
+        <OrthographicCamera makeDefault position={[0, 0.95, 5]} zoom={26} near={0.1} far={40} />
+        <WorkerPortraitModel worker={worker} currentTime={currentTime} />
+      </Canvas>
+      <span className="worker-portrait-id">{worker.entity_id}</span>
+    </div>
+  );
+}
+
 function MonitorTabs({ mode, setMode, counts }: { mode: MonitorMode; setMode: (mode: MonitorMode) => void; counts: Record<MonitorMode, number> }) {
   return (
     <div className="entity-monitor-tabs">
@@ -324,7 +378,7 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
               <article className={`worker-monitor-card ${selectedEntity?.entity_id === worker.entity_id ? "selected" : ""}`} key={worker.entity_id}>
                 <div className="worker-monitor-header">
                   <div className="worker-monitor-identity">
-                    <div className="worker-monitor-thumb robot-thumb">3D</div>
+                    <WorkerPortrait worker={worker} currentTime={currentTime} />
                     <div>
                       <div className="worker-monitor-name">{worker.label}</div>
                       <div className="worker-monitor-location">{regionLabel(worker, regions)}</div>

@@ -1000,6 +1000,7 @@ class HumanoidTaskRuntime:
                     "active": True,
                     "recovery_id": recovery_id,
                     "incident_code": incident_code,
+                    "incident_context": dict(incident.get("context", {}) or {}),
                     "step_index": index,
                     "step_count": len(steps),
                     "step_kind": kind,
@@ -1048,8 +1049,20 @@ class HumanoidTaskRuntime:
         code = str(step.get("code", "") or "").strip().upper()
         recovery_task = self._recovery_task_from_step(parent_task, code, recovery_context)
         self._log_task_event("HUMANOID_TASK_START", agent, recovery_task, status="running")
+        step_status = "completed"
+        previous_recovery_context = getattr(agent, "active_recovery_context", None)
+        agent.active_recovery_context = dict(recovery_context)
         try:
-            yield self.world.env.timeout(self._recovery_step_duration(code))
+            handled = False
+            if code == "TRANSFER" and str(recovery_context.get("incident_code", "")).strip().upper() == "ITEM_DROPPED":
+                handler = getattr(self.world, "_execute_dropped_item_recovery_transfer", None)
+                if callable(handler):
+                    handled = True
+                    ok = yield from handler(agent, parent_task, recovery_task, recovery_context)
+                    if not ok:
+                        step_status = "failed"
+            if not handled:
+                yield self.world.env.timeout(self._recovery_step_duration(code))
         except simpy.Interrupt:
             inactive_context = dict(recovery_context)
             inactive_context["active"] = False
@@ -1060,7 +1073,13 @@ class HumanoidTaskRuntime:
             inactive_context = dict(recovery_context)
             inactive_context["active"] = False
             recovery_task.humanoid["recovery_context"] = inactive_context
-            self._log_task_event("HUMANOID_TASK_END", agent, recovery_task, status="completed")
+            self._log_task_event("HUMANOID_TASK_END", agent, recovery_task, status=step_status)
+        finally:
+            if previous_recovery_context is None:
+                if hasattr(agent, "active_recovery_context"):
+                    delattr(agent, "active_recovery_context")
+            else:
+                agent.active_recovery_context = previous_recovery_context
 
     def _execute_recovery_primitive_step(self, agent: Worker, parent_task: Task, step: dict[str, Any], recovery_context: dict[str, Any]):
         code = str(step.get("code", "") or "").strip().upper()
@@ -1079,6 +1098,8 @@ class HumanoidTaskRuntime:
         previous_step_id = agent.current_step_id
         previous_step_call_code = agent.current_step_call_code
         previous_primitive = agent.current_primitive_call_code
+        previous_recovery_context = getattr(agent, "active_recovery_context", None)
+        agent.active_recovery_context = dict(recovery_context)
         self._log_task_event("HUMANOID_TASK_START", agent, recovery_task, status="running")
         agent.current_step_id = str(step_row["step_id"])
         agent.current_step_call_code = code
@@ -1103,6 +1124,11 @@ class HumanoidTaskRuntime:
             agent.current_step_id = previous_step_id
             agent.current_step_call_code = previous_step_call_code
             agent.current_primitive_call_code = previous_primitive
+            if previous_recovery_context is None:
+                if hasattr(agent, "active_recovery_context"):
+                    delattr(agent, "active_recovery_context")
+            else:
+                agent.active_recovery_context = previous_recovery_context
 
     def _recovery_task_from_step(self, parent_task: Task, task_code: str, recovery_context: dict[str, Any]) -> Task:
         code = str(task_code or "RECOVERY").strip().upper()

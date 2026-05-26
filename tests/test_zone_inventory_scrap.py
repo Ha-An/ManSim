@@ -48,6 +48,7 @@ class ZoneInventoryScrapTests(unittest.TestCase):
             self.assertEqual(row.width, wall.width)
             self.assertEqual(grid.zones["Warehouse"].x1 - 1, row.x + row.width - 1)
             for x in range(row.x, row.x + row.width):
+                self.assertIn((x, wall.y), grid.walls)
                 self.assertFalse(grid.is_passable_static((x, wall.y)))
                 self.assertFalse(grid.is_passable_static((x, row.y)))
                 self.assertTrue(grid.is_passable_static((x, row.y + 1)))

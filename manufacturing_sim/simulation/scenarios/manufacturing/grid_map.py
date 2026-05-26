@@ -186,6 +186,7 @@ class TileGridMap:
             machines_per_station=machines_per_station,
             material_shelf_capacity=material_shelf_capacity,
         )
+        walls |= cls._object_wall_tiles(objects)
         service_tiles = cls._build_object_service_tiles(width, height, walls, objects)
         zone_service_tiles = cls._build_zone_service_tiles(width, height, zones, walls, objects)
         return cls(
@@ -262,6 +263,16 @@ class TileGridMap:
                 walls.add((zone.x, y))
                 walls.add((zone.x1, y))
         return walls - doors
+
+    @staticmethod
+    def _object_wall_tiles(objects: dict[str, ObjectFootprint]) -> set[Tile]:
+        """Promote wall-like blocking objects into the canonical wall layer."""
+        return {
+            tile
+            for obj in objects.values()
+            if obj.object_type == "shelf_wall"
+            for tile in obj.tiles
+        }
 
     @classmethod
     def _default_objects(

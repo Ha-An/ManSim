@@ -261,6 +261,7 @@ class ManufacturingWorld:
         self.scrap_disposal_owner: str | None = None
 
         self.items: dict[str, Item] = {}
+        self.dropped_items: dict[str, dict[str, Any]] = {}
         self.item_counter = itertools.count(1)
         self.task_counter = itertools.count(1)
         self.machine_cycle_counter = itertools.count(1)
@@ -1092,16 +1093,23 @@ class ManufacturingWorld:
             return True
         return False
 
-    def _maybe_item_drop_incident(self, agent: Worker, *, logical_destination: str, move_id: str) -> bool:
+    def _maybe_item_drop_incident(self, agent: Worker, *, logical_destination: str, destination: str, move_id: str) -> bool:
         if not agent.carrying_item_id or not self._humanoid_incident_enabled("ITEM_DROPPED"):
+            return False
+        metadata = (agent.humanoid_state or {}).get("metadata") if isinstance(agent.humanoid_state, dict) else None
+        recovery_context = metadata.get("recovery_context") if isinstance(metadata, dict) else None
+        active_recovery_context = getattr(agent, "active_recovery_context", None)
+        if isinstance(active_recovery_context, dict) and bool(active_recovery_context.get("active", False)):
+            return False
+        if isinstance(recovery_context, dict) and bool(recovery_context.get("active", False)):
             return False
         probability = self._random_incident_probability("ITEM_DROPPED", per_tile=True)
         if probability <= 0.0 or self.rng.random() >= probability:
             return False
-        self._drop_agent_cargo_due_to_incident(agent, logical_destination=logical_destination, move_id=move_id)
+        self._drop_agent_cargo_due_to_incident(agent, logical_destination=logical_destination, destination=destination, move_id=move_id)
         return True
 
-    def _drop_agent_cargo_due_to_incident(self, agent: Worker, *, logical_destination: str, move_id: str) -> None:
+    def _drop_agent_cargo_due_to_incident(self, agent: Worker, *, logical_destination: str, destination: str, move_id: str) -> None:
         item_id = str(agent.carrying_item_id or "")
         item_type = str(agent.carrying_item_type or "")
         tile_payload = self._tile_payload(agent.tile)
@@ -1115,16 +1123,27 @@ class ManufacturingWorld:
                 "item_type": item_type,
                 "move_id": move_id,
                 "logical_destination": logical_destination,
+                "destination": str(destination or logical_destination),
                 "tile": tile_payload,
             },
         )
         if item_id:
+            self._register_dropped_item(
+                item_id,
+                item_type=item_type,
+                tile=agent.tile,
+                dropped_by=agent.agent_id,
+                destination=str(destination or logical_destination),
+                logical_destination=logical_destination,
+                move_id=move_id,
+            )
             self._set_item_state(
                 item_id,
                 ItemState.DROPPED,
                 location=self.agent_display_location(agent),
                 ref=f"dropped_by:{agent.agent_id}",
                 item_type=item_type or None,
+                tile=agent.tile,
             )
             self._abort_product_transport_session_for_item(item_id, reason="ITEM_DROPPED", destination="dropped")
         self.logger.log(
@@ -1139,6 +1158,7 @@ class ManufacturingWorld:
                 "reason": "ITEM_DROPPED",
                 "move_id": move_id,
                 "tile": tile_payload,
+                "destination": str(destination or logical_destination),
                 "humanoid_state": self._humanoid_state_payload(agent),
             },
         )
@@ -2681,6 +2701,7 @@ class ManufacturingWorld:
         location: str = "",
         ref: str = "",
         item_type: str | None = None,
+        tile: Tile | None = None,
     ) -> None:
         if not item_id:
             return
@@ -2696,6 +2717,8 @@ class ManufacturingWorld:
             item = self.items[item_id]
         else:
             item.state = next_state
+            if item_type:
+                item.item_type = str(item_type)
         if location.startswith("Station"):
             suffix = location.removeprefix("Station")
             if suffix.isdigit():
@@ -2704,19 +2727,77 @@ class ManufacturingWorld:
             item.current_station = None
         if ref:
             item.metadata["state_ref"] = ref
+        if tile is not None:
+            item.metadata["tile"] = self._tile_payload(tile)
+        details = {
+            "item_id": item_id,
+            "item_type": item.item_type,
+            "item_state": item.state.value,
+            "ref": ref,
+        }
+        if tile is not None:
+            details["tile"] = self._tile_payload(tile)
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
             event_type="ITEM_STATE_CHANGED",
             entity_id=item_id,
             location=location,
-            details={
-                "item_id": item_id,
-                "item_type": item.item_type,
-                "item_state": item.state.value,
-                "ref": ref,
-            },
+            details=details,
         )
+
+    def _register_dropped_item(
+        self,
+        item_id: str,
+        *,
+        item_type: str,
+        tile: Tile | None,
+        dropped_by: str,
+        destination: str,
+        logical_destination: str,
+        move_id: str,
+    ) -> None:
+        """Expose a dropped item as a recoverable floor pickup target.
+
+        HumanoidSim defines the incident and recovery protocol. ManSim owns the
+        environment fact that the item is physically available at a tile.
+        """
+        if not item_id or tile is None:
+            return
+        payload = {
+            "item_id": str(item_id),
+            "item_type": str(item_type or "unknown"),
+            "tile": tile,
+            "dropped_by": str(dropped_by),
+            "destination": str(destination or logical_destination),
+            "logical_destination": str(logical_destination or destination),
+            "move_id": str(move_id or ""),
+            "dropped_at": round(float(self.env.now), 3),
+        }
+        self.dropped_items[str(item_id)] = payload
+        item = self.items.get(str(item_id))
+        if item is not None:
+            item.metadata.update(
+                {
+                    "dropped_tile": self._tile_payload(tile),
+                    "dropped_by": str(dropped_by),
+                    "dropped_at": payload["dropped_at"],
+                    "recovery_destination": payload["destination"],
+                }
+            )
+        if self.grid_map is not None:
+            self.grid_map.service_tiles[str(item_id)] = [tile]
+
+    def _clear_dropped_item(self, item_id: str) -> None:
+        if not item_id:
+            return
+        self.dropped_items.pop(str(item_id), None)
+        if self.grid_map is not None:
+            self.grid_map.service_tiles.pop(str(item_id), None)
+        item = self.items.get(str(item_id))
+        if item is not None:
+            for key in ("dropped_tile", "dropped_by", "dropped_at", "recovery_destination"):
+                item.metadata.pop(key, None)
 
     def _next_item_id(self, prefix: str) -> str:
         return f"{prefix}-{next(self.item_counter)}"
@@ -6934,7 +7015,7 @@ class ManufacturingWorld:
                 logical_destination=logical_dst,
                 segment_duration=segment_duration,
             )
-            if self._maybe_item_drop_incident(agent, logical_destination=logical_dst, move_id=move_id):
+            if self._maybe_item_drop_incident(agent, logical_destination=logical_dst, destination=dst, move_id=move_id):
                 agent.current_move_segment_index = 0
                 agent.current_move_segment_from_tile = None
                 agent.current_move_segment_to_tile = None
@@ -7165,6 +7246,195 @@ class ManufacturingWorld:
             return result
         result = yield from self._execute_task_domain_action(agent, task)
         return result
+
+    def _dropped_item_recovery_destination(
+        self,
+        parent_task: Task,
+        item_type: str,
+        incident_context: dict[str, Any],
+        dropped_info: dict[str, Any],
+    ) -> str:
+        destination = str(
+            incident_context.get("destination")
+            or dropped_info.get("destination")
+            or incident_context.get("logical_destination")
+            or dropped_info.get("logical_destination")
+            or ""
+        ).strip()
+        if destination:
+            return destination
+        payload = parent_task.payload if isinstance(parent_task.payload, dict) else {}
+        if parent_task.task_type == "TRANSFER":
+            transfer_kind = str(payload.get("transfer_kind", "")).strip().lower()
+            if transfer_kind == "material_supply":
+                return f"material_queue_{int(payload.get('station', 1) or 1)}"
+            if transfer_kind == "inter_station":
+                from_station = int(payload.get("from_station", 1) or 1)
+                if from_station == self.inspection_queue_station:
+                    return "completed_product_buffer"
+                to_station = from_station + 1
+                return f"intermediate_queue_{to_station if to_station <= self.last_processing_station else self.inspection_queue_station}"
+            if transfer_kind == "battery_delivery":
+                return str(payload.get("target_agent_id", "") or "")
+        if parent_task.task_type == "SETUP_MACHINE":
+            return str(payload.get("machine_id", "") or "")
+        if parent_task.task_type == "INSPECT_PRODUCT":
+            return "inspection_table"
+        return str(dropped_info.get("logical_destination") or "")
+
+    def _place_recovered_dropped_item(
+        self,
+        agent: Agent,
+        item_id: str,
+        item_type: str,
+        destination: str,
+        parent_task: Task,
+    ) -> str:
+        normalized = self.grid_map.normalize_location(destination) if self.grid_map is not None else str(destination)
+        item_type_norm = str(item_type or "unknown").strip().lower()
+
+        if normalized.startswith("material_queue_"):
+            station = int(normalized.rsplit("_", 1)[-1])
+            self._push_material_queue(station, item_id)
+            return f"Station{station}"
+
+        if normalized.startswith("intermediate_queue_"):
+            station = int(normalized.rsplit("_", 1)[-1])
+            self._push_intermediate_queue(station, item_id)
+            return "Inspection" if station == self.inspection_queue_station else f"Station{station}"
+
+        if normalized == "inspection_output_queue":
+            self.output_buffers[self.inspection_queue_station].append(item_id)
+            self._set_item_state(
+                item_id,
+                ItemState.WAITING_INSPECTION_OUTPUT,
+                location="Inspection",
+                ref="inspection_output_queue",
+                item_type="product",
+            )
+            return "Inspection"
+
+        if normalized == "inspection_scrap_queue":
+            self._push_inspection_scrap_queue(item_id)
+            return "Inspection"
+
+        if normalized == "completed_product_buffer":
+            self.product_count += 1
+            self._set_item_state(
+                item_id,
+                ItemState.COMPLETED,
+                location="CompletedProducts",
+                ref="completed_product_buffer",
+                item_type="product",
+            )
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="COMPLETED_PRODUCT",
+                entity_id=item_id,
+                location="CompletedProducts",
+                details={"target": "completed_product_buffer", "source": "dropped_item_recovery"},
+            )
+            return "CompletedProducts"
+
+        if normalized == "scrap_disposal_bin":
+            self.disposed_scrap_count += 1
+            self._set_item_state(item_id, ItemState.SCRAPPED, location="ScrapDisposal", ref="scrap_disposal_bin", item_type=item_type_norm)
+            return "ScrapDisposal"
+
+        machine = self.machines.get(normalized)
+        if machine is not None:
+            if item_type_norm == "material" and machine.input_material is None:
+                machine.input_material = item_id
+            elif item_type_norm in {"intermediate", "product"} and machine.input_intermediate is None:
+                machine.input_intermediate = item_id
+            self._set_item_state(item_id, ItemState.LOADED_ON_MACHINE, location=f"Station{machine.station}", ref=machine.machine_id, item_type=item_type_norm)
+            return f"Station{machine.station}"
+
+        location = self.grid_map.logical_location(normalized) if self.grid_map is not None else str(parent_task.location or "")
+        self._set_item_state(item_id, ItemState.IN_QUEUE, location=location, ref=normalized, item_type=item_type_norm)
+        return location
+
+    def _execute_dropped_item_recovery_transfer(
+        self,
+        agent: Agent,
+        parent_task: Task,
+        recovery_task: Task,
+        recovery_context: dict[str, Any],
+    ):
+        incident_context = recovery_context.get("incident_context") if isinstance(recovery_context.get("incident_context"), dict) else {}
+        item_id = str(incident_context.get("item_id") or "")
+        if not item_id:
+            return False
+        dropped_info = self.dropped_items.get(item_id)
+        if not isinstance(dropped_info, dict):
+            return False
+        item_type = str(dropped_info.get("item_type") or incident_context.get("item_type") or "unknown")
+        dropped_tile = dropped_info.get("tile")
+        if not isinstance(dropped_tile, tuple):
+            dropped_tile = self._tile_from_payload(incident_context.get("tile"))
+        if dropped_tile is None:
+            return False
+
+        destination = self._dropped_item_recovery_destination(parent_task, item_type, incident_context, dropped_info)
+        if not destination:
+            return False
+
+        if agent.carrying_item_id != item_id:
+            self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO", reason="dropped_item_recovery_pickup")
+            yield from self.move_agent(agent, item_id, emit_move_events=True)
+            if agent.tile != dropped_tile:
+                recovery_task.payload["failure_reason"] = "dropped_item_unreachable"
+                return False
+            self._set_humanoid_primitive_hint(agent, "LOCALIZE_OBJECT", reason="dropped_item_recovery_localize")
+            yield self.env.timeout(max(0.0, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.0) or 0.0)))
+            self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM", reason="dropped_item_recovery_identify")
+            yield self.env.timeout(max(0.0, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.0) or 0.0)))
+            self._set_humanoid_primitive_hint(agent, "GRASP", reason="dropped_item_recovery_pickup")
+            if not self._set_agent_carrying(agent, item_type, item_id):
+                recovery_task.payload["failure_reason"] = "dropped_item_pickup_failed"
+                return False
+            self._clear_dropped_item(item_id)
+            self._set_humanoid_primitive_hint(agent, "LIFT", reason="dropped_item_recovery_pickup")
+
+        self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO", reason="dropped_item_recovery_dropoff")
+        yield from self.move_agent(agent, destination, emit_move_events=True)
+        if not self._confirm_object_service_tile(agent, destination, recovery_task, "dropped_item_recovery_dropoff"):
+            recovery_task.payload["failure_reason"] = "dropped_item_destination_unreachable"
+            return False
+        yield from self._dock_agent_at_target(agent, recovery_task, reason="dropped_item_recovery_dropoff_alignment")
+        self._set_humanoid_primitive_hint(agent, "PLACE", reason="dropped_item_recovery_dropoff")
+        placed_location = self._place_recovered_dropped_item(agent, item_id, item_type, destination, parent_task)
+        self._clear_agent_carrying(agent, destination=placed_location)
+        self._set_humanoid_primitive_hint(agent, "RELEASE", reason="dropped_item_recovery_dropoff")
+        for key in (
+            "transfer_item_id",
+            "transfer_intermediate_id",
+            "material_id",
+            "intermediate_id",
+            "inspection_product_id",
+            "scrap_item_id",
+        ):
+            if str(parent_task.payload.get(key, "")) == item_id:
+                parent_task.payload.pop(key, None)
+        parent_task.payload["dropped_item_recovered"] = True
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="DROPPED_ITEM_RECOVERED",
+            entity_id=item_id,
+            location=placed_location,
+            details={
+                "by": agent.agent_id,
+                "item_id": item_id,
+                "item_type": item_type,
+                "from_tile": self._tile_payload(dropped_tile),
+                "to": destination,
+                "recovery_id": recovery_context.get("recovery_id", ""),
+                "parent_task_id": parent_task.task_id,
+            },
+        )
+        return True
 
     def _execute_task_domain_action(self, agent: Agent, task: Task):
         task_type = task.task_type
@@ -8375,7 +8645,20 @@ class ManufacturingWorld:
 
             task = self._current_parent_task_stub(agent)
             runtime = getattr(self, "humanoid_runtime", None)
-            if runtime is not None and getattr(runtime, "enabled", False):
+            task_context = (agent.humanoid_state or {}).get("task_context") if isinstance(agent.humanoid_state, dict) else None
+            execution_status = (
+                str(task_context.get("execution_status", "")).strip().upper()
+                if isinstance(task_context, dict)
+                else ""
+            )
+            humanoid_task_started = bool(
+                execution_status and execution_status != "PENDING"
+                or agent.current_step_id
+                or agent.current_step_call_code
+                or agent.current_child_task_code
+                or agent.current_task_path
+            )
+            if runtime is not None and getattr(runtime, "enabled", False) and humanoid_task_started:
                 step_path = str(agent.current_step_path or "")
                 # Only close catalog steps that were actually started by
                 # HumanoidTaskRuntime. Domain-internal hints like NAVIGATE_TO may

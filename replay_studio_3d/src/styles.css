@@ -331,6 +331,62 @@ select:disabled {
   font-weight: 700;
 }
 
+.worker-monitor-portrait {
+  --portrait-accent: #7fd4ff;
+  position: relative;
+  width: 64px;
+  height: 78px;
+  flex: 0 0 64px;
+  border: 1px solid rgba(107, 140, 190, 0.36);
+  background:
+    linear-gradient(180deg, rgba(248, 252, 255, 0.98) 0%, rgba(220, 232, 246, 0.98) 100%),
+    radial-gradient(circle at 50% 18%, color-mix(in srgb, var(--portrait-accent) 26%, transparent), transparent 58%);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.72),
+    0 0 16px color-mix(in srgb, var(--portrait-accent) 14%, transparent);
+  overflow: hidden;
+}
+
+.worker-monitor-portrait-canvas {
+  position: absolute !important;
+  inset: 0;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.worker-monitor-portrait.executing {
+  border-color: color-mix(in srgb, var(--portrait-accent) 54%, rgba(104, 140, 214, 0.26));
+}
+
+.worker-monitor-portrait.assigned {
+  border-color: rgba(126, 181, 255, 0.46);
+}
+
+.worker-monitor-portrait.waiting {
+  --portrait-accent: #ffcf63;
+  border-color: rgba(255, 207, 99, 0.5);
+}
+
+.worker-monitor-portrait.blocked,
+.worker-monitor-portrait.disabled {
+  --portrait-accent: #ff6b7a;
+  border-color: rgba(255, 107, 122, 0.56);
+}
+
+.worker-portrait-id {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 3px;
+  z-index: 1;
+  color: #29415f;
+  font-size: 8px;
+  font-weight: 800;
+  text-align: center;
+  letter-spacing: 0.06em;
+  text-shadow: 0 1px 1px rgba(255, 255, 255, 0.8);
+}
+
 .machine-thumb {
   color: #87ffd1;
 }
@@ -472,34 +528,11 @@ select:disabled {
   user-select: none;
 }
 
-.worker-world-battery-hud {
-  pointer-events: none;
-  user-select: none;
-}
-
 .worker-world-hud-inner {
   display: flex;
   align-items: center;
   gap: 5px;
   transform: translateY(-2px);
-}
-
-.worker-world-battery {
-  width: 8px;
-  height: 30px;
-  border: 1px solid rgba(18, 45, 78, 0.9);
-  background: rgba(246, 250, 255, 0.92);
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.8);
-  display: flex;
-  align-items: flex-end;
-  border-radius: 2px;
-  overflow: hidden;
-}
-
-.worker-world-battery span {
-  display: block;
-  width: 100%;
-  background: #45cc89;
 }
 
 .worker-world-task {

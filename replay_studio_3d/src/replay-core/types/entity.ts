@@ -12,11 +12,15 @@ export type EntityType =
   | "transporter"
   | "order"
   | "task"
+  | "item"
   | "charger"
   | "maintenance_station"
   | "storage"
   | "shelf"
   | "material_slot"
+  | "scrap_queue"
+  | "scrap_bin"
+  | "inspection_table"
   | "buffer";
 
 export type EntityStatus =

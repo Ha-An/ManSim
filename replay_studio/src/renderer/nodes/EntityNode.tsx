@@ -22,6 +22,8 @@ export function getNodeSize(entity: BaseEntityState): NodeSize {
     case "buffer":
     case "storage":
       return { width: 92, height: 72 };
+    case "item":
+      return { width: 48, height: 48 };
     case "charger":
     case "maintenance_station":
       return { width: 92, height: 76 };
