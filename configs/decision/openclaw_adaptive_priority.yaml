@@ -3,14 +3,6 @@
 # intent into executable policy. Workers remain deterministic shop-floor executors.
 mode: openclaw_adaptive_priority
 
-urgent_discuss:
-  # Mid-day LLM escalation is not used in the current production path.
-  enabled: false
-
-norms:
-  # Shared norm targets are exposed to managers as reference context.
-  enabled: true
-
 llm:
   enabled: true
   provider: openclaw

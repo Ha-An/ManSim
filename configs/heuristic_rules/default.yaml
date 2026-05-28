@@ -1,22 +1,10 @@
-﻿# `adaptive_priority`와 `fixed_priority`가 공유하는 기본 rule set
-# - world의 초기 norm, base task priority, 규칙 기반 discuss/urgent 반응을 정의한다.
-# - LLM 모드에서도 base priority와 norm 초기값, guardrail 범위를 참조한다.
+# `adaptive_priority`와 `fixed_priority`가 공유하는 기본 rule set.
+# ManSim의 로컬 scripted planner와 LLM fallback이 사용하는 base priority,
+# quota, guardrail 값을 정의한다.
 
 world:
-  initial_norms:
-    # machine당 하루 PM 최소 작업량 기준
-    min_pm_per_machine_per_day: 1
-    # inspect_product 기본 multiplier
-    inspect_product_priority_weight: 1.0
-    # inspection backlog 목표 상한
-    inspection_backlog_target: 8
-    # station output buffer 목표 상한
-    max_output_buffer_target: 4
-    # active agent가 유지하려는 최소 battery reserve
-    battery_reserve_min: 50.0
-
   battery:
-    # 이 값 이하가 되면 mandatory battery swap 대상로 본다.
+    # 이 값 이하가 되면 mandatory battery swap 대상으로 본다.
     mandatory_swap_threshold_min: 15.0
     # 남은 배터리가 이 값 이하이면 동료에게 battery delivery를 우선 고려한다.
     deliver_to_others_threshold_min: 50.0
@@ -83,39 +71,10 @@ decision:
     inspection_quota_bonus: 10
     inspection_priority_multiplier: 1.2
 
-  discuss:
-    # 규칙 기반 norm update 범위
-    min_pm_cap: 3
-    machine_breakdown_raise_threshold: 3
-    machine_breakdown_raise_step: 1
-    machine_breakdown_lower_when_zero: true
-    inspect_product_priority_raise_scrap_threshold: 0.08
-    inspect_product_priority_raise_step: 0.1
-    inspect_product_priority_raise_cap: 1.8
-    inspect_product_priority_lower_scrap_threshold: 0.03
-    inspect_product_priority_lower_step: 0.05
-    inspect_product_priority_floor: 1.0
-
-  urgent:
-    # 규칙 기반 urgent_discuss가 반환하는 priority update 기본값
-    machine_breakdown_priority_updates:
-      repair_machine: 1.4
-      preventive_maintenance: 1.5
-    agent_discharged_priority_updates:
-      battery_delivery_discharged: 1.5
-      battery_delivery_low_battery: 1.2
-    battery_risk_priority_updates:
-      battery_swap: 1.5
-      battery_delivery_low_battery: 1.4
-    inspection_backlog_threshold: 15
-    inspect_product_priority_min_weight: 1.3
-
   llm_guardrails:
-    # LLM이 제안할 수 있는 weight, quota, norm 범위
+    # LLM이 제안할 수 있는 weight와 quota 범위
     task_priority_weight_min: 0.5
     task_priority_weight_max: 3.0
-    urgent_priority_update_min: 0.5
-    urgent_priority_update_max: 3.0
     quota_min: 0
     quota_max:
       warehouse_material_runs: 40
@@ -123,16 +82,6 @@ decision:
       transfer_runs: 80
       inspection_runs: 80
       pm_runs: 24
-    min_pm_per_machine_per_day_min: 1
-    min_pm_per_machine_per_day_max: 4
-    inspect_product_priority_weight_min: 0.5
-    inspect_product_priority_weight_max: 2.0
-    inspection_backlog_target_min: 2
-    inspection_backlog_target_max: 20
-    max_output_buffer_target_min: 1
-    max_output_buffer_target_max: 12
-    battery_reserve_min_min: 20.0
-    battery_reserve_min_max: 90.0
     agent_priority_multiplier_min: 0.75
     agent_priority_multiplier_max: 1.5
     agent_priority_decay: 0.08

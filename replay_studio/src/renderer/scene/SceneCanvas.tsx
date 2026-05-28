@@ -136,7 +136,8 @@ function drawTileGridOverlays(
     if (
       ["machine", "queue", "buffer", "scrap_queue", "scrap_bin", "inspection_table"].includes(
         String(footprint.object_type ?? ""),
-      )
+      ) ||
+      ["shelf_wall", "shelf_low_wall", "shelf_blocker"].includes(String(footprint.object_type ?? ""))
     ) {
       continue;
     }

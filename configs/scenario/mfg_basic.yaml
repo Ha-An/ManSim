@@ -154,8 +154,6 @@ initial_inventory:
     station2: 0
 
 dispatcher:
-  # urgent_discuss 연속 호출 최소 간격
-  urgent_chat_cooldown_min: 5
   # minute snapshot 기록 간격
   snapshot_interval_min: 1
 

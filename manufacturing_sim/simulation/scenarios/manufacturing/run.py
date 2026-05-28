@@ -289,7 +289,6 @@ def run(
     sim_total_min = float(total_days) * float(experiment_cfg["horizon"].get("minutes_per_day", 0))
     wall_clock_started = perf_counter()
     started_at_utc = _utc_now_iso()
-    urgent_cfg = decision_cfg.get("urgent_discuss", {}) if isinstance(decision_cfg.get("urgent_discuss", {}), dict) else {}
     series_cfg = experiment_cfg.get("_run_series", {}) if isinstance(experiment_cfg.get("_run_series", {}), dict) else {}
     run_index = max(1, int(series_cfg.get("run_index", 1) or 1))
     total_runs = max(run_index, int(series_cfg.get("total_runs", 1) or 1))
@@ -316,7 +315,6 @@ def run(
         "wall_clock_sec": 0.0,
         "wall_clock_human": "0s",
         "progress_path": str((output_root / "progress.json").resolve()),
-        "urgent_discuss_enabled": bool(urgent_cfg.get("enabled", True)),
         "worker_execution_mode": (
             str((experiment_cfg.get("worker", {}) if isinstance(experiment_cfg.get("worker", {}), dict) else {}).get("execution_mode", "")).strip()
             if decision_mode == "llm_planner"
@@ -378,7 +376,6 @@ def run(
             "communication_enabled": bool(comm_cfg.get("enabled", True)),
             "coordination_review_enabled": bool(evaluator_cfg.get("enabled", False)) if provider == "openclaw" else bool(comm_cfg.get("enabled", True)),
             "communication_language": llm_language,
-            "urgent_discuss_enabled": bool(urgent_cfg.get("enabled", True)),
             "evaluator_enabled": bool(evaluator_cfg.get("enabled", False)) if provider == "openclaw" else False,
             "evaluator_max_revision_requests": int(evaluator_cfg.get("max_revision_requests", 2) or 2) if provider == "openclaw" else 0,
         }
@@ -429,8 +426,6 @@ def run(
     env = simpy.Environment()
     world = ManufacturingWorld(env=env, cfg=experiment_cfg, logger=event_logger, decision_module=decision_module)
     world.bootstrap()
-    run_meta["norms_enabled"] = bool(getattr(world, "norms_enabled", True))
-    run_meta["initial_norms"] = dict(getattr(world, "norms", {})) if isinstance(getattr(world, "norms", {}), dict) else {}
 
     progress_lock = Lock()
     progress_stop = ThreadEvent()
@@ -526,7 +521,7 @@ def run(
 
             observation = world.build_observation(last_summary)
             strategy = decision_module.reflect(observation)
-            job_plan = decision_module.propose_jobs(observation, strategy, world.norms)
+            job_plan = decision_module.propose_jobs(observation, strategy, {})
             world.start_day(day, strategy, job_plan)
 
             day_end = day * world.minutes_per_day
@@ -548,7 +543,7 @@ def run(
                     details={"reason": world.termination_reason},
                 )
             else:
-                world.norms = decision_module.discuss(day_summary, world.norms)
+                review_result = decision_module.discuss(day_summary, {})
                 discussion_trace: list[dict[str, Any]] = []
                 if hasattr(decision_module, "consume_last_discussion_trace"):
                     consume_fn = getattr(decision_module, "consume_last_discussion_trace")
@@ -571,7 +566,13 @@ def run(
                         maybe_trace = consume_profile_fn()
                         if isinstance(maybe_trace, dict):
                             agent_priority_update_trace = maybe_trace
-                coordination_review_details: dict[str, Any] = {"day_summary": day_summary, "updated_norms": world.norms}
+                coordination_review_details: dict[str, Any] = {"day_summary": day_summary}
+                if isinstance(review_result, dict) and review_result:
+                    coordination_review_details["review_result"] = {
+                        str(key): value
+                        for key, value in review_result.items()
+                        if str(key) not in {"updated_policy", "shared_policy"}
+                    }
                 if comm_enabled is not None:
                     coordination_review_details["coordination_review_enabled"] = comm_enabled
                     coordination_review_details["communication_enabled"] = comm_enabled
@@ -810,6 +811,4 @@ def run(
         "llm_graph_path": str(run_meta.get("llm_graph_path", "")).strip(),
         "llm_wiki_dashboard_path": str(run_meta.get("llm_wiki_dashboard_path", "")).strip(),
     }
-
-
 

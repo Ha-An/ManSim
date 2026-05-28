@@ -21,12 +21,49 @@ export function taskCode(entity: BaseEntityState): string {
   return typeof direct === "string" ? direct.trim().toUpperCase() : "";
 }
 
+function idFromInstance(instanceId: unknown, code: string): string {
+  if (typeof instanceId !== "string" || !instanceId.trim()) return "";
+  const trimmed = instanceId.trim();
+  const suffix = code ? `:${code}` : "";
+  if (suffix && trimmed.toUpperCase().endsWith(suffix)) {
+    return trimmed.slice(0, -suffix.length);
+  }
+  return trimmed.split(":")[0] ?? trimmed;
+}
+
+function topLevelTaskId(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) return "";
+  const root = value.trim().split(/[/:]/)[0];
+  return root.trim();
+}
+
+export function taskId(entity: BaseEntityState): string {
+  const active = entity.attributes.active_task;
+  const activeRoot = topLevelTaskId(active);
+  if (activeRoot) return activeRoot;
+  const code = taskCode(entity).replace(/\s+\(RECOVERY\)$/i, "");
+  const context = taskContext(entity);
+  return topLevelTaskId(idFromInstance(context.task_instance_id ?? entity.attributes.current_task_instance_id, code));
+}
+
+export function taskLabel(entity: BaseEntityState): string {
+  const code = taskCode(entity);
+  if (!code) return "";
+  const id = taskId(entity);
+  return id ? `${code} (${id})` : code;
+}
+
 export function childTaskCode(entity: BaseEntityState): string {
   if (activeRecoveryContext(entity)) return "";
   if (humanoidStateValue(entity, "availability") === "AVAILABLE") return "";
   const child = entity.attributes.current_child_task_code;
   if (typeof child === "string" && child.trim()) return child.trim().toUpperCase();
   return "";
+}
+
+export function childTaskLabel(entity: BaseEntityState): string {
+  const code = childTaskCode(entity);
+  return code || "";
 }
 
 export function primitiveCode(entity: BaseEntityState): string {

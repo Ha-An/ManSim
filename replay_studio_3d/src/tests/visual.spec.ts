@@ -19,7 +19,9 @@ test("renders a nonblank 3D factory scene", async ({ page }) => {
   const logPath = process.env.MANSIM_3D_TEST_LOG;
   await page.goto(logPath ? `/?${new URLSearchParams({ log: logPath }).toString()}` : "/");
   await expect(page.getByText("Replay Studio 3D")).toBeVisible();
-  await expect(page.locator("canvas")).toHaveCount(1);
+  await expect(page.locator(".first-person-pip")).toBeVisible();
+  await expect(page.locator(".scene-viewport canvas").first()).toBeVisible();
+  await expect(page.locator(".first-person-viewport canvas")).toHaveCount(1);
   await page.waitForTimeout(1200);
   const screenshot = await page.screenshot();
   expect(nonBackgroundPixelRatio(screenshot)).toBeGreaterThan(0.02);

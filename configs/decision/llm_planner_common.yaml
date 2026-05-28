@@ -2,14 +2,6 @@
 # 기본값은 Gemma 4 E4B runtime이며, 모델 alias만 바꾸는 legacy preset은 이 파일을 상속해서 override한다.
 mode: llm_planner
 
-urgent_discuss:
-  # incident 발생 시 planner replan 이전에 scripted short-term priority 조정을 허용.
-  enabled: true
-
-norms:
-  # detector/planner guardrail과 fallback logic에서 shared norm target을 참조.
-  enabled: true
-
 llm:
   enabled: true
   # OpenClaw gateway에 전달되는 상위 provider/model 설정.

@@ -1,6 +1,6 @@
 # OpenClaw Adaptive Priority Call Flow
 
-`openclaw_adaptive_priority`는 ManSim의 OpenClaw 기반 LLM manager path입니다. 기본 simulation path는 OpenClaw 없는 `adaptive_priority`이며, 이 문서는 LLM manager loop를 명시적으로 켰을 때의 흐름을 설명합니다. 핵심 아이디어는 manager가 운영 의도를 만들고, deterministic compiler가 그 의도를 안전하게 실행 가능한 정책으로 바꾸는 것입니다.
+`openclaw_adaptive_priority`는 ManSim의 OpenClaw 기반 LLM manager path입니다. 현재 root 기본 simulation path는 `rolling_horizon_dedicated_roles`이고, `adaptive_priority`는 OpenClaw 없는 scripted baseline으로 유지됩니다. 이 문서는 LLM manager loop를 명시적으로 켰을 때의 흐름을 설명합니다. 핵심 아이디어는 manager가 운영 의도를 만들고, deterministic compiler가 그 의도를 안전하게 실행 가능한 정책으로 바꾸는 것입니다.
 
 ## 전체 흐름
 

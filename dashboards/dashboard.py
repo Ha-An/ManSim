@@ -38,6 +38,11 @@ PRIMARY_METRICS = [
     ("Coordination Incidents", "coordination_incident_total", "count", False, "Planning and execution mismatches."),
     ("Unique Replan Blockers", "unique_replan_blocker_total", "count", False, "Distinct blocker states that forced replanning."),
     ("Commitment Dispatches", "commitment_dispatch_total", "count", True, "Commitments that reached worker execution."),
+    ("Rolling Windows", "rolling_horizon_window_count", "count", True, "Rolling-horizon planning windows started and visible in replay."),
+    ("Rolling Dispatches", "rolling_horizon_dispatched_task_count", "count", True, "Tasks released by rolling-horizon dispatch."),
+    ("Rolling Stale Skips", "rolling_horizon_stale_skipped_task_count", "count", False, "Rolling-horizon assignments skipped because the task became infeasible before execution."),
+    ("Rolling Requeues", "rolling_horizon_requeued_task_count", "count", False, "Queued rolling-horizon tasks returned to the pool at a later window boundary."),
+    ("Rolling Max Queue", "rolling_horizon_max_worker_queue_length", "count", True, "Largest number of not-yet-started rolling tasks queued for one worker."),
     ("Product Lead Time", "completed_product_lead_time_avg_min", "minutes", False, "Average accepted-product completion time."),
 ]
 
@@ -49,6 +54,7 @@ METRIC_GROUPS = {
     "incidents": ["humanoid_incident_total", "humanoid_blocked_ratio_avg", "worker_local_response_total", "coordination_incident_total"],
     "collaboration": ["handover_item_count", "shared_product_carry_time_min", "shared_product_carry_ratio", "repair_helper_join_count", "repair_collaboration_time_min", "repair_collaboration_ratio", "repair_team_size_avg"],
     "traffic": ["collision_count", "near_miss_count", "edge_conflict_count", "path_overlap_count"],
+    "decision": ["rolling_horizon_window_count", "rolling_horizon_dispatched_task_count", "rolling_horizon_requeued_task_count", "rolling_horizon_max_worker_queue_length", "rolling_horizon_stale_skipped_task_count", "commitment_dispatch_total"],
 }
 
 
@@ -381,6 +387,31 @@ def _traffic_table(kpi: dict[str, Any]) -> str:
     if not rows:
         rows = "<tr><td colspan='2'>No worker-pair traffic conflicts.</td></tr>"
     return "<div class='panel'><h2>Traffic Conflicts by Worker Pair</h2><p class='muted'>Pairs are recorded directly from AGENT_TRAFFIC_CONFLICT events.</p><table><thead><tr><th>Worker Pair</th><th>Conflicts</th></tr></thead><tbody>" + rows + "</tbody></table></div>"
+
+
+def _rolling_horizon_table(kpi: dict[str, Any]) -> str:
+    payload = kpi.get("rolling_horizon", {}) if isinstance(kpi.get("rolling_horizon", {}), dict) else {}
+    dedicated_summary = (
+        payload.get("dedicated_role_summary", {})
+        if isinstance(payload.get("dedicated_role_summary", {}), dict)
+        else {}
+    )
+    rows = [
+        ("Enabled", "yes" if bool(payload.get("enabled", False)) else "no"),
+        ("Dedicated Roles", "yes" if bool(payload.get("dedicated_roles", False)) else "no"),
+        ("Window", f"{_safe_float(payload.get('window_min')):.1f} min"),
+        ("Priority Scope", "HumanoidSim task_code"),
+        ("Dispatch Policy", str(payload.get("dispatch_policy", "-"))),
+        ("Pending Candidates", str(_safe_int(payload.get("pending_candidate_count")))),
+        ("Queued Dispatches", str(_safe_int(payload.get("queued_dispatch_count")))),
+        ("Requeued Tasks", str(_safe_int(payload.get("requeued_task_count")))),
+        ("Max Worker Queue", str(_safe_int(payload.get("max_worker_queue_length")))),
+        ("Role Violations", str(_safe_int(dedicated_summary.get("role_violation_count")))),
+        ("Handover Dispatches", str(_safe_int(dedicated_summary.get("handover_dispatch_count")))),
+        ("A1 Battery Deliveries", str(_safe_int(dedicated_summary.get("battery_delivery_from_provider_count")))),
+    ]
+    body = "".join(f"<tr><td>{html.escape(label)}</td><td>{html.escape(value)}</td></tr>" for label, value in rows)
+    return "<div class='panel'><h2>Rolling Horizon Dispatch</h2><p class='muted'>This section is populated for rolling_horizon_aging_priority and rolling_horizon_dedicated_roles.</p><table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>" + body + "</tbody></table></div>"
 
 
 def _humanoid_incident_recovery_table(kpi: dict[str, Any]) -> str:
@@ -1085,12 +1116,19 @@ def export_kpi_dashboard(
         + _traffic_table(kpi)
         + "</div>",
     )
+    decision_section = _group_section(
+        "Decision / Dispatch",
+        "Decision-mode dispatch metrics, including rolling-horizon windows when a rolling mode is active.",
+        _summary_cards(kpi, METRIC_GROUPS["decision"]),
+        "<div class='grid cards-2'>" + _rolling_horizon_table(kpi) + "</div>",
+    )
     body_html = (
         _series_snapshot(manifest, current_run_id, kpi)
         + _run_horizon_cards(kpi, daily_summary, (current_run.get("run_meta", {}) if isinstance(current_run, dict) and isinstance(current_run.get("run_meta", {}), dict) else {}))
         + item_section
         + machine_section
         + worker_section
+        + decision_section
         + incident_section
         + collaboration_section
         + traffic_section

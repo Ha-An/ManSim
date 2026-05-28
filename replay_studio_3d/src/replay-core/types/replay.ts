@@ -9,6 +9,9 @@ export interface ReplayMetadata {
   domain: string;
   description?: string;
   created_at?: string;
+  decision_mode?: string;
+  run_index?: number;
+  total_runs?: number;
   total_duration: number;
   time_unit: "seconds" | "minutes";
 }

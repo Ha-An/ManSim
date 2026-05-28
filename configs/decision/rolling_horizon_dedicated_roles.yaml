@@ -1,0 +1,29 @@
+# Rolling horizon with dedicated humanoid roles.
+# Task opportunities are still pooled by rolling window, but each worker only
+# sees the HumanoidSim task codes assigned below. Lower list position means
+# higher priority for that worker; unresolved tasks age upward by window count.
+mode: rolling_horizon_dedicated_roles
+
+rolling_horizon:
+  window_min: 5.0
+  dispatch_policy: dedicated_role_aging_priority
+  worker_task_priority:
+    A1:
+      - REPLENISH_MATERIAL
+    A2:
+      - REPAIR_MACHINE
+      - SETUP_MACHINE
+      - UNLOAD_MACHINE
+    A3:
+      - MANAGE_ROBOT_POWER
+      - TRANSFER
+      - INSPECT_PRODUCT
+      - COLLECT_WASTE_OR_SCRAP
+      - PREVENTIVE_MAINTENANCE
+  aging:
+    rank_boost_per_window: 1
+
+battery:
+  low_threshold_ratio: 0.20
+  delivery_provider_agent_ids: [A3]
+  delivery_receiver_agent_ids: [A1, A2]

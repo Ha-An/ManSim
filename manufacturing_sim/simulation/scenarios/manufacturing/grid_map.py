@@ -159,6 +159,7 @@ class TileGridMap:
         self.tile_workers: dict[Tile, set[str]] = {}
         self.occupied_tiles: dict[Tile, str] = {}
         self.reserved_tiles: dict[Tile, str] = {}
+        self._travel_time_cache: dict[tuple[str, str], float] = {}
 
     @classmethod
     def from_world_config(
@@ -270,7 +271,7 @@ class TileGridMap:
         return {
             tile
             for obj in objects.values()
-            if obj.object_type == "shelf_wall"
+            if obj.object_type in {"shelf_wall", "shelf_low_wall", "shelf_blocker"}
             for tile in obj.tiles
         }
 
@@ -326,6 +327,7 @@ class TileGridMap:
         add("warehouse_material_shelf", "shelf", "Warehouse", shelf_rel_x, shelf_slot_start_rel_y - 1, shelf_wall_width, shelf_height, blocking=False)
         for row in range(shelf_rows):
             slot_rel_y = shelf_slot_start_rel_y + row * shelf_row_pitch
+            row_slot_count = max(0, min(slots_per_row, shelf_capacity - row * slots_per_row))
             add(
                 f"warehouse_material_shelf_wall_{row + 1:02d}",
                 "shelf_wall",
@@ -336,22 +338,26 @@ class TileGridMap:
                 1,
                 blocking=True,
             )
-            add(
-                f"warehouse_material_shelf_row_{row + 1:02d}",
-                "shelf_blocker",
-                "Warehouse",
-                shelf_rel_x,
-                slot_rel_y,
-                shelf_wall_width,
-                1,
-                blocking=True,
-            )
+            # Material spots stay visually open so the item can be rendered on
+            # the tile. Only the tiles between spots become low blockers.
+            for col in range(max(0, row_slot_count - 1)):
+                rel_x = shelf_rel_x + max(0, shelf_width - 2 - col * 2)
+                add(
+                    f"warehouse_material_shelf_spacer_{row + 1:02d}_{col + 1:02d}",
+                    "shelf_low_wall",
+                    "Warehouse",
+                    rel_x,
+                    slot_rel_y,
+                    1,
+                    1,
+                    blocking=True,
+                )
         for index in range(1, shelf_capacity + 1):
             row = (index - 1) // slots_per_row
             col = (index - 1) % slots_per_row
             rel_x = shelf_rel_x + max(0, shelf_width - 1 - col * 2)
             rel_y = shelf_slot_start_rel_y + row * shelf_row_pitch
-            add(f"warehouse_material_slot_{index:02d}", "material_slot", "Warehouse", rel_x, rel_y, 1, 1, blocking=False)
+            add(f"warehouse_material_slot_{index:02d}", "material_slot", "Warehouse", rel_x, rel_y, 1, 1, blocking=True)
         add("completed_product_buffer", "buffer", "CompletedProducts", 9, 5, queue_width, queue_height)
         add("scrap_disposal_bin", "scrap_bin", "ScrapDisposal", 9, 4, queue_width, queue_height)
         add("battery_rack", "charger", "BatteryStation", 4, 3, 5, 3)
@@ -693,19 +699,30 @@ class TileGridMap:
         dst_norm = self.normalize_location(dst)
         if src_norm == dst_norm:
             return 0.0
+        cache_key = (src_norm, dst_norm)
+        cached = self._travel_time_cache.get(cache_key)
+        if cached is not None:
+            return cached
         src_tiles = self.destination_tiles(src_norm, worker_id="__travel__", from_tile=None)
         dst_tiles = self.destination_tiles(dst_norm, worker_id="__travel__", from_tile=src_tiles[0] if src_tiles else None)
         if not src_tiles or not dst_tiles:
+            self._travel_time_cache[cache_key] = self.tile_time_min
             return self.tile_time_min
         best_edges: int | None = None
         for src_tile in src_tiles[:3]:
-            path = self.find_path(src_tile, dst_tiles[:4], worker_id="__travel__")
+            # Travel-time estimates are used for ranking and battery reserve
+            # checks. They should reflect the static factory layout, not the
+            # momentary reservation/occupancy state of other workers.
+            path = self.find_path(src_tile, dst_tiles[:4], worker_id="__travel__", ignore_dynamic=True)
             if path:
                 edges = max(0, len(path) - 1)
                 best_edges = edges if best_edges is None else min(best_edges, edges)
         if best_edges is None:
-            return self.tile_time_min * float(self.width_tiles + self.height_tiles)
-        return best_edges * self.tile_time_min
+            value = self.tile_time_min * float(self.width_tiles + self.height_tiles)
+        else:
+            value = best_edges * self.tile_time_min
+        self._travel_time_cache[cache_key] = value
+        return value
 
     def tile_payload(self, tile: Tile | None) -> dict[str, int] | None:
         if tile is None:
@@ -753,7 +770,7 @@ class TileGridMap:
             "scrap_bin": "buffer",
         }
         for obj in self.objects.values():
-            if obj.object_type in {"shelf_blocker", "shelf_wall"}:
+            if obj.object_type in {"shelf_blocker", "shelf_wall", "shelf_low_wall"}:
                 continue
             nodes.append(
                 {

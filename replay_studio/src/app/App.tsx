@@ -322,10 +322,16 @@ export default function App() {
     [currentFrame.domainState.entities],
   );
 
+  function isTrackedItemEntity(entity: BaseEntityState): boolean {
+    if (entity.entity_type !== "item") return false;
+    const itemType = typeof entity.attributes.item_type === "string" ? entity.attributes.item_type.trim().toLowerCase() : "";
+    return ["material", "intermediate", "product"].includes(itemType) || itemType.startsWith("battery");
+  }
+
   const itemEntities = useMemo(
     () =>
       Object.values(currentFrame.domainState.entities)
-        .filter((entity) => typeof entity.attributes.item_state === "string")
+        .filter(isTrackedItemEntity)
         .sort((left, right) => left.label.localeCompare(right.label)),
     [currentFrame.domainState.entities],
   );

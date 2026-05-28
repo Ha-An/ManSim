@@ -111,6 +111,216 @@ select:disabled {
   outline: none;
 }
 
+.rolling-pool-panel {
+  margin: 14px 0;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(86, 119, 190, 0.2);
+  background: linear-gradient(180deg, rgba(13, 21, 38, 0.96) 0%, rgba(9, 15, 28, 0.96) 100%);
+  color: #dbe7fb;
+}
+
+.rolling-pool-header,
+.rolling-pool-stats,
+.rolling-pool-body {
+  display: flex;
+  align-items: center;
+}
+
+.rolling-pool-header {
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.rolling-pool-header strong {
+  display: block;
+  margin-top: 3px;
+  color: #f7fbff;
+  font-size: 15px;
+}
+
+.rolling-pool-kicker {
+  color: #85a9e8;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+}
+
+.rolling-pool-stats {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  color: #b9c9e7;
+  font-size: 12px;
+}
+
+.rolling-pool-stats span,
+.rolling-status {
+  border: 1px solid rgba(111, 151, 226, 0.24);
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: rgba(18, 30, 55, 0.86);
+}
+
+.rolling-window-strip {
+  position: relative;
+  height: 26px;
+  margin-bottom: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(111, 151, 226, 0.18);
+  background: rgba(6, 12, 24, 0.54);
+  overflow: hidden;
+}
+
+.rolling-window-chip {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  min-width: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: rgba(69, 112, 190, 0.38);
+  color: #dce8fb;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.rolling-window-chip.active {
+  background: rgba(80, 208, 166, 0.82);
+  color: #071527;
+}
+
+.rolling-pool-body {
+  align-items: stretch;
+  gap: 12px;
+  flex-direction: column;
+}
+
+.rolling-table-wrap {
+  flex: 1;
+  min-width: 0;
+  max-height: 190px;
+  overflow: auto;
+  border-radius: 8px;
+  border: 1px solid rgba(111, 151, 226, 0.14);
+}
+
+.rolling-pool-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.rolling-pool-table th,
+.rolling-pool-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid rgba(111, 151, 226, 0.12);
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.rolling-pool-table th {
+  position: sticky;
+  top: 0;
+  background: #0d1729;
+  color: #91b1e9;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.rolling-status {
+  display: inline-block;
+  text-transform: uppercase;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.rolling-status.pool {
+  color: #b9cced;
+}
+
+.rolling-status.requeued {
+  color: #ffd166;
+}
+
+.rolling-status.dispatched {
+  color: #64e4b9;
+}
+
+.rolling-status.started {
+  color: #7dd3fc;
+}
+
+.rolling-status.completed {
+  color: #8fa6c8;
+}
+
+.rolling-status.skipped {
+  color: #ffb06f;
+}
+
+.rolling-empty {
+  color: #7f94bb;
+  font-size: 12px;
+  padding: 6px 8px;
+}
+
+.first-person-pip {
+  position: absolute;
+  left: 14px;
+  bottom: 14px;
+  z-index: 8;
+  width: min(340px, calc(100% - 28px));
+  border-radius: 10px;
+  border: 1px solid rgba(86, 119, 190, 0.2);
+  background: linear-gradient(180deg, rgba(13, 20, 36, 0.98) 0%, rgba(9, 15, 28, 0.98) 100%);
+  box-shadow: 0 18px 36px rgba(8, 15, 28, 0.36);
+  overflow: hidden;
+}
+
+.first-person-header {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 7px 8px;
+  border-bottom: 1px solid rgba(124, 148, 188, 0.18);
+}
+
+.first-person-worker-select {
+  min-width: 0;
+}
+
+.first-person-worker-select .ui-select {
+  min-width: 58px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+}
+
+.first-person-viewport {
+  height: 176px;
+  position: relative;
+  background: linear-gradient(180deg, #dce8f5 0%, #cbd9ea 100%);
+}
+
+.first-person-viewport canvas {
+  outline: none;
+}
+
+.first-person-empty {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  min-height: 144px;
+  color: #dbe7fb;
+  font-weight: 700;
+}
+
 .loading-state {
   display: grid;
   place-items: center;
@@ -626,6 +836,11 @@ select:disabled {
     height: auto;
     max-height: 420px;
   }
+
+  .rolling-pool-body {
+    flex-direction: column;
+  }
+
 }
 
 @media (max-width: 760px) {
@@ -643,5 +858,13 @@ select:disabled {
 
   .scene-viewport {
     min-height: 460px;
+  }
+
+  .first-person-header {
+    padding: 6px 7px;
+  }
+
+  .first-person-viewport {
+    height: 150px;
   }
 }

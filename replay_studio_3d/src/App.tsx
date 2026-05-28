@@ -4,7 +4,9 @@ import { parseReplayLog } from "./replay-core/parser/parseReplayLog";
 import type { BaseEntityState } from "./replay-core/types/entity";
 import type { ReplayFrameState, ReplayLog } from "./replay-core/types/replay";
 import { FactoryScene3D } from "./scene/FactoryScene3D";
+import { FirstPersonScene3D } from "./scene/FirstPersonScene3D";
 import { EntityMonitorPanel } from "./ui/EntityMonitorPanel";
+import { RollingTaskPoolPanel, isRollingHorizonReplay } from "./ui/RollingTaskPoolPanel";
 import {
   getRequestedLogPath,
   getRequestedManifestPath,
@@ -18,6 +20,16 @@ import {
 
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8] as const;
 type ReplaySpeed = (typeof SPEEDS)[number];
+
+function isWorkerEntity(entity: BaseEntityState | undefined): entity is BaseEntityState {
+  return Boolean(entity && (entity.entity_type === "worker" || entity.entity_type === "robot" || entity.entity_type === "transporter"));
+}
+
+function isTrackedItemEntity(entity: BaseEntityState): boolean {
+  if (entity.entity_type !== "item") return false;
+  const itemType = typeof entity.attributes.item_type === "string" ? entity.attributes.item_type.trim().toLowerCase() : "";
+  return ["material", "intermediate", "product"].includes(itemType) || itemType.startsWith("battery");
+}
 
 function formatTime(value: number, unit: string): string {
   const suffix = unit === "seconds" ? "s" : "min";
@@ -40,6 +52,7 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [speed, setSpeed] = useState<ReplaySpeed>(1);
   const [selectedEntityId, setSelectedEntityId] = useState<string | undefined>();
+  const [firstPersonWorkerId, setFirstPersonWorkerId] = useState<string | undefined>();
   const [runs, setRuns] = useState<ManifestRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
 
@@ -116,6 +129,7 @@ export default function App() {
   const currentTime = frame?.time ?? 0;
   const viewport = log?.layout?.viewport ?? { width: 1600, height: 960 };
   const currentFrame = frame;
+  const showRollingTaskPool = useMemo(() => isRollingHorizonReplay(log), [log]);
 
   const workerEntities = useMemo(
     () =>
@@ -124,6 +138,32 @@ export default function App() {
         .sort((left, right) => left.label.localeCompare(right.label)),
     [currentFrame?.domainState.entities],
   );
+
+  const firstPersonWorker = useMemo(() => {
+    if (!workerEntities.length) return undefined;
+    return (
+      workerEntities.find((worker) => worker.entity_id === firstPersonWorkerId) ??
+      workerEntities.find((worker) => worker.entity_id === "A1") ??
+      workerEntities[0]
+    );
+  }, [firstPersonWorkerId, workerEntities]);
+
+  useEffect(() => {
+    if (isWorkerEntity(selectedEntity)) setFirstPersonWorkerId(selectedEntity.entity_id);
+    // Sync only when the user selects a different entity, so the first-person
+    // dropdown can intentionally inspect another worker.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedEntityId]);
+
+  useEffect(() => {
+    if (!workerEntities.length) {
+      if (firstPersonWorkerId) setFirstPersonWorkerId(undefined);
+      return;
+    }
+    if (!workerEntities.some((worker) => worker.entity_id === firstPersonWorkerId)) {
+      setFirstPersonWorkerId((workerEntities.find((worker) => worker.entity_id === "A1") ?? workerEntities[0]).entity_id);
+    }
+  }, [firstPersonWorkerId, workerEntities]);
 
   const machineEntities = useMemo(
     () =>
@@ -136,7 +176,7 @@ export default function App() {
   const itemEntities = useMemo(
     () =>
       Object.values(currentFrame?.domainState.entities ?? {})
-        .filter((entity) => typeof entity.attributes.item_state === "string" || typeof entity.attributes.item_type === "string")
+        .filter(isTrackedItemEntity)
         .sort((left, right) => left.label.localeCompare(right.label)),
     [currentFrame?.domainState.entities],
   );
@@ -269,16 +309,57 @@ export default function App() {
             </div>
           </div>
 
+          {log && showRollingTaskPool && (
+            <RollingTaskPoolPanel
+              events={log.events}
+              currentTime={currentTime}
+              totalDuration={totalDuration}
+              timeUnit={log.metadata.time_unit}
+              decisionMode={log.metadata.decision_mode}
+            />
+          )}
+
           <div className="scene-viewport">
             {frame && log ? (
-              <FactoryScene3D
-                renderModel={frame.renderModel}
-                currentEvent={frame.currentEvent}
-                currentTime={frame.time}
-                viewport={viewport}
-                selectedEntityId={selectedEntityId}
-                onSelectEntity={setSelectedEntityId}
-              />
+              <>
+                <FactoryScene3D
+                  renderModel={frame.renderModel}
+                  currentEvent={frame.currentEvent}
+                  currentTime={frame.time}
+                  viewport={viewport}
+                  selectedEntityId={selectedEntityId}
+                  onSelectEntity={setSelectedEntityId}
+                />
+                <section className="first-person-pip" aria-label="Selected worker first-person view">
+                  <div className="first-person-header">
+                    <label className="control-inline first-person-worker-select">
+                      <select
+                        className="ui-select"
+                        value={firstPersonWorker?.entity_id ?? ""}
+                        onChange={(event) => setFirstPersonWorkerId(event.target.value || undefined)}
+                        disabled={!workerEntities.length}
+                        aria-label="Select first-person worker"
+                      >
+                        {workerEntities.map((worker) => (
+                          <option key={worker.entity_id} value={worker.entity_id}>
+                            {worker.entity_id}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  <div className="first-person-viewport">
+                    <FirstPersonScene3D
+                      renderModel={frame.renderModel}
+                      currentEvent={frame.currentEvent}
+                      currentTime={frame.time}
+                      viewport={viewport}
+                      worker={firstPersonWorker}
+                      onSelectEntity={setSelectedEntityId}
+                    />
+                  </div>
+                </section>
+              </>
             ) : (
               <div className="loading-state">{error ? "Unable to load replay." : "Loading replay..."}</div>
             )}

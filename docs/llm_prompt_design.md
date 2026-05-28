@@ -1,6 +1,6 @@
 # LLM Prompt Design
 
-ManSim의 LLM manager prompt stack은 `openclaw_adaptive_priority`를 기준으로 설계되어 있습니다. 기본 simulation path인 `adaptive_priority`는 LLM prompt를 사용하지 않습니다.
+ManSim의 LLM manager prompt stack은 `openclaw_adaptive_priority`를 기준으로 설계되어 있습니다. 현재 root 기본 simulation path인 `rolling_horizon_dedicated_roles`와 scripted baseline인 `adaptive_priority`는 LLM prompt를 사용하지 않습니다.
 
 ## Design Principle
 

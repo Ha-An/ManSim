@@ -1,0 +1,27 @@
+# Rolling horizon with aging priority.
+# Task opportunities are collected in a rolling window. At each window boundary,
+# older unresolved tasks receive a deterministic rank boost, so low-priority work
+# such as preventive maintenance cannot starve indefinitely.
+mode: rolling_horizon_aging_priority
+
+rolling_horizon:
+  window_min: 5.0
+  dispatch_policy: aging_priority
+  # Lower rank means higher priority. Each waited window improves the rank by
+  # aging.rank_boost_per_window.
+  task_code_priority_order:
+    - MANAGE_ROBOT_POWER
+    - REPAIR_MACHINE
+    - COLLECT_WASTE_OR_SCRAP
+    - UNLOAD_MACHINE
+    - HANDOVER_ITEM
+    - SETUP_MACHINE
+    - TRANSFER
+    - REPLENISH_MATERIAL
+    - INSPECT_PRODUCT
+    - PREVENTIVE_MAINTENANCE
+  aging:
+    rank_boost_per_window: 1
+
+battery:
+  low_threshold_ratio: 0.20

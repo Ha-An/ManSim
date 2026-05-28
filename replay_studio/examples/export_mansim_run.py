@@ -110,6 +110,14 @@ LAYOUT_TEMPLATE: Dict[str, Any] = {
     ],
 }
 
+ROLLING_HORIZON_REPLAY_TYPES = {
+    "ROLLING_HORIZON_WINDOW_START": "rolling_horizon_window_started",
+    "ROLLING_HORIZON_CANDIDATE_COLLECTED": "rolling_horizon_candidate_collected",
+    "ROLLING_HORIZON_DISPATCH": "rolling_horizon_dispatched",
+    "ROLLING_HORIZON_TASK_SKIPPED": "rolling_horizon_task_skipped",
+    "ROLLING_HORIZON_TASK_REQUEUED": "rolling_horizon_task_requeued",
+}
+
 QUEUE_ITEM_TYPE = {
     "material_queue_1": "material",
     "material_queue_2": "material",
@@ -855,6 +863,35 @@ def convert_events(
         location = raw.get("location")
         details = raw.get("details", {})
 
+        if raw_type in ROLLING_HORIZON_REPLAY_TYPES:
+            rolling_details = details if isinstance(details, dict) else {}
+            if raw_type != "ROLLING_HORIZON_WINDOW_START":
+                concrete_task_code = str(rolling_details.get("task_code") or rolling_details.get("task_type") or "").strip()
+                concrete_opportunity_id = str(rolling_details.get("opportunity_id") or entity_id or "").strip()
+                if not concrete_task_code or not concrete_opportunity_id.startswith("RHOPP-"):
+                    # Window-level dispatch summaries are useful in the core log,
+                    # but the replay task pool expects concrete task opportunities.
+                    # Exporting summaries as task rows creates blank table entries.
+                    continue
+            worker_id = rolling_details.get("worker_id") or rolling_details.get("assigned_worker_id")
+            entity_refs: Dict[str, Any] = {"primary": str(entity_id or rolling_details.get("opportunity_id") or raw_type)}
+            if worker_id:
+                entity_refs["related"] = [str(worker_id)]
+                entity_refs["target"] = str(worker_id)
+            payload = {
+                "core_event_type": raw_type,
+                "location": location,
+                **rolling_details,
+            }
+            push(
+                ROLLING_HORIZON_REPLAY_TYPES[raw_type],
+                timestamp,
+                entity_refs,
+                payload,
+                suffix="rh",
+            )
+            continue
+
         if raw_type == "WORKER_STATE_CHANGED" and entity_id:
             tile_position = tile_to_position(layout, details.get("tile"))
             payload: Dict[str, Any] = {
@@ -1034,6 +1071,9 @@ def convert_events(
                 "item_type": details.get("item_type"),
                 "ref": details.get("ref"),
             }
+            for key in ("source_item_ids", "source_material_ids", "source_intermediate_ids", "transformed_from_item_ids"):
+                if isinstance(details.get(key), list):
+                    item_attributes[key] = [str(item) for item in details.get(key, []) if str(item).strip()]
             if item_tile is not None:
                 item_attributes["tile"] = item_tile
             payload: Dict[str, Any] = {
@@ -1181,9 +1221,23 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_TASK_START" and entity_id:
+            task_id = str(details.get("task_id") or "").strip()
+            if task_id:
+                push(
+                    "rolling_horizon_task_started",
+                    timestamp,
+                    {"primary": task_id, "target": entity_id, "related": [entity_id]},
+                    {
+                        "task_id": task_id,
+                        "worker_id": entity_id,
+                        "task_code": details.get("task_code", ""),
+                        "task_type": details.get("task_type", ""),
+                        "instance_id": details.get("instance_id", ""),
+                    },
+                    suffix="rolling-start",
+                )
             if has_canonical_worker_events:
                 continue
-            task_id = details.get("task_id")
             target = task_target(details)
             label = task_label(details)
             task_end = task_end_by_id.get(task_id, {})
@@ -1249,9 +1303,34 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_TASK_END" and entity_id:
+            task_id = str(details.get("task_id") or "").strip()
+            task_status = str(details.get("status", "completed") or "completed").strip().lower()
+            task_reason = str(details.get("reason", "") or "").strip().lower()
+            # A battery handover temporarily interrupts the receiver's current task.
+            # Keep that task visible as STARTED in rolling-horizon replay tables
+            # until the resumed task emits its real completion event.
+            temporary_interrupt_reasons = {"battery_swap_wait", "battery_depleted", "horizon_reached"}
+            emit_lifecycle_completion = not (
+                task_status == "interrupted" and task_reason in temporary_interrupt_reasons
+            )
+            if task_id and emit_lifecycle_completion:
+                push(
+                    "rolling_horizon_task_completed",
+                    timestamp,
+                    {"primary": task_id, "target": entity_id, "related": [entity_id]},
+                    {
+                        "task_id": task_id,
+                        "worker_id": entity_id,
+                        "task_code": details.get("task_code", ""),
+                        "task_type": details.get("task_type", ""),
+                        "instance_id": details.get("instance_id", ""),
+                        "status": details.get("status", "completed"),
+                        "reason": details.get("reason", ""),
+                    },
+                    suffix="rolling-end",
+                )
             if has_canonical_worker_events:
                 continue
-            task_id = details.get("task_id")
             active = active_tasks.pop(entity_id, None)
             push(
                 "task_finished",
@@ -1796,6 +1875,9 @@ def export_run(run_dir: Path, output_log: Path, output_layout: Path) -> None:
             "domain": "manufacturing",
             "description": f"Existing ManSim manufacturing run reconstructed from events.jsonl with {len(worker_ids)} workers and {len(machine_ids)} machines.",
             "created_at": run_meta.get("started_at_utc"),
+            "decision_mode": run_meta.get("decision_mode"),
+            "run_index": run_meta.get("run_index"),
+            "total_runs": run_meta.get("total_runs"),
             "total_duration": float(run_meta.get("sim_total_min", run_meta.get("total_days", 0) * run_meta.get("minutes_per_day", 0))),
             "time_unit": "minutes",
             "replay_mode": "strict",

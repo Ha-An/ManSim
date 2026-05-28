@@ -235,14 +235,11 @@ def _config_section(run_meta: dict[str, Any] | None) -> str:
         return ""
 
     worker_local = payload.get("worker_local_response", {}) if isinstance(payload.get("worker_local_response", {}), dict) else {}
-    initial_norms = payload.get("initial_norms", {}) if isinstance(payload.get("initial_norms", {}), dict) else {}
     llm_meta = payload.get("llm", {}) if isinstance(payload.get("llm", {}), dict) else {}
     orchestration = llm_meta.get("openclaw", {}) if isinstance(llm_meta.get("openclaw", {}), dict) else {}
 
     top_cards = [
         ("Decision Mode", str(payload.get("decision_mode", "")).strip() or "-"),
-        ("Urgent Discuss", "enabled" if bool(payload.get("urgent_discuss_enabled", False)) else "disabled"),
-        ("Norms", "enabled" if bool(payload.get("norms_enabled", False)) else "disabled"),
         ("Worker Execution", str(payload.get("worker_execution_mode", "")).strip() or "-"),
     ]
 
@@ -265,8 +262,6 @@ def _config_section(run_meta: dict[str, Any] | None) -> str:
         ("blocked_duration_escalation_min", str(worker_local.get("blocked_duration_escalation_min", ""))),
         ("expiry_margin_escalation_min", str(worker_local.get("expiry_margin_escalation_min", ""))),
     ]
-
-    norms_rows = [(str(key), str(value)) for key, value in initial_norms.items()]
 
     llm_rows: list[tuple[str, str]] = []
     if llm_meta:
@@ -302,7 +297,6 @@ def _config_section(run_meta: dict[str, Any] | None) -> str:
         f"{summary_cards}</div></section>"
         "<section class='section'><div class='grid cards-2'>"
         f"{_render_key_value_table('Worker Local Response', worker_rows)}"
-        f"{_render_key_value_table('Initial Norms', norms_rows)}"
         "</div></section>"
     )
 

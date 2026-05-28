@@ -42,6 +42,19 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
+function asXYArray(value: unknown): XY[] {
+  return Array.isArray(value) ? value.map(asXY).filter((point): point is XY => Boolean(point)) : [];
+}
+
+function headingFromPoints(points: XY[]): number | undefined {
+  for (let index = points.length - 1; index > 0; index -= 1) {
+    const source = points[index - 1];
+    const target = points[index];
+    if (source.x !== target.x || source.y !== target.y) return Math.atan2(target.y - source.y, target.x - source.x);
+  }
+  return undefined;
+}
+
 function createDomainShell(time = 0): DomainState {
   return {
     entities: {},
@@ -217,17 +230,21 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       const entity = upsertEntity(next, primaryId);
       const from = asXY(event.payload.from) ?? entity.position;
       const to = asXY(event.payload.to) ?? asXY(event.payload.position) ?? entity.position;
+      const path = asXYArray(event.payload.path);
       if (from) entity.position = { ...from };
       entity.state = "moving";
       entity.updated_at = event.timestamp;
       entity.attributes.motion = {
         from,
         to,
-        path: Array.isArray(event.payload.path) ? event.payload.path : undefined,
+        path: path.length >= 2 ? path : undefined,
         display_path: Array.isArray(event.payload.display_path) ? event.payload.display_path : undefined,
+        paused: event.payload.paused === true,
         started_at: event.durative?.started_at ?? event.timestamp,
         ended_at: event.durative?.ended_at ?? event.timestamp,
       };
+      const heading = headingFromPoints(path.length >= 2 ? path : [from, to].filter((point): point is XY => Boolean(point)));
+      if (heading !== undefined) entity.attributes.last_heading_angle = heading;
       return next;
     }
     case "state_changed": {

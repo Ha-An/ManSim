@@ -8,9 +8,11 @@ import { HumanoidBlockModel } from "../scene/blockModels";
 import {
   cargoItemId,
   childTaskCode,
+  childTaskLabel,
   humanoidStateValue,
   primitiveCode,
   taskCode,
+  taskLabel,
   taskWindowProgress,
   workerColor,
 } from "../scene/entityVisuals";
@@ -226,11 +228,19 @@ function machineActiveWorkers(entity: BaseEntityState): string {
 }
 
 function itemType(entity: BaseEntityState): string {
-  return typeof entity.attributes.item_type === "string" ? entity.attributes.item_type.trim() : "";
+  const value = typeof entity.attributes.item_type === "string" ? entity.attributes.item_type.trim() : "";
+  return value.toLowerCase().startsWith("battery") ? "battery" : value;
 }
 
 function itemState(entity: BaseEntityState): string {
   return typeof entity.attributes.item_state === "string" ? entity.attributes.item_state.trim().toUpperCase() : "";
+}
+
+function itemLineage(entity: BaseEntityState, key: "source_material_ids" | "source_intermediate_ids" | "transformed_from_item_ids"): string {
+  const value = entity.attributes[key];
+  if (!Array.isArray(value)) return "-";
+  const ids = value.map(String).map((item) => item.trim()).filter(Boolean);
+  return ids.length ? ids.join(", ") : "-";
 }
 
 function itemStageGroup(entity: BaseEntityState): "queue" | "carried" | "loaded" | "completed" {
@@ -392,8 +402,8 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                   <div><span className="worker-monitor-key">Availability</span><span className="worker-monitor-value">{availability}</span></div>
                   <div><span className="worker-monitor-key">Mobility</span><span className="worker-monitor-value">{mobility}</span></div>
                   <div><span className="worker-monitor-key">Manipulation</span><span className="worker-monitor-value">{manipulation}</span></div>
-                  <div><span className="worker-monitor-key">Task</span><span className="worker-monitor-value">{valueOrDash(taskCode(worker) || context.task_code)}</span></div>
-                  <div><span className="worker-monitor-key">Child Task</span><span className="worker-monitor-value">{valueOrDash(childTaskCode(worker))}</span></div>
+                  <div><span className="worker-monitor-key">Task</span><span className="worker-monitor-value">{valueOrDash(taskLabel(worker) || taskCode(worker) || context.task_code)}</span></div>
+                  <div><span className="worker-monitor-key">Child Task</span><span className="worker-monitor-value">{valueOrDash(childTaskLabel(worker) || childTaskCode(worker))}</span></div>
                   <div><span className="worker-monitor-key">Primitive</span><span className="worker-monitor-value">{valueOrDash(primitiveCode(worker))}</span></div>
                   <div><span className="worker-monitor-key">Motion Path</span><span className="worker-monitor-value">{motionPathLabel(worker, currentTime, grid, viewport)}</span></div>
                   <div><span className="worker-monitor-key">Traffic</span><span className="worker-monitor-value">{trafficConflict(worker, currentTime)}</span></div>
@@ -463,6 +473,9 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                           <div><span className="worker-monitor-key">Item Type</span><span className="worker-monitor-value">{itemType(item) || "-"}</span></div>
                           <div><span className="worker-monitor-key">Stage</span><span className="worker-monitor-value">{itemStageTitle(stage)}</span></div>
                           <div><span className="worker-monitor-key">Reference</span><span className="worker-monitor-value">{String(item.attributes.ref ?? "-")}</span></div>
+                          <div><span className="worker-monitor-key">From Material</span><span className="worker-monitor-value">{itemLineage(item, "source_material_ids")}</span></div>
+                          <div><span className="worker-monitor-key">From Intermediate</span><span className="worker-monitor-value">{itemLineage(item, "source_intermediate_ids")}</span></div>
+                          <div><span className="worker-monitor-key">Transformed From</span><span className="worker-monitor-value">{itemLineage(item, "transformed_from_item_ids")}</span></div>
                         </div>
                       </article>
                     ))}

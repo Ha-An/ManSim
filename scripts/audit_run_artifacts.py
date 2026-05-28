@@ -246,6 +246,8 @@ def check_event_log_consistency(events: list[dict[str, Any]], audit: Audit) -> N
     recovery_active_nonblocked = 0
     self_traffic_conflicts = 0
     non_upper_incident_codes: set[str] = set()
+    rolling_missing_task_id = 0
+    rolling_missing_task_code = 0
 
     for event in events:
         event_type = str(event.get("type") or event.get("event_type") or "")
@@ -294,6 +296,23 @@ def check_event_log_consistency(events: list[dict[str, Any]], audit: Audit) -> N
             incident_code = str(details.get("incident_code") or "")
             if incident_code and incident_code != incident_code.upper():
                 non_upper_incident_codes.add(incident_code)
+        elif event_type in {
+            "ROLLING_HORIZON_CANDIDATE_COLLECTED",
+            "ROLLING_HORIZON_DISPATCH",
+            "ROLLING_HORIZON_TASK_REQUEUED",
+            "ROLLING_HORIZON_TASK_SKIPPED",
+        }:
+            task_code = str(details.get("task_code") or "").strip()
+            # Window summary events intentionally have no task identity. Any
+            # task-specific rolling event must keep the stable top-level task id
+            # so Replay/KPI/Gantt can follow it across requeue/re-dispatch.
+            if task_code:
+                if not str(details.get("task_id") or "").strip():
+                    rolling_missing_task_id += 1
+            if event_type in {"ROLLING_HORIZON_CANDIDATE_COLLECTED", "ROLLING_HORIZON_DISPATCH"}:
+                opportunity_id = str(details.get("opportunity_id") or "").strip()
+                if opportunity_id and not opportunity_id.startswith("RH-") and not task_code:
+                    rolling_missing_task_code += 1
 
         recovery_context = details.get("recovery_context")
         if isinstance(recovery_context, dict) and recovery_context.get("active") is True:
@@ -320,6 +339,10 @@ def check_event_log_consistency(events: list[dict[str, Any]], audit: Audit) -> N
         audit.error(f"event log has self traffic conflicts: {self_traffic_conflicts}")
     if non_upper_incident_codes:
         audit.error(f"incident codes are not uppercase: {sorted(non_upper_incident_codes)}")
+    if rolling_missing_task_id:
+        audit.error(f"rolling task events missing stable task_id: {rolling_missing_task_id}")
+    if rolling_missing_task_code:
+        audit.error(f"rolling task events missing task_code: {rolling_missing_task_code}")
 
 
 def check_replay_log(run_dir: Path, audit: Audit) -> None:

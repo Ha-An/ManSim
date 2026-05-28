@@ -9,7 +9,7 @@
 - `openclaw_adaptive_priority`
 - `llm_planner`, legacy 참고용
 
-기본 simulation path는 `adaptive_priority`입니다. LLM manager를 포함한 주력 OpenClaw path는 `openclaw_adaptive_priority`입니다.
+현재 root 기본 simulation path는 `rolling_horizon_dedicated_roles`입니다. OpenClaw manager를 명시적으로 켠 path는 `openclaw_adaptive_priority`이며, OpenClaw 없이 비교할 수 있는 scripted baseline으로 `adaptive_priority`도 유지합니다.
 
 ## Local Stack
 

@@ -1,4 +1,4 @@
-import type { XY } from "../replay-core/types/entity";
+import type { BaseEntityState, XY } from "../replay-core/types/entity";
 import type { LayoutGridConfig, LayoutGridObjectFootprint } from "../replay-core/types/layout";
 
 export interface WorldPoint {
@@ -11,6 +11,13 @@ export interface WorldRect {
   center: WorldPoint;
   width: number;
   depth: number;
+}
+
+export interface WorkerCameraPose {
+  position: WorldPoint;
+  target: WorldPoint;
+  headingAngle: number;
+  sourcePoint: XY;
 }
 
 export interface CoordinateMapper {
@@ -145,4 +152,43 @@ export function samplePath(points: XY[], progress: number): { point: XY; angle: 
 
 export function footprintForEntity(grid: LayoutGridConfig | undefined, entityId: string): LayoutGridObjectFootprint | undefined {
   return grid?.object_footprints?.find((footprint) => footprint.object_id === entityId);
+}
+
+function numericAttribute(entity: BaseEntityState, key: string): number | undefined {
+  const value = entity.attributes[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function motionProgress(motion: unknown, currentTime: number): number | undefined {
+  if (!motion || typeof motion !== "object") return undefined;
+  const payload = motion as Record<string, unknown>;
+  if (payload.paused === true) return undefined;
+  const startedAt = Number(payload.started_at);
+  const endedAt = Number(payload.ended_at);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt) || endedAt <= startedAt) return undefined;
+  return Math.max(0, Math.min(1, (currentTime - startedAt) / (endedAt - startedAt)));
+}
+
+export function workerCameraPose(entity: BaseEntityState | undefined, currentTime: number, mapper: CoordinateMapper): WorkerCameraPose | undefined {
+  if (!entity?.position) return undefined;
+
+  const motion = entity.attributes.motion;
+  const progress = motionProgress(motion, currentTime);
+  const path = motionPathPoints(motion);
+  const activeSample = progress !== undefined && path.length >= 2 ? samplePath(path, progress) : undefined;
+  const sourcePoint = activeSample?.point ?? entity.position;
+  const headingAngle = activeSample?.angle ?? numericAttribute(entity, "last_heading_angle") ?? -Math.PI / 2;
+  const position = mapper.pointToWorld(sourcePoint, 1.75);
+  const forward = { x: Math.cos(headingAngle), z: Math.sin(headingAngle) };
+
+  return {
+    position,
+    target: {
+      x: position.x + forward.x * 4,
+      y: position.y - 0.18,
+      z: position.z + forward.z * 4,
+    },
+    headingAngle,
+    sourcePoint,
+  };
 }

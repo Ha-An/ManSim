@@ -38,7 +38,7 @@ interface FactoryScene3DProps {
   onSelectEntity?: SelectHandler;
 }
 
-type SelectHandler = (entityId: string | undefined) => void;
+export type SelectHandler = (entityId: string | undefined) => void;
 
 function stopSelect(event: ThreeEvent<MouseEvent>, entityId: string, onSelect?: SelectHandler): void {
   event.stopPropagation();
@@ -111,16 +111,54 @@ function wallColor(tile: { x: number; y: number }, regions: RenderRegion[], mapp
   return "#10223a";
 }
 
+type WallRenderKind = "high" | "low";
+
+function wallLikeObjectTiles(grid?: LayoutGridConfig): Array<{ x: number; y: number; kind: WallRenderKind }> {
+  const out: Array<{ x: number; y: number; kind: WallRenderKind }> = [];
+  for (const footprint of grid?.object_footprints ?? []) {
+    if (
+      footprint.object_type !== "shelf_wall" &&
+      footprint.object_type !== "shelf_low_wall" &&
+      footprint.object_type !== "shelf_blocker"
+    ) {
+      continue;
+    }
+    const kind: WallRenderKind = footprint.object_type === "shelf_wall" ? "high" : "low";
+    for (let x = footprint.x; x < footprint.x + footprint.width; x += 1) {
+      for (let y = footprint.y; y < footprint.y + footprint.height; y += 1) {
+        out.push({ x, y, kind });
+      }
+    }
+  }
+  return out;
+}
+
 function GridShell({ renderModel, mapper }: { renderModel: ReplayRenderModel; mapper: CoordinateMapper }) {
   const grid = renderModel.grid;
+  const wallTiles = useMemo(() => {
+    const byKey = new Map<string, { x: number; y: number; kind: WallRenderKind }>();
+    const objectTiles = wallLikeObjectTiles(grid);
+    const objectKinds = new Map<string, WallRenderKind>();
+    for (const tile of objectTiles) objectKinds.set(`${tile.x},${tile.y}`, tile.kind);
+    for (const tile of grid?.walls ?? []) {
+      const key = `${tile.x},${tile.y}`;
+      byKey.set(key, { x: tile.x, y: tile.y, kind: objectKinds.get(key) ?? "high" });
+    }
+    for (const tile of objectTiles) {
+      byKey.set(`${tile.x},${tile.y}`, tile);
+    }
+    return Array.from(byKey.values());
+  }, [grid]);
   return (
     <group>
       <Block position={[0, -0.04, 0]} size={[mapper.gridWidth, 0.08, mapper.gridHeight]} color="#e8f1fb" />
       <gridHelper args={[Math.max(mapper.gridWidth, mapper.gridHeight), Math.max(mapper.gridWidth, mapper.gridHeight), "#9fb8d9", "#d2deee"]} position={[0, 0.03, 0]} />
       <RegionPlates regions={renderModel.regions} mapper={mapper} />
-      {(grid?.walls ?? []).map((tile, index) => {
-        const center = mapper.tileCenterToWorld({ x: tile.x + 0.5, y: tile.y + 0.5 }, 0.7);
-        return <Block key={`wall:${index}`} position={[center.x, center.y, center.z]} size={[1, 1.4, 1]} color={wallColor(tile, renderModel.regions, mapper)} />;
+      {wallTiles.map((tile, index) => {
+        const height = tile.kind === "low" ? 0.7 : 1.4;
+        const center = mapper.tileCenterToWorld({ x: tile.x + 0.5, y: tile.y + 0.5 }, height / 2);
+        const color = tile.kind === "low" ? "#8f98a3" : wallColor(tile, renderModel.regions, mapper);
+        return <Block key={`wall:${index}`} position={[center.x, center.y, center.z]} size={[1, height, 1]} color={color} />;
       })}
       {(grid?.doors ?? []).map((tile, index) => {
         const center = mapper.tileCenterToWorld({ x: tile.x + 0.5, y: tile.y + 0.5 }, 0.08);
@@ -470,12 +508,22 @@ function PlatformModel({
   const showQueueCount = entity.entity_type === "queue" || entity.entity_type === "buffer";
   const occupied = Boolean(entity.attributes.occupied || entity.attributes.material_item_id);
   const baseColor = platformSurfaceColor(entity);
+  if (isShelf) return null;
   return (
     <group position={[rect.center.x, 0, rect.center.z]} onClick={(event) => stopSelect(event, entity.entity_id, onSelect)}>
       <SelectionRing selected={selected} width={rect.width} depth={rect.depth} />
-      <Block position={[0, isMaterialSlot ? 0.04 : 0.18, 0]} size={[rect.width, isMaterialSlot ? 0.08 : 0.36, rect.depth]} color={isMaterialSlot ? "#30435c" : "#2c3f58"} />
+      {isMaterialSlot && <Block position={[0, 0.35, 0]} size={[rect.width, 0.7, rect.depth]} color="#8f98a3" />}
+      {!isMaterialSlot && <Block position={[0, 0.18, 0]} size={[rect.width, 0.36, rect.depth]} color="#2c3f58" />}
       {!isMaterialSlot && <Block position={[0, 0.42, 0]} size={[rect.width * 0.88, 0.1, rect.depth * 0.72]} color={baseColor} />}
-      {isMaterialSlot && occupied && <ItemShape itemType="material" position={[0, 0.34, 0]} scale={Math.max(0.62, Math.min(rect.width, rect.depth))} />}
+      {isMaterialSlot && occupied && (
+        <ItemShape
+          itemType="material"
+          // Keep shelf material visible even when old replay logs still have a
+          // half-height blocker on the same tile.
+          position={[0, 0.86, 0]}
+          scale={Math.max(0.62, Math.min(rect.width, rect.depth))}
+        />
+      )}
       {!isMaterialSlot && Array.from({ length: Math.min(8, Math.max(0, queueSize)) }).map((_, index) => {
         const x = -rect.width * 0.36 + (index % 4) * 0.55;
         const z = -rect.depth * 0.18 + Math.floor(index / 4) * 0.55;
@@ -521,12 +569,14 @@ function EntityModels({
   currentTime,
   selectedEntityId,
   onSelectEntity,
+  hiddenEntityIds,
 }: {
   renderModel: ReplayRenderModel;
   mapper: CoordinateMapper;
   currentTime: number;
   selectedEntityId?: string;
   onSelectEntity?: SelectHandler;
+  hiddenEntityIds?: Set<string>;
 }) {
   const grid = renderModel.grid;
   const nodes = renderModel.nodes;
@@ -535,6 +585,7 @@ function EntityModels({
   return (
     <group>
       {nodes.map((node) => {
+        if (hiddenEntityIds?.has(node.entity.entity_id)) return null;
         const selected = node.entity.entity_id === selectedEntityId;
         if (node.entity.entity_type === "worker" || node.entity.entity_type === "robot" || node.entity.entity_type === "transporter") {
           return <WorkerModel key={node.entity.entity_id} node={node} mapper={mapper} currentTime={currentTime} selected={selected} onSelect={onSelectEntity} />;
@@ -646,10 +697,50 @@ export function FactoryScene3D({
       <directionalLight position={[24, 44, 18]} intensity={1.25} castShadow shadow-mapSize-width={2048} shadow-mapSize-height={2048} />
       <OrthographicCamera makeDefault near={0.1} far={500} />
       <CameraRig gridWidth={mapper.gridWidth} gridHeight={mapper.gridHeight} />
-      <GridShell renderModel={renderModel} mapper={mapper} />
-      <MotionPathOverlay renderModel={renderModel} mapper={mapper} currentTime={currentTime} />
-      <TrafficConflictOverlay currentEvent={currentEvent} mapper={mapper} />
-      <EntityModels renderModel={renderModel} mapper={mapper} currentTime={currentTime} selectedEntityId={selectedEntityId} onSelectEntity={onSelectEntity} />
+      <FactoryWorldContents
+        renderModel={renderModel}
+        mapper={mapper}
+        currentTime={currentTime}
+        currentEvent={currentEvent}
+        selectedEntityId={selectedEntityId}
+        onSelectEntity={onSelectEntity}
+      />
     </Canvas>
+  );
+}
+
+export function FactoryWorldContents({
+  renderModel,
+  mapper,
+  currentTime,
+  currentEvent,
+  selectedEntityId,
+  onSelectEntity,
+  hiddenEntityIds,
+  showMotionPaths = true,
+}: {
+  renderModel: ReplayRenderModel;
+  mapper: CoordinateMapper;
+  currentTime: number;
+  currentEvent?: ReplayEvent;
+  selectedEntityId?: string;
+  onSelectEntity?: SelectHandler;
+  hiddenEntityIds?: Set<string>;
+  showMotionPaths?: boolean;
+}) {
+  return (
+    <>
+      <GridShell renderModel={renderModel} mapper={mapper} />
+      {showMotionPaths && <MotionPathOverlay renderModel={renderModel} mapper={mapper} currentTime={currentTime} />}
+      <TrafficConflictOverlay currentEvent={currentEvent} mapper={mapper} />
+      <EntityModels
+        renderModel={renderModel}
+        mapper={mapper}
+        currentTime={currentTime}
+        selectedEntityId={selectedEntityId}
+        onSelectEntity={onSelectEntity}
+        hiddenEntityIds={hiddenEntityIds}
+      />
+    </>
   );
 }

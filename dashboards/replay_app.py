@@ -1686,7 +1686,6 @@ def _collect_daily_review_events(events_df: pd.DataFrame, current_t: float) -> l
         details = row.details if isinstance(row.details, dict) else {}
         trace = details.get("review_trace", details.get("discussion_trace", []))
         day_summary = details.get("day_summary", {}) if isinstance(details.get("day_summary", {}), dict) else {}
-        updated_norms = details.get("updated_norms", {}) if isinstance(details.get("updated_norms", {}), dict) else {}
         communication_enabled = bool(details.get("coordination_review_enabled", details.get("communication_enabled", False)))
         session: dict[str, Any] = {
             "t": float(row.t),
@@ -1694,7 +1693,6 @@ def _collect_daily_review_events(events_df: pd.DataFrame, current_t: float) -> l
             "event_type": str(row.type),
             "communication_enabled": communication_enabled,
             "day_summary": day_summary,
-            "updated_norms": updated_norms,
             "mode": "daily_review",
             "worker_reports": {},
             "manager_review": {},
@@ -1818,10 +1816,6 @@ def _render_daily_review_panel(events_df: pd.DataFrame, current_t: float) -> Non
         if assignment:
             with st.expander("Day Start Job Assignment", expanded=False):
                 st.json(assignment)
-        updated_norms = session.get("updated_norms", {}) if isinstance(session.get("updated_norms", {}), dict) else {}
-        if updated_norms:
-            with st.expander("Updated Norms", expanded=False):
-                st.json(updated_norms)
         memory_update = session.get("memory_update", {}) if isinstance(session.get("memory_update", {}), dict) else {}
         if memory_update:
             with st.expander("??? ????", expanded=False):
@@ -2124,7 +2118,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 

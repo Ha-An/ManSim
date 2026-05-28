@@ -134,7 +134,8 @@ function recoveryStepLabel(entity: BaseEntityState, kind: "task" | "primitive"):
 }
 
 function itemType(entity: BaseEntityState): string {
-  return typeof entity.attributes.item_type === "string" ? entity.attributes.item_type.trim() : "";
+  const value = typeof entity.attributes.item_type === "string" ? entity.attributes.item_type.trim() : "";
+  return value.toLowerCase().startsWith("battery") ? "battery" : value;
 }
 
 function itemState(entity: BaseEntityState): string {
@@ -201,6 +202,34 @@ function workerTaskCode(entity: BaseEntityState): string {
   return "-";
 }
 
+function idFromTaskInstance(instanceId: unknown, code: string): string {
+  if (typeof instanceId !== "string" || !instanceId.trim()) return "";
+  const trimmed = instanceId.trim();
+  const suffix = code && code !== "-" ? `:${code}` : "";
+  if (suffix && trimmed.toUpperCase().endsWith(suffix.toUpperCase())) return trimmed.slice(0, -suffix.length);
+  return trimmed.split(":")[0] ?? trimmed;
+}
+
+function topLevelTaskId(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) return "";
+  return value.trim().split(/[/:]/)[0]?.trim() ?? "";
+}
+
+function workerTaskId(entity: BaseEntityState): string {
+  const active = entity.attributes.active_task;
+  const activeRoot = topLevelTaskId(active);
+  if (activeRoot) return activeRoot;
+  const code = workerTaskCode(entity).replace(/\s+\(RECOVERY\)$/i, "");
+  return topLevelTaskId(idFromTaskInstance(humanoidTaskContext(entity).task_instance_id ?? entity.attributes.current_task_instance_id, code));
+}
+
+function workerTaskLabel(entity: BaseEntityState): string {
+  const code = workerTaskCode(entity);
+  if (!code || code === "-") return "-";
+  const id = workerTaskId(entity);
+  return id ? `${code} (${id})` : code;
+}
+
 function workerChildTask(entity: BaseEntityState): string {
   if (activeRecoveryContext(entity)) return "-";
   if (!hasActiveHumanoidTask(entity)) return "-";
@@ -208,6 +237,11 @@ function workerChildTask(entity: BaseEntityState): string {
     typeof entity.attributes.current_child_task_code === "string" ? entity.attributes.current_child_task_code.trim() : "";
   if (childCode) return childCode;
   return "-";
+}
+
+function workerChildTaskLabel(entity: BaseEntityState): string {
+  const code = workerChildTask(entity);
+  return !code || code === "-" ? "-" : code;
 }
 
 function workerPrimitive(entity: BaseEntityState): string {
@@ -404,6 +438,13 @@ function itemRefLabel(entity: BaseEntityState): string {
   return typeof entity.attributes.ref === "string" && entity.attributes.ref.trim() ? entity.attributes.ref.trim() : "-";
 }
 
+function itemLineage(entity: BaseEntityState, key: "source_material_ids" | "source_intermediate_ids" | "transformed_from_item_ids"): string {
+  const value = entity.attributes[key];
+  if (!Array.isArray(value)) return "-";
+  const ids = value.map(String).map((item) => item.trim()).filter(Boolean);
+  return ids.length ? ids.join(", ") : "-";
+}
+
 function isCompletedProduct(entity: BaseEntityState): boolean {
   return itemType(entity).toLowerCase().includes("product") && itemState(entity) === "COMPLETED";
 }
@@ -587,11 +628,11 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                   </div>
                   <div>
                     <span className="worker-monitor-key">Task</span>
-                    <span className="worker-monitor-value">{workerTaskCode(worker)}</span>
+                    <span className="worker-monitor-value">{workerTaskLabel(worker)}</span>
                   </div>
                   <div>
                     <span className="worker-monitor-key">Child Task</span>
-                    <span className="worker-monitor-value">{workerChildTask(worker)}</span>
+                    <span className="worker-monitor-value">{workerChildTaskLabel(worker)}</span>
                   </div>
                   <div>
                     <span className="worker-monitor-key">Primitive</span>
@@ -728,6 +769,18 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                             <div>
                               <span className="worker-monitor-key">Reference</span>
                               <span className="worker-monitor-value">{itemRefLabel(item)}</span>
+                            </div>
+                            <div>
+                              <span className="worker-monitor-key">From Material</span>
+                              <span className="worker-monitor-value">{itemLineage(item, "source_material_ids")}</span>
+                            </div>
+                            <div>
+                              <span className="worker-monitor-key">From Intermediate</span>
+                              <span className="worker-monitor-value">{itemLineage(item, "source_intermediate_ids")}</span>
+                            </div>
+                            <div>
+                              <span className="worker-monitor-key">Transformed From</span>
+                              <span className="worker-monitor-value">{itemLineage(item, "transformed_from_item_ids")}</span>
                             </div>
                           </div>
                         </article>

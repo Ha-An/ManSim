@@ -2476,9 +2476,6 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
         self._write_operating_artifacts()
         return updated_norms
 
-    def urgent_discuss(self, event: dict[str, Any], local_state: dict[str, Any]) -> dict[str, Any]:
-        return {}
-
     def reflect_run(self, *, output_root: Path, kpi: dict[str, Any], daily_summaries: list[dict[str, Any]], run_meta: dict[str, Any]) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if self._knowledge_enabled():

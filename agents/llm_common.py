@@ -91,7 +91,7 @@ class OptionalLLMDecisionModule(DecisionModule):
             "battery_reserve_min",
         )
         norms_cfg = decision_cfg.get("norms", {}) if isinstance(decision_cfg.get("norms", {}), dict) else {}
-        self.norms_enabled = bool(norms_cfg.get("enabled", True))
+        self.norms_enabled = bool(norms_cfg.get("enabled", False))
 
         self.agent_priority_multiplier_min = float(self._decision_rule("llm_guardrails.agent_priority_multiplier_min", 0.75))
         self.agent_priority_multiplier_max = max(
@@ -3725,54 +3725,6 @@ class OptionalLLMDecisionModule(DecisionModule):
             manager_review=manager_review,
         )
         return sanitized_norms
-
-    def urgent_discuss(self, event: dict[str, Any], local_state: dict[str, Any]) -> dict[str, Any]:
-        fallback = {"priority_updates": {}}
-        prompt = self._prompt(
-            title="Urgent discussion for incident response.",
-            payload={
-                "event": event,
-                "local_state": local_state,
-                "memory": self._memory_context("urgent"),
-                "guardrails": self._llm_guardrails_payload("urgent"),
-            },
-            schema_hint='{"priority_updates": "map<allowed_task_priority_key,float>"}',
-        )
-        llm_obj = self._call_llm_json(
-            user_prompt=prompt,
-            system_prompt=self._shared_system_prompt(
-                "You are an urgent manufacturing response coordinator.",
-                [
-                    "This phase handles a disruptive event such as a machine breakdown or battery emergency.",
-                    "Use only the allowed direct task priority keys.",
-                    "Stay within the provided update range and make only moderate temporary adjustments.",
-                    "Do not rewrite the whole policy when the event only justifies a local correction.",
-                ],
-            ),
-            call_name="urgent_discuss",
-            context={"phase": "urgent_discuss", "event_type": event.get("event_type", "")},
-        )
-        return self._build_urgent(llm_obj, fallback)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

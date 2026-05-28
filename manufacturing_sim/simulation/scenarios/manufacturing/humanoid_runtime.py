@@ -541,8 +541,18 @@ class HumanoidTaskRuntime:
         priority_key = self.world._task_priority_key(task)
         if task_code == "REPLENISH_MATERIAL":
             station = int(payload.get("station", 1) or 1)
+            material_item_id = str(payload.get("transfer_item_id") or payload.get("material_item_id") or "").strip()
+            item_ref = (
+                {"entity_type": "material", "entity_id": material_item_id}
+                if material_item_id
+                else {
+                    "entity_type": "material",
+                    "selection_policy": "available_material_from_source",
+                    "quantity": 1,
+                }
+            )
             return {
-                "item": {"entity_type": "material", "entity_id": payload.get("transfer_item_id") or f"material_station_{station}"},
+                "item": item_ref,
                 "source": "Warehouse",
                 "destination": f"material_queue_{station}",
                 "rule": {"station": station, "target_level": self.world.inventory_targets.get("material", {}).get(f"station{station}")},
@@ -1135,7 +1145,10 @@ class HumanoidTaskRuntime:
         recovery_id = str(recovery_context.get("recovery_id", "recovery"))
         step_index = int(recovery_context.get("step_index", 0) or 0)
         return Task(
-            task_id=f"{parent_task.task_id}:{recovery_id}:step{step_index:02d}:{code}",
+            # Recovery steps are part of the parent top-level task instance.
+            # Keep the stable task id on the parent and use instance/path fields
+            # for the recovery step boundary.
+            task_id=parent_task.task_id,
             task_type=code,
             priority_key=parent_task.priority_key,
             priority=parent_task.priority,
@@ -1325,7 +1338,9 @@ class HumanoidTaskRuntime:
         except KeyError:
             pass
         return Task(
-            task_id=f"{parent_task.task_id}:{step.get('step_id', task_code)}",
+            # Child tasks are nested workflow boundaries, not separately
+            # dispatched top-level tasks. Keep the parent stable id.
+            task_id=parent_task.task_id,
             task_type=task_code,
             priority_key=parent_task.priority_key,
             priority=parent_task.priority,
