@@ -2,7 +2,7 @@ import type { EntityType, XY } from "./entity";
 
 export type LayoutSource = "log" | "config" | "auto";
 
-export type LayoutRegionKind = "station" | "inspection" | "storage" | "battery" | "home" | "generic";
+export type LayoutRegionKind = "station" | "inspection" | "storage" | "battery" | "home" | "generic" | "dock" | "materials" | "paint" | "scrap";
 
 export interface LayoutRegionConfig {
   region_id: string;
@@ -42,11 +42,14 @@ export interface LayoutGridConfig {
   tile_time_min?: number;
   walls?: Array<{ x: number; y: number }>;
   doors?: Array<{ x: number; y: number }>;
+  cart_route_tiles?: Array<{ x: number; y: number }>;
+  cart_parking_tiles?: Array<{ x: number; y: number }>;
   object_footprints?: LayoutGridObjectFootprint[];
   service_tiles?: Record<string, Array<{ x: number; y: number }>>;
 }
 
 export interface LayoutConfig {
+  scenario_type?: string;
   source_priority?: LayoutSource[];
   regions?: LayoutRegionConfig[];
   nodes?: LayoutNodeConfig[];

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
 from pathlib import Path
@@ -18,6 +19,11 @@ try:
 except Exception:  # pragma: no cover - keeps standalone demo exporter usable.
     TileGridMap = None  # type: ignore[assignment]
 
+try:
+    from manufacturing_sim.simulation.scenarios.shipyard.grid_map import ShipyardTileGridMap
+except Exception:  # pragma: no cover - keeps standalone demo exporter usable.
+    ShipyardTileGridMap = None  # type: ignore[assignment]
+
 
 REGION_ID = {
     "Home": "warehouse_region",
@@ -28,6 +34,11 @@ REGION_ID = {
     "BatteryStation": "battery_station_region",
     "CompletedProducts": "completed_products_region",
     "ScrapDisposal": "scrap_disposal_region",
+    "ShipDock": "ship_dock_region",
+    "MaterialYard": "material_yard_region",
+    "PaintSupply": "paint_supply_region",
+    "BatteryZone": "battery_zone_region",
+    "ScrapArea": "scrap_area_region",
 }
 
 QUEUE_META = {
@@ -187,7 +198,16 @@ def _stations_from_scenario(scenario_cfg: Dict[str, Any]) -> List[int]:
 
 def build_layout(worker_ids: List[str], scenario_cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
     scenario_cfg = scenario_cfg if isinstance(scenario_cfg, dict) else {}
+    scenario_type = str(scenario_cfg.get("type") or scenario_cfg.get("scenario_type") or scenario_cfg.get("name") or "").strip().lower()
     map_cfg = scenario_cfg.get("map", {}) if isinstance(scenario_cfg.get("map", {}), dict) else {}
+    if scenario_type in {"shipyard", "shipyard_basic"} and ShipyardTileGridMap is not None and bool(map_cfg.get("enabled", True)):
+        try:
+            grid = ShipyardTileGridMap.from_world_config(scenario_cfg)
+            layout = grid.to_replay_layout(worker_ids)
+            layout["scenario_type"] = "shipyard_basic"
+            return layout
+        except Exception:
+            pass
     if TileGridMap is not None and bool(map_cfg.get("enabled", True)):
         factory_cfg = scenario_cfg.get("factory", {}) if isinstance(scenario_cfg.get("factory", {}), dict) else {}
         try:
@@ -312,6 +332,7 @@ def build_initial_state(
     positions = layout_positions(layout)
     entities: Dict[str, Dict[str, Any]] = {}
     material_slot_attrs = initial_material_slots or {}
+    is_shipyard = str(layout.get("scenario_type", "")).strip().lower() == "shipyard_basic"
 
     def add_entity(entity_id: str, entity_type: str, label: str, state: str, *, attributes: Dict[str, Any] | None = None) -> None:
         entities[entity_id] = {
@@ -325,25 +346,33 @@ def build_initial_state(
             "updated_at": 0,
         }
 
-    for queue_id, (entity_type, label) in QUEUE_META.items():
-        attributes = {"queue_size": 0}
-        if queue_id in QUEUE_ITEM_TYPE:
-            attributes["item_type"] = QUEUE_ITEM_TYPE[queue_id]
-        if queue_id in {"completed_product_buffer", "warehouse_buffer"}:
-            attributes = {"completed_count": 0, "item_type": QUEUE_ITEM_TYPE.get(queue_id, "product")}
-        if queue_id == "inspection_scrap_queue":
-            attributes = {"queue_size": 0, "queue_kind": "scrap", "item_type": "scrap"}
-        if queue_id == "scrap_disposal_bin":
-            attributes = {"disposed_scrap_count": 0}
-        if queue_id == "warehouse_material_shelf":
-            attributes = dict(initial_shelf_attributes or {"shelf_count": 0, "shelf_capacity": 0})
-        add_entity(queue_id, entity_type, label, "waiting", attributes=attributes)
+    if not is_shipyard:
+        for queue_id, (entity_type, label) in QUEUE_META.items():
+            attributes = {"queue_size": 0}
+            if queue_id in QUEUE_ITEM_TYPE:
+                attributes["item_type"] = QUEUE_ITEM_TYPE[queue_id]
+            if queue_id in {"completed_product_buffer", "warehouse_buffer"}:
+                attributes = {"completed_count": 0, "item_type": QUEUE_ITEM_TYPE.get(queue_id, "product")}
+            if queue_id == "inspection_scrap_queue":
+                attributes = {"queue_size": 0, "queue_kind": "scrap", "item_type": "scrap"}
+            if queue_id == "scrap_disposal_bin":
+                attributes = {"disposed_scrap_count": 0}
+            if queue_id == "warehouse_material_shelf":
+                attributes = dict(initial_shelf_attributes or {"shelf_count": 0, "shelf_capacity": 0})
+            add_entity(queue_id, entity_type, label, "waiting", attributes=attributes)
 
     for node in layout.get("nodes", []):
         if not isinstance(node, dict):
             continue
         entity_id = str(node.get("entity_id", "") or "")
         entity_type = str(node.get("entity_type", "") or "")
+        if is_shipyard and entity_id and entity_id not in entities and entity_type != "worker":
+            label = "" if entity_type == "ship_work_tile" else entity_id.replace("section_", "").replace("ship_tile_", "Tile ").replace("_", " ").title()
+            state = "WAIT_WELD" if entity_type in {"ship_section", "ship_work_tile"} else "waiting"
+            attributes = dict(node.get("attributes", {}) if isinstance(node.get("attributes", {}), dict) else {})
+            if isinstance(node.get("tile"), dict):
+                attributes.setdefault("tile", node.get("tile"))
+            add_entity(entity_id, entity_type, label, state, attributes=attributes)
         if entity_id.startswith("warehouse_material_slot_") and entity_id not in entities:
             add_entity(
                 entity_id,
@@ -362,19 +391,20 @@ def build_initial_state(
                 ),
             )
 
-    for queue_id, (entity_type, label, source_ref) in OUTPUT_QUEUE_META.items():
-        add_entity(
-            queue_id,
-            entity_type,
-            label,
-            "waiting",
-            attributes={
-                "queue_size": 0,
-                "queue_kind": "output",
-                "source_ref": source_ref,
-                "item_type": QUEUE_ITEM_TYPE.get(queue_id, "product"),
-            },
-        )
+    if not is_shipyard:
+        for queue_id, (entity_type, label, source_ref) in OUTPUT_QUEUE_META.items():
+            add_entity(
+                queue_id,
+                entity_type,
+                label,
+                "waiting",
+                attributes={
+                    "queue_size": 0,
+                    "queue_kind": "output",
+                    "source_ref": source_ref,
+                    "item_type": QUEUE_ITEM_TYPE.get(queue_id, "product"),
+                },
+            )
 
     for machine_id in machine_ids:
         add_entity(
@@ -449,6 +479,8 @@ def build_task_end_index(raw_events: List[Dict[str, Any]]) -> Dict[str, Dict[str
 def resolve_region_id(location: str | None) -> str | None:
     if not location:
         return None
+    if str(location).startswith("section_"):
+        return str(location)
     return REGION_ID.get(location)
 
 
@@ -556,7 +588,7 @@ def task_target(details: Dict[str, Any]) -> str | None:
         if kind in {"battery_delivery_low_battery", "battery_delivery_discharged"}:
             return "battery_rack"
         return resolve_region_id(details.get("location")) or "warehouse_buffer"
-    if task_type in {"SETUP_MACHINE", "REPAIR_MACHINE", "UNLOAD_MACHINE", "PREVENTIVE_MAINTENANCE"}:
+    if task_type in {"LOAD_MACHINE", "SETUP_MACHINE", "REPAIR_MACHINE", "UNLOAD_MACHINE", "PREVENTIVE_MAINTENANCE"}:
         return payload.get("machine_id")
     if task_type == "BATTERY_SWAP":
         return "battery_rack"
@@ -646,6 +678,7 @@ def convert_events(
     has_canonical_worker_events = any(
         event.get("type") in {"WORKER_STATE_CHANGED", "WORKER_CARGO_CHANGED"} for event in raw_events
     )
+    worker_humanoid_state_cache: Dict[str, Dict[str, Any]] = {}
 
     def push(event_type: str, timestamp: float, entity_refs: Dict[str, Any], payload: Dict[str, Any], *, durative: Dict[str, Any] | None = None, suffix: str = "a") -> None:
         converted.append(
@@ -741,12 +774,38 @@ def convert_events(
             payload["display_path"] = path_positions
         return payload
 
-    def canonical_worker_attributes(details: Dict[str, Any], event_index: int, worker_id: str) -> Dict[str, Any]:
+    def next_worker_humanoid_state(event_index: int, worker_id: str, timestamp: float) -> Dict[str, Any] | None:
+        for future in raw_events[event_index + 1 :]:
+            future_time = float(future.get("t", timestamp) or timestamp)
+            if future_time != timestamp:
+                break
+            if future.get("entity_id") != worker_id:
+                continue
+            future_details = future.get("details") if isinstance(future.get("details"), dict) else {}
+            state = future_details.get("humanoid_state")
+            if isinstance(state, dict):
+                return copy.deepcopy(state)
+        return None
+
+    def canonical_worker_attributes(
+        details: Dict[str, Any],
+        event_index: int,
+        worker_id: str,
+        *,
+        prefer_next_state: bool = False,
+        timestamp: float | None = None,
+    ) -> Dict[str, Any]:
         attrs: Dict[str, Any] = {}
         humanoid_state = details.get("humanoid_state")
+        if not isinstance(humanoid_state, dict) and prefer_next_state and timestamp is not None:
+            humanoid_state = next_worker_humanoid_state(event_index, worker_id, timestamp)
+        if not isinstance(humanoid_state, dict):
+            humanoid_state = worker_humanoid_state_cache.get(worker_id)
         has_active_task_context = False
         if isinstance(humanoid_state, dict):
-            attrs["humanoid_state"] = humanoid_state
+            attrs["humanoid_state"] = copy.deepcopy(humanoid_state)
+            if details.get("humanoid_state") is humanoid_state:
+                worker_humanoid_state_cache[worker_id] = copy.deepcopy(humanoid_state)
             task_context = humanoid_state.get("task_context")
             if isinstance(task_context, dict):
                 has_active_task_context = bool(str(task_context.get("task_code") or "").strip())
@@ -833,8 +892,10 @@ def convert_events(
             attrs["task_label"] = details.get("task_id") or details.get("current_task_id")
         if "battery_remaining_min" in details:
             remaining = float(details.get("battery_remaining_min") or 0.0)
-            attrs["battery_period_min"] = battery_period_min
-            attrs["battery_pct"] = max(0.0, min(100.0, 100.0 * remaining / max(1.0, battery_period_min)))
+            event_battery_period_min = float(details.get("battery_period_min") or battery_period_min)
+            attrs["battery_remaining_min"] = remaining
+            attrs["battery_period_min"] = event_battery_period_min
+            attrs["battery_pct"] = max(0.0, min(100.0, 100.0 * remaining / max(1.0, event_battery_period_min)))
         return attrs
 
     def conflict_position_payload(details: Dict[str, Any]) -> Dict[str, Any]:
@@ -892,10 +953,87 @@ def convert_events(
             )
             continue
 
+        if raw_type == "CART_STATE_CHANGED" and entity_id:
+            tile_position = tile_to_position(layout, details.get("tile"))
+            attrs = {
+                "cart_id": details.get("cart_id", entity_id),
+                "vehicle_id": details.get("vehicle_id", entity_id),
+                "status": details.get("status", "parked"),
+                "inventory_kind": details.get("inventory_kind", ""),
+                "inventory_count": details.get("inventory_count", 0),
+                "reserved_count": details.get("reserved_count", 0),
+                "available_count": details.get("available_count", 0),
+                "capacity": details.get("capacity", 0),
+                "owner": details.get("owner", ""),
+                "assigned_worker_id": details.get("assigned_worker_id", ""),
+                "assigned_task_id": details.get("assigned_task_id", ""),
+                "parking_spot_id": details.get("parking_spot_id", ""),
+                "cockpit_tile": details.get("cockpit_tile") or details.get("tile"),
+                "cargo_tile": details.get("cargo_tile"),
+                "heading": details.get("heading", {}),
+                "footprint_tiles": details.get("footprint_tiles", []),
+                "footprint_length_tiles": details.get("footprint_length_tiles", 1),
+                "tile": details.get("tile"),
+            }
+            raw_status = str(details.get("status", "parked") or "parked").lower()
+            replay_state = "moving" if raw_status == "moving" else "working" if raw_status in {"reserved", "loading"} else "idle"
+            payload: Dict[str, Any] = {"state": replay_state, "attributes": attrs}
+            if tile_position is not None:
+                payload["position"] = tile_position
+            push("state_changed", timestamp, {"primary": entity_id}, payload, suffix="cart")
+            continue
+
+        if raw_type == "CART_MOVE_TILE_START" and entity_id:
+            from_position = tile_to_position(layout, details.get("from_tile"))
+            to_position = tile_to_position(layout, details.get("to_tile"))
+            if from_position and to_position:
+                started_at = float(details.get("started_at", timestamp) or timestamp)
+                ended_at = float(details.get("ended_at", started_at) or started_at)
+                push(
+                    "entity_moved",
+                    timestamp,
+                    {"primary": entity_id, "related": [str(details.get("worker_id", ""))]},
+                    {
+                        "from": from_position,
+                        "to": to_position,
+                        "path": [from_position, to_position],
+                        "display_path": [from_position, to_position],
+                        "label": f"cart tile {details.get('from_tile', '')} -> {details.get('to_tile', '')}",
+                        "move_id": details.get("move_id"),
+                        "segment_index": details.get("segment_index"),
+                    },
+                    durative={
+                        "started_at": started_at,
+                        "ended_at": ended_at,
+                        "expected_duration": max(0.0, ended_at - started_at),
+                    },
+                    suffix=f"cart-tile-start-{details.get('segment_index', 0)}",
+                )
+            continue
+
+        if raw_type == "CART_MOVE_TILE_END" and entity_id:
+            to_position = tile_to_position(layout, details.get("to_tile"))
+            payload: Dict[str, Any] = {
+                "attributes": {
+                    "cart_id": details.get("cart_id", entity_id),
+                    "worker_id": details.get("worker_id", ""),
+                        "task_id": details.get("task_id", ""),
+                        "tile": details.get("tile") or details.get("to_tile"),
+                        "cockpit_tile": details.get("cockpit_tile") or details.get("tile") or details.get("to_tile"),
+                        "cargo_tile": details.get("cargo_tile"),
+                        "heading": details.get("heading", {}),
+                        "footprint_tiles": details.get("footprint_tiles", []),
+                    }
+                }
+            if to_position is not None:
+                payload["position"] = to_position
+            push("state_changed", timestamp, {"primary": entity_id}, payload, suffix=f"cart-tile-end-{details.get('segment_index', 0)}")
+            continue
+
         if raw_type == "WORKER_STATE_CHANGED" and entity_id:
             tile_position = tile_to_position(layout, details.get("tile"))
             payload: Dict[str, Any] = {
-                "attributes": canonical_worker_attributes(details, index, entity_id),
+                "attributes": canonical_worker_attributes(details, index, entity_id, timestamp=timestamp),
             }
             if tile_position is not None:
                 payload["position"] = tile_position
@@ -912,7 +1050,7 @@ def convert_events(
 
         if raw_type == "WORKER_CARGO_CHANGED" and entity_id:
             cargo = details.get("cargo") if isinstance(details.get("cargo"), dict) else {}
-            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs = canonical_worker_attributes(details, index, entity_id, timestamp=timestamp)
             attrs.update(
                 {
                     "cargo": cargo,
@@ -929,13 +1067,13 @@ def convert_events(
             continue
 
         if raw_type == "HUMANOID_TASK_START" and entity_id:
-            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs = canonical_worker_attributes(details, index, entity_id, timestamp=timestamp)
             attrs["task_window"] = humanoid_task_window(task_window_by_key, entity_id, timestamp, details)
             push("state_changed", timestamp, {"primary": entity_id}, {"attributes": attrs})
             continue
 
         if raw_type == "HUMANOID_TASK_END" and entity_id:
-            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs = canonical_worker_attributes(details, index, entity_id, prefer_next_state=True, timestamp=timestamp)
             if details.get("parent_task_code"):
                 parent_window_details = {
                     "task_id": details.get("parent_task_id"),
@@ -986,7 +1124,7 @@ def convert_events(
             continue
 
         if raw_type == "HUMANOID_STEP_START" and entity_id:
-            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs = canonical_worker_attributes(details, index, entity_id, timestamp=timestamp)
             push(
                 "state_changed",
                 timestamp,
@@ -998,7 +1136,7 @@ def convert_events(
             continue
 
         if raw_type == "HUMANOID_STEP_END" and entity_id:
-            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs = canonical_worker_attributes(details, index, entity_id, timestamp=timestamp)
             attrs.update(
                 {
                     "current_step_id": "",
@@ -1012,7 +1150,7 @@ def convert_events(
             continue
 
         if raw_type == "HUMANOID_INCIDENT" and entity_id:
-            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs = canonical_worker_attributes(details, index, entity_id, timestamp=timestamp)
             incident_payload = {
                 "code": details.get("incident_code"),
                 "category": details.get("incident_category"),
@@ -1038,6 +1176,33 @@ def convert_events(
             )
             continue
 
+        if raw_type in {"SHIP_SECTION_STATE_CHANGED", "SHIP_TILE_STATE_CHANGED"} and entity_id:
+            section_state = str(details.get("state", "WAIT_WELD"))
+            tile_id = str(details.get("ship_tile_id") or entity_id)
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": tile_id},
+                {
+                    "state": "done" if section_state == "COMPLETE" else "working",
+                    "attributes": {
+                        "section_id": details.get("section_id", tile_id.replace("section_", "")),
+                        "work_tile_id": details.get("work_tile_id", ""),
+                        "ship_tile_id": tile_id,
+                        "ship_section_state": section_state,
+                        "ship_surface_state": section_state,
+                        "surface_tile_state": section_state,
+                        "tile": details.get("tile"),
+                        "requires_sealant": bool(details.get("requires_sealant", False)),
+                        "sealant_applied": bool(details.get("sealant_applied", False)),
+                        "rework_target": details.get("rework_target", ""),
+                        "active_worker_id": details.get("worker_id", ""),
+                        "active_task_id": details.get("task_id", ""),
+                    },
+                },
+            )
+            continue
+
         if raw_type == "MACHINE_STATE_CHANGED" and entity_id:
             machine_state = str(details.get("machine_state", "WAIT_INPUT"))
             state = "idle"
@@ -1055,6 +1220,9 @@ def convert_events(
                 "repair_team_size": details.get("repair_team_size", 0),
                 "repair_remaining_min": details.get("repair_remaining_min", 0.0),
                 "input_item_id": details.get("input_item_id"),
+                "input_material_id": details.get("input_material_id"),
+                "input_intermediate_id": details.get("input_intermediate_id"),
+                "setup_ready": details.get("setup_ready"),
                 "output_item_id": details.get("output_item_id"),
                 "wait_visual": "completed_output" if machine_state == "DONE_WAIT_UNLOAD" else None,
                 "wait_item_kind": machine_output_item_kind(entity_id) if machine_state == "DONE_WAIT_UNLOAD" else None,
@@ -1157,7 +1325,7 @@ def convert_events(
 
         if raw_type == "AGENT_MOVE_TILE_END" and entity_id:
             to_position = tile_to_position(layout, details.get("to_tile"))
-            attrs = canonical_worker_attributes(details, index, entity_id)
+            attrs = canonical_worker_attributes(details, index, entity_id, timestamp=timestamp)
             attrs["motion"] = None
             payload: Dict[str, Any] = {"attributes": attrs}
             if to_position is not None:
@@ -1223,6 +1391,7 @@ def convert_events(
         if raw_type == "AGENT_TASK_START" and entity_id:
             task_id = str(details.get("task_id") or "").strip()
             if task_id:
+                task_payload = details.get("payload") if isinstance(details.get("payload"), dict) else {}
                 push(
                     "rolling_horizon_task_started",
                     timestamp,
@@ -1233,6 +1402,8 @@ def convert_events(
                         "task_code": details.get("task_code", ""),
                         "task_type": details.get("task_type", ""),
                         "instance_id": details.get("instance_id", ""),
+                        "target": task_payload.get("target") or details.get("location", ""),
+                        "rolling_task_signature": task_payload,
                     },
                     suffix="rolling-start",
                 )
@@ -1268,8 +1439,6 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_PICK_ITEM" and entity_id:
-            if has_canonical_worker_events:
-                continue
             item_type = details.get("item_type")
             push(
                 "state_changed",
@@ -1286,8 +1455,6 @@ def convert_events(
             continue
 
         if raw_type == "AGENT_DROP_ITEM" and entity_id:
-            if has_canonical_worker_events:
-                continue
             push(
                 "state_changed",
                 timestamp,
@@ -1314,6 +1481,7 @@ def convert_events(
                 task_status == "interrupted" and task_reason in temporary_interrupt_reasons
             )
             if task_id and emit_lifecycle_completion:
+                task_payload = details.get("payload") if isinstance(details.get("payload"), dict) else {}
                 push(
                     "rolling_horizon_task_completed",
                     timestamp,
@@ -1326,6 +1494,8 @@ def convert_events(
                         "instance_id": details.get("instance_id", ""),
                         "status": details.get("status", "completed"),
                         "reason": details.get("reason", ""),
+                        "target": task_payload.get("target") or details.get("location", ""),
+                        "rolling_task_signature": task_payload,
                     },
                     suffix="rolling-end",
                 )
@@ -1536,6 +1706,10 @@ def convert_events(
                         "wait_visual": None,
                         "wait_item_kind": None,
                         "machine_state": "PROCESSING",
+                        "input_item_id": details.get("input_intermediate") or details.get("input_material"),
+                        "input_material_id": details.get("input_material"),
+                        "input_intermediate_id": details.get("input_intermediate"),
+                        "output_item_id": None,
                         "process_window": {
                             "started_at": timestamp,
                             "ended_at": end_time or timestamp,
@@ -1556,6 +1730,10 @@ def convert_events(
                         "utilization": 0.0,
                         "process_window": None,
                         "machine_state": "DONE_WAIT_UNLOAD",
+                        "input_item_id": None,
+                        "input_material_id": None,
+                        "input_intermediate_id": None,
+                        "output_item_id": details.get("output_item_id") or details.get("output_intermediate"),
                         "wait_visual": "completed_output",
                         "wait_item_kind": machine_output_item_kind(entity_id),
                     },
@@ -1830,8 +2008,9 @@ def load_scenario_runtime(run_dir: Path) -> Dict[str, float]:
             config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
             scenario_cfg = config.get("scenario", {}) if isinstance(config.get("scenario", {}), dict) else {}
             agent_cfg = scenario_cfg.get("agent", {}) if isinstance(scenario_cfg.get("agent", {}), dict) else {}
+            worker_cfg = scenario_cfg.get("worker", {}) if isinstance(scenario_cfg.get("worker", {}), dict) else {}
             machine_failure_cfg = scenario_cfg.get("machine_failure", {}) if isinstance(scenario_cfg.get("machine_failure", {}), dict) else {}
-            battery_period = agent_cfg.get("battery_swap_period_min")
+            battery_period = worker_cfg.get("battery_swap_period_min", agent_cfg.get("battery_swap_period_min"))
             repair_time = machine_failure_cfg.get("repair_time_min")
             if battery_period is not None:
                 runtime["battery_period_min"] = float(battery_period)
@@ -1866,14 +2045,17 @@ def export_run(run_dir: Path, output_log: Path, output_layout: Path) -> None:
     layout = build_layout(worker_ids, scenario_cfg)
     converted_events = convert_events(raw_events, layout, battery_period_min, repair_total_min)
     initial_shelf_attributes, initial_material_slots = initial_warehouse_material_state(raw_events)
+    scenario_type = str(run_meta.get("scenario_type") or layout.get("scenario_type") or scenario_cfg.get("type") or scenario_cfg.get("name") or "factory_mfg_basic")
+    domain = "shipyard" if scenario_type == "shipyard_basic" else "manufacturing"
 
     replay_log = {
         "schema_version": "1.0",
         "metadata": {
             "run_id": str(run_dir.name),
-            "title": f"ManSim Existing Run {run_dir.name}",
-            "domain": "manufacturing",
-            "description": f"Existing ManSim manufacturing run reconstructed from events.jsonl with {len(worker_ids)} workers and {len(machine_ids)} machines.",
+            "title": f"ManSim {scenario_type} Run {run_dir.name}",
+            "domain": domain,
+            "scenario_type": scenario_type,
+            "description": f"Existing ManSim {domain} run reconstructed from events.jsonl with {len(worker_ids)} workers and {len(machine_ids)} machines.",
             "created_at": run_meta.get("started_at_utc"),
             "decision_mode": run_meta.get("decision_mode"),
             "run_index": run_meta.get("run_index"),

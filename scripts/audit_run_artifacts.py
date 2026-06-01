@@ -56,6 +56,21 @@ AVAILABILITY_STATES = {
     "DISABLED",
 }
 
+MANUFACTURING_SCENARIOS = {"", "mfg_basic", "factory_mfg_basic", "manufacturing", "factory"}
+SHIPYARD_SCENARIOS = {"shipyard", "shipyard_basic"}
+SHIPYARD_KPI_KEYS = [
+    "makespan_min",
+    "surface_tile_count",
+    "completed_surface_tile_count",
+    "surface_tile_completion_ratio",
+    "welded_surface_tile_count",
+    "painted_surface_tile_count",
+    "rework_count",
+    "quality_pass_rate",
+    "worker_utilization_by_worker",
+    "incident_count_by_code",
+]
+
 
 def _humanoid_state_axis_values() -> dict[str, list[str]]:
     try:
@@ -97,6 +112,42 @@ def _load_json(path: Path, audit: Audit) -> Any:
     except Exception as exc:
         audit.error(f"failed to load JSON {path.name}: {exc}")
         return {}
+
+
+def _scenario_type(run_dir: Path, kpi: dict[str, Any] | None = None) -> str:
+    if isinstance(kpi, dict):
+        scenario = str(kpi.get("scenario_type") or "").strip()
+        if scenario:
+            return scenario
+    for name in ["run_meta.json", "replay_studio_log.json"]:
+        path = run_dir / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if name == "run_meta.json":
+            scenario = str(data.get("scenario_type") or "").strip()
+        else:
+            metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
+            scenario = str(metadata.get("scenario_type") or "").strip() if isinstance(metadata, dict) else ""
+        if scenario:
+            return scenario
+    return ""
+
+
+def _allows_open_runtime_events(run_dir: Path) -> bool:
+    path = run_dir / "kpi.json"
+    if not path.exists():
+        return False
+    try:
+        kpi = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(kpi, dict):
+        return False
+    return kpi.get("terminated") is False
 
 
 def _iter_events(path: Path, audit: Audit) -> list[dict[str, Any]]:
@@ -144,9 +195,14 @@ def check_kpi(run_dir: Path, audit: Audit) -> None:
     if not isinstance(kpi, dict):
         audit.error("kpi.json root is not an object")
         return
+    scenario_type = _scenario_type(run_dir, kpi)
     for key in REQUIRED_KPI_KEYS:
         if key not in kpi:
             audit.error(f"kpi.json missing key: {key}")
+    if scenario_type in SHIPYARD_SCENARIOS:
+        for key in SHIPYARD_KPI_KEYS:
+            if key not in kpi:
+                audit.error(f"shipyard kpi.json missing key: {key}")
     state_axis = kpi.get("humanoid_state_time_by_axis")
     if isinstance(state_axis, dict):
         for axis in ["availability", "mobility", "power", "manipulation"]:
@@ -172,7 +228,9 @@ def check_kpi(run_dir: Path, audit: Audit) -> None:
         audit.error("repair_collaboration_time_min is negative")
     audit.note(
         "kpi "
+        f"scenario={scenario_type or 'unknown'} "
         f"products={kpi.get('total_products', 0)} "
+        f"surface_tiles={kpi.get('completed_surface_tile_count', kpi.get('completed_section_count', '-'))}/{kpi.get('surface_tile_completion_ratio', kpi.get('section_completion_ratio', '-'))} "
         f"incidents={kpi.get('humanoid_incident_total', 0)} "
         f"repair_collab_min={kpi.get('repair_collaboration_time_min', 0)}"
     )
@@ -202,7 +260,7 @@ def _positive_availability_durations(events: list[dict[str, Any]]) -> dict[str, 
     return {key: value for key, value in durations.items() if value > 0.0001}
 
 
-def check_gantt(run_dir: Path, events: list[dict[str, Any]], audit: Audit) -> None:
+def check_gantt(run_dir: Path, events: list[dict[str, Any]], audit: Audit, scenario_type: str = "") -> None:
     path = run_dir / "gantt_segments.csv"
     try:
         rows = list(csv.DictReader(path.open(newline="", encoding="utf-8")))
@@ -213,7 +271,10 @@ def check_gantt(run_dir: Path, events: list[dict[str, Any]], audit: Audit) -> No
         audit.error("gantt_segments.csv has no rows")
         return
     groups = {row.get("entity_group", "") for row in rows}
-    unexpected_groups = groups - {"Worker", "Machine"}
+    allowed_groups = {"Worker", "Machine"}
+    if scenario_type in SHIPYARD_SCENARIOS:
+        allowed_groups.update({"Ship Section", "Ship Surface"})
+    unexpected_groups = groups - allowed_groups
     if unexpected_groups:
         audit.error(f"gantt has unexpected entity groups: {sorted(unexpected_groups)}")
     product_lanes = [row.get("lane", "") for row in rows if str(row.get("lane", "")).upper().startswith(("PRODUCT", "MAT-", "INT-"))]
@@ -236,7 +297,7 @@ def check_gantt(run_dir: Path, events: list[dict[str, Any]], audit: Audit) -> No
     audit.note(f"gantt rows={len(rows)} worker_statuses={sorted(worker_statuses)}")
 
 
-def check_event_log_consistency(events: list[dict[str, Any]], audit: Audit) -> None:
+def check_event_log_consistency(events: list[dict[str, Any]], audit: Audit, *, allow_open_tasks: bool = False) -> None:
     task_starts: dict[tuple[Any, Any, Any, Any], int] = defaultdict(int)
     task_ends: dict[tuple[Any, Any, Any, Any], int] = defaultdict(int)
     step_starts: dict[tuple[Any, Any, Any, Any, Any], int] = defaultdict(int)
@@ -326,9 +387,15 @@ def check_event_log_consistency(events: list[dict[str, Any]], audit: Audit) -> N
     task_mismatch = _diff_count(task_starts, task_ends)
     step_mismatch = _diff_count(step_starts, step_ends)
     if task_mismatch:
-        audit.error(f"humanoid task start/end mismatch count: {task_mismatch}")
+        if allow_open_tasks:
+            audit.warn(f"humanoid task start/end mismatch count on open horizon: {task_mismatch}")
+        else:
+            audit.error(f"humanoid task start/end mismatch count: {task_mismatch}")
     if step_mismatch:
-        audit.error(f"humanoid primitive step start/end mismatch count: {step_mismatch}")
+        if allow_open_tasks:
+            audit.warn(f"humanoid primitive step start/end mismatch count on open horizon: {step_mismatch}")
+        else:
+            audit.error(f"humanoid primitive step start/end mismatch count: {step_mismatch}")
     if available_with_task_context:
         audit.error(f"worker state AVAILABLE retains task_context: {available_with_task_context}")
     if blocked_without_reason:
@@ -345,7 +412,7 @@ def check_event_log_consistency(events: list[dict[str, Any]], audit: Audit) -> N
         audit.error(f"rolling task events missing task_code: {rolling_missing_task_code}")
 
 
-def check_replay_log(run_dir: Path, audit: Audit) -> None:
+def check_replay_log(run_dir: Path, audit: Audit, scenario_type: str = "") -> None:
     replay = _load_json(run_dir / "replay_studio_log.json", audit)
     if not isinstance(replay, dict):
         audit.error("replay_studio_log.json root is not an object")
@@ -355,11 +422,12 @@ def check_replay_log(run_dir: Path, audit: Audit) -> None:
         if isinstance(replay.get("initial_state", {}), dict)
         else {}
     )
-    if "completed_product_buffer" not in initial_entities:
+    if scenario_type in MANUFACTURING_SCENARIOS and "completed_product_buffer" not in initial_entities:
         audit.error("replay initial state missing completed_product_buffer")
-    completed_entity = initial_entities.get("completed_product_buffer", {})
-    if isinstance(completed_entity, dict) and completed_entity.get("position") is None:
-        audit.error("completed_product_buffer has no replay position")
+    if scenario_type in MANUFACTURING_SCENARIOS:
+        completed_entity = initial_entities.get("completed_product_buffer", {})
+        if isinstance(completed_entity, dict) and completed_entity.get("position") is None:
+            audit.error("completed_product_buffer has no replay position")
     events = replay.get("events", [])
     if not isinstance(events, list):
         audit.error("replay events is not a list")
@@ -391,7 +459,11 @@ def check_replay_log(run_dir: Path, audit: Audit) -> None:
                 self_traffic_conflicts.append(str(event.get("event_id", "")))
         if event.get("event_type") == "state_changed" and _is_worker_id(refs.get("primary")):
             if "humanoid_state" not in attrs:
-                missing_humanoid_state_workers[str(refs.get("primary"))] += 1
+                # Carry-only visual updates intentionally avoid restating the full
+                # HumanoidSim snapshot; the previous snapshot remains authoritative.
+                carry_only_keys = {"carrying_item_id", "carrying_item_type", "pose_hint", "cargo"}
+                if not set(attrs.keys()).issubset(carry_only_keys):
+                    missing_humanoid_state_workers[str(refs.get("primary"))] += 1
     if stale_machine_overlay_count:
         audit.error(f"replay has stale machine wait overlays: {stale_machine_overlay_count}")
     if self_traffic_conflicts:
@@ -401,27 +473,39 @@ def check_replay_log(run_dir: Path, audit: Audit) -> None:
     audit.note(f"replay events={len(events)}")
 
 
-def check_layout(run_dir: Path, audit: Audit) -> None:
+def check_layout(run_dir: Path, audit: Audit, scenario_type: str = "") -> None:
     layout = _load_json(run_dir / "replay_studio_layout.json", audit)
     nodes = layout.get("nodes", []) if isinstance(layout, dict) else []
-    completed = next((node for node in nodes if isinstance(node, dict) and node.get("entity_id") == "completed_product_buffer"), None)
-    if not completed:
-        audit.error("layout missing completed_product_buffer node")
-    elif completed.get("region_id") != "completed_products_region":
-        audit.error(f"completed_product_buffer is in unexpected region: {completed.get('region_id')}")
-    if any(isinstance(node, dict) and node.get("entity_id") == "warehouse_buffer" for node in nodes):
-        audit.warn("layout still contains warehouse_buffer alias node")
+    if scenario_type in SHIPYARD_SCENARIOS:
+        if not any(isinstance(node, dict) and str(node.get("entity_type") or "") in {"ship_hull", "ship_hull_segment"} for node in nodes):
+            audit.error("shipyard layout missing ship hull nodes")
+        work_tile_count = sum(
+            1
+            for node in nodes
+            if isinstance(node, dict) and str(node.get("entity_type") or "") == "ship_work_tile"
+        )
+        if work_tile_count <= 0:
+            audit.error("shipyard layout has no ship_work_tile nodes")
+    else:
+        completed = next((node for node in nodes if isinstance(node, dict) and node.get("entity_id") == "completed_product_buffer"), None)
+        if not completed:
+            audit.error("layout missing completed_product_buffer node")
+        elif completed.get("region_id") != "completed_products_region":
+            audit.error(f"completed_product_buffer is in unexpected region: {completed.get('region_id')}")
+        if any(isinstance(node, dict) and node.get("entity_id") == "warehouse_buffer" for node in nodes):
+            audit.warn("layout still contains warehouse_buffer alias node")
 
 
 def audit_run(run_dir: Path) -> Audit:
     audit = Audit()
     check_required_files(run_dir, audit)
     events = _iter_events(run_dir / "events.jsonl", audit)
+    scenario_type = _scenario_type(run_dir)
     check_kpi(run_dir, audit)
-    check_event_log_consistency(events, audit)
-    check_gantt(run_dir, events, audit)
-    check_replay_log(run_dir, audit)
-    check_layout(run_dir, audit)
+    check_event_log_consistency(events, audit, allow_open_tasks=_allows_open_runtime_events(run_dir))
+    check_gantt(run_dir, events, audit, scenario_type)
+    check_replay_log(run_dir, audit, scenario_type)
+    check_layout(run_dir, audit, scenario_type)
     return audit
 
 

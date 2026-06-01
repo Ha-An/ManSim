@@ -18,10 +18,19 @@ export type EntityType =
   | "storage"
   | "shelf"
   | "material_slot"
+  | "cart"
+  | "cart_parking_spot"
   | "scrap_queue"
   | "scrap_bin"
   | "inspection_table"
-  | "buffer";
+  | "buffer"
+  | "ship_hull"
+  | "ship_hull_segment"
+  | "ship_work_tile"
+  | "ship_section"
+  | "tool_rack"
+  | "material_rack"
+  | "paint_rack";
 
 export type EntityStatus =
   | "idle"

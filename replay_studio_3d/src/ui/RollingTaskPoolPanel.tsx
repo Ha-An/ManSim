@@ -131,6 +131,21 @@ function windowIndex(event: ReplayEvent): number {
 function compactTarget(payload: Record<string, unknown>): string {
   const signature = asRecord(payload.rolling_task_signature ?? payload.task_signature);
   const transferKind = typeof signature.transfer_kind === "string" ? signature.transfer_kind.trim() : "";
+  const taskCode = asText(payload.task_code) ?? "";
+  if (taskCode === "OPERATE_VEHICLE_TRANSPORT") {
+    const source = asText(signature.source) ?? "-";
+    const spot = asText(signature.parking_spot_id) ?? asText(signature.target) ?? "-";
+    const itemType = asText(signature.item_type) ?? "item";
+    const batchCount = signature.batch_count !== undefined ? String(signature.batch_count) : "?";
+    const vehicleId = asText(signature.vehicle_id) ?? "cart";
+    return `${vehicleId}: ${source} -> ${spot} / ${itemType} x${batchCount}`;
+  }
+  if (transferKind === "cart_supply") {
+    const cartId = asText(signature.source_cart_id) ?? asText(signature.source) ?? "cart";
+    const destination = asText(signature.destination) ?? asText(signature.ship_tile_id) ?? asText(signature.target) ?? "-";
+    const itemType = asText(signature.item_type) ?? "item";
+    return `${cartId} -> ${destination} / ${itemType}`;
+  }
   const targetId = typeof signature.target_id === "string" ? signature.target_id.trim() : "";
   if (
     transferKind === "material_supply" &&
@@ -152,7 +167,7 @@ function compactTarget(payload: Record<string, unknown>): string {
   ]
     .map((part) => (typeof part === "string" ? part.trim() : ""))
     .filter(Boolean);
-  return parts.length ? parts.slice(0, 3).join(" / ") : "-";
+  return parts.length ? parts.slice(0, 3).join(" / ") : asText(payload.target) ?? "-";
 }
 
 function makeEntry(event: ReplayEvent, status: RollingTaskStatus): MutableEntry {
@@ -250,7 +265,17 @@ export function buildRollingTaskPoolModel(events: ReplayEvent[], currentTime: nu
 
     if (event.event_type === "rolling_horizon_task_started" || event.event_type === "rolling_horizon_task_completed") {
       const taskId = lifecycleTaskId(event);
-      const entry = taskId ? entriesByTaskId.get(taskId) : undefined;
+      let entry = taskId ? entriesByTaskId.get(taskId) : undefined;
+      if (!entry && taskId) {
+        entry = makeEntry(event, event.event_type === "rolling_horizon_task_started" ? "started" : "completed");
+        entry.taskId = entry.taskId ?? taskId;
+        entry.assignedWorkerId = asText(event.payload.worker_id) ?? asText(event.entity_refs.target) ?? entry.assignedWorkerId;
+        const workerId = asText(event.payload.worker_id) ?? asText(event.entity_refs.target);
+        if (workerId) entry.workerIds.add(workerId);
+        currentWindow.entries.set(entry.rowKey, entry);
+        entriesByRowKey.set(entry.rowKey, entry);
+        entriesByTaskId.set(taskId, entry);
+      }
       if (entry) {
         entry.status = event.event_type === "rolling_horizon_task_started" ? "started" : "completed";
         entry.updatedAt = event.timestamp;

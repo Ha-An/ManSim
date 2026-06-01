@@ -1586,6 +1586,36 @@ export function SceneCanvas({ width, height, viewport, renderModel, currentEvent
         ctx.fillStyle = "#17314d";
         ctx.font = "700 9px Consolas";
         ctx.fillText(String(count), x + 52, y + 52);
+      } else if (
+        node.entity.entity_type === "ship_work_tile" ||
+        node.entity.entity_type === "ship_hull" ||
+        node.entity.entity_type === "ship_hull_segment"
+      ) {
+        const state = String(
+          node.entity.attributes.ship_surface_state ??
+            node.entity.attributes.surface_tile_state ??
+            node.entity.state ??
+            "WAIT_WELD",
+        ).toUpperCase();
+        const isWorkTile = node.entity.entity_type === "ship_work_tile";
+        const fill = !isWorkTile
+          ? "#56697f"
+          : state === "COMPLETE"
+            ? "#16a085"
+            : state === "PAINTED"
+              ? "#3498db"
+              : state === "SURFACE_PREPARED"
+                ? "#95a5a6"
+                : state === "WELDED"
+                  ? "#f39c12"
+                  : state === "REWORK_REQUIRED"
+                    ? "#e74c3c"
+                    : "#2f3a45";
+        ctx.fillStyle = fill;
+        ctx.strokeStyle = "rgba(10, 24, 44, 0.55)";
+        ctx.lineWidth = 1;
+        ctx.fillRect(x, y, nodeWidth, nodeHeight);
+        ctx.strokeRect(x, y, nodeWidth, nodeHeight);
       } else if (node.entity.entity_type === "charger" || node.entity.entity_type === "maintenance_station") {
         if (node.entity.entity_id !== "battery_rack") {
           drawMiniHud(ctx, x + 2, y, 64, labelText(node.entity.label), "PWR", style.accent);

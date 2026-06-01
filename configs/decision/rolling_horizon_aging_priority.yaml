@@ -9,17 +9,30 @@ rolling_horizon:
   dispatch_policy: aging_priority
   # Lower rank means higher priority. Each waited window improves the rank by
   # aging.rank_boost_per_window.
-  task_code_priority_order:
-    - MANAGE_ROBOT_POWER
-    - REPAIR_MACHINE
-    - COLLECT_WASTE_OR_SCRAP
-    - UNLOAD_MACHINE
-    - HANDOVER_ITEM
-    - SETUP_MACHINE
-    - TRANSFER
-    - REPLENISH_MATERIAL
-    - INSPECT_PRODUCT
-    - PREVENTIVE_MAINTENANCE
+  scenario_task_code_priority_order:
+    factory_mfg_basic:
+      - MANAGE_ROBOT_POWER
+      - REPAIR_MACHINE
+      - COLLECT_WASTE_OR_SCRAP
+      - UNLOAD_MACHINE
+      - HANDOVER_ITEM
+      - LOAD_MACHINE
+      - SETUP_MACHINE
+      - TRANSFER
+      - REPLENISH_MATERIAL
+      - INSPECT_PRODUCT
+      - PREVENTIVE_MAINTENANCE
+    shipyard_basic:
+      - MANAGE_ROBOT_POWER
+      - OPERATE_VEHICLE_TRANSPORT
+      - TRANSFER
+      - WELD_SEAM
+      - VERIFY_SHIP_SECTION
+      - PAINT_SURFACE
+      - PREPARE_SURFACE
+      - COLLECT_WASTE_OR_SCRAP
+  # Backward-compatible fallback for older scenario configs.
+  task_code_priority_order: []
   aging:
     rank_boost_per_window: 1
 

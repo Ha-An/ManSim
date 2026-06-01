@@ -10,6 +10,7 @@ export interface ReplayMetadata {
   description?: string;
   created_at?: string;
   decision_mode?: string;
+  scenario_type?: string;
   run_index?: number;
   total_runs?: number;
   total_duration: number;

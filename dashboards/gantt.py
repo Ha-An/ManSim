@@ -58,6 +58,8 @@ def _lane_sort_key(raw: str) -> tuple[int, tuple[int, str] | tuple[int, int, str
     text = str(raw)
     if _is_worker_id(text):
         return (0, _worker_sort_key(text))
+    if text.startswith("section_"):
+        return (2, (999, 999, text))
     return (1, _machine_sort_key(text))
 
 
@@ -356,6 +358,81 @@ def _humanoid_task_mix(events: list[dict[str, Any]]) -> dict[str, str]:
     return {agent: " | ".join(f"{task}:{count}" for task, count in sorted(vals.items())) for agent, vals in counts.items()}
 
 
+def _build_ship_surface_intervals(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sim_end = max((float(event.get("t", 0.0) or 0.0) for event in events), default=0.0)
+    surface_events = [
+        event
+        for event in sorted(events, key=lambda item: float(item.get("t", 0.0) or 0.0))
+        if str(event.get("type", "")) in {"SHIP_TILE_STATE_CHANGED", "SHIP_SECTION_STATE_CHANGED"}
+    ]
+    if not surface_events:
+        return []
+    current: dict[str, dict[str, Any]] = {}
+    last_t: dict[str, float] = {}
+    last_event: dict[str, dict[str, Any]] = {}
+    intervals: list[dict[str, Any]] = []
+
+    def add_interval(surface_lane: str, end_t: float, end_event: dict[str, Any]) -> None:
+        start_t = last_t.get(surface_lane, 0.0)
+        if end_t <= start_t:
+            return
+        state = str(current.get(surface_lane, {}).get("state") or "WAIT_WELD")
+        intervals.append(
+            {
+                "lane": surface_lane,
+                "entity_group": "Ship Surface",
+                "status": state,
+                "start": start_t,
+                "end": end_t,
+                "duration": end_t - start_t,
+                "interval_type": state,
+                "start_event": last_event.get(surface_lane, end_event),
+                "end_event": end_event,
+            }
+        )
+
+    for event in surface_events:
+        lane = str(event.get("entity_id", "")).strip()
+        if not lane:
+            continue
+        event_t = float(event.get("t", 0.0) or 0.0)
+        details = _details(event)
+        if lane not in current:
+            current[lane] = {"state": "WAIT_WELD"}
+            last_t[lane] = 0.0
+            last_event[lane] = {
+                "t": 0.0,
+                "day": 0,
+                "type": "SHIP_SURFACE_INITIAL",
+                "entity_id": lane,
+                "location": event.get("location", ""),
+                "details": {
+                    "state": "WAIT_WELD",
+                    "section_id": details.get("section_id", lane),
+                    "work_tile_id": details.get("work_tile_id", lane),
+                },
+            }
+        add_interval(lane, event_t, event)
+        current[lane] = dict(details)
+        last_t[lane] = event_t
+        last_event[lane] = event
+
+    for lane in sorted(current):
+        add_interval(
+            lane,
+            sim_end,
+            {
+                "t": sim_end,
+                "day": 0,
+                "type": "SHIP_SURFACE_FINAL",
+                "entity_id": lane,
+                "location": "ShipDock",
+                "details": current[lane],
+            },
+        )
+    return intervals
+
+
 def export_gantt(
     events: list[dict[str, Any]],
     output_dir: Path,
@@ -396,6 +473,7 @@ def export_gantt(
         "Machine",
     )
     machine_wait_unload = _build_finished_wait_unload(events)
+    ship_sections = _build_ship_surface_intervals(events)
 
     rows = (
         worker_availability
@@ -403,6 +481,7 @@ def export_gantt(
         + machine_down_break
         + machine_down_pm
         + machine_wait_unload
+        + ship_sections
     )
     rows.sort(key=lambda row: (_lane_sort_key(str(row.get("lane", ""))), float(row.get("start", 0.0) or 0.0), str(row.get("status", ""))))
 
@@ -503,6 +582,10 @@ def export_gantt(
                 "output_intermediate": str(ed.get("output_intermediate", "")),
                 "unload_agent": str(ed.get("unload_agent", "")),
                 "unload_task_id": str(ed.get("unload_task_id", "")),
+                "section_id": str(sd.get("section_id", ed.get("section_id", ""))),
+                "work_tile_id": str(sd.get("work_tile_id", ed.get("work_tile_id", ""))),
+                "section_worker_id": str(sd.get("worker_id", ed.get("worker_id", ""))),
+                "section_task_id": str(sd.get("task_id", ed.get("task_id", ""))),
                 "humanoid_task_mix": task_mix.get(lane, ""),
                 "start_day": int(start_event.get("day", 0) or 0),
                 "end_day": int(end_event.get("day", 0) or 0),
@@ -525,6 +608,10 @@ def export_gantt(
             lines.append(_hover_line("Primitive", row.get("primitive_call_code", "")))
             lines.append(_hover_line("Mobility", row.get("mobility", "")))
             lines.append(_hover_line("Reason", row.get("reason", "")))
+        elif row["entity_group"] == "Ship Surface":
+            lines.append(_hover_line("Surface Tile", row.get("work_tile_id", row.get("section_id", ""))))
+            lines.append(_hover_line("Worker", row.get("section_worker_id", "")))
+            lines.append(_hover_line("Task", row.get("section_task_id", "")))
         else:
             lines.append(_hover_line("Cycle", row.get("cycle_id", "")))
             lines.append(_hover_line("Unload agent", row.get("unload_agent", "")))
@@ -553,12 +640,26 @@ def export_gantt(
         "RUNNING": "#27ae60",
         "DOWN": "#e74c3c",
         "FINISHED-WAIT-UNLOAD": "#f39c12",
+        "WAIT_WELD": "#2f3a45",
+        "WELDED": "#f39c12",
+        "SURFACE_PREPARED": "#95a5a6",
+        "PAINTED": "#3498db",
+        "VERIFIED": "#2ecc71",
+        "COMPLETE": "#27ae60",
+        "REWORK_REQUIRED": "#e74c3c",
     }
     status_order = AVAILABILITY_STATES + [
         "UNKNOWN",
         "RUNNING",
         "DOWN",
         "FINISHED-WAIT-UNLOAD",
+        "WAIT_WELD",
+        "WELDED",
+        "SURFACE_PREPARED",
+        "PAINTED",
+        "VERIFIED",
+        "COMPLETE",
+        "REWORK_REQUIRED",
     ]
 
     fig = px.timeline(
@@ -591,8 +692,10 @@ def export_gantt(
 
     worker_statuses = set(AVAILABILITY_STATES) | {"UNKNOWN"}
     machine_statuses = {"RUNNING", "DOWN", "FINISHED-WAIT-UNLOAD"}
+    section_statuses = {"WAIT_WELD", "WELDED", "SURFACE_PREPARED", "PAINTED", "VERIFIED", "COMPLETE", "REWORK_REQUIRED"}
     seen_worker_group = False
     seen_machine_group = False
+    seen_section_group = False
     for trace in fig.data:
         status_name = str(getattr(trace, "name", ""))
         if status_name in worker_statuses:
@@ -609,6 +712,13 @@ def export_gantt(
             if not seen_machine_group:
                 trace.legendgrouptitle = {"text": "Machine"}
                 seen_machine_group = True
+        elif status_name in section_statuses:
+            if str(getattr(trace, "hoverinfo", "")) != "skip":
+                trace.hovertemplate = "%{customdata[0]}<extra></extra>"
+            trace.legendgroup = "Ship Surface"
+            if not seen_section_group:
+                trace.legendgrouptitle = {"text": "Ship Surface"}
+                seen_section_group = True
 
     fig.update_yaxes(
         autorange="reversed",

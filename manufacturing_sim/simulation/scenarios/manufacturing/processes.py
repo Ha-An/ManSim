@@ -29,6 +29,11 @@ def machine_lifecycle(env: simpy.Environment, world: ManufacturingWorld, machine
             yield env.timeout(1)
             continue
 
+        if not bool(getattr(machine, "setup_ready", False)):
+            world._set_machine_state(machine, MachineState.WAIT_INPUT, reason="waiting_setup")
+            yield env.timeout(1)
+            continue
+
         cycle_id = world.start_machine_cycle(machine)
         start_t = env.now
         machine.active_process = env.active_process

@@ -54,7 +54,7 @@ function interpolatePosition(entity: BaseEntityState, basePosition: { x: number;
 }
 
 function isMobileEntity(entity: BaseEntityState): boolean {
-  return entity.entity_type === "worker" || entity.entity_type === "robot" || entity.entity_type === "transporter";
+  return entity.entity_type === "worker" || entity.entity_type === "robot" || entity.entity_type === "transporter" || entity.entity_type === "cart";
 }
 
 function resolveEntityPosition(

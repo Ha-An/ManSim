@@ -141,6 +141,59 @@ describe("replay core copy", () => {
     expect(next.entities.S1M2.attributes.wait_item_kind).toBeUndefined();
   });
 
+  it("keeps separate S2 machine input slots when legacy logs replace input_item_id", () => {
+    const domainState: DomainState = {
+      entities: {
+        S2M2: {
+          entity_id: "S2M2",
+          entity_type: "machine",
+          state: "waiting",
+          label: "S2M2",
+          attributes: {},
+          relations: {},
+          updated_at: 140,
+        },
+      },
+      resources: {},
+      queues: {},
+      interactions: {},
+      current_event_index: 0,
+      current_time: 140,
+    };
+
+    const withMaterial = applyEvent(domainState, {
+      event_id: "s2-material",
+      sequence_index: 1,
+      timestamp: 141,
+      event_type: "state_changed",
+      entity_refs: { primary: "S2M2" },
+      payload: {
+        state: "waiting",
+        attributes: {
+          machine_state: "WAIT_INPUT",
+          input_item_id: "MAT-WH-4",
+        },
+      },
+    });
+    const withIntermediate = applyEvent(withMaterial, {
+      event_id: "s2-intermediate",
+      sequence_index: 2,
+      timestamp: 145,
+      event_type: "state_changed",
+      entity_refs: { primary: "S2M2" },
+      payload: {
+        state: "waiting",
+        attributes: {
+          machine_state: "WAIT_INPUT",
+          input_item_id: "INT-S1-32",
+        },
+      },
+    });
+
+    expect(withIntermediate.entities.S2M2.attributes.input_material_id).toBe("MAT-WH-4");
+    expect(withIntermediate.entities.S2M2.attributes.input_intermediate_id).toBe("INT-S1-32");
+  });
+
   it("stores the last worker heading from movement paths for first-person replay", () => {
     const domainState: DomainState = {
       entities: {

@@ -140,6 +140,34 @@ function clearStaleMachineWaitAttributes(entity: BaseEntityState, rawAttributes:
   delete entity.attributes.wait_item_kind;
 }
 
+function normalizeMachineItemSlots(entity: BaseEntityState, rawAttributes: unknown): void {
+  if (!rawAttributes || typeof rawAttributes !== "object") return;
+  if (entity.entity_type !== "machine" && entity.entity_type !== "workstation") return;
+  const raw = rawAttributes as Record<string, unknown>;
+  const inputItemId = typeof raw.input_item_id === "string" ? raw.input_item_id.trim() : "";
+  const inputMaterialId = typeof raw.input_material_id === "string" ? raw.input_material_id.trim() : "";
+  const inputIntermediateId = typeof raw.input_intermediate_id === "string" ? raw.input_intermediate_id.trim() : "";
+  if (inputMaterialId) entity.attributes.input_material_id = inputMaterialId;
+  if (inputIntermediateId) entity.attributes.input_intermediate_id = inputIntermediateId;
+
+  // Older ManSim replay logs only had one representative input_item_id.
+  // Preserve the other machine input slot when a later event reports the
+  // second S2 input, so material and intermediate remain visible together.
+  if (inputItemId && !inputMaterialId && !inputIntermediateId) {
+    const normalized = inputItemId.toUpperCase();
+    if (normalized.startsWith("MAT-")) entity.attributes.input_material_id = inputItemId;
+    else if (normalized.startsWith("INT-")) entity.attributes.input_intermediate_id = inputItemId;
+  }
+
+  if (raw.input_item_id === null && raw.input_material_id === undefined && raw.input_intermediate_id === undefined) {
+    delete entity.attributes.input_material_id;
+    delete entity.attributes.input_intermediate_id;
+  }
+  if (raw.input_material_id === null) delete entity.attributes.input_material_id;
+  if (raw.input_intermediate_id === null) delete entity.attributes.input_intermediate_id;
+  if (raw.output_item_id === null) delete entity.attributes.output_item_id;
+}
+
 function clearHumanoidTaskAttributes(entity: BaseEntityState): void {
   delete entity.attributes.active_task;
   delete entity.attributes.active_target_id;
@@ -262,6 +290,7 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       if (rawAttributes && typeof rawAttributes === "object" && (rawAttributes as Record<string, unknown>).task_window === null) {
         delete entity.attributes.task_window;
       }
+      normalizeMachineItemSlots(entity, rawAttributes);
       clearStaleMachineWaitAttributes(entity, rawAttributes);
       const humanoidState = rawAttributes && typeof rawAttributes === "object" ? (rawAttributes as Record<string, unknown>).humanoid_state : undefined;
       if (

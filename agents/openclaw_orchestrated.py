@@ -2022,7 +2022,7 @@ class OpenClawOrchestratedDecisionModule(OptionalLLMDecisionModule):
         if any(token in name for token in ("material", "starvation")):
             families.add("material_supply")
         if any(token in name for token in ("intermediate", "setup", "wait_input")):
-            families.update({"setup_machine", "inter_station_transfer"})
+            families.update({"load_machine", "setup_machine", "inter_station_transfer"})
         if any(token in name for token in ("battery", "discharged")):
             families.update({"battery_swap", "battery_delivery_low_battery", "battery_delivery_discharged"})
         rows: list[str] = []

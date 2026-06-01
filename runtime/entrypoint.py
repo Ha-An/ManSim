@@ -33,7 +33,7 @@ from dashboards.gantt import export_gantt
 from dashboards.manifest import build_dashboard_manifest, write_dashboard_manifests
 from agents.modes import normalize_decision_mode
 from knowledge import KnowledgeStore
-from manufacturing_sim.simulation.scenarios.manufacturing.run import run
+from manufacturing_sim.simulation.scenarios.registry import run_scenario as run
 from runtime.compat import build_legacy_experiment_cfg
 
 
@@ -146,6 +146,81 @@ def _ensure_replay_studio_server(cfg: DictConfig) -> None:
     except Exception:
         return
 
+    for _ in range(20):
+        if _tcp_port_open("127.0.0.1", port):
+            return
+        time.sleep(0.25)
+
+
+def _start_python_dist_server(*, repo_root: Path, app_dir: Path, port: int, log_dir: Path) -> None:
+    dist_index = app_dir / "dist" / "index.html"
+    server_script = repo_root / "scripts" / "serve_replay_studio_3d_dist.py"
+    if not dist_index.exists() or not server_script.exists():
+        return
+    stdout = (log_dir / "replay_studio_3d_dist.stdout.log").open("a", encoding="utf-8")
+    stderr = (log_dir / "replay_studio_3d_dist.stderr.log").open("a", encoding="utf-8")
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(server_script),
+                "--repo-root",
+                str(repo_root),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ],
+            cwd=str(repo_root),
+            stdout=stdout,
+            stderr=stderr,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+    except Exception:
+        return
+
+
+def _ensure_replay_studio_3d_server(cfg: DictConfig) -> None:
+    ui_cfg = _runtime_ui_cfg(cfg)
+    if not bool(ui_cfg.get("auto_start_replay_studio_3d", bool(ui_cfg.get("auto_start_replay_studio", True)))):
+        return
+    if not bool(ui_cfg.get("auto_open_results", False)):
+        return
+
+    port = int(ui_cfg.get("replay_studio_3d_preferred_port", 5174) or 5174)
+    if _tcp_port_open("127.0.0.1", port):
+        return
+
+    repo_root = Path(__file__).resolve().parents[1]
+    app_dir = repo_root / "replay_studio_3d"
+    package_json = app_dir / "package.json"
+    log_dir = repo_root / ".tooling" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    npm = "npm.cmd" if os.name == "nt" else "npm"
+    if package_json.exists():
+        stdout = (log_dir / "replay_studio_3d.stdout.log").open("a", encoding="utf-8")
+        stderr = (log_dir / "replay_studio_3d.stderr.log").open("a", encoding="utf-8")
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            subprocess.Popen(
+                [npm, "run", "dev", "--", "--host", "127.0.0.1", "--port", str(port)],
+                cwd=str(app_dir),
+                stdout=stdout,
+                stderr=stderr,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            for _ in range(20):
+                if _tcp_port_open("127.0.0.1", port):
+                    return
+                time.sleep(0.25)
+        except Exception:
+            pass
+
+    _start_python_dist_server(repo_root=repo_root, app_dir=app_dir, port=port, log_dir=log_dir)
     for _ in range(20):
         if _tcp_port_open("127.0.0.1", port):
             return
@@ -658,6 +733,7 @@ def main(cfg: DictConfig) -> None:
 
     child_output_dir = Path(str(last_result.get("output_dir", runtime_output_dir)))
     _ensure_replay_studio_server(cfg)
+    _ensure_replay_studio_3d_server(cfg)
     _open_selected_artifacts(runtime_output_dir, child_output_dir, cfg)
     print(json.dumps(last_result["kpi"], indent=2, ensure_ascii=False))
 

@@ -474,6 +474,19 @@ select:disabled {
   gap: 8px;
 }
 
+.entity-monitor-mode-select {
+  display: grid;
+  gap: 5px;
+  color: #8ea6cf;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.entity-monitor-mode-select .ui-select {
+  width: 100%;
+}
+
 .entity-monitor-tab {
   border: 1px solid rgba(104, 140, 214, 0.24);
   background: linear-gradient(180deg, rgba(18, 26, 45, 0.98) 0%, rgba(12, 18, 33, 0.98) 100%);
@@ -603,6 +616,10 @@ select:disabled {
 
 .item-thumb {
   color: #ffd166;
+}
+
+.tile-thumb {
+  color: #86efac;
 }
 
 .worker-monitor-name {

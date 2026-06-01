@@ -76,7 +76,7 @@ class ScriptedDecisionModule(DecisionModule):
                 self._apply_priority_updates(weights, self._rule("propose_jobs.scrap_priority_multipliers", {"inspect_product": 1.2}))
             wait_input_count = sum(1 for state in observation.get("machine_states", {}).values() if state == "WAIT_INPUT")
             if wait_input_count >= int(self._rule("propose_jobs.wait_input_machine_threshold", 2)):
-                self._apply_priority_updates(weights, self._rule("propose_jobs.wait_input_priority_multipliers", {"setup_machine": 1.15, "inter_station_transfer": 1.15, "material_supply": 1.1}))
+                self._apply_priority_updates(weights, self._rule("propose_jobs.wait_input_priority_multipliers", {"load_machine": 1.15, "setup_machine": 1.15, "inter_station_transfer": 1.15, "material_supply": 1.1}))
             if observation.get("inspection_backlog", 0) > int(self._rule("propose_jobs.inspection_backlog_threshold", 10)):
                 quotas["inspection_runs"] = int(quotas.get("inspection_runs", 0)) + int(self._rule("propose_jobs.inspection_quota_bonus", 10))
                 self._apply_priority_updates(weights, {"inspect_product": float(self._rule("propose_jobs.inspection_priority_multiplier", 1.2))})

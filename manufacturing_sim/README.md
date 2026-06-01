@@ -32,7 +32,7 @@ Worker는 `HumanoidSim`의 `HumanoidStateSnapshot`과 `TaskSpec -> child Task ->
 - ManSim은 factory scenario에서 발생한 event와 side effect를 기록합니다.
 - Task 후보는 기존 priority family도 보존하지만 실행과 Replay/KPI 기준은 `task_code`입니다.
 - Primitive step 중 domain action은 ManSim queue/machine/inspection/battery side effect를 호출합니다.
-- Setup, unload, inspection은 queue와 machine/table/output buffer 사이의 carry 이동까지 tile path로 수행합니다.
+- `LOAD_MACHINE`, unload, inspection은 queue와 machine/table/output buffer 사이의 carry 이동까지 tile path로 수행합니다. `SETUP_MACHINE`은 input이 이미 적재된 machine에서 fixture, recipe, program setup만 수행합니다.
 - 비도메인 primitive는 `configs/humanoidsim/default.yaml`의 `primitive_timing.default_min`만큼 최소 시간을 소비합니다.
 
 ## Decision Modes

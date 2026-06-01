@@ -290,16 +290,24 @@ def _series_strip(manifest: dict[str, Any] | None, current_run_id: str | None) -
     run = _find_run(manifest, current_run_id)
     current_products = 0
     current_closure = 0.0
+    output_label = "Products"
+    closure_label = "Closure"
     if run:
         kpi = run.get("kpi", {}) if isinstance(run.get("kpi", {}), dict) else {}
-        current_products = int(kpi.get("total_products", 0) or 0)
-        current_closure = float(kpi.get("downstream_closure_ratio", 0.0) or 0.0)
+        if str(kpi.get("scenario_type", "")).strip() == "shipyard_basic":
+            output_label = "Surface Tiles"
+            closure_label = "Completion"
+            current_products = int(kpi.get("completed_surface_tile_count", kpi.get("total_products", 0)) or 0)
+            current_closure = float(kpi.get("surface_tile_completion_ratio", kpi.get("downstream_closure_ratio", 0.0)) or 0.0)
+        else:
+            current_products = int(kpi.get("total_products", 0) or 0)
+            current_closure = float(kpi.get("downstream_closure_ratio", 0.0) or 0.0)
     peak = analysis.get("peak_run", {}) if isinstance(analysis.get("peak_run", {}), dict) else {}
     worst = analysis.get("worst_run", {}) if isinstance(analysis.get("worst_run", {}), dict) else {}
     parts = [
         f"<span><strong>Run</strong> {html.escape(str(current_run_id or manifest.get('current_run', '-')))}</span>",
-        f"<span><strong>Products</strong> {current_products}</span>",
-        f"<span><strong>Closure</strong> {current_closure:.3f}</span>",
+        f"<span><strong>{html.escape(output_label)}</strong> {current_products}</span>",
+        f"<span><strong>{html.escape(closure_label)}</strong> {current_closure:.3f}</span>",
     ]
     if len(runs) > 1:
         parts.extend(

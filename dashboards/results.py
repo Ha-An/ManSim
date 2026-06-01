@@ -88,6 +88,12 @@ def _format_value(value: float, kind: str) -> str:
     return f"{value:.2f}"
 
 
+def _format_optional_value(value: Any, kind: str) -> str:
+    if value is None or value == "":
+        return "pending" if kind == "minutes" else "-"
+    return _format_value(_safe_float(value), kind)
+
+
 def _format_sim_time(run_meta: dict[str, Any] | None) -> str:
     payload = run_meta if isinstance(run_meta, dict) else {}
     total_days = _safe_int(payload.get("total_days", 0))
@@ -138,14 +144,35 @@ def _metric_delta(current: dict[str, Any], reference: dict[str, Any], key: str, 
 
 def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) -> str:
     payload = run_meta if isinstance(run_meta, dict) else {}
+    scenario_type = str(kpi.get("scenario_type") or payload.get("scenario_type") or "").strip()
+    if scenario_type == "shipyard_basic":
+        output_card = (
+            "Completed Surface Tiles",
+            _format_value(_safe_float(kpi.get("completed_surface_tile_count", kpi.get("completed_section_count", kpi.get("total_products")))), "count"),
+            "Ship exterior tiles that completed welding, surface preparation, painting, and inspection.",
+        )
+        lead_time_card = (
+            "Ship Makespan",
+            _format_optional_value(kpi.get("makespan_min", kpi.get("completed_product_lead_time_avg_min")), "minutes"),
+            "Elapsed simulated minutes until every ship surface tile reaches COMPLETE.",
+        )
+        input_wait_card = (
+            "Surface Completion",
+            _format_value(_safe_float(kpi.get("surface_tile_completion_ratio", kpi.get("section_completion_ratio", kpi.get("downstream_closure_ratio")))), "ratio"),
+            "Share of ship exterior surface tiles in COMPLETE state.",
+        )
+    else:
+        output_card = ("Accepted Products", _format_value(_safe_float(kpi.get("total_products")), "count"), "Finished products accepted in this run.")
+        lead_time_card = ("Product Lead Time", _format_value(_safe_float(kpi.get("completed_product_lead_time_avg_min")), "minutes"), "Average end-to-end product completion time.")
+        input_wait_card = ("Product Input Wait", _format_value(_safe_float(kpi.get("product_input_wait_avg_min")), "minutes"), "Average waiting time before inspection/product intake clears.")
     cards = [
-        ("Accepted Products", _format_value(_safe_float(kpi.get("total_products")), "count"), "Finished products accepted in this run."),
+        output_card,
         ("Closure Ratio", _format_value(_safe_float(kpi.get("downstream_closure_ratio")), "ratio"), "How much downstream output was actually closed."),
         ("Humanoid Incidents", _format_value(_safe_float(kpi.get("humanoid_incident_total")), "count"), "HumanoidSim incident events recorded during worker execution."),
         ("Coordination Incidents", _format_value(_safe_float(kpi.get("coordination_incident_total")), "count"), "Execution friction caused by planning/coordination mismatch."),
         ("Commitment Dispatches", _format_value(_safe_float(kpi.get("commitment_dispatch_total")), "count"), "Planner commitments that reached worker execution."),
-        ("Product Lead Time", _format_value(_safe_float(kpi.get("completed_product_lead_time_avg_min")), "minutes"), "Average end-to-end product completion time."),
-        ("Product Input Wait", _format_value(_safe_float(kpi.get("product_input_wait_avg_min")), "minutes"), "Average waiting time before inspection/product intake clears."),
+        lead_time_card,
+        input_wait_card,
         ("Machine Broken Ratio", _format_value(_safe_float(kpi.get("machine_broken_ratio")), "ratio"), "Share of machine time lost to breakdown."),
         ("Machine PM Ratio", _format_value(_safe_float(kpi.get("machine_pm_ratio")), "ratio"), "Share of machine time spent on preventive maintenance."),
         ("Wall Clock", str(payload.get("wall_clock_human", "")).strip() or str(kpi.get("wall_clock_human", "")).strip() or "-", "Actual elapsed execution time for this simulation run."),

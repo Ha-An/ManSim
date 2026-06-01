@@ -219,19 +219,181 @@ def compare_scalar(findings: list[str], label: str, actual: float | int, expecte
         findings.append(f"{label}: expected {expected}, found {actual}")
 
 
+def compare_humanoid_state_metrics(
+    findings: list[str],
+    *,
+    kpi: dict,
+    events: list[dict],
+    agent_ids: set[str],
+    sim_end: float,
+) -> None:
+    expected_humanoid_state = humanoid_state_time_from_events(events, agent_ids, sim_end)
+    observed_humanoid_state = kpi.get("humanoid_state_time_by_worker", {})
+    for agent_id in sorted(agent_ids):
+        expected_worker = expected_humanoid_state.get(agent_id, {})
+        observed_worker = observed_humanoid_state.get(agent_id, {}) if isinstance(observed_humanoid_state, dict) else {}
+        for axis, expected_states in expected_worker.items():
+            observed_states = observed_worker.get(axis, {}) if isinstance(observed_worker, dict) else {}
+            if not isinstance(observed_states, dict):
+                observed_states = {}
+            for state in sorted(set(expected_states) | set(observed_states)):
+                compare_scalar(
+                    findings,
+                    f"humanoid_state_time_by_worker[{agent_id}][{axis}][{state}]",
+                    float(observed_states.get(state, 0.0) or 0.0),
+                    expected_states.get(state, 0.0),
+                    0.01,
+                )
+            if not approx_equal(sum(float(v) for v in observed_states.values()), sim_end, 0.01):
+                findings.append(f"humanoid_state_time_by_worker[{agent_id}][{axis}] does not sum to sim_end")
+
+    expected_axis_totals = humanoid_axis_totals(expected_humanoid_state)
+    observed_axis_totals = kpi.get("humanoid_state_time_by_axis", {})
+    for axis, expected_states in expected_axis_totals.items():
+        observed_states = observed_axis_totals.get(axis, {}) if isinstance(observed_axis_totals, dict) else {}
+        observed_states = observed_states if isinstance(observed_states, dict) else {}
+        for state in sorted(set(expected_states) | set(observed_states)):
+            compare_scalar(
+                findings,
+                f"humanoid_state_time_by_axis[{axis}][{state}]",
+                float(observed_states.get(state, 0.0) or 0.0),
+                expected_states.get(state, 0.0),
+                0.01,
+            )
+
+    expected_ratios = humanoid_state_ratios(expected_humanoid_state)
+    observed_ratios = kpi.get("humanoid_state_ratio_by_worker", {})
+    for agent_id, worker_rows in expected_ratios.items():
+        observed_worker = observed_ratios.get(agent_id, {}) if isinstance(observed_ratios, dict) else {}
+        observed_worker = observed_worker if isinstance(observed_worker, dict) else {}
+        for axis, expected_states in worker_rows.items():
+            observed_states = observed_worker.get(axis, {}) if isinstance(observed_worker.get(axis, {}), dict) else {}
+            for state in sorted(set(expected_states) | set(observed_states)):
+                compare_scalar(
+                    findings,
+                    f"humanoid_state_ratio_by_worker[{agent_id}][{axis}][{state}]",
+                    float(observed_states.get(state, 0.0) or 0.0),
+                    expected_states.get(state, 0.0),
+                    2e-6,
+                )
+
+    expected_execution_ratios = humanoid_execution_ratios(expected_humanoid_state)
+    expected_blocked_ratios = humanoid_blocked_ratios(expected_humanoid_state)
+    expected_unavailable_ratios = humanoid_unavailable_ratios(expected_humanoid_state)
+    for agent_id in sorted(agent_ids):
+        compare_scalar(
+            findings,
+            f"humanoid_execution_ratio_by_worker[{agent_id}]",
+            kpi.get("humanoid_execution_ratio_by_worker", {}).get(agent_id, 0.0),
+            expected_execution_ratios.get(agent_id, 0.0),
+            1e-6,
+        )
+        compare_scalar(
+            findings,
+            f"humanoid_blocked_ratio_by_worker[{agent_id}]",
+            kpi.get("humanoid_blocked_ratio_by_worker", {}).get(agent_id, 0.0),
+            expected_blocked_ratios.get(agent_id, 0.0),
+            1e-6,
+        )
+        compare_scalar(
+            findings,
+            f"humanoid_unavailable_ratio_by_worker[{agent_id}]",
+            kpi.get("humanoid_unavailable_ratio_by_worker", {}).get(agent_id, 0.0),
+            expected_unavailable_ratios.get(agent_id, 0.0),
+            1e-6,
+        )
+    compare_scalar(
+        findings,
+        "humanoid_execution_ratio_avg",
+        kpi.get("humanoid_execution_ratio_avg", 0.0),
+        round6(mean(expected_execution_ratios.values()) if expected_execution_ratios else 0.0),
+        1e-6,
+    )
+    compare_scalar(
+        findings,
+        "humanoid_blocked_ratio_avg",
+        kpi.get("humanoid_blocked_ratio_avg", 0.0),
+        round6(mean(expected_blocked_ratios.values()) if expected_blocked_ratios else 0.0),
+        1e-6,
+    )
+    compare_scalar(
+        findings,
+        "humanoid_unavailable_ratio_avg",
+        kpi.get("humanoid_unavailable_ratio_avg", 0.0),
+        round6(mean(expected_unavailable_ratios.values()) if expected_unavailable_ratios else 0.0),
+        1e-6,
+    )
+
+
 def audit_run(output_dir: Path) -> tuple[list[str], dict]:
     kpi = load_json(output_dir / "kpi.json")
     daily = load_json(output_dir / "daily_summary.json").get("days", [])
     snapshots = load_json(output_dir / "minute_snapshots.json").get("snapshots", [])
     events = load_jsonl(output_dir / "events.jsonl")
     sim_end = float(max((event.get("t", 0.0) or 0.0) for event in events) if events else 0.0)
+    run_meta = kpi.get("run_meta", {}) if isinstance(kpi.get("run_meta", {}), dict) else {}
+    configured_end = float(run_meta.get("sim_total_min") or run_meta.get("sim_time_min") or 0.0)
+    termination_reason = str(kpi.get("termination_reason") or "").strip()
+    # Some scenario plugins do not emit a terminal event exactly at the horizon.
+    # When a run simply reaches the configured horizon, KPI state integration still
+    # uses the full configured simulation time, so the audit should too.
+    if configured_end > sim_end and (not bool(kpi.get("terminated")) or termination_reason == "completed_horizon"):
+        sim_end = configured_end
     if sim_end <= 0.0:
-        sim_end = float(kpi.get("run_meta", {}).get("sim_time_min", 0.0) or 0.0)
+        sim_end = configured_end
     findings: list[str] = []
 
     agent_ids = set(kpi.get("agent_discharged_ratio_by_agent", {}).keys())
+    if not agent_ids and isinstance(kpi.get("humanoid_state_time_by_worker"), dict):
+        agent_ids = {str(worker_id) for worker_id in kpi.get("humanoid_state_time_by_worker", {}).keys()}
     machine_ids = set(kpi.get("machine_time_by_machine", {}).keys())
     num_days = len(daily)
+
+    scenario_type = str(kpi.get("scenario_type") or kpi.get("run_meta", {}).get("scenario_type") or "").strip()
+    if scenario_type == "shipyard_basic":
+        final_surface_state: dict[str, str] = {}
+        completed_at: dict[str, float] = {}
+        rework_count = 0
+        verify_ends = 0
+        for event in events:
+            event_type = str(event.get("type", "")).strip()
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            if event_type in {"SHIP_TILE_STATE_CHANGED", "SHIP_SECTION_STATE_CHANGED"}:
+                tile_id = str(details.get("work_tile_id") or details.get("section_id") or event.get("entity_id") or "").replace("section_", "")
+                state = str(details.get("state") or "")
+                if tile_id:
+                    final_surface_state[tile_id] = state
+                    if state == "COMPLETE":
+                        completed_at.setdefault(tile_id, float(event.get("t", 0.0) or 0.0))
+                    elif state == "REWORK_REQUIRED":
+                        rework_count += 1
+            elif event_type == "AGENT_TASK_END" and str(details.get("task_code") or details.get("task_type") or "") == "VERIFY_SHIP_SECTION":
+                verify_ends += 1
+        completed_count = sum(1 for state in final_surface_state.values() if state == "COMPLETE")
+        surface_total = int(kpi.get("surface_tile_count", 0) or 0) or max(1, len(final_surface_state))
+        expected_terminated = completed_count >= surface_total and surface_total > 0
+        makespan = round3(max(completed_at.values(), default=0.0)) if expected_terminated else None
+        compare_scalar(findings, "completed_surface_tile_count", kpi.get("completed_surface_tile_count", kpi.get("completed_section_count", 0)), completed_count, 0.0)
+        compare_scalar(findings, "completed_section_count", kpi.get("completed_section_count", 0), completed_count, 0.0)
+        compare_scalar(findings, "total_products", kpi.get("total_products", 0), completed_count, 0.0)
+        compare_scalar(findings, "surface_tile_completion_ratio", kpi.get("surface_tile_completion_ratio", kpi.get("section_completion_ratio", 0.0)), round6(completed_count / surface_total), 1e-6)
+        compare_scalar(findings, "section_completion_ratio", kpi.get("section_completion_ratio", 0.0), round6(completed_count / surface_total), 1e-6)
+        if expected_terminated:
+            compare_scalar(findings, "makespan_min", kpi.get("makespan_min", 0.0), makespan, 0.01)
+        elif kpi.get("makespan_min") is not None:
+            findings.append(f"makespan_min: expected null before all surface tiles complete, found {kpi.get('makespan_min')}")
+        compare_scalar(findings, "rework_count", kpi.get("rework_count", 0), rework_count, 0.0)
+        compare_scalar(findings, "quality_pass_rate", kpi.get("quality_pass_rate", 0.0), round6(completed_count / verify_ends if verify_ends else 0.0), 1e-6)
+        if kpi.get("terminated") and kpi.get("termination_reason") != "all_ship_surface_tiles_complete":
+            findings.append(f"termination_reason: expected all_ship_surface_tiles_complete, found {kpi.get('termination_reason')}")
+        compare_humanoid_state_metrics(findings, kpi=kpi, events=events, agent_ids=agent_ids, sim_end=max(makespan or 0.0, sim_end, 1.0))
+        report = {
+            "output_dir": str(output_dir),
+            "finding_count": len(findings),
+            "sim_end": sim_end,
+            "scenario_type": scenario_type,
+        }
+        return findings, report
 
     total_products = sum(1 for event in events if str(event.get("type", "")).strip() == "COMPLETED_PRODUCT")
     scrap_count = sum(1 for event in events if str(event.get("type", "")).strip() == "SCRAP")

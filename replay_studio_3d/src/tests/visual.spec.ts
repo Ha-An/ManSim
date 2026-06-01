@@ -25,5 +25,5 @@ test("renders a nonblank 3D factory scene", async ({ page }) => {
   await page.waitForTimeout(1200);
   const screenshot = await page.screenshot();
   expect(nonBackgroundPixelRatio(screenshot)).toBeGreaterThan(0.02);
-  await expect(page.getByRole("button", { name: /Worker/i })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: /Monitor/i })).toBeVisible();
 });

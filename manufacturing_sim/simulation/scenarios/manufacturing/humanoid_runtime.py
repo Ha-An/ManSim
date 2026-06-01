@@ -15,6 +15,7 @@ TASK_CODE_BY_PRIORITY_KEY: dict[str, str] = {
     "battery_swap": "MANAGE_ROBOT_POWER",
     "battery_delivery_low_battery": "TRANSFER",
     "battery_delivery_discharged": "TRANSFER",
+    "load_machine": "LOAD_MACHINE",
     "setup_machine": "SETUP_MACHINE",
     "unload_machine": "UNLOAD_MACHINE",
     "inspect_product": "INSPECT_PRODUCT",
@@ -28,6 +29,7 @@ TASK_CODE_BY_PRIORITY_KEY: dict[str, str] = {
 DOMAIN_ACTION_CALLS: dict[str, set[str]] = {
     "TRANSFER": {"GRASP"},
     "MANAGE_ROBOT_POWER": {"EXECUTE_SYSTEM_ACTION"},
+    "LOAD_MACHINE": {"EXECUTE_MACHINE_ACTION"},
     "SETUP_MACHINE": {"EXECUTE_MACHINE_ACTION"},
     "UNLOAD_MACHINE": {"EXECUTE_MACHINE_ACTION"},
     "INSPECT_PRODUCT": {"EXECUTE_QUALITY_ACTION"},
@@ -40,7 +42,6 @@ DOMAIN_ACTION_CALLS: dict[str, set[str]] = {
 
 NESTED_DOMAIN_ACTION_CHILD_CALLS: dict[str, set[str]] = {
     "REPLENISH_MATERIAL": {"TRANSFER"},
-    "SETUP_MACHINE": {"LOAD_MACHINE"},
     "PREVENTIVE_MAINTENANCE": {"INSPECT_MACHINE"},
     "COLLECT_WASTE_OR_SCRAP": {"TRANSFER"},
 }
@@ -579,6 +580,16 @@ class HumanoidTaskRuntime:
             }
         if task_code == "MANAGE_ROBOT_POWER":
             return {"robot": agent.agent_id, "action": "swap_battery", "station": "battery_rack", "target_soc": 1.0}
+        if task_code == "LOAD_MACHINE":
+            item_id = str(payload.get("item_id") or payload.get("material_id") or payload.get("intermediate_id") or "")
+            item_type = str(payload.get("item_type") or ("intermediate" if payload.get("load_slot") == "intermediate" else "material"))
+            source = str(payload.get("source") or f"{item_type}_queue_{payload.get('station', '')}")
+            return {
+                "machine": str(payload.get("machine_id", "")),
+                "item": {"entity_type": item_type, "entity_id": item_id},
+                "source": source,
+                "target_slot": str(payload.get("load_slot") or item_type),
+            }
         if task_code == "SETUP_MACHINE":
             return {"machine": str(payload.get("machine_id", "")), "setup_spec": {"station": payload.get("station"), "payload": dict(payload)}}
         if task_code == "UNLOAD_MACHINE":

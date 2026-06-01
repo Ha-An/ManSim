@@ -130,6 +130,7 @@ export default function App() {
   const viewport = log?.layout?.viewport ?? { width: 1600, height: 960 };
   const currentFrame = frame;
   const showRollingTaskPool = useMemo(() => isRollingHorizonReplay(log), [log]);
+  const scenarioType = String(log?.metadata.scenario_type ?? log?.layout?.scenario_type ?? "").trim().toLowerCase();
 
   const workerEntities = useMemo(
     () =>
@@ -170,6 +171,22 @@ export default function App() {
       Object.values(currentFrame?.domainState.entities ?? {})
         .filter((entity) => entity.entity_type === "machine" || entity.entity_type === "workstation")
         .sort((left, right) => left.label.localeCompare(right.label)),
+    [currentFrame?.domainState.entities],
+  );
+
+  const tileEntities = useMemo(
+    () =>
+      Object.values(currentFrame?.domainState.entities ?? {})
+        .filter((entity) => entity.entity_type === "ship_work_tile")
+        .sort((left, right) => left.entity_id.localeCompare(right.entity_id)),
+    [currentFrame?.domainState.entities],
+  );
+
+  const cartEntities = useMemo(
+    () =>
+      Object.values(currentFrame?.domainState.entities ?? {})
+        .filter((entity) => entity.entity_type === "cart")
+        .sort((left, right) => left.entity_id.localeCompare(right.entity_id)),
     [currentFrame?.domainState.entities],
   );
 
@@ -370,12 +387,15 @@ export default function App() {
           <EntityMonitorPanel
             workers={workerEntities}
             machines={machineEntities}
+            tiles={tileEntities}
+            carts={cartEntities}
             items={itemEntities}
             regions={frame?.renderModel.regions ?? []}
             currentTime={currentTime}
             selectedEntity={selectedEntity}
             grid={log?.layout?.grid}
             viewport={viewport}
+            scenarioType={scenarioType}
           />
         </aside>
       </div>

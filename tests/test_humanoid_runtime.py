@@ -42,6 +42,12 @@ SELECTED_TASK_ARGS = {
         "machine": "S1M1",
         "setup_spec": {"station": 1},
     },
+    "LOAD_MACHINE": {
+        "machine": "S1M1",
+        "item": {"entity_type": "material", "entity_id": "MAT-1"},
+        "source": "material_queue_1",
+        "target_slot": "material",
+    },
     "UNLOAD_MACHINE": {
         "machine": "S1M1",
         "item": {"entity_type": "machine_output", "entity_id": "S1M1"},

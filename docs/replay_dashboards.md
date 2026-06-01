@@ -113,6 +113,8 @@ Worker monitor는 다음 정보를 표시합니다.
 - Input queue는 노랑, output/completed queue는 파랑, scrap queue는 분홍 계열로 표시합니다.
 - Inspection table은 layout footprint를 우선 사용해 block table로 표시합니다.
 - Shelf wall과 aisle 구조는 `grid.walls`와 object footprint를 기준으로 표시합니다.
+- Shipyard run에서는 ship surface tile을 상태별 색상으로 표시하고, cart route lane과 parking spot을 layout에서 직접 그립니다.
+- Cart는 기본 2 tile footprint로 표시합니다. 뒤쪽 cockpit에는 실제 운행/적재 중인 driver만 보이고, 앞쪽 cargo bay에는 적재 item count가 표시됩니다. 예약만 된 cart는 worker가 탑승한 것처럼 보이지 않습니다.
 - `rolling_horizon_aging_priority`와 `rolling_horizon_dedicated_roles` run에서는 3D scene 위쪽에 Task Pool 패널이 표시됩니다.
 
 ## Rolling Horizon Task Pool Panel

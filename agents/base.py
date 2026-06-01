@@ -14,6 +14,7 @@ TASK_PRIORITY_KEYS: tuple[str, ...] = (
     "battery_delivery_discharged",
     "repair_machine",
     "unload_machine",
+    "load_machine",
     "setup_machine",
     "inter_station_transfer",
     "material_supply",
@@ -25,6 +26,7 @@ TASK_PRIORITY_KEYS: tuple[str, ...] = (
 FIXED_TASK_ASSIGNABLE_FAMILIES: tuple[str, ...] = (
     "repair_machine",
     "unload_machine",
+    "load_machine",
     "setup_machine",
     "preventive_maintenance",
     "inspect_product",

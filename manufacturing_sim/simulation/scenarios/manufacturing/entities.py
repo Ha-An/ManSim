@@ -64,6 +64,7 @@ class Machine:
     repair_done_event: Any = None
     repair_monitor_process: Any = None
     repair_monitor_token: int = 0
+    setup_ready: bool = False
     setup_owner: Optional[str] = None
     unload_owner: Optional[str] = None
     pm_owner: Optional[str] = None
@@ -95,6 +96,7 @@ class Worker:
     current_task_type: Optional[str] = None
     current_task_code: Optional[str] = None
     current_task_instance_id: Optional[str] = None
+    current_task_payload: dict[str, Any] = field(default_factory=dict)
     current_child_task_code: Optional[str] = None
     current_child_task_name: Optional[str] = None
     current_child_task_instance_id: Optional[str] = None

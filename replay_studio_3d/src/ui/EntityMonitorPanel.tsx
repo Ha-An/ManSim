@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties } from "react";
+﻿import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { Canvas } from "@react-three/fiber";
 import { OrthographicCamera } from "@react-three/drei";
 import type { BaseEntityState, XY } from "../replay-core/types/entity";
@@ -18,17 +18,20 @@ import {
 } from "../scene/entityVisuals";
 import { DEFAULT_GRID, DEFAULT_VIEWPORT, isMotionActive, motionDisplayPathPoints, motionPathPoints, samplePath } from "../scene/coordinates";
 
-type MonitorMode = "worker" | "machine" | "item";
+type MonitorMode = "worker" | "machine" | "tile" | "cart" | "item";
 
 interface EntityMonitorPanelProps {
   workers: BaseEntityState[];
   machines: BaseEntityState[];
+  tiles: BaseEntityState[];
+  carts: BaseEntityState[];
   items: BaseEntityState[];
   regions: RenderRegion[];
   currentTime: number;
   selectedEntity?: BaseEntityState;
   grid?: LayoutGridConfig;
   viewport?: { width: number; height: number };
+  scenarioType?: string;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -38,6 +41,47 @@ function clamp(value: number, min: number, max: number): number {
 function valueOrDash(value: unknown): string {
   if (value === undefined || value === null || value === "") return "-";
   return String(value);
+}
+
+function cartStatus(entity: BaseEntityState): string {
+  return valueOrDash(entity.attributes.status || entity.state).toUpperCase();
+}
+
+function cartWorkerLabel(entity: BaseEntityState): string {
+  const status = cartStatus(entity);
+  if (status === "MOVING" || status === "LOADING") return "Driver";
+  if (status === "RESERVED") return "Reserved By";
+  return "Worker";
+}
+
+function cartWorkerValue(entity: BaseEntityState): string {
+  const status = cartStatus(entity);
+  if (status === "MOVING" || status === "LOADING" || status === "RESERVED") {
+    return valueOrDash(entity.attributes.assigned_worker_id || entity.attributes.owner);
+  }
+  return "-";
+}
+
+function itemTypeFromId(itemId: string): string {
+  const normalized = itemId.trim().toUpperCase();
+  if (normalized.startsWith("MAT-")) return "material";
+  if (normalized.startsWith("INT-")) return "intermediate";
+  if (normalized.startsWith("PRODUCT-")) return "product";
+  if (normalized.includes("BATTERY")) return "battery";
+  return "item";
+}
+
+function machineItemSummary(itemId: unknown, items: BaseEntityState[]): string {
+  if (typeof itemId !== "string" || !itemId.trim()) return "-";
+  const trimmed = itemId.trim();
+  const item = items.find((candidate) => candidate.entity_id === trimmed);
+  const type = typeof item?.attributes.item_type === "string" && item.attributes.item_type.trim()
+    ? item.attributes.item_type.trim()
+    : itemTypeFromId(trimmed);
+  const state = typeof item?.attributes.item_state === "string" && item.attributes.item_state.trim()
+    ? item.attributes.item_state.trim()
+    : item?.state;
+  return state ? `${trimmed} / ${type} / ${state}` : `${trimmed} / ${type}`;
 }
 
 function progressFromWindow(windowValue: unknown, currentTime: number): number | undefined {
@@ -316,19 +360,67 @@ function WorkerPortrait({ worker, currentTime }: { worker: BaseEntityState; curr
   );
 }
 
-function MonitorTabs({ mode, setMode, counts }: { mode: MonitorMode; setMode: (mode: MonitorMode) => void; counts: Record<MonitorMode, number> }) {
+function monitorLabel(mode: MonitorMode): string {
+  if (mode === "worker") return "Worker";
+  if (mode === "machine") return "Machine";
+  if (mode === "tile") return "Tile";
+  if (mode === "cart") return "Cart";
+  return "Item";
+}
+
+function MonitorSelect({
+  mode,
+  setMode,
+  counts,
+  modes,
+}: {
+  mode: MonitorMode;
+  setMode: (mode: MonitorMode) => void;
+  counts: Record<MonitorMode, number>;
+  modes: MonitorMode[];
+}) {
   return (
-    <div className="entity-monitor-tabs">
-      {(["worker", "machine", "item"] as MonitorMode[]).map((tab) => (
-        <button key={tab} type="button" className={`entity-monitor-tab ${mode === tab ? "active" : ""}`} onClick={() => setMode(tab)}>
-          <span>{tab === "worker" ? "Worker" : tab === "machine" ? "Machine" : "Item"}</span>
-          <span className="entity-monitor-tab-count">{counts[tab]}</span>
-        </button>
-      ))}
-    </div>
+    <label className="entity-monitor-mode-select">
+      <span>Monitor</span>
+      <select className="ui-select" value={mode} onChange={(event) => setMode(event.target.value as MonitorMode)}>
+        {modes.map((tab) => (
+          <option key={tab} value={tab}>
+            {monitorLabel(tab).toUpperCase()} ({counts[tab]})
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
+function tileState(entity: BaseEntityState): string {
+  return String(
+    entity.attributes.ship_surface_state ??
+      entity.attributes.surface_tile_state ??
+      entity.attributes.ship_section_state ??
+      entity.attributes.state ??
+      entity.state ??
+      "-",
+  ).toUpperCase();
+}
+
+function tileCoord(entity: BaseEntityState): string {
+  const tile = entity.attributes.tile;
+  if (!tile || typeof tile !== "object") return "-";
+  const x = Number((tile as Record<string, unknown>).x);
+  const y = Number((tile as Record<string, unknown>).y);
+  return Number.isFinite(x) && Number.isFinite(y) ? `(${x}, ${y})` : "-";
+}
+
+function tileDisplayId(entity: BaseEntityState): string {
+  return typeof entity.attributes.work_tile_id === "string" && entity.attributes.work_tile_id.trim()
+    ? entity.attributes.work_tile_id.trim()
+    : entity.entity_id;
+}
+
+function statusTitle(mode: MonitorMode): string {
+  return `${monitorLabel(mode)} Monitor`;
+}
 function Meter({ label, value, kind }: { label: string; value: number | undefined; kind: "battery" | "task" | "machine" }) {
   return (
     <div className="worker-monitor-meter">
@@ -343,8 +435,34 @@ function Meter({ label, value, kind }: { label: string; value: number | undefine
   );
 }
 
-export function EntityMonitorPanel({ workers, machines, items, regions, currentTime, selectedEntity, grid, viewport }: EntityMonitorPanelProps) {
+function attributeTileCoord(value: unknown): string {
+  if (!value || typeof value !== "object") return "-";
+  const x = Number((value as Record<string, unknown>).x);
+  const y = Number((value as Record<string, unknown>).y);
+  return Number.isFinite(x) && Number.isFinite(y) ? `(${x}, ${y})` : "-";
+}
+
+export function EntityMonitorPanel({
+  workers,
+  machines,
+  tiles,
+  carts,
+  items,
+  regions,
+  currentTime,
+  selectedEntity,
+  grid,
+  viewport,
+  scenarioType,
+}: EntityMonitorPanelProps) {
   const [mode, setMode] = useState<MonitorMode>("worker");
+  const isShipyard = String(scenarioType ?? "").toLowerCase() === "shipyard_basic" || tiles.length > 0;
+  const modes = useMemo<MonitorMode[]>(() => (isShipyard ? ["worker", "tile", "cart", "item"] : ["worker", "machine", "item"]), [isShipyard]);
+
+  useEffect(() => {
+    if (!modes.includes(mode)) setMode(modes[0] ?? "worker");
+  }, [mode, modes]);
+
   const groupedItems = useMemo(() => {
     const groups: Record<"queue" | "carried" | "loaded" | "completed", BaseEntityState[]> = {
       queue: [],
@@ -359,14 +477,14 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
     return groups;
   }, [items]);
 
-  const counts = { worker: workers.length, machine: machines.length, item: items.length } satisfies Record<MonitorMode, number>;
-  const title = mode === "worker" ? "Worker Monitor" : mode === "machine" ? "Machine Monitor" : "Item Monitor";
+  const counts = { worker: workers.length, machine: machines.length, tile: tiles.length, cart: carts.length, item: items.length } satisfies Record<MonitorMode, number>;
+  const title = statusTitle(mode);
 
   return (
     <section className="panel-card worker-monitor-panel">
       <div className="entity-monitor-header">
         <h3>{title}</h3>
-        <MonitorTabs mode={mode} setMode={setMode} counts={counts} />
+        <MonitorSelect mode={mode} setMode={setMode} counts={counts} modes={modes} />
       </div>
 
       {selectedEntity && (
@@ -437,12 +555,78 @@ export function EntityMonitorPanel({ workers, machines, items, regions, currentT
                 <div className="worker-monitor-grid">
                   <div><span className="worker-monitor-key">Machine State</span><span className="worker-monitor-value">{statusLabel(machine)}</span></div>
                   <div><span className="worker-monitor-key">Active Workers</span><span className="worker-monitor-value">{machineActiveWorkers(machine)}</span></div>
-                  <div><span className="worker-monitor-key">Input Item</span><span className="worker-monitor-value">{String(machine.attributes.input_item_id ?? "-")}</span></div>
-                  <div><span className="worker-monitor-key">Output Item</span><span className="worker-monitor-value">{String(machine.attributes.output_item_id ?? "-")}</span></div>
+                  <div><span className="worker-monitor-key">Loaded Material</span><span className="worker-monitor-value">{machineItemSummary(machine.attributes.input_material_id, items)}</span></div>
+                  {/^S2M/i.test(machine.entity_id) && (
+                    <div><span className="worker-monitor-key">Loaded Intermediate</span><span className="worker-monitor-value">{machineItemSummary(machine.attributes.input_intermediate_id, items)}</span></div>
+                  )}
+                  <div><span className="worker-monitor-key">Completed Output</span><span className="worker-monitor-value">{machineItemSummary(machine.attributes.output_item_id, items)}</span></div>
                 </div>
               </article>
             );
           })}
+        </div>
+      )}
+
+      {mode === "tile" && (
+        <div className="worker-monitor-list">
+          {tiles.length === 0 ? (
+            <div className="entity-monitor-empty">No ship work tiles are active in this replay.</div>
+          ) : (
+            tiles.map((tile) => (
+              <article className={`worker-monitor-card ${selectedEntity?.entity_id === tile.entity_id ? "selected" : ""}`} key={tile.entity_id}>
+                <div className="worker-monitor-header">
+                  <div className="worker-monitor-identity">
+                    <div className="worker-monitor-thumb tile-thumb">TL</div>
+                    <div>
+                      <div className="worker-monitor-name">{tileDisplayId(tile)}</div>
+                      <div className="worker-monitor-location">{tileCoord(tile)}</div>
+                    </div>
+                  </div>
+                  <div className="worker-monitor-state">{tileState(tile)}</div>
+                </div>
+                <div className="worker-monitor-grid">
+                  <div><span className="worker-monitor-key">State</span><span className="worker-monitor-value">{tileState(tile)}</span></div>
+                  <div><span className="worker-monitor-key">Tile</span><span className="worker-monitor-value">{tileCoord(tile)}</span></div>
+                  <div><span className="worker-monitor-key">Worker</span><span className="worker-monitor-value">{valueOrDash(tile.attributes.active_worker_id)}</span></div>
+                  <div><span className="worker-monitor-key">Task</span><span className="worker-monitor-value">{valueOrDash(tile.attributes.active_task_id)}</span></div>
+                  <div><span className="worker-monitor-key">Rework</span><span className="worker-monitor-value">{valueOrDash(tile.attributes.rework_target)}</span></div>
+                </div>
+              </article>
+            ))
+          )}
+        </div>
+      )}
+
+      {mode === "cart" && (
+        <div className="worker-monitor-list">
+          {carts.length === 0 ? (
+            <div className="entity-monitor-empty">No carts are active in this replay.</div>
+          ) : (
+            carts.map((cart) => (
+              <article className={`worker-monitor-card ${selectedEntity?.entity_id === cart.entity_id ? "selected" : ""}`} key={cart.entity_id}>
+                <div className="worker-monitor-header">
+                  <div className="worker-monitor-identity">
+                    <div className="worker-monitor-thumb cart-thumb">CT</div>
+                    <div>
+                      <div className="worker-monitor-name">{cart.label || cart.entity_id}</div>
+                      <div className="worker-monitor-location">{valueOrDash(cart.attributes.parking_spot_id || "route")}</div>
+                    </div>
+                  </div>
+                  <div className="worker-monitor-state">{cartStatus(cart)}</div>
+                </div>
+                <div className="worker-monitor-grid">
+                  <div><span className="worker-monitor-key">Position</span><span className="worker-monitor-value">{tileCoord(cart)}</span></div>
+                  <div><span className="worker-monitor-key">Cockpit</span><span className="worker-monitor-value">{attributeTileCoord(cart.attributes.cockpit_tile || cart.attributes.tile)}</span></div>
+                  <div><span className="worker-monitor-key">Cargo Bay</span><span className="worker-monitor-value">{attributeTileCoord(cart.attributes.cargo_tile)}</span></div>
+                  <div><span className="worker-monitor-key">Inventory</span><span className="worker-monitor-value">{valueOrDash(cart.attributes.inventory_kind)} x{valueOrDash(cart.attributes.inventory_count)}</span></div>
+                  <div><span className="worker-monitor-key">Reserved</span><span className="worker-monitor-value">{valueOrDash(cart.attributes.reserved_count)}</span></div>
+                  <div><span className="worker-monitor-key">Capacity</span><span className="worker-monitor-value">{valueOrDash(cart.attributes.capacity)}</span></div>
+                  <div><span className="worker-monitor-key">{cartWorkerLabel(cart)}</span><span className="worker-monitor-value">{cartWorkerValue(cart)}</span></div>
+                  <div><span className="worker-monitor-key">Task</span><span className="worker-monitor-value">{valueOrDash(cart.attributes.assigned_task_id)}</span></div>
+                </div>
+              </article>
+            ))
+          )}
         </div>
       )}
 

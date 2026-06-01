@@ -5,5 +5,7 @@ ui:
     - results_dashboard.html
   streamlit_preferred_port: 8505
   replay_studio_preferred_port: 5173
+  replay_studio_3d_preferred_port: 5174
   auto_start_replay_studio: true
+  auto_start_replay_studio_3d: true
   replay_studio_auto_install: true

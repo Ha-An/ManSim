@@ -16,6 +16,7 @@ world:
     battery_delivery_low_battery: 140.0
     repair_machine: 115.0
     unload_machine: 110.0
+    load_machine: 105.0
     setup_machine: 90.0
     inter_station_transfer: 85.0
     material_supply: 85.0
@@ -37,6 +38,7 @@ decision:
       battery_delivery_discharged: 1.0
       repair_machine: 1.0
       unload_machine: 1.0
+      load_machine: 1.0
       setup_machine: 1.0
       inter_station_transfer: 1.0
       material_supply: 1.0
@@ -63,6 +65,7 @@ decision:
 
     wait_input_machine_threshold: 2
     wait_input_priority_multipliers:
+      load_machine: 1.15
       setup_machine: 1.15
       inter_station_transfer: 1.15
       material_supply: 1.1

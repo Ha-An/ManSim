@@ -50,7 +50,7 @@ class RollingHorizonDecisionTests(unittest.TestCase):
 
     def test_general_task_waits_until_window_boundary(self) -> None:
         cfg = _load_cfg()
-        self.assertIn("task_code_priority_order", cfg["decision"]["rolling_horizon"])
+        self.assertIn("scenario_task_code_priority_order", cfg["decision"]["rolling_horizon"])
         self.assertNotIn("scan_interval_min", cfg["decision"]["rolling_horizon"])
         with tempfile.TemporaryDirectory() as tmp:
             logger = EventLogger(Path(tmp))
@@ -81,7 +81,10 @@ class RollingHorizonDecisionTests(unittest.TestCase):
 
     def test_priority_rank_uses_humanoidsim_task_code_not_task_family(self) -> None:
         cfg = _load_cfg()
-        cfg["decision"]["rolling_horizon"]["task_code_priority_order"] = ["TRANSFER", "REPAIR_MACHINE"]
+        cfg["decision"]["rolling_horizon"]["scenario_task_code_priority_order"]["factory_mfg_basic"] = [
+            "TRANSFER",
+            "REPAIR_MACHINE",
+        ]
         with tempfile.TemporaryDirectory() as tmp:
             logger = EventLogger(Path(tmp))
             try:

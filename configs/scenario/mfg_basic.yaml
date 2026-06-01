@@ -1,5 +1,6 @@
 ﻿# 기본 제조 실험 시나리오
 name: mfg_basic
+type: factory_mfg_basic
 
 horizon:
   # 총 시뮬레이션 일수

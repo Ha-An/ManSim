@@ -45,6 +45,7 @@ TASK_ID_PREFIX_BY_TASK_CODE: dict[str, str] = {
     "REPLENISH_MATERIAL": "MAT",
     "TRANSFER": "TR",
     "MANAGE_ROBOT_POWER": "BAT",
+    "LOAD_MACHINE": "LOAD",
     "SETUP_MACHINE": "SET",
     "UNLOAD_MACHINE": "UL",
     "INSPECT_PRODUCT": "INS",
@@ -53,6 +54,36 @@ TASK_ID_PREFIX_BY_TASK_CODE: dict[str, str] = {
     "HANDOVER_ITEM": "HND",
     "COLLECT_WASTE_OR_SCRAP": "SCRAP",
 }
+
+_SCENARIO_ALIASES = {
+    "": "factory_mfg_basic",
+    "mfg_basic": "factory_mfg_basic",
+    "manufacturing": "factory_mfg_basic",
+    "factory": "factory_mfg_basic",
+    "factory_mfg_basic": "factory_mfg_basic",
+    "shipyard": "shipyard_basic",
+    "shipyard_basic": "shipyard_basic",
+}
+
+
+def _normalized_scenario_key(cfg: dict[str, Any]) -> str:
+    raw = str(cfg.get("scenario_type") or cfg.get("type") or cfg.get("name") or "factory_mfg_basic").strip().lower()
+    return _SCENARIO_ALIASES.get(raw, raw)
+
+
+def _scenario_entry(mapping: Any, scenario_key: str) -> Any:
+    if not isinstance(mapping, dict):
+        return None
+    candidates = [
+        scenario_key,
+        "mfg_basic" if scenario_key == "factory_mfg_basic" else "",
+        "factory" if scenario_key == "factory_mfg_basic" else "",
+        "shipyard" if scenario_key == "shipyard_basic" else "",
+    ]
+    for key in candidates:
+        if key and key in mapping:
+            return mapping[key]
+    return None
 
 
 class ManufacturingWorld:
@@ -312,6 +343,7 @@ class ManufacturingWorld:
     def _init_rolling_horizon(self, decision_cfg: dict[str, Any]) -> None:
         rolling_cfg = decision_cfg.get("rolling_horizon", {}) if isinstance(decision_cfg.get("rolling_horizon", {}), dict) else {}
         battery_cfg = decision_cfg.get("battery", {}) if isinstance(decision_cfg.get("battery", {}), dict) else {}
+        scenario_key = _normalized_scenario_key(self.cfg)
         self.rolling_horizon_enabled = self.decision_mode in {
             "rolling_horizon_aging_priority",
             "rolling_horizon_dedicated_roles",
@@ -343,6 +375,7 @@ class ManufacturingWorld:
             "COLLECT_WASTE_OR_SCRAP",
             "UNLOAD_MACHINE",
             "HANDOVER_ITEM",
+            "LOAD_MACHINE",
             "SETUP_MACHINE",
             "TRANSFER",
             "REPLENISH_MATERIAL",
@@ -351,11 +384,14 @@ class ManufacturingWorld:
         ]
         default_worker_task_priority = {
             "A1": ["MANAGE_ROBOT_POWER", "REPLENISH_MATERIAL"],
-            "A2": ["REPAIR_MACHINE", "SETUP_MACHINE", "UNLOAD_MACHINE"],
+            "A2": ["REPAIR_MACHINE", "LOAD_MACHINE", "SETUP_MACHINE", "UNLOAD_MACHINE"],
             "A3": ["TRANSFER", "INSPECT_PRODUCT", "COLLECT_WASTE_OR_SCRAP", "PREVENTIVE_MAINTENANCE"],
         }
+        scenario_worker_priority = _scenario_entry(rolling_cfg.get("scenario_worker_task_priority", {}), scenario_key)
         raw_worker_priority = (
-            rolling_cfg.get("worker_task_priority", {})
+            scenario_worker_priority
+            if isinstance(scenario_worker_priority, dict)
+            else rolling_cfg.get("worker_task_priority", {})
             if isinstance(rolling_cfg.get("worker_task_priority", {}), dict)
             else {}
         )
@@ -378,7 +414,12 @@ class ManufacturingWorld:
             worker_id: {code: index + 1 for index, code in enumerate(codes)}
             for worker_id, codes in self.rolling_horizon_worker_task_priority.items()
         }
-        configured_order = rolling_cfg.get("task_code_priority_order", [])
+        scenario_order = _scenario_entry(rolling_cfg.get("scenario_task_code_priority_order", {}), scenario_key)
+        configured_order = (
+            scenario_order
+            if isinstance(scenario_order, list)
+            else rolling_cfg.get("task_code_priority_order", [])
+        )
         dedicated_order: list[str] = []
         for codes in self.rolling_horizon_worker_task_priority.values():
             dedicated_order.extend(codes)
@@ -1511,7 +1552,7 @@ class ManufacturingWorld:
             tags.append("reliability")
         if task.task_type == "INSPECT_PRODUCT":
             tags.append("inspection")
-        if task.task_type in {"UNLOAD_MACHINE", "TRANSFER"}:
+        if task.task_type in {"LOAD_MACHINE", "UNLOAD_MACHINE", "TRANSFER"}:
             tags.append("flow")
         return Opportunity(
             opportunity_id=self._task_opportunity_id(task),
@@ -1638,6 +1679,8 @@ class ManufacturingWorld:
             return "repair_machine"
         if task.task_type == "UNLOAD_MACHINE":
             return "unload_machine"
+        if task.task_type == "LOAD_MACHINE":
+            return "load_machine"
         if task.task_type == "SETUP_MACHINE":
             return "setup_machine"
         if task.task_type == "PREVENTIVE_MAINTENANCE":
@@ -2045,6 +2088,7 @@ class ManufacturingWorld:
 
     def _set_humanoid_primitive_hint(self, agent: Agent, primitive_call_code: str, *, reason: str = "primitive_hint") -> None:
         """Update the HumanoidSim state snapshot for domain-internal primitives."""
+        primitive_call_code = self._catalog_primitive_for_active_task(agent, primitive_call_code)
         agent.current_primitive_call_code = str(primitive_call_code or "")
         runtime = getattr(self, "humanoid_runtime", None)
         if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "set_step_state"):
@@ -2069,6 +2113,49 @@ class ManufacturingWorld:
         )
         return
 
+    def _catalog_primitive_for_active_task(self, agent: Agent, primitive_call_code: str) -> str:
+        """Keep Replay state aligned with the active HumanoidSim task spec.
+
+        Domain helpers may perform fine-grained side effects such as GRASP or
+        PLACE while an atomic catalog task represents those effects as one
+        semantic primitive. The worker panel should show the catalog primitive,
+        not an implementation detail that does not belong to the active task.
+        """
+        primitive = str(primitive_call_code or "").strip().upper()
+        if not primitive:
+            return primitive
+        task_code = str(agent.current_child_task_code or agent.current_task_code or "").strip().upper()
+        if not task_code:
+            return primitive
+        runtime = getattr(self, "humanoid_runtime", None)
+        catalog = getattr(runtime, "catalog", None)
+        task_spec = getattr(catalog, "tasks", {}).get(task_code) if catalog is not None else None
+        steps = getattr(task_spec, "steps", None)
+        if not steps:
+            return primitive
+        declared_primitives: set[str] = set()
+        for step in steps:
+            level = getattr(getattr(step, "expected_level", None), "value", getattr(step, "expected_level", ""))
+            if str(level or "").strip().upper() == "PRIMITIVE_SKILL":
+                declared_primitives.add(str(getattr(step, "call_code", "") or "").strip().upper())
+        if not declared_primitives or primitive in declared_primitives:
+            return primitive
+        if primitive == "ALIGN" and "NAVIGATE_TO" in declared_primitives:
+            return "NAVIGATE_TO"
+        internal_manipulation = {"REACH_TO", "GRASP", "LIFT", "PLACE", "RELEASE", "VERIFY_PLACEMENT"}
+        semantic_fallbacks = (
+            "EXECUTE_MACHINE_ACTION",
+            "EXECUTE_QUALITY_ACTION",
+            "EXECUTE_MAINTENANCE_ACTION",
+            "EXECUTE_SYSTEM_ACTION",
+            "EXECUTE_HUMAN_COLLABORATION_ACTION",
+        )
+        if primitive in internal_manipulation:
+            for fallback in semantic_fallbacks:
+                if fallback in declared_primitives:
+                    return fallback
+        return primitive
+
     def _resume_humanoid_task_after_recovery(self, agent: Agent, *, reason: str, source: str) -> None:
         """Return a worker from incident recovery back to its active task context."""
         current_availability = str(self._humanoid_state_payload(agent).get("availability", "")).upper()
@@ -2090,10 +2177,11 @@ class ManufacturingWorld:
         duration = max(0.0, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.0) or 0.0))
         if duration > 1e-9:
             yield self.env.timeout(duration)
+        finished_call_code = self._catalog_primitive_for_active_task(agent, "ALIGN")
         self._transition_humanoid_state(
             agent,
             "primitive_finished",
-            step={"step_id": agent.current_step_id or "align_target", "call_code": "ALIGN"},
+            step={"step_id": agent.current_step_id or "align_target", "call_code": finished_call_code},
             status="completed",
             reason=reason,
             source="mansim.alignment",
@@ -2109,7 +2197,7 @@ class ManufacturingWorld:
             priority_key="",
             priority=0.0,
             location=str(worker.location),
-            payload={},
+            payload=copy.deepcopy(getattr(worker, "current_task_payload", {}) or {}),
             task_code=task_code,
             instance_id=task_instance_id,
             assigned_robot_id=worker.worker_id,
@@ -2125,7 +2213,7 @@ class ManufacturingWorld:
             priority_key="",
             priority=0.0,
             location=str(worker.location),
-            payload={},
+            payload=copy.deepcopy(getattr(worker, "current_task_payload", {}) or {}),
             task_code=task_code,
             instance_id=task_instance_id,
             assigned_robot_id=worker.worker_id,
@@ -2804,6 +2892,9 @@ class ManufacturingWorld:
                 "machine_state": machine.state.value,
                 "reason": reason,
                 "input_item_id": machine.input_intermediate or machine.input_material,
+                "input_material_id": machine.input_material,
+                "input_intermediate_id": machine.input_intermediate,
+                "setup_ready": bool(getattr(machine, "setup_ready", False)),
                 "output_item_id": machine.output_intermediate,
                 "active_worker_ids": [candidate for candidate in (machine.setup_owner, machine.unload_owner, machine.pm_owner) if candidate]
                 + list(machine.repair_team),
@@ -3130,10 +3221,17 @@ class ManufacturingWorld:
                     ref=payload.get("from_station"),
                     item_type="product" if from_station_value >= self.last_processing_station else "intermediate",
                 )
-        elif task_type == "SETUP_MACHINE":
+        elif task_type == "LOAD_MACHINE":
             station = str(payload.get("station", "") or "")
-            _add(payload.get("material_id"), source=f"material_queue_{station}", ref=station, item_type="material")
-            _add(payload.get("intermediate_id"), source=f"intermediate_queue_{station}", ref=station, item_type="intermediate")
+            load_slot = str(payload.get("load_slot", "") or "").strip().lower()
+            item_type = "intermediate" if load_slot == "intermediate" else "material"
+            source = f"{item_type}_queue_{station}"
+            _add(
+                payload.get("item_id") or payload.get("material_id") or payload.get("intermediate_id"),
+                source=source,
+                ref=station,
+                item_type=item_type,
+            )
         elif task_type == "INSPECT_PRODUCT":
             _add(
                 payload.get("inspection_product_id"),
@@ -3257,15 +3355,15 @@ class ManufacturingWorld:
                 self.active_battery_delivery_owner = agent.agent_id
                 owner_kind = "battery_delivery"
                 owner_ref = target_id
-        elif task_type in {"SETUP_MACHINE", "UNLOAD_MACHINE", "PREVENTIVE_MAINTENANCE"}:
+        elif task_type in {"LOAD_MACHINE", "SETUP_MACHINE", "UNLOAD_MACHINE", "PREVENTIVE_MAINTENANCE"}:
             machine = self.machines.get(str(payload.get("machine_id", "")))
             if machine is None:
                 return False
-            if task_type == "SETUP_MACHINE":
+            if task_type in {"LOAD_MACHINE", "SETUP_MACHINE"}:
                 if machine.setup_owner is not None and machine.setup_owner != agent.agent_id:
                     return False
                 machine.setup_owner = agent.agent_id
-                owner_kind = "machine_setup"
+                owner_kind = "machine_load" if task_type == "LOAD_MACHINE" else "machine_setup"
             elif task_type == "UNLOAD_MACHINE":
                 if machine.unload_owner is not None and machine.unload_owner != agent.agent_id:
                     return False
@@ -3316,7 +3414,7 @@ class ManufacturingWorld:
                 target.battery_service_owner = None
             if self.active_battery_delivery_owner == owner_agent:
                 self.active_battery_delivery_owner = None
-        elif kind == "machine_setup":
+        elif kind in {"machine_load", "machine_setup"}:
             machine = self.machines.get(ref)
             if machine is not None and machine.setup_owner == owner_agent:
                 machine.setup_owner = None
@@ -5088,6 +5186,7 @@ class ManufacturingWorld:
             return
         was_processing = machine.state == MachineState.PROCESSING
         machine.broken = True
+        machine.setup_ready = False
         machine.failures += 1
         machine.failed_since = self.env.now
         machine.repair_team = []
@@ -5223,23 +5322,24 @@ class ManufacturingWorld:
                 + float(self.movement_cfg["unload_min"])
                 + float(self.travel_time(machine.machine_id, output_buffer_id))
             )
+        if task_type == "LOAD_MACHINE":
+            machine = self.machines.get(str(task.payload.get("machine_id", "")))
+            if machine is None:
+                return 0.0
+            source = str(task.payload.get("source") or "")
+            if not source:
+                slot = str(task.payload.get("load_slot") or "material").strip().lower()
+                source = f"{'intermediate' if slot == 'intermediate' else 'material'}_queue_{machine.station}"
+            return (
+                float(self.travel_time(self.agent_display_location(agent), source))
+                + float(self.travel_time(source, machine.machine_id))
+                + max(0.1, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.1) or 0.1))
+            )
         if task_type == "SETUP_MACHINE":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
-            station = machine.station
-            needs_material = machine.input_material is None
-            needs_intermediate = self._station_requires_intermediate(station) and machine.input_intermediate is None
-            estimate = float(self.travel_time(self.agent_display_location(agent), machine.machine_id))
-            if needs_material:
-                estimate += float(self.travel_time(machine.machine_id, f"material_queue_{station}"))
-                estimate += float(self.travel_time(f"material_queue_{station}", machine.machine_id))
-                estimate += float(self.movement_cfg["setup_min"])
-            if needs_intermediate:
-                estimate += float(self.travel_time(machine.machine_id, f"intermediate_queue_{station}"))
-                estimate += float(self.travel_time(f"intermediate_queue_{station}", machine.machine_id))
-                estimate += float(self.movement_cfg["setup_min"])
-            return estimate
+            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + float(self.movement_cfg["setup_min"])
         if task_type == "INSPECT_PRODUCT":
             return (
                 float(self.travel_time(self.agent_display_location(agent), "intermediate_queue_4"))
@@ -5641,6 +5741,7 @@ class ManufacturingWorld:
         agent.current_task_type = task.task_type
         agent.current_task_code = task.task_code or ""
         agent.current_task_instance_id = task.instance_id or ""
+        agent.current_task_payload = copy.deepcopy(task.payload) if isinstance(task.payload, dict) else {}
         agent.current_child_task_code = None
         agent.current_child_task_name = None
         agent.current_child_task_instance_id = None
@@ -5873,6 +5974,7 @@ class ManufacturingWorld:
         agent.current_task_type = None
         agent.current_task_code = None
         agent.current_task_instance_id = None
+        agent.current_task_payload = {}
         agent.current_child_task_code = None
         agent.current_child_task_name = None
         agent.current_child_task_instance_id = None
@@ -5959,15 +6061,40 @@ class ManufacturingWorld:
                 if self.material_supply_owner.get(station) == agent.agent_id:
                     self.material_supply_owner[station] = None
 
-        elif task.task_type == "SETUP_MACHINE":
+        elif task.task_type == "LOAD_MACHINE":
             machine = self.machines.get(task.payload.get("machine_id"))
             station = machine.station if machine is not None else int(task.payload.get("station", 1))
-            material_id = task.payload.pop("material_id", None)
-            intermediate_id = task.payload.pop("intermediate_id", None)
-            if material_id is not None:
-                self._appendleft_if_absent(self.material_queues[station], str(material_id))
-            if intermediate_id is not None and station in self.intermediate_queues:
-                self._appendleft_if_absent(self.intermediate_queues[station], str(intermediate_id))
+            load_slot = str(task.payload.get("load_slot") or "").strip().lower()
+            item_id = task.payload.get("item_id")
+            if item_id is None:
+                item_id = task.payload.get("material_id")
+            if item_id is None:
+                item_id = task.payload.get("intermediate_id")
+            item_id = str(item_id or "").strip()
+            loaded_on_machine = False
+            if machine is not None and item_id:
+                if load_slot == "intermediate":
+                    loaded_on_machine = str(machine.input_intermediate or "") == item_id
+                else:
+                    loaded_on_machine = str(machine.input_material or "") == item_id
+            task.payload.pop("item_id", None)
+            task.payload.pop("material_id", None)
+            task.payload.pop("intermediate_id", None)
+            if item_id is not None:
+                if loaded_on_machine:
+                    pass
+                elif load_slot == "intermediate" and station in self.intermediate_queues:
+                    self._appendleft_if_absent(self.intermediate_queues[station], str(item_id))
+                else:
+                    self._appendleft_if_absent(self.material_queues[station], str(item_id))
+            if machine is not None:
+                if machine.setup_owner == agent.agent_id:
+                    machine.setup_owner = None
+                if machine.state == MachineState.SETUP:
+                    self._set_machine_state(machine, MachineState.WAIT_INPUT, reason=reason)
+
+        elif task.task_type == "SETUP_MACHINE":
+            machine = self.machines.get(task.payload.get("machine_id"))
             if machine is not None:
                 if machine.setup_owner == agent.agent_id:
                     machine.setup_owner = None
@@ -6314,7 +6441,7 @@ class ManufacturingWorld:
                     return int(task.payload.get("from_station"))
                 except (TypeError, ValueError):
                     return None
-        if task.task_type in {"SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
+        if task.task_type in {"LOAD_MACHINE", "SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
             try:
                 return int(task.payload.get("station")) if task.payload.get("station") not in {None, ""} else None
             except (TypeError, ValueError):
@@ -6327,10 +6454,46 @@ class ManufacturingWorld:
             return None
         return None
 
+    @staticmethod
+    def _task_is_material_supply_for_station(task: Task | None, station: int) -> bool:
+        if task is None:
+            return False
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        if str(getattr(task, "task_type", "") or "").strip().upper() != "TRANSFER":
+            return False
+        if str(payload.get("transfer_kind", "") or "").strip().lower() != "material_supply":
+            return False
+        try:
+            return int(payload.get("station", 0) or 0) == int(station)
+        except (TypeError, ValueError):
+            return False
+
+    def _active_material_supply_task_ids_for_station(self, station: int) -> list[str]:
+        active: list[str] = []
+        for agent in self.agents.values():
+            payload = copy.deepcopy(getattr(agent, "current_task_payload", {}) or {})
+            current_task = Task(
+                task_id=str(agent.current_task_id or ""),
+                task_type=str(agent.current_task_type or ""),
+                priority_key="",
+                priority=0.0,
+                location=str(agent.location),
+                payload=payload,
+                task_code=str(agent.current_task_code or ""),
+                instance_id=str(agent.current_task_instance_id or ""),
+                assigned_robot_id=agent.agent_id,
+            )
+            if current_task.task_id and self._task_is_material_supply_for_station(current_task, station):
+                active.append(current_task.task_id)
+            suspended = agent.suspended_task if isinstance(agent.suspended_task, Task) else None
+            if suspended is not None and self._task_is_material_supply_for_station(suspended, station):
+                active.append(str(suspended.task_id or ""))
+        return sorted({task_id for task_id in active if task_id})
+
     def _task_target_id(self, task: Task) -> str:
         if task.task_type == "BATTERY_SWAP":
             return str(task.payload.get("target_agent_id", ""))
-        if task.task_type in {"SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
+        if task.task_type in {"LOAD_MACHINE", "SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
             return str(task.payload.get("machine_id", ""))
         if task.task_type == "INSPECT_PRODUCT":
             return "inspection"
@@ -6354,7 +6517,7 @@ class ManufacturingWorld:
     def _task_target_type(self, task: Task) -> str:
         if task.task_type == "BATTERY_SWAP":
             return "agent"
-        if task.task_type in {"SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
+        if task.task_type in {"LOAD_MACHINE", "SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
             return "machine"
         if task.task_type == "INSPECT_PRODUCT":
             return "station"
@@ -6387,8 +6550,10 @@ class ManufacturingWorld:
             return "A broken machine is idle and can be repaired immediately."
         if task.task_type == "UNLOAD_MACHINE":
             return "A machine has finished output waiting for unload."
+        if task.task_type == "LOAD_MACHINE":
+            return "A required machine input slot can be filled from a station queue."
         if task.task_type == "SETUP_MACHINE":
-            return "A machine is ready for setup because required inputs are present."
+            return "A machine has all required inputs loaded and needs recipe, fixture, or program setup before processing."
         if task.task_type == "PREVENTIVE_MAINTENANCE":
             return "A machine is idle and due for preventive maintenance."
         if task.task_type == "INSPECT_PRODUCT":
@@ -6721,6 +6886,7 @@ class ManufacturingWorld:
                 or ""
             ),
             "source_slot_id": str(payload.get("source_slot_id") or ""),
+            "load_slot": str(payload.get("load_slot") or ""),
             "machine_id": str(payload.get("machine_id") or ""),
             "target_agent_id": str(payload.get("target_agent_id") or ""),
             "source_agent_id": str(payload.get("source_agent_id") or ""),
@@ -6764,6 +6930,11 @@ class ManufacturingWorld:
         source_slot_id = str(payload.get("source_slot_id") or "").strip()
         if source_slot_id:
             keys.add(f"material_slot:{source_slot_id}")
+        if str(task.task_type).strip().upper() == "LOAD_MACHINE":
+            machine_for_slot = str(payload.get("machine_id") or self._task_target_id(task) or "").strip()
+            load_slot = str(payload.get("load_slot") or "").strip().lower()
+            if machine_for_slot and load_slot:
+                keys.add(f"machine_slot:{machine_for_slot}:{load_slot}")
         machine_id = str(payload.get("machine_id") or "").strip()
         if not machine_id and self._task_target_type(task) == "machine":
             machine_id = self._task_target_id(task)
@@ -7847,6 +8018,7 @@ class ManufacturingWorld:
         deliver_priority_low_battery = float(self._rule("world.task_priority.battery_delivery_low_battery", 140.0))
         priority_repair_machine = float(self._rule("world.task_priority.repair_machine", 115.0))
         priority_unload_machine = float(self._rule("world.task_priority.unload_machine", 110.0))
+        priority_load_machine = float(self._rule("world.task_priority.load_machine", 105.0))
         priority_setup_machine = float(self._rule("world.task_priority.setup_machine", 90.0))
         priority_pm = float(self._rule("world.task_priority.preventive_maintenance", 65.0))
         priority_inter_station_transfer = float(self._rule("world.task_priority.inter_station_transfer", 85.0))
@@ -7914,51 +8086,77 @@ class ManufacturingWorld:
                 and machine.state == MachineState.WAIT_INPUT
                 and machine.setup_owner is None
                 and machine.output_intermediate is None
-                and (
-                    machine.input_material is None
-                    or (self._station_requires_intermediate(machine.station) and machine.input_intermediate is None)
-                )
-                and (
-                    machine.input_material is not None
-                    or len(self.material_queues[machine.station]) > 0
-                )
-                and (
-                    not self._station_requires_intermediate(machine.station)
-                    or machine.input_intermediate is not None
-                    or len(self.intermediate_queues[machine.station]) > 0
-                )
             ):
-                setup_payload: dict[str, Any] = {"machine_id": machine.machine_id, "station": machine.station}
+                load_created = False
                 if machine.input_material is None:
                     material_id = self._first_unreserved_queue_item(
                         self.material_queues[machine.station],
                         agent.agent_id,
                         exclude_item_ids=local_candidate_item_ids,
                     )
-                    if not material_id:
-                        continue
-                    setup_payload["material_id"] = material_id
-                    local_candidate_item_ids.add(material_id)
+                    if material_id:
+                        local_candidate_item_ids.add(material_id)
+                        load_created = True
+                        tasks.append(
+                            Task(
+                                task_id=self._next_task_id("LOAD"),
+                                task_type="LOAD_MACHINE",
+                                priority_key="load_machine",
+                                priority=priority_load_machine,
+                                location=f"Station{machine.station}",
+                                payload={
+                                    "machine_id": machine.machine_id,
+                                    "station": machine.station,
+                                    "load_slot": "material",
+                                    "item_type": "material",
+                                    "item_id": material_id,
+                                    "material_id": material_id,
+                                    "source": f"material_queue_{machine.station}",
+                                },
+                            )
+                        )
                 if self._station_requires_intermediate(machine.station) and machine.input_intermediate is None:
                     intermediate_id = self._first_unreserved_queue_item(
                         self.intermediate_queues[machine.station],
                         agent.agent_id,
                         exclude_item_ids=local_candidate_item_ids,
                     )
-                    if not intermediate_id:
-                        continue
-                    setup_payload["intermediate_id"] = intermediate_id
-                    local_candidate_item_ids.add(intermediate_id)
-                tasks.append(
-                    Task(
-                        task_id=self._next_task_id("SET"),
-                        task_type="SETUP_MACHINE",
-                        priority_key="setup_machine",
-                        priority=priority_setup_machine,
-                        location=f"Station{machine.station}",
-                        payload=setup_payload,
-                    )
+                    if intermediate_id:
+                        local_candidate_item_ids.add(intermediate_id)
+                        load_created = True
+                        tasks.append(
+                            Task(
+                                task_id=self._next_task_id("LOAD"),
+                                task_type="LOAD_MACHINE",
+                                priority_key="load_machine",
+                                priority=priority_load_machine,
+                                location=f"Station{machine.station}",
+                                payload={
+                                    "machine_id": machine.machine_id,
+                                    "station": machine.station,
+                                    "load_slot": "intermediate",
+                                    "item_type": "intermediate",
+                                    "item_id": intermediate_id,
+                                    "intermediate_id": intermediate_id,
+                                    "source": f"intermediate_queue_{machine.station}",
+                                },
+                            )
+                        )
+                inputs_ready = machine.input_material is not None and (
+                    not self._station_requires_intermediate(machine.station)
+                    or machine.input_intermediate is not None
                 )
+                if inputs_ready and not machine.setup_ready and not load_created:
+                    tasks.append(
+                        Task(
+                            task_id=self._next_task_id("SET"),
+                            task_type="SETUP_MACHINE",
+                            priority_key="setup_machine",
+                            priority=priority_setup_machine,
+                            location=f"Station{machine.station}",
+                            payload={"machine_id": machine.machine_id, "station": machine.station},
+                        )
+                    )
 
             pm_due = self.env.now - machine.last_pm_at >= self.pm_interval_target_min
             if (
@@ -8013,7 +8211,12 @@ class ManufacturingWorld:
 
         for station in self.stations:
             material_target = int(self.inventory_targets["material"][f"station{station}"])
-            if len(self.material_queues[station]) < material_target and self.material_supply_owner.get(station) is None:
+            active_supply_task_ids = self._active_material_supply_task_ids_for_station(station)
+            if (
+                len(self.material_queues[station]) < material_target
+                and self.material_supply_owner.get(station) is None
+                and not active_supply_task_ids
+            ):
                 if self._material_shelf_count() > 0:
                     tasks.append(
                         Task(
@@ -8698,7 +8901,7 @@ class ManufacturingWorld:
                 return f"intermediate_queue_{to_station if to_station <= self.last_processing_station else self.inspection_queue_station}"
             if transfer_kind == "battery_delivery":
                 return str(payload.get("target_agent_id", "") or "")
-        if parent_task.task_type == "SETUP_MACHINE":
+        if parent_task.task_type in {"LOAD_MACHINE", "SETUP_MACHINE"}:
             return str(payload.get("machine_id", "") or "")
         if parent_task.task_type == "INSPECT_PRODUCT":
             return "inspection_table"
@@ -8861,7 +9064,7 @@ class ManufacturingWorld:
     def _execute_task_domain_action(self, agent: Agent, task: Task):
         task_type = task.task_type
 
-        if task_type in {"UNLOAD_MACHINE", "SETUP_MACHINE", "PREVENTIVE_MAINTENANCE"}:
+        if task_type in {"LOAD_MACHINE", "UNLOAD_MACHINE", "SETUP_MACHINE", "PREVENTIVE_MAINTENANCE"}:
             machine = self.machines[task.payload["machine_id"]]
             # Broken machines are strictly limited to REPAIR_MACHINE only.
             if machine.broken:
@@ -9463,6 +9666,110 @@ class ManufacturingWorld:
 
             return False
 
+        if task_type == "LOAD_MACHINE":
+            machine = self.machines[task.payload["machine_id"]]
+            station = machine.station
+            if machine.setup_owner is not None and machine.setup_owner != agent.agent_id:
+                return False
+            machine.setup_owner = agent.agent_id
+
+            try:
+                if machine.broken or machine.output_intermediate is not None:
+                    return False
+                if machine.state not in {MachineState.WAIT_INPUT, MachineState.SETUP, MachineState.IDLE}:
+                    return False
+                load_slot = str(task.payload.get("load_slot") or task.payload.get("target_slot") or "").strip().lower()
+                if load_slot not in {"material", "intermediate"}:
+                    load_slot = "intermediate" if task.payload.get("intermediate_id") else "material"
+                item_type = "intermediate" if load_slot == "intermediate" else "material"
+                if load_slot == "material" and machine.input_material is not None:
+                    return False
+                if load_slot == "intermediate":
+                    if not self._station_requires_intermediate(station) or machine.input_intermediate is not None:
+                        return False
+
+                item_id = str(
+                    task.payload.get("item_id")
+                    or task.payload.get("material_id")
+                    or task.payload.get("intermediate_id")
+                    or ""
+                )
+                source_queue_id = f"{item_type}_queue_{station}"
+                self._set_humanoid_primitive_hint(agent, "CHECK_SAFETY_ZONE")
+                self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                yield from self.move_agent(agent, source_queue_id, emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, source_queue_id, task, f"load_machine_{load_slot}_pickup"):
+                    return False
+                yield from self._dock_agent_at_target(agent, task, reason=f"load_machine_{load_slot}_pickup_alignment")
+                self._set_humanoid_primitive_hint(agent, "READ_MACHINE_STATE")
+                if load_slot == "material":
+                    popped_item = self._pop_material_queue(station, item_id or None)
+                    resource_name = "material_queue"
+                else:
+                    popped_item = self._pop_intermediate_queue(station, item_id or None)
+                    resource_name = "intermediate_queue"
+                if popped_item is None:
+                    task.payload["failure_reason"] = "RESOURCE_PREEMPTED" if item_id else "missing_input"
+                    if item_id and bool(self.humanoid_incident_natural_cfg.get("RESOURCE_PREEMPTED", True)):
+                        self._emit_humanoid_incident(
+                            agent,
+                            "RESOURCE_PREEMPTED",
+                            task=task,
+                            primitive_call_code="PRIMITIVE_IDENTIFY_ITEM",
+                            source="mansim.resource_race",
+                            context={"station": station, "item_id": item_id, "resource": resource_name},
+                        )
+                    return False
+                item_id = popped_item
+                task.payload["item_id"] = item_id
+                task.payload[f"{item_type}_id"] = item_id
+                self._set_humanoid_primitive_hint(agent, "EXECUTE_MACHINE_ACTION")
+                self._set_humanoid_primitive_hint(agent, "GRASP")
+                if not self._set_agent_carrying(agent, item_type, item_id):
+                    if load_slot == "material":
+                        self._appendleft_if_absent(self.material_queues[station], item_id)
+                    else:
+                        self._appendleft_if_absent(self.intermediate_queues[station], item_id)
+                    task.payload.pop("item_id", None)
+                    task.payload.pop(f"{item_type}_id", None)
+                    return False
+                self._set_humanoid_primitive_hint(agent, "LIFT")
+                self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
+                yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, machine.machine_id, task, f"load_machine_{load_slot}_dropoff"):
+                    if load_slot == "material":
+                        self._appendleft_if_absent(self.material_queues[station], item_id)
+                    else:
+                        self._appendleft_if_absent(self.intermediate_queues[station], item_id)
+                    self._clear_agent_carrying(agent, destination=source_queue_id)
+                    return False
+                yield from self._dock_agent_at_target(agent, task, reason=f"load_machine_{load_slot}_dropoff_alignment")
+                self._set_humanoid_primitive_hint(agent, "PLACE")
+                yield self.env.timeout(max(0.0, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.0) or 0.0)))
+                if load_slot == "material":
+                    if machine.input_material is not None:
+                        self._appendleft_if_absent(self.material_queues[station], item_id)
+                        self._clear_agent_carrying(agent, destination=source_queue_id)
+                        return False
+                    machine.input_material = item_id
+                else:
+                    if machine.input_intermediate is not None:
+                        self._appendleft_if_absent(self.intermediate_queues[station], item_id)
+                        self._clear_agent_carrying(agent, destination=source_queue_id)
+                        return False
+                    machine.input_intermediate = item_id
+                self._set_item_state(item_id, ItemState.LOADED_ON_MACHINE, location=f"Station{station}", ref=machine.machine_id, item_type=item_type)
+                machine.setup_ready = False
+                self._clear_agent_carrying(agent, destination=machine.machine_id)
+                self._set_humanoid_primitive_hint(agent, "RELEASE")
+                self._set_humanoid_primitive_hint(agent, "VERIFY_MACHINE_STATE")
+                self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="input_loaded_waiting_setup")
+                return True
+
+            finally:
+                if machine.setup_owner == agent.agent_id:
+                    machine.setup_owner = None
+
         if task_type == "SETUP_MACHINE":
             machine = self.machines[task.payload["machine_id"]]
             station = machine.station
@@ -9496,22 +9803,13 @@ class ManufacturingWorld:
             try:
                 if machine.broken or machine.output_intermediate is not None:
                     return False
-                if machine.state not in {MachineState.WAIT_INPUT, MachineState.SETUP}:
-                    return False
                 requires_intermediate = self._station_requires_intermediate(station)
-                needs_material = machine.input_material is None
-                needs_intermediate = requires_intermediate and machine.input_intermediate is None
-                if not needs_material and not needs_intermediate:
-                    self._set_machine_state(machine, MachineState.IDLE, reason="setup_not_needed")
+                if machine.input_material is None or (requires_intermediate and machine.input_intermediate is None):
+                    return False
+                if machine.setup_ready:
                     return False
 
-                has_reserved_material = bool(task.payload.get("material_id"))
-                has_reserved_intermediate = bool(task.payload.get("intermediate_id")) if requires_intermediate else False
-                if needs_material and not has_reserved_material and not self.material_queues[station]:
-                    return False
-                if needs_intermediate and not has_reserved_intermediate and not self.intermediate_queues[station]:
-                    return False
-
+                self._set_humanoid_primitive_hint(agent, "CHECK_SAFETY_ZONE")
                 self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                 yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
                 if not self._confirm_object_service_tile(agent, machine.machine_id, task, "setup_machine"):
@@ -9540,116 +9838,8 @@ class ManufacturingWorld:
                     location=f"Station{station}",
                     details={"by": agent.agent_id, "task_id": task.task_id, "setup_id": setup_event_id},
                 )
-
-                if needs_material:
-                    material_id = str(task.payload.get("material_id", ""))
-                    if agent.carrying_item_id != material_id:
-                        material_queue_id = f"material_queue_{station}"
-                        self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
-                        yield from self.move_agent(agent, material_queue_id, emit_move_events=True)
-                        if not self._confirm_object_service_tile(agent, material_queue_id, task, "setup_material_pickup"):
-                            self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="material_queue_unreachable")
-                            _close_setup_event("material_queue_unreachable")
-                            return False
-                        yield from self._dock_agent_at_target(agent, task, reason="setup_material_pickup_alignment")
-                        popped_material = self._pop_material_queue(station, material_id or None)
-                        if popped_material is None:
-                            task.payload["failure_reason"] = "RESOURCE_PREEMPTED" if material_id else "missing_material"
-                            if material_id and bool(self.humanoid_incident_natural_cfg.get("RESOURCE_PREEMPTED", True)):
-                                self._emit_humanoid_incident(
-                                    agent,
-                                    "RESOURCE_PREEMPTED",
-                                    task=task,
-                                    primitive_call_code="PRIMITIVE_IDENTIFY_ITEM",
-                                    source="mansim.resource_race",
-                                    context={"station": station, "item_id": material_id, "resource": "material_queue"},
-                                )
-                            self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="missing_material")
-                            _close_setup_event("missing_material")
-                            return False
-                        material_id = popped_material
-                        task.payload["material_id"] = material_id
-                    # One carry slot: load material first.
-                    self._set_humanoid_primitive_hint(agent, "GRASP")
-                    if not self._set_agent_carrying(agent, "material", material_id):
-                        self._appendleft_if_absent(self.material_queues[station], material_id)
-                        task.payload.pop("material_id", None)
-                        self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="carry_failed_material")
-                        _close_setup_event("carry_failed_material")
-                        return False
-                    self._set_humanoid_primitive_hint(agent, "LIFT")
-                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
-                    yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
-                    if not self._confirm_object_service_tile(agent, machine.machine_id, task, "setup_material_load"):
-                        self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="machine_unreachable_material")
-                        _close_setup_event("machine_unreachable_material")
-                        return False
-                    yield from self._dock_agent_at_target(agent, task, reason="setup_material_load_alignment")
-                    self._set_humanoid_primitive_hint(agent, "PLACE")
-                    yield self.env.timeout(setup_step)
-                    machine.input_material = material_id
-                    self._set_item_state(material_id, ItemState.LOADED_ON_MACHINE, location=f"Station{station}", ref=machine.machine_id, item_type="material")
-                    task.payload.pop("material_id", None)
-                    self._clear_agent_carrying(agent, destination=machine.machine_id)
-                    self._set_humanoid_primitive_hint(agent, "RELEASE")
-
-                if needs_intermediate:
-                    intermediate_id = str(task.payload.get("intermediate_id", ""))
-                    if agent.carrying_item_id != intermediate_id:
-                        intermediate_queue_id = f"intermediate_queue_{station}"
-                        self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
-                        yield from self.move_agent(agent, intermediate_queue_id, emit_move_events=True)
-                        if not self._confirm_object_service_tile(agent, intermediate_queue_id, task, "setup_intermediate_pickup"):
-                            self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="intermediate_queue_unreachable")
-                            _close_setup_event("intermediate_queue_unreachable")
-                            return False
-                        yield from self._dock_agent_at_target(agent, task, reason="setup_intermediate_pickup_alignment")
-                        popped_intermediate = self._pop_intermediate_queue(station, intermediate_id or None)
-                        if popped_intermediate is None:
-                            task.payload["failure_reason"] = "RESOURCE_PREEMPTED" if intermediate_id else "missing_intermediate"
-                            if intermediate_id and bool(self.humanoid_incident_natural_cfg.get("RESOURCE_PREEMPTED", True)):
-                                self._emit_humanoid_incident(
-                                    agent,
-                                    "RESOURCE_PREEMPTED",
-                                    task=task,
-                                    primitive_call_code="PRIMITIVE_IDENTIFY_ITEM",
-                                    source="mansim.resource_race",
-                                    context={"station": station, "item_id": intermediate_id, "resource": "intermediate_queue"},
-                                )
-                            self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="missing_intermediate")
-                            _close_setup_event("missing_intermediate")
-                            return False
-                        intermediate_id = popped_intermediate
-                        task.payload["intermediate_id"] = intermediate_id
-                    # Then load intermediate as a separate one-item carry.
-                    self._set_humanoid_primitive_hint(agent, "GRASP")
-                    if not self._set_agent_carrying(agent, "intermediate", intermediate_id):
-                        self._appendleft_if_absent(self.intermediate_queues[station], intermediate_id)
-                        task.payload.pop("intermediate_id", None)
-                        self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="carry_failed_intermediate")
-                        _close_setup_event("carry_failed_intermediate")
-                        return False
-                    self._set_humanoid_primitive_hint(agent, "LIFT")
-                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
-                    yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
-                    if not self._confirm_object_service_tile(agent, machine.machine_id, task, "setup_intermediate_load"):
-                        self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="machine_unreachable_intermediate")
-                        _close_setup_event("machine_unreachable_intermediate")
-                        return False
-                    yield from self._dock_agent_at_target(agent, task, reason="setup_intermediate_load_alignment")
-                    self._set_humanoid_primitive_hint(agent, "PLACE")
-                    yield self.env.timeout(setup_step)
-                    machine.input_intermediate = intermediate_id
-                    self._set_item_state(intermediate_id, ItemState.LOADED_ON_MACHINE, location=f"Station{station}", ref=machine.machine_id, item_type="intermediate")
-                    task.payload.pop("intermediate_id", None)
-                    self._clear_agent_carrying(agent, destination=machine.machine_id)
-                    self._set_humanoid_primitive_hint(agent, "RELEASE")
-
-                if machine.input_material is None or (requires_intermediate and machine.input_intermediate is None):
-                    self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="incomplete_inputs")
-                    _close_setup_event("incomplete_inputs")
-                    return False
-
+                yield self.env.timeout(setup_step)
+                machine.setup_ready = True
                 self._set_machine_state(machine, MachineState.IDLE, reason="setup_completed")
                 self._set_humanoid_primitive_hint(agent, "VERIFY_MACHINE_STATE")
                 _close_setup_event("completed")
@@ -9658,13 +9848,7 @@ class ManufacturingWorld:
             finally:
                 if machine.setup_owner == agent.agent_id:
                     machine.setup_owner = None
-                    if machine.state == MachineState.SETUP and (
-                        machine.input_material is None
-                        or (
-                            self._station_requires_intermediate(station)
-                            and machine.input_intermediate is None
-                        )
-                    ):
+                    if machine.state == MachineState.SETUP and not machine.setup_ready:
                         _close_setup_event("aborted")
                         self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="setup_aborted")
         if task_type == "INSPECT_PRODUCT":
@@ -10039,6 +10223,7 @@ class ManufacturingWorld:
         )
         machine.input_material = None
         machine.input_intermediate = None
+        machine.setup_ready = False
         machine.output_intermediate = output_id
         self._set_item_state(output_id, ItemState.WAITING_MACHINE_UNLOAD, location=f"Station{machine.station}", ref=machine.machine_id, item_type=output_type)
         self._set_machine_state(machine, MachineState.DONE_WAIT_UNLOAD, reason="cycle_completed")
@@ -10063,6 +10248,7 @@ class ManufacturingWorld:
     def abort_machine_cycle(self, machine: Machine, cycle_id: str, reason: str) -> None:
         machine.input_material = None
         machine.input_intermediate = None
+        machine.setup_ready = False
         self._set_machine_state(machine, MachineState.BROKEN if machine.broken else MachineState.WAIT_INPUT, reason=reason)
         self.logger.log(
             t=self.env.now,
@@ -10084,7 +10270,7 @@ class ManufacturingWorld:
         downstream_keys = {"unload_machine", "inter_station_transfer", "inspect_product"}
         reliability_keys = {"repair_machine", "preventive_maintenance"}
         battery_keys = {"battery_swap", "battery_delivery_low_battery", "battery_delivery_discharged"}
-        supply_keys = {"material_supply", "setup_machine"}
+        supply_keys = {"material_supply", "load_machine", "setup_machine"}
 
         for agent_id in sorted(self.agents.keys()):
             completed_counts = self._empty_agent_priority_counter()

@@ -8,6 +8,11 @@ from .shell import render_page_shell
 
 
 PRIMARY_METRICS = [
+    ("Ship Makespan", "makespan_min", "minutes", False, "Elapsed simulated minutes until every ship surface tile reaches COMPLETE."),
+    ("Completed Surface Tiles", "completed_surface_tile_count", "count", True, "Ship exterior tiles that completed welding, surface prep, painting, and inspection."),
+    ("Surface Completion", "surface_tile_completion_ratio", "ratio", True, "Share of ship exterior surface tiles in COMPLETE state."),
+    ("Ship Reworks", "rework_count", "count", False, "Ship surface tile inspection failures that required rework."),
+    ("Ship Quality Pass", "quality_pass_rate", "ratio", True, "Share of ship surface tile inspection attempts that passed."),
     ("Accepted Products", "total_products", "count", True, "Finished products accepted in this run."),
     ("Disposed Scrap", "disposed_scrap_count", "count", True, "Inspection-fail products delivered to ScrapDisposal."),
     ("Shelf Materials", "warehouse_material_shelf_count", "count", True, "Material items currently available on the shared warehouse shelf."),
@@ -48,6 +53,7 @@ PRIMARY_METRICS = [
 
 PRIMARY_METRIC_LOOKUP = {key: (label, key, kind, higher_is_better, description) for (label, key, kind, higher_is_better, description) in PRIMARY_METRICS}
 METRIC_GROUPS = {
+    "shipyard": ["makespan_min", "completed_surface_tile_count", "surface_tile_completion_ratio", "rework_count", "quality_pass_rate"],
     "item": ["total_products", "disposed_scrap_count", "warehouse_material_shelf_count", "downstream_closure_ratio", "throughput_per_sim_hour", "completed_product_lead_time_avg_min"],
     "machine": ["machine_utilization", "machine_broken_ratio", "machine_pm_ratio", "wall_clock_sec"],
     "worker": ["humanoid_execution_ratio_avg", "humanoid_blocked_ratio_avg", "humanoid_unavailable_ratio_avg", "worker_local_response_total", "commitment_dispatch_total"],
@@ -119,6 +125,12 @@ def _format_metric(value: float, kind: str) -> str:
     if kind == "float":
         return f"{value:.2f}"
     return f"{int(round(value))}"
+
+
+def _format_metric_value(raw_value: Any, kind: str) -> str:
+    if raw_value is None or raw_value == "":
+        return "pending" if kind == "minutes" else "-"
+    return _format_metric(_safe_float(raw_value), kind)
 
 
 def _format_ratio_percent(value: float) -> str:
@@ -224,9 +236,9 @@ def _summary_cards(kpi: dict[str, Any], metric_keys: list[str] | None = None) ->
         if metric is None:
             continue
         label, key, kind, _higher_is_better, description = metric
-        value = _safe_float(kpi.get(key))
+        raw_value = kpi.get(key)
         cards.append(
-            f"<div class='card'><div class='label'>{html.escape(label)}</div><div class='value'>{html.escape(_format_metric(value, kind))}</div><div class='sub'>{html.escape(description)}</div></div>"
+            f"<div class='card'><div class='label'>{html.escape(label)}</div><div class='value'>{html.escape(_format_metric_value(raw_value, kind))}</div><div class='sub'>{html.escape(description)}</div></div>"
         )
     return "<div class='grid cards-4'>" + "".join(cards) + "</div>"
 
@@ -480,6 +492,8 @@ def export_kpi_dashboard(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     dashboard_path = output_dir / "kpi_dashboard.html"
+    scenario_type = str(kpi.get("scenario_type", "")).strip()
+    is_shipyard = scenario_type == "shipyard_basic"
 
     days = [int(d["day"]) for d in daily_summary]
     daily_products = [float(d.get("products", 0.0) or 0.0) for d in daily_summary]
@@ -579,9 +593,20 @@ def export_kpi_dashboard(
         include_plotlyjs = False
 
     products_fig = go.Figure()
-    products_fig.add_trace(go.Bar(name="Products", x=days, y=daily_products, text=[f"{value:.0f}" for value in daily_products], textposition="outside", marker_color="#1d4e89"))
+    product_trace_name = "Surface Tiles" if is_shipyard else "Products"
+    product_panel_title = "Daily Surface Tiles" if is_shipyard else "Daily Products"
+    products_fig.add_trace(
+        go.Bar(
+            name=product_trace_name,
+            x=days,
+            y=daily_products,
+            text=[f"{value:.0f}" for value in daily_products],
+            textposition="outside",
+            marker_color="#1d4e89",
+        )
+    )
     _common_layout(products_fig, y_title="Count", x_title="Day")
-    _add_panel("daily_products", "Daily Products", products_fig)
+    _add_panel("daily_products", product_panel_title, products_fig)
 
     scrap_rate_fig = go.Figure()
     scrap_rate_fig.add_trace(
@@ -1042,9 +1067,9 @@ def export_kpi_dashboard(
     if isinstance(current_run, dict):
         subtitle = f"Quantitative view for {str(current_run.get('label', current_run_id or 'selected run'))}. KPI cards and tables stay fixed above the charts, and the charts are split by topic so each one has its own legend."
     item_section = _group_section(
-        "Item Metrics",
-        "Production outcome, downstream closure, item flow, and queue waiting time.",
-        _summary_cards(kpi, METRIC_GROUPS["item"]),
+        "Shipyard Surface Metrics" if is_shipyard else "Item Metrics",
+        "Ship exterior surface-tile completion, rework, quality, and makespan." if is_shipyard else "Production outcome, downstream closure, item flow, and queue waiting time.",
+        _summary_cards(kpi, METRIC_GROUPS["shipyard"] if is_shipyard else METRIC_GROUPS["item"]),
         "<div class='grid cards-2'>"
         + panel_figures["daily_products"]
         + panel_figures["daily_scrap_rate"]

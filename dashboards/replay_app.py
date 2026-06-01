@@ -1504,7 +1504,7 @@ def _draw_factory_map(
     # Agents
     if not agent_df.empty:
         offsets = [(-0.18, -0.18), (0.18, -0.18), (-0.18, 0.18), (0.18, 0.18), (0.0, 0.0), (0.0, 0.28)]
-        machine_adjacent_tasks = {"UNLOAD_MACHINE", "SETUP_MACHINE", "PREVENTIVE_MAINTENANCE", "REPAIR_MACHINE"}
+        machine_adjacent_tasks = {"LOAD_MACHINE", "UNLOAD_MACHINE", "SETUP_MACHINE", "PREVENTIVE_MAINTENANCE", "REPAIR_MACHINE"}
         machine_adjacent_offsets = [(0.11, 0.0), (0.11, 0.07), (0.11, -0.07), (0.03, 0.1), (0.03, -0.1)]
         # Keep battery-swap sender/receiver visually attached in the same zone.
         battery_pair_anchor: dict[tuple[str, str], tuple[float, float]] = {}
@@ -2118,6 +2118,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 

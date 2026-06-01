@@ -7,19 +7,39 @@ mode: rolling_horizon_dedicated_roles
 rolling_horizon:
   window_min: 5.0
   dispatch_policy: dedicated_role_aging_priority
-  worker_task_priority:
-    A1:
-      - REPLENISH_MATERIAL
-    A2:
-      - REPAIR_MACHINE
-      - SETUP_MACHINE
-      - UNLOAD_MACHINE
-    A3:
-      - MANAGE_ROBOT_POWER
-      - TRANSFER
-      - INSPECT_PRODUCT
-      - COLLECT_WASTE_OR_SCRAP
-      - PREVENTIVE_MAINTENANCE
+  scenario_worker_task_priority:
+    factory_mfg_basic:
+      A1:
+        - REPLENISH_MATERIAL
+      A2:
+        - REPAIR_MACHINE
+        - LOAD_MACHINE
+        - SETUP_MACHINE
+        - UNLOAD_MACHINE
+      A3:
+        - MANAGE_ROBOT_POWER
+        - TRANSFER
+        - INSPECT_PRODUCT
+        - COLLECT_WASTE_OR_SCRAP
+        - PREVENTIVE_MAINTENANCE
+    shipyard_basic:
+      A1:
+        - OPERATE_VEHICLE_TRANSPORT
+        - TRANSFER
+        - WELD_SEAM
+        - MANAGE_ROBOT_POWER
+      A2:
+        - WELD_SEAM
+        - PREPARE_SURFACE
+      A3:
+        - OPERATE_VEHICLE_TRANSPORT
+        - TRANSFER
+        - PAINT_SURFACE
+        - VERIFY_SHIP_SECTION
+        - MANAGE_ROBOT_POWER
+        - COLLECT_WASTE_OR_SCRAP
+  # Backward-compatible fallback for older scenario configs.
+  worker_task_priority: {}
   aging:
     rank_boost_per_window: 1
 

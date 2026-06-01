@@ -740,7 +740,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     function workerMachineTarget(worker) {
       if (!(worker.activeTask && worker.activeTask.task_type)) return "";
       const taskType = String(worker.activeTask.task_type).toUpperCase();
-      if (!new Set(["UNLOAD_MACHINE", "SETUP_MACHINE", "PREVENTIVE_MAINTENANCE", "REPAIR_MACHINE"]).has(taskType)) return "";
+      if (!new Set(["LOAD_MACHINE", "UNLOAD_MACHINE", "SETUP_MACHINE", "PREVENTIVE_MAINTENANCE", "REPAIR_MACHINE"]).has(taskType)) return "";
       return String(worker.activeTask.payload.machine_id || worker.activeTask.target || "");
     }
     function workerPlacementKind(worker) {

@@ -154,6 +154,8 @@ export function machineProcessProgress(entity: BaseEntityState, currentTime: num
 export function itemColor(itemType: string): string {
   const normalized = itemType.toLowerCase();
   if (normalized.includes("battery")) return "#ffd166";
+  if (normalized.includes("paint")) return "#d2529f";
+  if (normalized.includes("weld") || normalized.includes("wire")) return "#f59e0b";
   if (normalized.includes("product")) return "#63d471";
   if (normalized.includes("intermediate") || normalized.includes("transfer")) return "#69d2e7";
   if (normalized.includes("material")) return "#75a7ff";

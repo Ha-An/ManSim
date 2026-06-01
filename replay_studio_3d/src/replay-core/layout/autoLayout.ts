@@ -22,6 +22,15 @@ const typeAnchors: Record<EntityType, { x: number; y: number }> = {
   transporter: { x: 320, y: 660 },
   order: { x: 860, y: 140 },
   task: { x: 860, y: 240 },
+  ship_hull: { x: 600, y: 360 },
+  ship_hull_segment: { x: 600, y: 360 },
+  ship_work_tile: { x: 600, y: 360 },
+  ship_section: { x: 600, y: 360 },
+  tool_rack: { x: 180, y: 160 },
+  material_rack: { x: 920, y: 160 },
+  paint_rack: { x: 980, y: 320 },
+  cart: { x: 500, y: 660 },
+  cart_parking_spot: { x: 500, y: 600 },
 };
 
 export function buildAutoLayout(entities: BaseEntityState[]): LayoutConfig {

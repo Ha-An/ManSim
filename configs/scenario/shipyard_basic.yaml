@@ -1,0 +1,72 @@
+# Shipyard v1 scenario.
+# A fixed ship silhouette sits in the center of a 100x70 tile map. Humanoids
+# repair exterior surface tiles; each tile goes through welding, surface
+# preparation, painting, and inspection.
+name: shipyard_basic
+type: shipyard_basic
+
+horizon:
+  num_days: 5
+  minutes_per_day: 240
+
+factory:
+  num_workers: 3
+  machines_per_station: 0
+
+map:
+  enabled: true
+  width_tiles: 100
+  height_tiles: 70
+  tile_time_min: 0.12
+
+movement:
+  default_min: 4.0
+  to_battery_station_min: 5.0
+  traffic:
+    enabled: true
+    mode: strict_reservation
+
+worker:
+  battery_swap_period_min: 240
+  battery_pickup_time_min: 4
+  battery_delivery_extra_min: 3
+
+quality:
+  defect_prob: 0.08
+
+dispatcher:
+  snapshot_interval_min: 1
+
+shipyard:
+  layout:
+    zones:
+      ShipDock: {x: 12, y: 9, w: 76, h: 46}
+      BatteryZone: {x: 4, y: 54, w: 16, h: 10}
+      PaintSupply: {x: 4, y: 5, w: 18, h: 8}
+      MaterialYard: {x: 78, y: 5, w: 18, h: 10}
+      ScrapArea: {x: 82, y: 54, w: 14, h: 10}
+  logistics:
+    cart_count: 2
+    cart_capacity: 20
+    cart_footprint_tiles: 2
+    cart_lane_width_tiles: 2
+    parking_spot_count: 6
+    cart_load_model: single_item_type
+  surface_tiles:
+    center: {x: 50, y: 32}
+    length_tiles: 62
+    beam_tiles: 24
+    target_count: 120
+  operations:
+    OPERATE_VEHICLE_TRANSPORT:
+      default_min: 0.8
+    TRANSFER:
+      default_min: 0.35
+    WELD_SEAM:
+      default_min: 1.0
+    PREPARE_SURFACE:
+      default_min: 0.5
+    PAINT_SURFACE:
+      default_min: 0.8
+    VERIFY_SHIP_SECTION:
+      default_min: 0.4
