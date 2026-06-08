@@ -19,6 +19,16 @@ class ShipWorkTileLayout:
 class CartParkingSpotLayout:
     parking_spot_id: str
     tile: Tile
+    heading: Tile = (0, 1)
+
+    @property
+    def cargo_tile(self) -> Tile:
+        return (self.tile[0] + self.heading[0], self.tile[1] + self.heading[1])
+
+    @property
+    def footprint_tiles(self) -> tuple[Tile, ...]:
+        cargo_tile = self.cargo_tile
+        return (self.tile,) if cargo_tile == self.tile else (self.tile, cargo_tile)
 
 
 class ShipyardTileGridMap:
@@ -328,21 +338,49 @@ class ShipyardTileGridMap:
             # only the junction where the source spur meets the hull ring.
             cart_source_tiles[source_name] = source_center
 
+        span_x = max(1, right - left)
+        quarter_x = left + span_x // 4
+        mid_x = (left + right) // 2
+        three_quarter_x = right - span_x // 4
         candidate_spots = [
-            (left, top + lane_width // 2),
-            ((left + right) // 2, top + lane_width // 2),
-            (right, top + lane_width // 2),
-            (left, bottom - lane_width // 2),
-            ((left + right) // 2, bottom - lane_width // 2),
-            (right, bottom - lane_width // 2),
+            ((quarter_x, top), (0, -1)),
+            ((mid_x, top), (0, -1)),
+            ((three_quarter_x, top), (0, -1)),
+            ((quarter_x, bottom), (0, 1)),
+            ((mid_x, bottom), (0, 1)),
+            ((three_quarter_x, bottom), (0, 1)),
         ]
         spots: dict[str, CartParkingSpotLayout] = {}
-        for index, candidate in enumerate(candidate_spots[:parking_count], start=1):
-            if candidate not in route:
-                route.add(candidate)
+        reserved_parking_tiles: set[Tile] = set()
+        for index, (route_anchor, heading) in enumerate(candidate_spots[:parking_count], start=1):
             parking_id = f"CART-PARK-{index:02d}"
-            spots[parking_id] = CartParkingSpotLayout(parking_spot_id=parking_id, tile=candidate)
+            anchor = (route_anchor[0] + heading[0], route_anchor[1] + heading[1])
+            spot = CartParkingSpotLayout(parking_spot_id=parking_id, tile=anchor, heading=heading)
+            if (
+                not all(0 <= tile[0] < width and 0 <= tile[1] < height for tile in spot.footprint_tiles)
+                or set(spot.footprint_tiles).intersection(hull_tiles)
+                or set(spot.footprint_tiles).intersection(reserved_parking_tiles)
+            ):
+                fallback_heading = cls._cart_parking_heading(route_anchor, route, reserved_parking_tiles)
+                spot = CartParkingSpotLayout(parking_spot_id=parking_id, tile=route_anchor, heading=fallback_heading)
+                route.update(spot.footprint_tiles)
+            reserved_parking_tiles.update(spot.footprint_tiles)
+            spots[parking_id] = spot
         return route - hull_tiles, spots, cart_source_tiles
+
+    @staticmethod
+    def _cart_parking_heading(candidate: Tile, route: set[Tile], reserved_tiles: set[Tile]) -> Tile:
+        x, y = candidate
+        preferred = ((1, 0), (-1, 0), (0, 1), (0, -1))
+        for heading in preferred:
+            cargo_tile = (x + heading[0], y + heading[1])
+            if cargo_tile in route and cargo_tile not in reserved_tiles:
+                return heading
+        for heading in preferred:
+            cargo_tile = (x + heading[0], y + heading[1])
+            if cargo_tile in route:
+                return heading
+        return (0, 1)
 
     @staticmethod
     def _zone_door_tiles(zones: dict[str, ZoneRect], width: int, height: int) -> set[Tile]:
@@ -521,8 +559,11 @@ class ShipyardTileGridMap:
     def cart_source_tile(self, source: str) -> Tile | None:
         return self.cart_source_tiles.get(str(source))
 
+    def cart_parking_tiles(self) -> set[Tile]:
+        return {tile for spot in self.cart_parking_spots.values() for tile in spot.footprint_tiles}
+
     def find_cart_route_path(self, start: Tile, goal: Tile, blocked_tiles: set[Tile] | None = None, footprint_tiles: int = 1) -> list[Tile]:
-        allowed = set(self.cart_route_tiles) | {spot.tile for spot in self.cart_parking_spots.values()} | set(self.cart_source_tiles.values())
+        allowed = set(self.cart_route_tiles) | self.cart_parking_tiles() | set(self.cart_source_tiles.values())
         blocked = set(blocked_tiles or set()) - {start}
 
         def step_heading(source: Tile, target: Tile) -> Tile:
@@ -656,21 +697,12 @@ class ShipyardTileGridMap:
                     "tile": self.tile_payload(tile),
                 }
             )
-        for spot in self.cart_parking_spots.values():
-            nodes.append(
-                {
-                    "entity_id": spot.parking_spot_id,
-                    "entity_type": "cart_parking_spot",
-                    "region_id": self.REGION_ID["ShipDock"],
-                    "position": self.tile_to_position(spot.tile),
-                    "tile": self.tile_payload(spot.tile),
-                    "footprint": {"x": spot.tile[0], "y": spot.tile[1], "width": 1, "height": 1},
-                    "attributes": {"parking_spot_id": spot.parking_spot_id, "kind": "cart_parking"},
-                }
-            )
         for index in range(1, self.cart_count + 1):
             cart_id = f"CART-{index:02d}"
             tile = self.initial_cart_tile(cart_id)
+            parking_spot = next((spot for spot in self.cart_parking_spots.values() if spot.tile == tile), None)
+            heading = parking_spot.heading if parking_spot is not None else (0, 1)
+            footprint_tiles = parking_spot.footprint_tiles if parking_spot is not None else (tile, (tile[0] + heading[0], tile[1] + heading[1]))
             nodes.append(
                 {
                     "entity_id": cart_id,
@@ -684,6 +716,11 @@ class ShipyardTileGridMap:
                         "inventory_kind": "",
                         "inventory_count": 0,
                         "reserved_count": 0,
+                        "parking_spot_id": parking_spot.parking_spot_id if parking_spot is not None else "",
+                        "cockpit_tile": self.tile_payload(tile),
+                        "cargo_tile": self.tile_payload(footprint_tiles[1] if len(footprint_tiles) > 1 else None),
+                        "heading": {"x": int(heading[0]), "y": int(heading[1])},
+                        "footprint_tiles": self.path_payload(footprint_tiles),
                     },
                 }
             )
@@ -699,7 +736,7 @@ class ShipyardTileGridMap:
                 "walls": self.path_payload(sorted(self.walls)),
                 "doors": self.path_payload(sorted(self.doors)),
                 "cart_route_tiles": self.path_payload(sorted(self.cart_route_tiles)),
-                "cart_parking_tiles": self.path_payload(spot.tile for spot in self.cart_parking_spots.values()),
+                "cart_parking_tiles": self.path_payload(sorted(self.cart_parking_tiles())),
                 "object_footprints": [
                     {
                         "object_id": obj.object_id,

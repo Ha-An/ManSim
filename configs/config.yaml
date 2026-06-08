@@ -1,7 +1,7 @@
 # ManSim vNext root config (Hydra)
 # Override with `decision=...`, `scenario=...`, or dotted Hydra keys.
 defaults:
-  - scenario: mfg_basic
+  - scenario: factory_mfg_basic
   # Decision modes:
   # - fixed_priority: fixed scripted baseline
   # - adaptive_priority: adaptive scripted baseline

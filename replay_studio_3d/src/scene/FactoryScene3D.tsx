@@ -159,8 +159,8 @@ function GridShell({ renderModel, mapper }: { renderModel: ReplayRenderModel; ma
         return <Block key={`cart-route:${index}`} position={[center.x, center.y, center.z]} size={[1, 0.1, 1]} color="#38bdf8" opacity={0.82} />;
       })}
       {(grid?.cart_parking_tiles ?? []).map((tile, index) => {
-        const center = mapper.tileCenterToWorld({ x: tile.x + 0.5, y: tile.y + 0.5 }, 0.1);
-        return <Block key={`cart-parking:${index}`} position={[center.x, center.y, center.z]} size={[0.92, 0.14, 0.92]} color="#facc15" opacity={0.9} />;
+        const center = mapper.tileCenterToWorld({ x: tile.x + 0.5, y: tile.y + 0.5 }, 0.055);
+        return <Block key={`cart-parking:${index}`} position={[center.x, center.y, center.z]} size={[0.96, 0.04, 0.96]} color="#facc15" opacity={0.86} />;
       })}
       {wallTiles.map((tile, index) => {
         const height = tile.kind === "low" ? 0.7 : 1.4;
@@ -967,7 +967,6 @@ function EntityModels({
           node.entity.entity_type === "ship_hull_segment" ||
           node.entity.entity_type === "ship_section" ||
           node.entity.entity_type === "ship_work_tile" ||
-          node.entity.entity_type === "cart_parking_spot" ||
           node.entity.entity_type === "tool_rack" ||
           node.entity.entity_type === "material_rack" ||
           node.entity.entity_type === "paint_rack" ||

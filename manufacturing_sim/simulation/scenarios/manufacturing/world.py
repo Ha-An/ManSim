@@ -55,31 +55,21 @@ TASK_ID_PREFIX_BY_TASK_CODE: dict[str, str] = {
     "COLLECT_WASTE_OR_SCRAP": "SCRAP",
 }
 
-_SCENARIO_ALIASES = {
-    "": "factory_mfg_basic",
-    "mfg_basic": "factory_mfg_basic",
-    "manufacturing": "factory_mfg_basic",
-    "factory": "factory_mfg_basic",
+_SUPPORTED_SCENARIO_KEYS = {
     "factory_mfg_basic": "factory_mfg_basic",
-    "shipyard": "shipyard_basic",
     "shipyard_basic": "shipyard_basic",
 }
 
 
 def _normalized_scenario_key(cfg: dict[str, Any]) -> str:
     raw = str(cfg.get("scenario_type") or cfg.get("type") or cfg.get("name") or "factory_mfg_basic").strip().lower()
-    return _SCENARIO_ALIASES.get(raw, raw)
+    return _SUPPORTED_SCENARIO_KEYS.get(raw, raw)
 
 
 def _scenario_entry(mapping: Any, scenario_key: str) -> Any:
     if not isinstance(mapping, dict):
         return None
-    candidates = [
-        scenario_key,
-        "mfg_basic" if scenario_key == "factory_mfg_basic" else "",
-        "factory" if scenario_key == "factory_mfg_basic" else "",
-        "shipyard" if scenario_key == "shipyard_basic" else "",
-    ]
+    candidates = [scenario_key]
     for key in candidates:
         if key and key in mapping:
             return mapping[key]
@@ -219,6 +209,15 @@ class ManufacturingWorld:
         self.pm_interval_target_min = float(self.machine_failure_cfg["pm_interval_target_min"])
 
         self.battery_swap_period_min = float(self.agent_cfg["battery_swap_period_min"])
+        battery_drain_cfg = self.agent_cfg.get("battery_drain", {}) if isinstance(self.agent_cfg.get("battery_drain", {}), dict) else {}
+        self.battery_available_rate_multiplier = max(
+            0.0,
+            float(battery_drain_cfg.get("available_rate_multiplier", 1.0) or 1.0),
+        )
+        self.battery_non_available_rate_multiplier = max(
+            0.0,
+            float(battery_drain_cfg.get("non_available_rate_multiplier", 2.0) or 2.0),
+        )
 
         self.current_day = 1
         self.current_strategy = StrategyState()
@@ -451,6 +450,34 @@ class ManufacturingWorld:
             0,
             int(aging_cfg.get("rank_boost_per_window", 1) or 1),
         )
+        immediate_cfg = (
+            rolling_cfg.get("immediate_task_triggers", {})
+            if isinstance(rolling_cfg.get("immediate_task_triggers", {}), dict)
+            else {}
+        )
+        self.rolling_horizon_immediate_triggers_enabled = bool(immediate_cfg.get("enabled", False))
+        self.rolling_horizon_immediate_queue_policy = (
+            str(immediate_cfg.get("queue_policy", "pool_only")).strip().lower() or "pool_only"
+        )
+        self.rolling_horizon_immediate_protect_from_window_requeue = bool(
+            immediate_cfg.get("protect_from_window_requeue", self.rolling_horizon_immediate_queue_policy == "next_after_current")
+        )
+        default_immediate_task_codes = {
+            "worker_low_battery": ["MANAGE_ROBOT_POWER"],
+            "machine_broken": ["REPAIR_MACHINE"],
+        }
+        raw_immediate_task_codes = immediate_cfg.get("event_task_codes", default_immediate_task_codes)
+        if not isinstance(raw_immediate_task_codes, dict):
+            raw_immediate_task_codes = default_immediate_task_codes
+        self.rolling_horizon_immediate_event_task_codes: dict[str, set[str]] = {}
+        for event_name, values in raw_immediate_task_codes.items():
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, list):
+                continue
+            codes = {str(value or "").strip().upper() for value in values if str(value or "").strip()}
+            if codes:
+                self.rolling_horizon_immediate_event_task_codes[str(event_name or "").strip().lower()] = codes
 
         self.rolling_horizon_window_index = 0
         self.rolling_horizon_window_start_min = 0.0
@@ -468,6 +495,7 @@ class ManufacturingWorld:
             "empty_window_count": 0,
             "requeued_task_count": 0,
             "max_worker_queue_length": 0,
+            "immediate_dispatched_task_count": 0,
         }
         self.rolling_horizon_max_queue_length_by_worker: dict[str, int] = defaultdict(int)
         self.rolling_horizon_dedicated_role_metrics: dict[str, Any] = {
@@ -708,30 +736,44 @@ class ManufacturingWorld:
             "under_pm": 0,
         }
 
+    def _observed_machine_state(self, machine: Machine) -> MachineState:
+        """Return the state dashboards/KPIs should observe for transient repair.
+
+        The domain keeps ``machine.broken`` true while repair work is active so
+        downstream logic still knows the machine cannot process. For monitoring,
+        KPI, and replay snapshots, a machine with an active repair team should
+        be counted as UNDER_REPAIR instead of BROKEN.
+        """
+        if machine.state == MachineState.BROKEN and self._repair_team_size(machine) > 0:
+            return MachineState.UNDER_REPAIR
+        return machine.state
+
     def _machine_state_bucket(self, machine: Machine) -> str:
-        if machine.state == MachineState.PROCESSING:
+        observed_state = self._observed_machine_state(machine)
+        if observed_state == MachineState.PROCESSING:
             return "processing"
-        if machine.state == MachineState.DONE_WAIT_UNLOAD:
+        if observed_state == MachineState.DONE_WAIT_UNLOAD:
             return "finished_wait_unload"
-        if machine.state == MachineState.BROKEN:
+        if observed_state == MachineState.BROKEN:
             return "broken"
-        if machine.state == MachineState.UNDER_REPAIR:
+        if observed_state == MachineState.UNDER_REPAIR:
             return "under_repair"
-        if machine.state == MachineState.UNDER_PM:
+        if observed_state == MachineState.UNDER_PM:
             return "under_pm"
         return "wait_input"
 
     def _machine_wait_reasons(self, machine: Machine) -> list[str]:
         reasons: list[str] = []
-        if machine.state == MachineState.BROKEN:
+        observed_state = self._observed_machine_state(machine)
+        if observed_state == MachineState.BROKEN:
             reasons.append("broken")
-        if machine.state == MachineState.UNDER_REPAIR:
+        if observed_state == MachineState.UNDER_REPAIR:
             reasons.append("under_repair")
-        if machine.state == MachineState.UNDER_PM:
+        if observed_state == MachineState.UNDER_PM:
             reasons.append("under_pm")
-        if machine.output_intermediate is not None or machine.state == MachineState.DONE_WAIT_UNLOAD:
+        if machine.output_intermediate is not None or observed_state == MachineState.DONE_WAIT_UNLOAD:
             reasons.append("waiting_unload")
-        if machine.state == MachineState.WAIT_INPUT:
+        if observed_state == MachineState.WAIT_INPUT:
             has_material = machine.input_material is not None or len(self.material_queues[machine.station]) > 0
             if not has_material:
                 reasons.append("missing_material")
@@ -772,7 +814,7 @@ class ManufacturingWorld:
             by_id[machine_id] = {
                 "station": f"Station{machine.station}",
                 "station_index": int(machine.station),
-                "state": machine.state.value,
+                "state": self._observed_machine_state(machine).value,
                 "broken": bool(machine.broken),
                 "has_output_waiting_unload": bool(machine.output_intermediate is not None),
                 "material_available_now": bool(machine.input_material is not None or len(self.material_queues[machine.station]) > 0),
@@ -958,7 +1000,7 @@ class ManufacturingWorld:
             "trends": self._observation_trends(),
             # 규칙 기반 planner와 일부 로깅 경로가 아직 참조하는 호환 필드다. LLM 프롬프트에는 별도 compact view만 전달된다.
             "inspection_backlog": queues["inspection"]["inspection_input"],
-            "machine_states": {mid: machine.state.value for mid, machine in self.machines.items()},
+            "machine_states": {mid: self._observed_machine_state(machine).value for mid, machine in self.machines.items()},
             "last_day_machine_breaks": int(recent_history["last_day_machine_breakdowns"]),
             "last_day_scrap_rate": float(recent_history["last_day_scrap_rate"]),
             "commitments": commitments,
@@ -1504,13 +1546,17 @@ class ManufacturingWorld:
 
     def _end_battery_swap_wait(self, target_agent: Agent, from_agent_id: str) -> None:
         """Clear the receiver-side wait marker after delivery, cancel, or retry."""
-        if target_agent.awaiting_battery_from == str(from_agent_id):
-            target_agent.awaiting_battery_from = None
+        was_waiting_for_sender = target_agent.awaiting_battery_from == str(from_agent_id)
         current_state = self._humanoid_state_payload(target_agent)
         current_reason = current_state.get("reason") if isinstance(current_state.get("reason"), dict) else {}
-        if (
+        was_wait_state = (
             str(current_state.get("availability", "")).upper() == "WAITING"
             and str(current_reason.get("code", "")).lower() == "battery_swap_wait"
+        )
+        if was_waiting_for_sender:
+            target_agent.awaiting_battery_from = None
+        if (
+            was_wait_state
             and not target_agent.discharged
         ):
             self._transition_humanoid_state(
@@ -1520,6 +1566,8 @@ class ManufacturingWorld:
                 source="mansim.power",
                 metadata={"cargo_present": False, "from_agent_id": str(from_agent_id)},
             )
+        if not was_waiting_for_sender and not was_wait_state:
+            return
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -1819,6 +1867,7 @@ class ManufacturingWorld:
         conflicts = self.traffic_monitor.begin_segment(segment)
         recovery_requested = self._log_traffic_conflicts(agent, conflicts)
         if self.traffic_emit_tile_step_events:
+            self._update_battery_accounting(agent, started_at)
             self.logger.log(
                 t=started_at,
                 day=self.day_for_time(started_at),
@@ -1834,6 +1883,7 @@ class ManufacturingWorld:
                     "started_at": round(float(started_at), 3),
                     "ended_at": round(float(ended_at), 3),
                     "humanoid_state": self._humanoid_state_payload(agent),
+                    "battery_remaining_min": round(float(self.battery_remaining(agent)), 3),
                 },
             )
         return recovery_requested
@@ -1852,6 +1902,7 @@ class ManufacturingWorld:
         if self.traffic_monitor is not None:
             self.traffic_monitor.end_segment(agent.agent_id, move_id, segment_index, ended_at=float(ended_at))
         if self.traffic_emit_tile_step_events:
+            self._update_battery_accounting(agent, ended_at)
             self.logger.log(
                 t=ended_at,
                 day=self.day_for_time(ended_at),
@@ -1866,6 +1917,7 @@ class ManufacturingWorld:
                     "logical_destination": logical_destination,
                     "ended_at": round(float(ended_at), 3),
                     "humanoid_state": self._humanoid_state_payload(agent),
+                    "battery_remaining_min": round(float(self.battery_remaining(agent)), 3),
                 },
             )
 
@@ -1938,7 +1990,7 @@ class ManufacturingWorld:
                 "warehouse_material_shelf_capacity": self.material_shelf_capacity,
                 "inspection_scrap_queue_length": len(self.inspection_scrap_queue),
                 "disposed_scrap_count": int(self.disposed_scrap_count),
-                "machine_states": {mid: m.state.value for mid, m in self.machines.items()},
+                "machine_states": {mid: self._observed_machine_state(m).value for mid, m in self.machines.items()},
                 "worker_tiles": {
                     worker_id: self._tile_payload(worker.tile)
                     for worker_id, worker in self.workers.items()
@@ -1967,6 +2019,7 @@ class ManufacturingWorld:
         status: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        self._update_battery_accounting(worker)
         runtime = getattr(self, "humanoid_runtime", None)
         if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "transition_state"):
             runtime.transition_state(
@@ -2006,6 +2059,7 @@ class ManufacturingWorld:
         )
 
     def _apply_humanoid_transition_event(self, worker: Worker, transition_event: Any) -> None:
+        self._update_battery_accounting(worker)
         runtime = getattr(self, "humanoid_runtime", None)
         if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "apply_transition_event"):
             runtime.apply_transition_event(worker, transition_event)
@@ -2047,6 +2101,19 @@ class ManufacturingWorld:
             location=self.worker_display_location(worker),
             details=details,
         )
+
+    def log_periodic_worker_state_observations(self, *, reason: str = "snapshot_tick") -> None:
+        """Emit passive worker snapshots so Replay panels stay current while idle.
+
+        Battery accounting is intentionally lazy: the budget is reduced whenever a
+        worker snapshot is requested. AVAILABLE workers can otherwise sit without
+        task or motion events for long spans, leaving the Replay side panel on an
+        old battery value even though the simulated battery has continued to drain.
+        """
+        if self.terminated or self.logger.closed:
+            return
+        for worker in self.workers.values():
+            self._log_worker_state_observation(worker, reason=reason)
 
     def _set_humanoid_for_task(self, worker: Worker, task: Task | None, *, reason: str, task_id: str | None = None) -> None:
         if worker.discharged:
@@ -2250,11 +2317,20 @@ class ManufacturingWorld:
     def _humanoid_state_payload(self, worker: Worker) -> dict[str, Any]:
         runtime = getattr(self, "humanoid_runtime", None)
         if runtime is not None and getattr(runtime, "enabled", False) and hasattr(runtime, "state_payload"):
-            return runtime.state_payload(worker)
-        if not isinstance(worker.humanoid_state, dict) or not worker.humanoid_state:
-            worker.humanoid_state = default_humanoid_state_payload(worker.worker_id)
-        worker.humanoid_state["humanoid_id"] = worker.worker_id
-        return copy.deepcopy(worker.humanoid_state)
+            payload = runtime.state_payload(worker)
+        else:
+            if not isinstance(worker.humanoid_state, dict) or not worker.humanoid_state:
+                worker.humanoid_state = default_humanoid_state_payload(worker.worker_id)
+            worker.humanoid_state["humanoid_id"] = worker.worker_id
+            payload = copy.deepcopy(worker.humanoid_state)
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        metadata["battery_remaining_min"] = round(float(self.battery_remaining(worker)), 3)
+        metadata["battery_period_min"] = round(float(getattr(self, "battery_swap_period_min", 0.0) or 0.0), 3)
+        metadata["low_threshold_ratio"] = round(float(getattr(self, "rolling_horizon_battery_low_ratio", 0.0) or 0.0), 3)
+        payload["metadata"] = metadata
+        payload["humanoid_id"] = worker.worker_id
+        payload["timestamp_s"] = round(float(self.env.now), 3)
+        return payload
 
     def _worker_cargo_payload(self, worker: Worker) -> dict[str, Any]:
         session = self._transport_session_for_worker(worker)
@@ -3129,21 +3205,68 @@ class ManufacturingWorld:
         )
         self._set_worker_cargo(agent, None, None, destination=destination)
 
+    @staticmethod
+    def _reserved_item_ids_from_payload(payload: dict[str, Any] | None) -> set[str]:
+        if not isinstance(payload, dict):
+            return set()
+        ids: set[str] = set()
+        scalar_keys = (
+            "item_id",
+            "material_id",
+            "intermediate_id",
+            "transfer_item_id",
+            "material_item_id",
+            "transfer_intermediate_id",
+            "inspection_product_id",
+            "scrap_item_id",
+        )
+        list_keys = ("item_ids", "_reserved_item_ids")
+        for key in scalar_keys:
+            value = str(payload.get(key, "") or "").strip()
+            if value:
+                ids.add(value)
+        for key in list_keys:
+            values = payload.get(key)
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                item_id = str(value or "").strip()
+                if item_id:
+                    ids.add(item_id)
+        return ids
+
+    def _active_task_reserved_item_ids(self, *, exclude_task_id: str = "") -> set[str]:
+        """Items already committed to a running worker task.
+
+        Rolling-horizon queues can be re-scanned while another worker is still
+        executing a task whose concrete item has not yet left its source queue.
+        Treat that active task payload as a reservation so another opportunity
+        cannot briefly claim the same item before the stale check catches up.
+        """
+        excluded_task = str(exclude_task_id or "").strip()
+        ids: set[str] = set()
+        for agent in self.agents.values():
+            current_task_id = str(getattr(agent, "current_task_id", "") or "").strip()
+            if not current_task_id or (excluded_task and current_task_id == excluded_task):
+                continue
+            payload = getattr(agent, "current_task_payload", {}) or {}
+            ids.update(self._reserved_item_ids_from_payload(payload))
+        return ids
+
     def _item_reserved_by_other(self, item_id: str, agent_id: str = "", task_id: str = "") -> bool:
         item_id = str(item_id or "").strip()
         if not item_id:
             return False
         reservations = getattr(self, "item_reservations", {})
         reservation = reservations.get(item_id) if isinstance(reservations, dict) else None
-        if not isinstance(reservation, dict):
-            return False
-        owner_agent = str(reservation.get("agent_id", "") or "").strip()
-        owner_task = str(reservation.get("task_id", "") or "").strip()
-        if agent_id and owner_agent == str(agent_id).strip():
-            return False
-        if task_id and owner_task == str(task_id).strip():
-            return False
-        return True
+        if isinstance(reservation, dict):
+            owner_task = str(reservation.get("task_id", "") or "").strip()
+            if task_id and owner_task == str(task_id).strip():
+                return False
+            return True
+        if item_id in self._active_task_reserved_item_ids(exclude_task_id=task_id):
+            return True
+        return False
 
     def _reserve_item_for_task(
         self,
@@ -4678,7 +4801,7 @@ class ManufacturingWorld:
             snapshots = [
                 {
                     "t": 0.0,
-                    "machine_states": {machine_id: machine.state.value for machine_id, machine in self.machines.items()},
+                    "machine_states": {machine_id: self._observed_machine_state(machine).value for machine_id, machine in self.machines.items()},
                 }
             ]
 
@@ -5212,12 +5335,64 @@ class ManufacturingWorld:
             details={"reason": reason, "station": machine.station},
             notify_workers=[agent_id for agent_id, agent in self.agents.items() if self.agent_display_location(agent) == f"Station{machine.station}"],
         )
+        self._rolling_horizon_collect_immediate_candidates("machine_broken")
         if was_processing and machine.active_process is not None and machine.active_process.is_alive:
             machine.active_process.interrupt("machine_breakdown")
 
     def battery_remaining(self, agent: Agent, at_t: float | None = None) -> float:
-        t = self.env.now if at_t is None else float(at_t)
-        return max(0.0, self.battery_swap_period_min - max(0.0, t - float(agent.last_battery_swap)))
+        period = float(getattr(self, "battery_swap_period_min", 0.0) or 0.0)
+        if period <= 0:
+            return 0.0
+        now = float(self.env.now)
+        if at_t is None or float(at_t) <= now:
+            return max(0.0, self._update_battery_accounting(agent, now))
+        current = self._update_battery_accounting(agent, now)
+        future_delta = max(0.0, float(at_t) - now)
+        return max(0.0, current - future_delta * self._battery_drain_rate_multiplier(agent))
+
+    def _battery_drain_rate_multiplier(self, agent: Agent) -> float:
+        availability = str((agent.humanoid_state or {}).get("availability", "AVAILABLE")).strip().upper()
+        if availability == "AVAILABLE":
+            return float(getattr(self, "battery_available_rate_multiplier", 1.0) or 1.0)
+        return float(getattr(self, "battery_non_available_rate_multiplier", 2.0) or 2.0)
+
+    def _ensure_battery_accounting(self, agent: Agent, now: float) -> None:
+        swap_at = float(getattr(agent, "last_battery_swap", 0.0) or 0.0)
+        budget = getattr(agent, "battery_remaining_budget_min", None)
+        accounted_swap_at = float(getattr(agent, "battery_accounting_swap_at", swap_at) or 0.0)
+        if budget is None or abs(accounted_swap_at - swap_at) > 1e-9:
+            # Backward compatibility: tests and legacy code may still set
+            # last_battery_swap directly. Initialize the budget from that value.
+            elapsed = max(0.0, now - swap_at)
+            period = float(getattr(self, "battery_swap_period_min", 0.0) or 0.0)
+            initial_budget = period - elapsed * float(getattr(self, "battery_available_rate_multiplier", 1.0) or 1.0)
+            agent.battery_remaining_budget_min = max(0.0, initial_budget)
+            agent.battery_last_accounted_at = now
+            agent.battery_accounting_swap_at = swap_at
+
+    def _update_battery_accounting(self, agent: Agent, at_t: float | None = None) -> float:
+        now = float(self.env.now if at_t is None else at_t)
+        period = float(getattr(self, "battery_swap_period_min", 0.0) or 0.0)
+        if period <= 0:
+            return 0.0
+        self._ensure_battery_accounting(agent, now)
+        last_raw = getattr(agent, "battery_last_accounted_at", None)
+        last = now if last_raw is None else float(last_raw)
+        if now > last:
+            elapsed = max(0.0, now - last)
+            remaining_raw = getattr(agent, "battery_remaining_budget_min", period)
+            remaining = float(remaining_raw if remaining_raw is not None else period)
+            agent.battery_remaining_budget_min = max(0.0, remaining - elapsed * self._battery_drain_rate_multiplier(agent))
+            agent.battery_last_accounted_at = now
+        budget_raw = getattr(agent, "battery_remaining_budget_min", period)
+        return float(budget_raw if budget_raw is not None else period)
+
+    def _reset_worker_battery(self, agent: Agent) -> None:
+        now = float(self.env.now)
+        agent.last_battery_swap = now
+        agent.battery_remaining_budget_min = float(self.battery_swap_period_min)
+        agent.battery_last_accounted_at = now
+        agent.battery_accounting_swap_at = now
 
     def _battery_service_margin_min(self) -> float:
         return max(3.0, float(self.movement_cfg.get("setup_min", 3.0)) + 1.0)
@@ -5251,7 +5426,7 @@ class ManufacturingWorld:
 
     def _humanoid_power_event_for_battery(self, agent: Agent) -> str:
         remaining = float(self.battery_remaining(agent))
-        if agent.discharged or remaining <= 1e-6:
+        if agent.discharged:
             return "disabled"
         if remaining <= self._battery_mandatory_threshold(agent):
             return "power_critical"
@@ -5279,6 +5454,8 @@ class ManufacturingWorld:
             source="mansim.power",
             metadata={
                 "battery_remaining_min": round(float(self.battery_remaining(agent)), 3),
+                "battery_period_min": round(float(getattr(self, "battery_swap_period_min", 0.0) or 0.0), 3),
+                "low_threshold_ratio": round(float(getattr(self, "rolling_horizon_battery_low_ratio", 0.2) or 0.2), 6),
                 "low_threshold_min": round(float(self._battery_low_alert_threshold(agent)), 3),
                 "critical_threshold_min": round(float(self._battery_mandatory_threshold(agent)), 3),
             },
@@ -5410,6 +5587,7 @@ class ManufacturingWorld:
             details=details,
             notify_workers=[agent.agent_id],
         )
+        self._rolling_horizon_collect_immediate_candidates("worker_low_battery")
 
     def _battery_interrupt_exempt(self, agent: Agent) -> bool:
         return bool(getattr(agent, "battery_swap_critical", False))
@@ -5673,6 +5851,45 @@ class ManufacturingWorld:
             )
         return self._edge_location_label(edge_from, edge_to, progress)
 
+    def _agents_in_handover_contact(self, provider: Agent, receiver: Agent) -> bool:
+        """Return true only when a battery handoff is physically plausible."""
+        if self.grid_map is None:
+            return provider.location == receiver.location
+        if provider.tile is None or receiver.tile is None:
+            return False
+        return abs(int(provider.tile[0]) - int(receiver.tile[0])) + abs(int(provider.tile[1]) - int(receiver.tile[1])) <= 1
+
+    def _ensure_battery_handover_contact(
+        self,
+        provider: Agent,
+        receiver: Agent,
+        *,
+        emit_move_events: bool = True,
+    ):
+        """Move the provider into actual tile contact before completing delivery.
+
+        Zone-level location equality is not enough for battery delivery in the
+        tile-map factory. The provider must reach the receiver's current worker
+        service tile so the replay and the state transition agree about where
+        the handoff happened.
+        """
+        if self._agents_in_handover_contact(provider, receiver):
+            return self.agent_display_location(receiver)
+
+        if self.grid_map is not None:
+            self._set_humanoid_primitive_hint(provider, "NAVIGATE_TO")
+            yield from self.move_agent(provider, receiver.agent_id, emit_move_events=emit_move_events)
+            if self._agents_in_handover_contact(provider, receiver):
+                return self.agent_display_location(receiver)
+            return None
+
+        if provider.location != receiver.location:
+            self._set_humanoid_primitive_hint(provider, "NAVIGATE_TO")
+            yield from self.move_agent(provider, receiver.location, emit_move_events=emit_move_events)
+        if provider.location != receiver.location:
+            return None
+        return str(receiver.location)
+
     def _wait_for_agent_at_battery_handover_destination(
         self,
         provider: Agent,
@@ -5688,11 +5905,7 @@ class ManufacturingWorld:
         while self._has_in_transit_position(receiver):
             yield self.env.timeout(0.1)
 
-        if provider.location != receiver.location:
-            yield from self.move_agent(provider, receiver.location, emit_move_events=True)
-        if provider.location != receiver.location:
-            return None
-        return str(receiver.location or destination)
+        return (yield from self._ensure_battery_handover_contact(provider, receiver, emit_move_events=True))
 
     def discharge_agent(
         self,
@@ -6343,21 +6556,10 @@ class ManufacturingWorld:
             # latency in the reserve calculation so a feasible production task
             # cannot strand the worker just short of the charger/helper.
             battery_reserve += max(0.0, float(getattr(self, "rolling_horizon_window_min", 0.0) or 0.0))
-        if (
+        delivery_receiver = (
             self._rolling_horizon_dedicated_roles_active()
             and agent.agent_id in set(getattr(self, "rolling_horizon_battery_delivery_receiver_agent_ids", []))
-            and self.battery_remaining(agent)
-            <= self._battery_delivery_trigger_threshold(agent)
-            + max(0.0, float(getattr(self, "rolling_horizon_window_min", 0.0) or 0.0))
-        ):
-            # Dedicated receivers do not self-swap. Once they are close enough to
-            # the delivery threshold, they should wait for A1 instead of accepting
-            # another production assignment that cannot be serviced by themselves.
-            filtered = [
-                task
-                for task in filtered
-                if self._task_priority_key(task) in {"battery_delivery_low_battery", "battery_delivery_discharged"}
-            ]
+        )
         if self._rolling_horizon_self_battery_swap_due(agent):
             self_swaps = [task for task in filtered if self._rolling_horizon_is_self_battery_swap(task, agent)]
             if self_swaps:
@@ -6369,6 +6571,13 @@ class ManufacturingWorld:
         for task in filtered:
             family = self._task_priority_key(task)
             if family in {"battery_swap", "battery_delivery_low_battery", "battery_delivery_discharged"}:
+                battery_safe.append(task)
+                continue
+            if delivery_receiver:
+                # Dedicated battery receivers are serviced by a provider. They
+                # should keep executing normal production work while delivery is
+                # in flight; only actual depletion or the final handoff pause
+                # should stop their work loop.
                 battery_safe.append(task)
                 continue
             if self.battery_remaining(agent) >= self._task_estimated_duration(agent, task) + battery_reserve:
@@ -6870,14 +7079,21 @@ class ManufacturingWorld:
         payload = task.payload if isinstance(task.payload, dict) else {}
         item_ids = payload.get("item_ids")
         normalized_item_ids = sorted(str(item_id) for item_id in item_ids if str(item_id)) if isinstance(item_ids, list) else []
+        transfer_kind = str(payload.get("transfer_kind", "")).strip().lower()
+        signature_location = str(task.location)
+        if str(task.task_type).strip().upper() == "TRANSFER" and transfer_kind == "battery_delivery":
+            # Battery delivery is keyed by the receiver, not by the receiver's
+            # transient in-transit label. Otherwise a moving low-battery worker
+            # creates a fresh rolling opportunity every few tiles.
+            signature_location = ""
         return {
             "task_code": self._rolling_horizon_task_code(task),
             "task_type": str(task.task_type),
             "target_type": self._task_target_type(task),
             "target_id": self._task_target_id(task),
             "target_station": self._task_target_station(task),
-            "location": str(task.location),
-            "transfer_kind": str(payload.get("transfer_kind", "")).strip().lower(),
+            "location": signature_location,
+            "transfer_kind": transfer_kind,
             "transfer_item_id": str(
                 payload.get("transfer_item_id")
                 or payload.get("material_item_id")
@@ -6959,6 +7175,12 @@ class ManufacturingWorld:
                 item_id = str(item_value or "").strip()
                 if item_id:
                     keys.add(f"item:{item_id}")
+        reserved_item_ids = payload.get("_reserved_item_ids")
+        if isinstance(reserved_item_ids, list):
+            for item_value in reserved_item_ids:
+                item_id = str(item_value or "").strip()
+                if item_id:
+                    keys.add(f"item:{item_id}")
         return sorted(keys)
 
     def _rolling_horizon_queued_resource_index(self) -> dict[str, str]:
@@ -6975,6 +7197,19 @@ class ManufacturingWorld:
                     value = str(key or "").strip()
                     if value:
                         index[value] = opportunity_id
+        return index
+
+    def _rolling_horizon_active_resource_index(self) -> dict[str, str]:
+        index: dict[str, str] = {}
+        for agent in self.agents.values():
+            task_id = str(getattr(agent, "current_task_id", "") or "").strip()
+            if not task_id:
+                continue
+            task = self._current_parent_task_stub(agent)
+            for key in self._rolling_horizon_exclusive_resource_keys(task):
+                value = str(key or "").strip()
+                if value:
+                    index[value] = task_id
         return index
 
     def _rolling_horizon_rebuild_pending_resource_index(self) -> None:
@@ -7030,9 +7265,16 @@ class ManufacturingWorld:
             queue = self.rolling_horizon_dispatch_queues.get(worker_id)
             if not queue:
                 continue
+            retained_urgent_entries: list[dict[str, Any]] = []
             while queue:
                 queue_entry = queue.popleft()
                 if not isinstance(queue_entry, dict):
+                    continue
+                if (
+                    bool(queue_entry.get("urgent_dispatch", False))
+                    and bool(getattr(self, "rolling_horizon_immediate_protect_from_window_requeue", False))
+                ):
+                    retained_urgent_entries.append(queue_entry)
                     continue
                 opportunity_id = str(queue_entry.get("opportunity_id", "") or "").strip()
                 if not opportunity_id:
@@ -7092,8 +7334,13 @@ class ManufacturingWorld:
                         "reason": "window_boundary_replan",
                     },
                 )
+            if retained_urgent_entries:
+                for entry in reversed(retained_urgent_entries):
+                    queue.appendleft(entry)
         if requeued_count:
             self._rolling_horizon_rebuild_pending_resource_index()
+            self._rolling_horizon_refresh_queue_metrics()
+        elif any(self.rolling_horizon_dispatch_queues.values()):
             self._rolling_horizon_refresh_queue_metrics()
         return requeued_count
 
@@ -7134,13 +7381,50 @@ class ManufacturingWorld:
             )
             self._rolling_horizon_log_window_start()
 
-    def _rolling_horizon_collect_candidates(self) -> None:
+    def _rolling_horizon_immediate_task_codes_for_event(self, event_name: str) -> set[str]:
+        if not self._rolling_horizon_active():
+            return set()
+        if not bool(getattr(self, "rolling_horizon_immediate_triggers_enabled", False)):
+            return set()
+        return set(
+            getattr(self, "rolling_horizon_immediate_event_task_codes", {}).get(
+                str(event_name or "").strip().lower(),
+                set(),
+            )
+        )
+
+    def _rolling_horizon_collect_immediate_candidates(self, event_name: str) -> None:
+        task_code_filter = self._rolling_horizon_immediate_task_codes_for_event(event_name)
+        if not task_code_filter:
+            return
+        self._rolling_horizon_log_window_start()
+        self._rolling_horizon_collect_candidates(
+            task_code_filter=task_code_filter,
+            collection_trigger=str(event_name or "").strip().lower() or "immediate",
+        )
+        if str(getattr(self, "rolling_horizon_immediate_queue_policy", "")).strip().lower() == "next_after_current":
+            self._rolling_horizon_dispatch_immediate_candidates(
+                str(event_name or "").strip().lower() or "immediate",
+                task_code_filter,
+            )
+
+    def _rolling_horizon_collect_candidates(
+        self,
+        *,
+        task_code_filter: set[str] | None = None,
+        collection_trigger: str = "scheduled_scan",
+    ) -> None:
         now = float(self.env.now)
+        normalized_task_code_filter = {
+            str(code or "").strip().upper()
+            for code in (task_code_filter or set())
+            if str(code or "").strip()
+        }
+        collection_trigger = str(collection_trigger or "scheduled_scan").strip().lower() or "scheduled_scan"
         queued_resource_index = self._rolling_horizon_queued_resource_index()
+        queued_resource_index.update(self._rolling_horizon_active_resource_index())
         for agent_id in sorted(self.agents.keys()):
             agent = self.agents[agent_id]
-            if not self._rolling_horizon_worker_available(agent):
-                continue
             candidates = self._bind_humanoid_candidates_for_agent(
                 agent,
                 self._filter_candidates_for_agent(agent, self._candidate_tasks(agent)),
@@ -7153,6 +7437,8 @@ class ManufacturingWorld:
             for task in candidates:
                 priority_key = self._task_priority_key(task)
                 task_code = self._rolling_horizon_task_code(task)
+                if normalized_task_code_filter and task_code not in normalized_task_code_filter:
+                    continue
                 if (
                     priority_key == "battery_swap"
                     and self._rolling_horizon_is_self_battery_swap(task, agent)
@@ -7227,6 +7513,10 @@ class ManufacturingWorld:
                     entry["task_id"] = self._next_task_id_for_task_code(task_code)
                 entry["last_seen_min"] = now
                 entry["effective_priority_rank"] = self._rolling_horizon_effective_rank(entry)
+                if collection_trigger != "scheduled_scan":
+                    entry["immediate_trigger"] = True
+                    entry["collection_trigger"] = collection_trigger
+                    entry["last_immediate_seen_min"] = now
                 task_for_worker = copy.deepcopy(task)
                 task_for_worker.task_id = str(entry.get("task_id", "") or task_for_worker.task_id)
                 self._sync_task_instance_id(task_for_worker)
@@ -7261,11 +7551,207 @@ class ManufacturingWorld:
                         "waited_window_count": self._rolling_horizon_waited_window_count(entry),
                         "task_signature": dict(entry["task_signature"]),
                         "rolling_task_signature": dict(entry["rolling_task_signature"]),
+                        "collection_trigger": collection_trigger,
+                        "immediate_trigger": collection_trigger != "scheduled_scan",
                         "role_policy": str(entry.get("role_policy", "")),
                         "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                         "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
                     },
                 )
+
+    def _rolling_horizon_insert_dispatch_queue_entry(
+        self,
+        worker_id: str,
+        queue_entry: dict[str, Any],
+        *,
+        urgent: bool = False,
+    ) -> None:
+        queue = self.rolling_horizon_dispatch_queues[worker_id]
+        if not urgent:
+            queue.append(queue_entry)
+            return
+        insert_at = 0
+        for existing in queue:
+            if not isinstance(existing, dict) or not bool(existing.get("urgent_dispatch", False)):
+                break
+            insert_at += 1
+        queue.insert(insert_at, queue_entry)
+
+    def _rolling_horizon_dispatch_immediate_candidates(
+        self,
+        event_name: str,
+        task_code_filter: set[str],
+    ) -> None:
+        event_name = str(event_name or "immediate").strip().lower() or "immediate"
+        normalized_task_code_filter = {
+            str(code or "").strip().upper()
+            for code in (task_code_filter or set())
+            if str(code or "").strip()
+        }
+        if not normalized_task_code_filter or not self.rolling_horizon_pending:
+            return
+        window_index = int(self.rolling_horizon_window_index)
+        opportunities = sorted(
+            [
+                entry
+                for entry in self.rolling_horizon_pending.values()
+                if bool(entry.get("immediate_trigger", False))
+                and str(entry.get("collection_trigger", "")).strip().lower() == event_name
+                and str(entry.get("task_code", "")).strip().upper() in normalized_task_code_filter
+            ],
+            key=lambda entry: (
+                self._rolling_horizon_effective_rank(entry),
+                float(entry.get("first_seen_min", 0.0) or 0.0),
+                str(entry.get("task_code", "")),
+                str(entry.get("opportunity_id", "")),
+            ),
+        )
+        if not opportunities:
+            return
+
+        dispatched_opportunity_ids: set[str] = set()
+        stale_opportunity_ids: set[str] = set()
+        committed_resource_keys: set[str] = set(self._rolling_horizon_queued_resource_index().keys())
+        committed_resource_keys.update(self._rolling_horizon_active_resource_index().keys())
+        for entry in opportunities:
+            opportunity_id = str(entry.get("opportunity_id", "")).strip()
+            resource_keys = [str(key or "").strip() for key in entry.get("exclusive_resource_keys", []) if str(key or "").strip()]
+            if any(key in committed_resource_keys for key in resource_keys):
+                # Another queued/running task already owns this urgent resource.
+                continue
+            tasks_by_worker = entry.get("tasks_by_worker", {})
+            if not isinstance(tasks_by_worker, dict):
+                continue
+            rows: list[tuple[int, float, float, str]] = []
+            saw_available_resource = False
+            for worker_id, task in tasks_by_worker.items():
+                worker_id = str(worker_id)
+                agent = self.agents.get(worker_id)
+                if agent is None or not isinstance(task, Task):
+                    continue
+                if self._rolling_horizon_self_battery_swap_due(agent) and not self._rolling_horizon_is_self_battery_swap(task, agent):
+                    continue
+                if not self._task_item_dependencies_available(task, agent):
+                    continue
+                saw_available_resource = True
+                if not self._rolling_horizon_worker_available(agent):
+                    continue
+                if not self._rolling_horizon_task_allowed_for_worker(worker_id, task):
+                    self.rolling_horizon_dedicated_role_metrics["role_violation_count"] += 1
+                    continue
+                if self._rolling_horizon_opportunity_id(task) != opportunity_id:
+                    continue
+                queue_length = len(self.rolling_horizon_dispatch_queues.get(worker_id, ()))
+                rows.append(
+                    (
+                        int(queue_length),
+                        float(self._task_estimated_duration(agent, task)),
+                        float(self.travel_time(agent.location, task.location)),
+                        worker_id,
+                    )
+                )
+            if not saw_available_resource:
+                stale_opportunity_ids.add(opportunity_id)
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="ROLLING_HORIZON_TASK_SKIPPED",
+                    entity_id=opportunity_id,
+                    location=str(entry.get("location", "CoordinationReview")),
+                    details={
+                        "window_index": window_index,
+                        "opportunity_id": opportunity_id,
+                        "task_id": str(entry.get("task_id", "")),
+                        "task_code": str(entry.get("task_code", "")),
+                        "priority_key": str(entry.get("priority_key", "")),
+                        "task_type": str(entry.get("task_type", "")),
+                        "base_priority_rank": int(entry.get("base_priority_rank", 9999) or 9999),
+                        "effective_priority_rank": self._rolling_horizon_effective_rank(entry),
+                        "waited_window_count": self._rolling_horizon_waited_window_count(entry),
+                        "task_signature": dict(entry.get("task_signature", {})),
+                        "rolling_task_signature": dict(entry.get("rolling_task_signature", {})),
+                        "exclusive_resource_keys": list(resource_keys),
+                        "role_policy": str(entry.get("role_policy", "")),
+                        "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
+                        "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
+                        "collection_trigger": event_name,
+                        "immediate_trigger": True,
+                        "reason": "stale_or_unavailable_resource",
+                    },
+                )
+                self.rolling_horizon_metrics["stale_skipped_task_count"] += 1
+                continue
+            if not rows:
+                continue
+            rows.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+            capacity = max(1, int(entry.get("capacity", 1) or 1))
+            if not bool(entry.get("shareable", False)):
+                capacity = 1
+            for _queue_length, _duration, _travel, worker_id in rows[:capacity]:
+                effective_rank = self._rolling_horizon_effective_rank(entry)
+                queue_entry = {
+                    "window_index": window_index,
+                    "first_window_index": int(entry.get("first_window_index", window_index) or window_index),
+                    "first_seen_min": float(entry.get("first_seen_min", self.env.now) or self.env.now),
+                    "opportunity_id": str(entry.get("opportunity_id", "")),
+                    "task_id": str(entry.get("task_id", "")),
+                    "task_code": str(entry.get("task_code", "")),
+                    "priority_key": str(entry.get("priority_key", "")),
+                    "task_type": str(entry.get("task_type", "")),
+                    "location": str(entry.get("location", "CoordinationReview")),
+                    "base_priority_rank": int(entry.get("base_priority_rank", 9999) or 9999),
+                    "effective_priority_rank": effective_rank,
+                    "waited_window_count": self._rolling_horizon_waited_window_count(entry),
+                    "task_signature": dict(entry.get("task_signature", {})),
+                    "rolling_task_signature": dict(entry.get("rolling_task_signature", {})),
+                    "target_type": str(entry.get("target_type", "")),
+                    "target_id": str(entry.get("target_id", "")),
+                    "target_station": entry.get("target_station"),
+                    "shareable": bool(entry.get("shareable", False)),
+                    "capacity": int(entry.get("capacity", 1) or 1),
+                    "exclusive_resource_keys": list(entry.get("exclusive_resource_keys", [])),
+                    "role_policy": str(entry.get("role_policy", "")),
+                    "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
+                    "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
+                    "assigned_worker_id": worker_id,
+                    "queue_length_before": int(_queue_length),
+                    "assigned_at_min": round(float(self.env.now), 3),
+                    "urgent_dispatch": True,
+                    "collection_trigger": event_name,
+                    "queue_policy": str(getattr(self, "rolling_horizon_immediate_queue_policy", "")),
+                }
+                self._rolling_horizon_insert_dispatch_queue_entry(worker_id, queue_entry, urgent=True)
+                dispatched_opportunity_ids.add(str(entry.get("opportunity_id", "")))
+                committed_resource_keys.update(resource_keys)
+                self.rolling_horizon_metrics["dispatched_task_count"] += 1
+                self.rolling_horizon_metrics["immediate_dispatched_task_count"] += 1
+                self._rolling_horizon_refresh_queue_metrics()
+                if self._rolling_horizon_dedicated_roles_active():
+                    self.rolling_horizon_dedicated_role_metrics["dispatched_by_worker"][worker_id] += 1
+                    if str(entry.get("task_code", "")) == "HANDOVER_ITEM":
+                        self.rolling_horizon_dedicated_role_metrics["handover_dispatch_count"] += 1
+                    priority_key = str(entry.get("priority_key", ""))
+                    if priority_key in {"battery_delivery_low_battery", "battery_delivery_discharged"} and worker_id in set(getattr(self, "rolling_horizon_battery_delivery_provider_agent_ids", [])):
+                        self.rolling_horizon_dedicated_role_metrics["battery_delivery_from_provider_count"] += 1
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="ROLLING_HORIZON_DISPATCH",
+                    entity_id=str(entry.get("opportunity_id", "")),
+                    location=str(entry.get("location", "CoordinationReview")),
+                    details={
+                        **queue_entry,
+                        "assigned_worker_id": worker_id,
+                        "dispatch_policy": self.rolling_horizon_dispatch_policy,
+                        "candidate_worker_count": len(rows),
+                        "immediate_trigger": True,
+                    },
+                )
+
+        for opportunity_id in dispatched_opportunity_ids | stale_opportunity_ids:
+            self.rolling_horizon_pending.pop(opportunity_id, None)
+        if dispatched_opportunity_ids or stale_opportunity_ids:
+            self._rolling_horizon_rebuild_pending_resource_index()
 
     def _rolling_horizon_dispatch_window(self) -> None:
         window_index = int(self.rolling_horizon_window_index)
@@ -7300,6 +7786,7 @@ class ManufacturingWorld:
         dispatched_opportunity_ids: set[str] = set()
         stale_opportunity_ids: set[str] = set()
         committed_resource_keys: set[str] = set(self._rolling_horizon_queued_resource_index().keys())
+        committed_resource_keys.update(self._rolling_horizon_active_resource_index().keys())
         for entry in opportunities:
             opportunity_id = str(entry.get("opportunity_id", "")).strip()
             resource_keys = [str(key or "").strip() for key in entry.get("exclusive_resource_keys", []) if str(key or "").strip()]
@@ -7500,6 +7987,106 @@ class ManufacturingWorld:
             },
         )
 
+    def _load_machine_task_from_rolling_horizon_queue_entry(self, agent: Agent, queue_entry: dict[str, Any]) -> Task | None:
+        signature = queue_entry.get("rolling_task_signature")
+        if not isinstance(signature, dict):
+            return None
+        task_type = str(queue_entry.get("task_type") or signature.get("task_type") or "").strip().upper()
+        task_code = str(queue_entry.get("task_code") or signature.get("task_code") or task_type).strip().upper()
+        if task_type != "LOAD_MACHINE" and task_code != "LOAD_MACHINE":
+            return None
+
+        machine_id = str(signature.get("machine_id") or signature.get("target_id") or "").strip()
+        machine = self.machines.get(machine_id)
+        if machine is None:
+            return None
+        task_id = str(queue_entry.get("task_id") or "").strip() or self._next_task_id_for_task_code("LOAD_MACHINE")
+        try:
+            station = int(signature.get("target_station") or machine.station)
+        except (TypeError, ValueError):
+            station = int(machine.station)
+        load_slot = str(signature.get("load_slot") or "").strip().lower()
+        item_id = str(signature.get("item_id") or signature.get("transfer_item_id") or "").strip()
+        if load_slot not in {"material", "intermediate"}:
+            item = self.items.get(item_id)
+            load_slot = "intermediate" if item is not None and str(item.item_type).lower() == "intermediate" else "material"
+        item_type = "intermediate" if load_slot == "intermediate" else "material"
+        source = str(signature.get("source") or f"{item_type}_queue_{station}").strip()
+
+        if not self._load_machine_queue_entry_feasible(agent, machine, station, load_slot, item_id, task_id):
+            return None
+
+        payload = {
+            "machine_id": machine.machine_id,
+            "station": station,
+            "load_slot": load_slot,
+            "item_type": item_type,
+            "item_id": item_id,
+            "source": source,
+        }
+        if item_type == "material":
+            payload["material_id"] = item_id
+        else:
+            payload["intermediate_id"] = item_id
+        task = Task(
+            task_id=task_id,
+            task_type="LOAD_MACHINE",
+            priority_key=str(queue_entry.get("priority_key") or "load_machine"),
+            priority=float(queue_entry.get("priority", self._rule("world.task_priority.load_machine", 105.0)) or 0.0),
+            location=str(queue_entry.get("location") or f"Station{station}"),
+            payload=payload,
+            task_code="LOAD_MACHINE",
+            assigned_robot_id=agent.agent_id,
+        )
+        self._sync_task_instance_id(task)
+        return self._bind_humanoid_candidate_for_agent(agent, task)
+
+    def _load_machine_queue_entry_feasible(
+        self,
+        agent: Agent,
+        machine: Machine,
+        station: int,
+        load_slot: str,
+        item_id: str,
+        task_id: str,
+    ) -> bool:
+        if machine.broken or machine.output_intermediate is not None:
+            return False
+        if machine.setup_owner is not None and machine.setup_owner != agent.agent_id:
+            return False
+        if machine.state not in {MachineState.WAIT_INPUT, MachineState.SETUP, MachineState.IDLE}:
+            return False
+        if load_slot == "material":
+            if machine.input_material is not None:
+                return False
+            queue = self.material_queues.get(station)
+        elif load_slot == "intermediate":
+            if not self._station_requires_intermediate(station) or machine.input_intermediate is not None:
+                return False
+            queue = self.intermediate_queues.get(station)
+        else:
+            return False
+        if queue is None or not item_id:
+            return False
+        if item_id not in queue:
+            return False
+        if self._item_reserved_by_other(item_id, agent.agent_id, task_id):
+            return False
+        return True
+
+    def _task_from_rolling_horizon_queue_entry(self, agent: Agent, queue_entry: dict[str, Any]) -> Task | None:
+        # Rolling dispatch queues carry a stable task id and enough resource
+        # signature to execute a still-valid queued task even when the current
+        # candidate scan would bind the same item to another open resource.
+        reconstructed = self._load_machine_task_from_rolling_horizon_queue_entry(agent, queue_entry)
+        if reconstructed is None:
+            return None
+        if not self._rolling_horizon_task_allowed_for_worker(agent.agent_id, reconstructed):
+            return None
+        if not self._task_item_dependencies_available(reconstructed, agent):
+            return None
+        return reconstructed
+
     def _select_rolling_horizon_task(self, agent: Agent, candidates: list[Task]) -> Task | None:
         queue = self.rolling_horizon_dispatch_queues.get(agent.agent_id)
         if not queue:
@@ -7514,9 +8101,15 @@ class ManufacturingWorld:
                 and self._task_item_dependencies_available(task, agent)
             ]
             if not matching:
-                self._rolling_horizon_log_task_skip(agent, queue_entry, "stale_or_infeasible_candidate")
-                continue
-            task = sorted(matching, key=lambda item: self._task_sort_key(item, agent))[0]
+                reconstructed = self._task_from_rolling_horizon_queue_entry(agent, queue_entry)
+                if reconstructed is None:
+                    self._rolling_horizon_log_task_skip(agent, queue_entry, "stale_or_infeasible_candidate")
+                    continue
+                task = reconstructed
+                fallback_reason = "rolling_horizon_dispatch_reconstructed"
+            else:
+                task = sorted(matching, key=lambda item: self._task_sort_key(item, agent))[0]
+                fallback_reason = "rolling_horizon_dispatch"
             stable_task_id = str(queue_entry.get("task_id", "") or "").strip()
             if stable_task_id:
                 task.task_id = stable_task_id
@@ -7533,7 +8126,7 @@ class ManufacturingWorld:
                 candidate_count=len(candidates),
                 score_hint=-float(queue_entry.get("effective_priority_rank", self._rolling_horizon_priority(task)) or 0.0),
                 decision_focus=[self._task_priority_key(task)],
-                fallback_reason="rolling_horizon_dispatch",
+                fallback_reason=fallback_reason,
             )
         return None
 
@@ -9141,7 +9734,7 @@ class ManufacturingWorld:
                     task.payload["battery_item_id"] = battery_item_id
                 if not self._set_agent_carrying(agent, "battery", battery_item_id):
                     return False
-                agent.last_battery_swap = self.env.now
+                self._reset_worker_battery(agent)
                 agent.discharged = False
                 agent.discharged_since = None
                 agent.low_battery_alerted = False
@@ -9345,6 +9938,14 @@ class ManufacturingWorld:
                             return False
                         handover_location = str(target_agent.location)
 
+                    handover_location = yield from self._ensure_battery_handover_contact(
+                        agent,
+                        target_agent,
+                        emit_move_events=True,
+                    )
+                    if handover_location is None:
+                        return False
+
                     if not target_agent.discharged and target_agent.awaiting_battery_from is None:
                         self._start_battery_swap_wait(target_agent, agent.agent_id)
                         if target_agent.process_ref is not None and target_agent.process_ref.is_alive:
@@ -9352,16 +9953,17 @@ class ManufacturingWorld:
 
                     yield self.env.timeout(float(self.agent_cfg["battery_delivery_extra_min"]))
 
-                    if agent.location != target_agent.location:
-                        self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
-                        yield from self.move_agent(agent, target_agent.location, emit_move_events=True)
-                    if agent.location != target_agent.location:
+                    handover_location = yield from self._ensure_battery_handover_contact(
+                        agent,
+                        target_agent,
+                        emit_move_events=True,
+                    )
+                    if handover_location is None:
                         return False
-                    handover_location = str(target_agent.location)
 
                     became_discharged_during_delivery = target_agent.discharged
                     self._set_humanoid_primitive_hint(agent, "PLACE")
-                    target_agent.last_battery_swap = self.env.now
+                    self._reset_worker_battery(target_agent)
                     target_agent.discharged = False
                     target_agent.discharged_since = None
                     target_agent.low_battery_alerted = False
@@ -9404,6 +10006,11 @@ class ManufacturingWorld:
                         location=handover_location,
                         details={"by": agent.agent_id, "was_discharged": bool(was_discharged or became_discharged_during_delivery)},
                     )
+                    # The receiver only pauses for the physical handoff. Returning
+                    # the spent battery is the provider's follow-up work and must
+                    # not keep the receiver blocked from resuming its suspended task.
+                    if target_agent.awaiting_battery_from == agent.agent_id:
+                        self._end_battery_swap_wait(target_agent, agent.agent_id)
                     if target_agent.suspended_task is not None and target_agent.suspended_task.task_type == "BATTERY_SWAP":
                         target_agent.suspended_task = None
                     self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
@@ -10221,6 +10828,7 @@ class ManufacturingWorld:
                 "transformed_from_item_ids": list(dict.fromkeys(source_item_ids)),
             }
         )
+        machine.active_process = None
         machine.input_material = None
         machine.input_intermediate = None
         machine.setup_ready = False
@@ -10245,10 +10853,27 @@ class ManufacturingWorld:
             },
         )
 
-    def abort_machine_cycle(self, machine: Machine, cycle_id: str, reason: str) -> None:
-        machine.input_material = None
-        machine.input_intermediate = None
+    def abort_machine_cycle(self, machine: Machine, cycle_id: str, reason: str, *, elapsed_min: float = 0.0) -> None:
+        input_material_id = machine.input_material
+        input_intermediate_id = machine.input_intermediate
+        machine.active_process = None
         machine.setup_ready = False
+        if input_material_id:
+            self._set_item_state(
+                input_material_id,
+                ItemState.LOADED_ON_MACHINE,
+                location=f"Station{machine.station}",
+                ref=machine.machine_id,
+                item_type="material",
+            )
+        if input_intermediate_id:
+            self._set_item_state(
+                input_intermediate_id,
+                ItemState.LOADED_ON_MACHINE,
+                location=f"Station{machine.station}",
+                ref=machine.machine_id,
+                item_type="intermediate",
+            )
         self._set_machine_state(machine, MachineState.BROKEN if machine.broken else MachineState.WAIT_INPUT, reason=reason)
         self.logger.log(
             t=self.env.now,
@@ -10256,7 +10881,14 @@ class ManufacturingWorld:
             event_type="MACHINE_ABORTED",
             entity_id=machine.machine_id,
             location=f"Station{machine.station}",
-            details={"cycle_id": cycle_id, "reason": reason},
+            details={
+                "cycle_id": cycle_id,
+                "reason": reason,
+                "elapsed_min": round(float(elapsed_min), 3),
+                "retained_input_material": input_material_id,
+                "retained_input_intermediate": input_intermediate_id,
+                "progress_policy": "restart_after_repair",
+            },
         )
 
     def _empty_agent_priority_counter(self, *, float_values: bool = False) -> dict[str, float] | dict[str, int]:
@@ -10709,6 +11341,7 @@ class ManufacturingWorld:
             "rolling_horizon_window_count": int(self.rolling_horizon_metrics.get("started_window_count", 0)),
             "rolling_horizon_candidate_collected_count": int(self.rolling_horizon_metrics.get("candidate_collected_count", 0)),
             "rolling_horizon_dispatched_task_count": int(self.rolling_horizon_metrics.get("dispatched_task_count", 0)),
+            "rolling_horizon_immediate_dispatched_task_count": int(self.rolling_horizon_metrics.get("immediate_dispatched_task_count", 0)),
             "rolling_horizon_stale_skipped_task_count": int(self.rolling_horizon_metrics.get("stale_skipped_task_count", 0)),
             "rolling_horizon_requeued_task_count": int(self.rolling_horizon_metrics.get("requeued_task_count", 0)),
             "rolling_horizon_max_worker_queue_length": int(self.rolling_horizon_metrics.get("max_worker_queue_length", 0)),
@@ -10721,6 +11354,7 @@ class ManufacturingWorld:
                 "dispatched_window_count": int(self.rolling_horizon_metrics.get("window_count", 0)),
                 "candidate_collected_count": int(self.rolling_horizon_metrics.get("candidate_collected_count", 0)),
                 "dispatched_task_count": int(self.rolling_horizon_metrics.get("dispatched_task_count", 0)),
+                "immediate_dispatched_task_count": int(self.rolling_horizon_metrics.get("immediate_dispatched_task_count", 0)),
                 "stale_skipped_task_count": int(self.rolling_horizon_metrics.get("stale_skipped_task_count", 0)),
                 "requeued_task_count": int(self.rolling_horizon_metrics.get("requeued_task_count", 0)),
                 "empty_window_count": int(self.rolling_horizon_metrics.get("empty_window_count", 0)),
@@ -10730,6 +11364,10 @@ class ManufacturingWorld:
                 "max_queue_length_by_worker": dict(self.rolling_horizon_max_queue_length_by_worker),
                 "task_code_priority_order": list(getattr(self, "rolling_horizon_task_code_priority_order", [])),
                 "rank_boost_per_window": int(getattr(self, "rolling_horizon_rank_boost_per_window", 1) or 0),
+                "immediate_queue_policy": str(getattr(self, "rolling_horizon_immediate_queue_policy", "")),
+                "immediate_protect_from_window_requeue": bool(
+                    getattr(self, "rolling_horizon_immediate_protect_from_window_requeue", False)
+                ),
                 "worker_task_priority": {
                     str(worker_id): list(codes)
                     for worker_id, codes in getattr(self, "rolling_horizon_worker_task_priority", {}).items()

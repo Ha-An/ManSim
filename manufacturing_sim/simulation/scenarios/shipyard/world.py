@@ -39,23 +39,21 @@ TASK_ID_PREFIX = {
     "MANAGE_ROBOT_POWER": "BAT",
 }
 
-_SCENARIO_ALIASES = {
-    "shipyard": "shipyard_basic",
+_SUPPORTED_SCENARIO_KEYS = {
     "shipyard_basic": "shipyard_basic",
-    "mfg_basic": "factory_mfg_basic",
     "factory_mfg_basic": "factory_mfg_basic",
 }
 
 
 def _scenario_key(cfg: dict[str, Any]) -> str:
     raw = str(cfg.get("scenario_type") or cfg.get("type") or cfg.get("name") or "shipyard_basic").strip().lower()
-    return _SCENARIO_ALIASES.get(raw, raw)
+    return _SUPPORTED_SCENARIO_KEYS.get(raw, raw)
 
 
 def _scenario_entry(mapping: Any, scenario_key: str) -> Any:
     if not isinstance(mapping, dict):
         return None
-    candidates = [scenario_key, "shipyard" if scenario_key == "shipyard_basic" else ""]
+    candidates = [scenario_key]
     for key in candidates:
         if key and key in mapping:
             return mapping[key]
@@ -138,10 +136,41 @@ class ShipyardWorld:
             "requeued_task_count": 0,
             "max_worker_queue_length": 0,
         }
+        immediate_cfg = (
+            rolling_cfg.get("immediate_task_triggers", {})
+            if isinstance(rolling_cfg.get("immediate_task_triggers", {}), dict)
+            else {}
+        )
+        self.rolling_horizon_immediate_triggers_enabled = bool(immediate_cfg.get("enabled", False))
+        default_immediate_task_codes = {
+            "worker_low_battery": ["MANAGE_ROBOT_POWER"],
+            "machine_broken": ["REPAIR_MACHINE"],
+        }
+        raw_immediate_task_codes = immediate_cfg.get("event_task_codes", default_immediate_task_codes)
+        if not isinstance(raw_immediate_task_codes, dict):
+            raw_immediate_task_codes = default_immediate_task_codes
+        self.rolling_horizon_immediate_event_task_codes: dict[str, set[str]] = {}
+        for event_name, values in raw_immediate_task_codes.items():
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, list):
+                continue
+            codes = {str(value or "").strip().upper() for value in values if str(value or "").strip()}
+            if codes:
+                self.rolling_horizon_immediate_event_task_codes[str(event_name or "").strip().lower()] = codes
         battery_cfg = decision_cfg.get("battery", {}) if isinstance(decision_cfg.get("battery", {}), dict) else {}
         self.battery_period_min = float(worker_cfg.get("battery_swap_period_min", 240) or 240)
         self.battery_pickup_time_min = float(worker_cfg.get("battery_pickup_time_min", 4.0) or 4.0)
         self.battery_delivery_extra_min = float(worker_cfg.get("battery_delivery_extra_min", 3.0) or 3.0)
+        battery_drain_cfg = worker_cfg.get("battery_drain", {}) if isinstance(worker_cfg.get("battery_drain", {}), dict) else {}
+        self.battery_available_rate_multiplier = max(
+            0.0,
+            float(battery_drain_cfg.get("available_rate_multiplier", 1.0) or 1.0),
+        )
+        self.battery_non_available_rate_multiplier = max(
+            0.0,
+            float(battery_drain_cfg.get("non_available_rate_multiplier", 2.0) or 2.0),
+        )
         self.battery_low_threshold_ratio = float(battery_cfg.get("low_threshold_ratio", 0.20) or 0.20)
         self.battery_critical_threshold_ratio = float(
             battery_cfg.get("critical_threshold_ratio", max(0.01, self.battery_low_threshold_ratio * 0.5)) or 0.10
@@ -222,6 +251,7 @@ class ShipyardWorld:
         return f"{prefix}-{self.task_counter:06d}"
 
     def _emit_worker_state(self, worker: Worker, event_type: str = "WORKER_STATE_CHANGED") -> None:
+        self._update_worker_battery_accounting(worker)
         self._sync_worker_power_state(worker)
         battery_remaining = self._worker_battery_remaining_min(worker.worker_id)
         self.logger.log(
@@ -276,7 +306,7 @@ class ShipyardWorld:
         )
 
     def _cart_allowed_tiles(self) -> set[tuple[int, int]]:
-        return set(self.map.cart_route_tiles) | {spot.tile for spot in self.map.cart_parking_spots.values()} | set(self.map.cart_source_tiles.values())
+        return set(self.map.cart_route_tiles) | self.map.cart_parking_tiles() | set(self.map.cart_source_tiles.values())
 
     @staticmethod
     def _cart_step_heading(from_tile: tuple[int, int], to_tile: tuple[int, int], fallback: tuple[int, int] = (0, 1)) -> tuple[int, int]:
@@ -286,6 +316,10 @@ class ShipyardWorld:
 
     def _cart_heading_at_tile(self, tile: tuple[int, int], preferred: tuple[int, int] | None = None) -> tuple[int, int]:
         allowed = self._cart_allowed_tiles()
+        if preferred is None:
+            for spot in self.map.cart_parking_spots.values():
+                if spot.tile == tile:
+                    return spot.heading
         candidates = []
         if preferred is not None:
             candidates.append(preferred)
@@ -319,11 +353,47 @@ class ShipyardWorld:
     def _worker_battery_remaining_min(self, worker_id: str | None = None) -> float:
         if self.battery_period_min <= 0:
             return 0.0
-        last_swap = 0.0
         if worker_id and worker_id in self.workers:
-            last_swap = float(getattr(self.workers[worker_id], "last_battery_swap", 0.0) or 0.0)
-        elapsed = max(0.0, float(self.env.now) - last_swap)
-        return max(0.0, self.battery_period_min - elapsed)
+            return max(0.0, self._update_worker_battery_accounting(self.workers[worker_id]))
+        return max(0.0, self.battery_period_min)
+
+    def _battery_drain_rate_multiplier(self, worker: Worker) -> float:
+        availability = str((worker.humanoid_state or {}).get("availability", "AVAILABLE")).strip().upper()
+        if availability == "AVAILABLE":
+            return float(getattr(self, "battery_available_rate_multiplier", 1.0) or 1.0)
+        return float(getattr(self, "battery_non_available_rate_multiplier", 2.0) or 2.0)
+
+    def _ensure_worker_battery_accounting(self, worker: Worker, now: float) -> None:
+        swap_at = float(getattr(worker, "last_battery_swap", 0.0) or 0.0)
+        budget = getattr(worker, "battery_remaining_budget_min", None)
+        accounted_swap_at = float(getattr(worker, "battery_accounting_swap_at", swap_at) or 0.0)
+        if budget is None or abs(accounted_swap_at - swap_at) > 1e-9:
+            elapsed = max(0.0, now - swap_at)
+            initial_budget = float(self.battery_period_min) - elapsed * float(getattr(self, "battery_available_rate_multiplier", 1.0) or 1.0)
+            worker.battery_remaining_budget_min = max(0.0, initial_budget)
+            worker.battery_last_accounted_at = now
+            worker.battery_accounting_swap_at = swap_at
+
+    def _update_worker_battery_accounting(self, worker: Worker) -> float:
+        now = float(self.env.now)
+        self._ensure_worker_battery_accounting(worker, now)
+        last_raw = getattr(worker, "battery_last_accounted_at", None)
+        last = now if last_raw is None else float(last_raw)
+        if now > last:
+            elapsed = max(0.0, now - last)
+            remaining_raw = getattr(worker, "battery_remaining_budget_min", self.battery_period_min)
+            remaining = float(remaining_raw if remaining_raw is not None else self.battery_period_min)
+            worker.battery_remaining_budget_min = max(0.0, remaining - elapsed * self._battery_drain_rate_multiplier(worker))
+            worker.battery_last_accounted_at = now
+        budget_raw = getattr(worker, "battery_remaining_budget_min", self.battery_period_min)
+        return float(budget_raw if budget_raw is not None else self.battery_period_min)
+
+    def _reset_worker_battery(self, worker: Worker) -> None:
+        now = float(self.env.now)
+        worker.last_battery_swap = now
+        worker.battery_remaining_budget_min = float(self.battery_period_min)
+        worker.battery_last_accounted_at = now
+        worker.battery_accounting_swap_at = now
 
     def _battery_low_threshold_min(self) -> float:
         return max(0.0, self.battery_period_min * self.battery_low_threshold_ratio)
@@ -364,8 +434,11 @@ class ShipyardWorld:
                 },
             },
         ).to_dict()
+        if desired_power in {"POWER_LOW", "POWER_CRITICAL"}:
+            self._rolling_horizon_collect_immediate_candidates("worker_low_battery")
 
     def _transition(self, worker: Worker, event: dict[str, Any]) -> None:
+        self._update_worker_battery_accounting(worker)
         event.setdefault("timestamp_s", float(self.env.now) * 60.0)
         worker.humanoid_state = transition_humanoid_state(worker.humanoid_state, event).to_dict()
         self._emit_worker_state(worker)
@@ -504,7 +577,41 @@ class ShipyardWorld:
             },
         )
 
-    def _rolling_horizon_collect_candidates(self) -> None:
+    def _rolling_horizon_immediate_task_codes_for_event(self, event_name: str) -> set[str]:
+        if not self.rolling_horizon_enabled:
+            return set()
+        if not bool(getattr(self, "rolling_horizon_immediate_triggers_enabled", False)):
+            return set()
+        return set(
+            getattr(self, "rolling_horizon_immediate_event_task_codes", {}).get(
+                str(event_name or "").strip().lower(),
+                set(),
+            )
+        )
+
+    def _rolling_horizon_collect_immediate_candidates(self, event_name: str) -> None:
+        task_code_filter = self._rolling_horizon_immediate_task_codes_for_event(event_name)
+        if not task_code_filter:
+            return
+        if self.rolling_horizon_window_index < 0:
+            self._rolling_horizon_start_window(float(self.env.now))
+        self._rolling_horizon_collect_candidates(
+            task_code_filter=task_code_filter,
+            collection_trigger=str(event_name or "").strip().lower() or "immediate",
+        )
+
+    def _rolling_horizon_collect_candidates(
+        self,
+        *,
+        task_code_filter: set[str] | None = None,
+        collection_trigger: str = "scheduled_scan",
+    ) -> None:
+        normalized_task_code_filter = {
+            str(code or "").strip().upper()
+            for code in (task_code_filter or set())
+            if str(code or "").strip()
+        }
+        collection_trigger = str(collection_trigger or "scheduled_scan").strip().lower() or "scheduled_scan"
         existing_keys = {
             str(entry.get("resource_key", ""))
             for entry in self.rolling_horizon_pending.values()
@@ -522,6 +629,8 @@ class ShipyardWorld:
                     existing_keys.add(self._resource_key_for_payload(work_tile.work_tile_id, task_code, extra_payload))
         for worker in self.workers.values():
             for task in self._candidate_tasks_for_worker(worker):
+                if normalized_task_code_filter and task.task_code not in normalized_task_code_filter:
+                    continue
                 resource_key = self._resource_key(task)
                 if resource_key in existing_keys:
                     continue
@@ -540,6 +649,8 @@ class ShipyardWorld:
                     "first_window_index": self.rolling_horizon_window_index,
                     "last_updated": float(self.env.now),
                     "status": "pool",
+                    "collection_trigger": collection_trigger,
+                    "immediate_trigger": collection_trigger != "scheduled_scan",
                 }
                 self.rolling_horizon_pending[opportunity_id] = entry
                 existing_keys.add(resource_key)
@@ -769,6 +880,8 @@ class ShipyardWorld:
             "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
             "role_policy": "dedicated_roles" if self.decision_mode == "rolling_horizon_dedicated_roles" else "aging_priority",
             "rolling_task_signature": payload,
+            "collection_trigger": str(entry.get("collection_trigger", "scheduled_scan")),
+            "immediate_trigger": bool(entry.get("immediate_trigger", False)),
             "reason": entry.get("skip_reason", ""),
         }
         self.logger.log(
@@ -852,6 +965,7 @@ class ShipyardWorld:
                     "parking_spot_id": parking_spot.parking_spot_id,
                     "target": parking_spot.parking_spot_id,
                     "target_tile": self.map.tile_payload(parking_spot.tile),
+                    "parking_footprint_tiles": self.map.path_payload(parking_spot.footprint_tiles),
                     "route_id": "shipyard_cart_route",
                 }
                 candidates.append(
@@ -873,7 +987,7 @@ class ShipyardWorld:
                         },
                     )
                 )
-                reserved_spot_tiles.add(parking_spot.tile)
+                reserved_spot_tiles.update(parking_spot.footprint_tiles)
                 remaining_demand -= batch_count
         return candidates
 
@@ -932,17 +1046,24 @@ class ShipyardWorld:
         if not target_tiles:
             return None
         excluded_tiles = excluded_tiles or set()
-        occupied_tiles = {
-            cart.tile for cart in self.carts.values() if cart.status in {"parked", "reserved", "moving", "loading"}
-        }
+        occupied_tiles: set[tuple[int, int]] = set()
+        for cart in self.carts.values():
+            if cart.status in {"parked", "reserved", "moving", "loading"}:
+                occupied_tiles.update(self._cart_footprint_tiles(cart))
         occupied_tiles.update(excluded_tiles)
         for cart in self.carts.values():
             if cart.reserved_parking_spot_id in self.map.cart_parking_spots:
-                occupied_tiles.add(self.map.cart_parking_spots[cart.reserved_parking_spot_id].tile)
-        candidate_spots = [spot for spot in self.map.cart_parking_spots.values() if spot.tile not in occupied_tiles]
+                occupied_tiles.update(self.map.cart_parking_spots[cart.reserved_parking_spot_id].footprint_tiles)
+        candidate_spots = [
+            spot
+            for spot in self.map.cart_parking_spots.values()
+            if not set(spot.footprint_tiles).intersection(occupied_tiles)
+        ]
         if not candidate_spots:
             candidate_spots = [
-                spot for spot in self.map.cart_parking_spots.values() if spot.tile not in excluded_tiles
+                spot
+                for spot in self.map.cart_parking_spots.values()
+                if not set(spot.footprint_tiles).intersection(excluded_tiles)
             ] or list(self.map.cart_parking_spots.values())
         best_spot = None
         best_score = 10**9
@@ -1505,7 +1626,7 @@ class ShipyardWorld:
 
         cart.status = "parked"
         cart.parking_spot_id = parking_id
-        cart.heading = self._cart_heading_at_tile(cart.tile, cart.heading)
+        cart.heading = parking.heading if parking is not None else self._cart_heading_at_tile(cart.tile, cart.heading)
         cart.reserved_parking_spot_id = ""
         cart.owner = None
         cart.assigned_task_id = None
@@ -1698,7 +1819,7 @@ class ShipyardWorld:
         serviced_worker_id = receiver_id if action == "battery_delivery" and receiver_id in self.workers else worker.worker_id
         if serviced_worker_id in self.workers:
             serviced_worker = self.workers[serviced_worker_id]
-            serviced_worker.last_battery_swap = float(self.env.now)
+            self._reset_worker_battery(serviced_worker)
             serviced_worker.battery_service_owner = None
             serviced_worker.awaiting_battery_from = None
             self._emit_worker_state(serviced_worker)

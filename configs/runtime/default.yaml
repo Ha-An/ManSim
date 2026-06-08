@@ -6,6 +6,7 @@ ui:
   streamlit_preferred_port: 8505
   replay_studio_preferred_port: 5173
   replay_studio_3d_preferred_port: 5174
-  auto_start_replay_studio: true
+  # Legacy 2D Replay Studio is no longer exposed in the shared hub UI.
+  auto_start_replay_studio: false
   auto_start_replay_studio_3d: true
   replay_studio_auto_install: true

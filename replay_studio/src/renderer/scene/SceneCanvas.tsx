@@ -601,11 +601,14 @@ function workerTaskCode(entity: { attributes: Record<string, unknown> }): string
 }
 
 function workerHasHumanoidIncident(entity: { attributes: Record<string, unknown> }): boolean {
-  const incident = entity.attributes.incident_bubble ?? entity.attributes.last_humanoid_incident;
-  if (incident && typeof incident === "object") {
-    const code = (incident as Record<string, unknown>).code;
-    if (typeof code === "string" && code.trim()) return true;
+  const recovery = entity.attributes.current_recovery_context;
+  if (recovery && typeof recovery === "object") {
+    const row = recovery as Record<string, unknown>;
+    const code = row.incident_code;
+    if (row.active === true && typeof code === "string" && code.trim()) return true;
   }
+  const availability = humanoidStateValue(entity, "availability");
+  if (availability !== "BLOCKED" && availability !== "WAITING") return false;
   const reason = humanoidStateRecord(entity).reason;
   if (reason && typeof reason === "object") {
     const metadata = (reason as Record<string, unknown>).metadata;

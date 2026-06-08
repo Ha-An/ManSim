@@ -463,6 +463,19 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
                 if start is not None and t >= start:
                     broken_pure_min[entity_id] += t - start
                 repair_active[entity_id] = t
+            elif event_type == "MACHINE_REPAIR_HELPER_JOIN":
+                if entity_id not in repair_active:
+                    start = broken_active.pop(entity_id, None)
+                    if start is not None and t >= start:
+                        broken_pure_min[entity_id] += t - start
+                    repair_active[entity_id] = t
+            elif event_type == "MACHINE_REPAIR_HELPER_LEAVE":
+                team_size = int(details.get("repair_team_size", 0) or 0)
+                if team_size <= 0:
+                    start_repair = repair_active.pop(entity_id, None)
+                    if start_repair is not None and t >= start_repair:
+                        repair_min[entity_id] += t - start_repair
+                    broken_active[entity_id] = t
             elif event_type == "MACHINE_REPAIRED":
                 start_repair = repair_active.pop(entity_id, None)
                 if start_repair is not None and t >= start_repair:

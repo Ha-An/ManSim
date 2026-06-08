@@ -575,6 +575,20 @@ def humanoid_task_window(
     }
 
 
+def is_recovery_humanoid_task(details: Dict[str, Any]) -> bool:
+    recovery_context = details.get("recovery_context")
+    if isinstance(recovery_context, dict):
+        return True
+    instance_id = str(details.get("instance_id") or "")
+    return ":recovery:" in instance_id
+
+
+def owns_worker_task_window(details: Dict[str, Any]) -> bool:
+    if is_recovery_humanoid_task(details):
+        return False
+    return not bool(details.get("parent_task_code"))
+
+
 def task_target(details: Dict[str, Any]) -> str | None:
     payload = details.get("payload", {})
     task_type = details.get("task_type")
@@ -674,6 +688,7 @@ def convert_events(
         "output_buffer_station_4": "inspection_output_queue",
     }
     output_buffer_counts = {alias: 0 for alias in output_buffer_alias.values()}
+    output_buffer_items_popped: set[tuple[str, str]] = set()
     converted: List[Dict[str, Any]] = []
     has_canonical_worker_events = any(
         event.get("type") in {"WORKER_STATE_CHANGED", "WORKER_CARGO_CHANGED"} for event in raw_events
@@ -804,6 +819,7 @@ def convert_events(
         has_active_task_context = False
         if isinstance(humanoid_state, dict):
             attrs["humanoid_state"] = copy.deepcopy(humanoid_state)
+            attrs["humanoid_state"]["timestamp_s"] = timestamp
             if details.get("humanoid_state") is humanoid_state:
                 worker_humanoid_state_cache[worker_id] = copy.deepcopy(humanoid_state)
             task_context = humanoid_state.get("task_context")
@@ -896,6 +912,13 @@ def convert_events(
             attrs["battery_remaining_min"] = remaining
             attrs["battery_period_min"] = event_battery_period_min
             attrs["battery_pct"] = max(0.0, min(100.0, 100.0 * remaining / max(1.0, event_battery_period_min)))
+            state_for_battery = attrs.get("humanoid_state")
+            if isinstance(state_for_battery, dict):
+                state_for_battery["timestamp_s"] = timestamp
+                metadata = state_for_battery.get("metadata") if isinstance(state_for_battery.get("metadata"), dict) else {}
+                metadata["battery_remaining_min"] = remaining
+                metadata["battery_period_min"] = event_battery_period_min
+                state_for_battery["metadata"] = metadata
         return attrs
 
     def conflict_position_payload(details: Dict[str, Any]) -> Dict[str, Any]:
@@ -1068,13 +1091,14 @@ def convert_events(
 
         if raw_type == "HUMANOID_TASK_START" and entity_id:
             attrs = canonical_worker_attributes(details, index, entity_id, timestamp=timestamp)
-            attrs["task_window"] = humanoid_task_window(task_window_by_key, entity_id, timestamp, details)
+            if owns_worker_task_window(details):
+                attrs["task_window"] = humanoid_task_window(task_window_by_key, entity_id, timestamp, details)
             push("state_changed", timestamp, {"primary": entity_id}, {"attributes": attrs})
             continue
 
         if raw_type == "HUMANOID_TASK_END" and entity_id:
             attrs = canonical_worker_attributes(details, index, entity_id, prefer_next_state=True, timestamp=timestamp)
-            if details.get("parent_task_code"):
+            if details.get("parent_task_code") and not is_recovery_humanoid_task(details):
                 parent_window_details = {
                     "task_id": details.get("parent_task_id"),
                     "instance_id": details.get("parent_instance_id"),
@@ -1118,7 +1142,7 @@ def convert_events(
                     "current_primitive_call_code": "",
                 }
             )
-            if not details.get("parent_task_code"):
+            if owns_worker_task_window(details):
                 attrs["task_window"] = None
             push("state_changed", timestamp, {"primary": entity_id}, {"attributes": attrs})
             continue
@@ -1569,7 +1593,8 @@ def convert_events(
             continue
 
         if raw_type == "QUEUE_POP":
-            queue_id = entity_id
+            raw_queue_id = str(entity_id or "")
+            queue_id = output_buffer_alias.get(raw_queue_id, raw_queue_id)
             if queue_id in QUEUE_META:
                 item_type = details.get("queue") or QUEUE_ITEM_TYPE.get(queue_id)
                 push(
@@ -1578,6 +1603,19 @@ def convert_events(
                     {"primary": details.get("item_id"), "source": queue_id, "target": resolve_region_id(location)},
                     {"item_id": details.get("item_id"), "queue_id": queue_id, "item_type": item_type},
                 )
+            elif queue_id in OUTPUT_QUEUE_META:
+                item_id = str(details.get("item_id") or "")
+                item_type = QUEUE_ITEM_TYPE.get(queue_id, details.get("queue") or "item")
+                if item_id:
+                    output_buffer_items_popped.add((raw_queue_id, item_id))
+                output_buffer_counts[queue_id] = max(0, output_buffer_counts.get(queue_id, 0) - 1)
+                push(
+                    "queue_exited",
+                    timestamp,
+                    {"primary": item_id, "source": queue_id, "target": resolve_region_id(location)},
+                    {"item_id": item_id, "queue_id": queue_id, "item_type": item_type},
+                )
+                push_output_buffer_state(timestamp, queue_id)
             continue
 
         if raw_type == "WAREHOUSE_MATERIAL_RESTOCK":
@@ -1684,8 +1722,13 @@ def convert_events(
             source_alias = output_buffer_alias.get(source)
             target_alias = output_buffer_alias.get(target)
             if source_alias:
-                output_buffer_counts[source_alias] = max(0, output_buffer_counts[source_alias] - 1)
-                push_output_buffer_state(timestamp, source_alias)
+                item_id = str(entity_id or details.get("item_id") or "")
+                pop_key = (str(source), item_id)
+                if pop_key in output_buffer_items_popped:
+                    output_buffer_items_popped.discard(pop_key)
+                else:
+                    output_buffer_counts[source_alias] = max(0, output_buffer_counts[source_alias] - 1)
+                    push_output_buffer_state(timestamp, source_alias)
             if target_alias:
                 output_buffer_counts[target_alias] += 1
                 push_output_buffer_state(timestamp, target_alias)

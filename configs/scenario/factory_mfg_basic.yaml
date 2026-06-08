@@ -1,5 +1,5 @@
 ﻿# 기본 제조 실험 시나리오
-name: mfg_basic
+name: factory_mfg_basic
 type: factory_mfg_basic
 
 horizon:
@@ -131,6 +131,11 @@ machine_failure:
 worker:
   # 배터리 교체가 필요한 사용 주기(분)
   battery_swap_period_min: 200
+  # Availability state에 따른 배터리 소모 배율.
+  # AVAILABLE이 아니면 기본적으로 두 배 빠르게 소모된다.
+  battery_drain:
+    available_rate_multiplier: 0.5
+    non_available_rate_multiplier: 1.0
   # fresh battery 픽업 시간
   battery_pickup_time_min: 5
   # 배터리 전달 작업의 추가 서비스 시간

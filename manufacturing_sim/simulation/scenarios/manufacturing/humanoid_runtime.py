@@ -409,6 +409,7 @@ class HumanoidTaskRuntime:
         normalized.setdefault("task_context", None)
         normalized.setdefault("reason", None)
         normalized.setdefault("metadata", {})
+        self._clear_resolved_incident_metadata(normalized)
         try:
             issues = self._imports["validate_state_snapshot"](normalized)
         except Exception as exc:
@@ -420,6 +421,40 @@ class HumanoidTaskRuntime:
             ]
             raise RuntimeError(f"HumanoidSim state validation issues for {worker.agent_id}: {rendered}")
         return normalized
+
+    @staticmethod
+    def _clear_resolved_incident_metadata(snapshot: dict[str, Any]) -> None:
+        availability = str(snapshot.get("availability", "") or "").strip().upper()
+        if availability in {"BLOCKED", "WAITING"}:
+            return
+        metadata = snapshot.get("metadata")
+        if not isinstance(metadata, dict):
+            return
+        recovery_context = metadata.get("recovery_context")
+        recovery_active = isinstance(recovery_context, dict) and bool(recovery_context.get("active", False))
+        if recovery_active:
+            return
+        incident_keys = {
+            "context",
+            "incident_category",
+            "incident_code",
+            "incident_severity",
+            "original_reason_code",
+            "primitive_call_code",
+            "reason_code",
+            "reason_message",
+            "recovery_context",
+            "recovery_id",
+            "recovery_protocol",
+        }
+        for key in incident_keys:
+            metadata.pop(key, None)
+        reason = snapshot.get("reason")
+        if isinstance(reason, dict):
+            code = str(reason.get("code", "") or "").strip().upper()
+            source = str(reason.get("source", "") or "").strip()
+            if code and source.startswith("mansim.recovery"):
+                snapshot["reason"] = None
 
     def _task_context_from_worker(self, worker: Worker) -> dict[str, Any] | None:
         if not any([worker.current_task_id, worker.current_task_code, worker.current_step_id, worker.current_primitive_call_code]):
@@ -455,6 +490,8 @@ class HumanoidTaskRuntime:
         metadata = {
             "source": "mansim",
             "battery_remaining_min": round(float(self.world.battery_remaining(worker)), 3),
+            "battery_period_min": round(float(getattr(self.world, "battery_swap_period_min", 0.0) or 0.0), 3),
+            "low_threshold_ratio": round(float(getattr(self.world, "rolling_horizon_battery_low_ratio", 0.2) or 0.2), 6),
         }
         metadata.update({key: value for key, value in extra.items() if value not in {None, ""}})
         return metadata

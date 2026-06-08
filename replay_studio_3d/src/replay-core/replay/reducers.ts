@@ -189,6 +189,40 @@ function clearHumanoidTaskAttributes(entity: BaseEntityState): void {
   delete entity.attributes.current_execution_status;
 }
 
+function isActiveRecoveryContext(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  return (value as Record<string, unknown>).active === true;
+}
+
+function hasActiveHumanoidTaskContext(rawAttributes: unknown): boolean {
+  if (!rawAttributes || typeof rawAttributes !== "object") return false;
+  const humanoidState = (rawAttributes as Record<string, unknown>).humanoid_state;
+  if (!humanoidState || typeof humanoidState !== "object") return false;
+  const taskContext = (humanoidState as Record<string, unknown>).task_context;
+  if (!taskContext || typeof taskContext !== "object") return false;
+  return typeof (taskContext as Record<string, unknown>).task_code === "string";
+}
+
+function clearResolvedHumanoidIncidentAttributes(entity: BaseEntityState, rawAttributes: unknown): void {
+  if (!rawAttributes || typeof rawAttributes !== "object") return;
+  const raw = rawAttributes as Record<string, unknown>;
+  const humanoidState = raw.humanoid_state;
+  if (!humanoidState || typeof humanoidState !== "object") return;
+
+  const stateMetadata = (humanoidState as Record<string, unknown>).metadata;
+  const stateRecoveryContext =
+    stateMetadata && typeof stateMetadata === "object"
+      ? (stateMetadata as Record<string, unknown>).recovery_context
+      : undefined;
+  if (isActiveRecoveryContext(raw.current_recovery_context) || isActiveRecoveryContext(stateRecoveryContext)) return;
+
+  // Replay events are merged incrementally, so absence of a recovery context in
+  // the next humanoid state must actively clear the previous incident display.
+  delete entity.attributes.current_recovery_context;
+  delete entity.attributes.incident_bubble;
+  delete entity.attributes.last_humanoid_incident;
+}
+
 function upsertResource(next: DomainState, resourceId: string): ResourceState {
   const existing = next.resources[resourceId];
   if (existing) {
@@ -287,12 +321,18 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       if (rawAttributes && typeof rawAttributes === "object" && (rawAttributes as Record<string, unknown>).motion === null) {
         delete entity.attributes.motion;
       }
-      if (rawAttributes && typeof rawAttributes === "object" && (rawAttributes as Record<string, unknown>).task_window === null) {
+      if (
+        rawAttributes &&
+        typeof rawAttributes === "object" &&
+        (rawAttributes as Record<string, unknown>).task_window === null &&
+        !hasActiveHumanoidTaskContext(rawAttributes)
+      ) {
         delete entity.attributes.task_window;
       }
       normalizeMachineItemSlots(entity, rawAttributes);
       clearStaleMachineWaitAttributes(entity, rawAttributes);
       const humanoidState = rawAttributes && typeof rawAttributes === "object" ? (rawAttributes as Record<string, unknown>).humanoid_state : undefined;
+      clearResolvedHumanoidIncidentAttributes(entity, rawAttributes);
       if (
         humanoidState &&
         typeof humanoidState === "object" &&

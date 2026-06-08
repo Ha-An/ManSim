@@ -272,6 +272,59 @@ describe("replay core copy", () => {
     expect((next.entities.A2.attributes.motion as Record<string, unknown>).paused).toBe(true);
   });
 
+  it("does not clear a worker task window while an active humanoid task context is still present", () => {
+    const domainState: DomainState = {
+      entities: {
+        A3: {
+          entity_id: "A3",
+          entity_type: "worker",
+          state: "working",
+          label: "A3",
+          attributes: {
+            active_task: "TR-002436",
+            task_window: { started_at: 170.1, ended_at: 201.0, task_id: "TR-002436" },
+          },
+          relations: {},
+          updated_at: 179.4,
+        },
+      },
+      resources: {},
+      queues: {},
+      interactions: {},
+      current_event_index: 0,
+      current_time: 179.4,
+    };
+
+    const next = applyEvent(domainState, {
+      event_id: "recovery-step-end",
+      sequence_index: 1,
+      timestamp: 179.5,
+      event_type: "state_changed",
+      entity_refs: { primary: "A3" },
+      payload: {
+        attributes: {
+          active_task: "TR-002436",
+          task_window: null,
+          humanoid_state: {
+            task_context: {
+              task_code: "TRANSFER",
+              task_instance_id: "TR-002436:TRANSFER/TR-002436:TRANSFER:recovery:TRAFFIC_WAIT:00179399/step01:TRANSFER",
+              step_id: "recovery_01_navigate_to",
+              primitive_call_code: "NAVIGATE_TO",
+              execution_status: "SUCCESS",
+            },
+          },
+        },
+      },
+    });
+
+    expect(next.entities.A3.attributes.task_window).toEqual({
+      started_at: 170.1,
+      ended_at: 201.0,
+      task_id: "TR-002436",
+    });
+  });
+
   it("recognizes rolling horizon logs and aggregates task pool opportunities", () => {
     const parsed = parseReplayLog({
       schema_version: "1.0",

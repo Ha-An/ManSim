@@ -26,7 +26,7 @@ Simulator core가 담당하지 않는 것:
 
 ## Key Files
 
-- `manufacturing_sim/simulation/scenarios/registry.py`: `scenario.type` alias resolution and plugin runner dispatch.
+- `manufacturing_sim/simulation/scenarios/registry.py`: `scenario.type` lookup and plugin runner dispatch.
 - `manufacturing_sim/simulation/scenarios/manufacturing/world.py`: Factory world state, task enumeration, execution, KPI aggregation.
 - `manufacturing_sim/simulation/scenarios/manufacturing/humanoid_runtime.py`: HumanoidSim catalog/profile validation, nested task flattening, primitive execution bridge.
 - `manufacturing_sim/simulation/scenarios/manufacturing/grid_map.py`: Tile map, pathfinding, object footprints, worker tile occupancy.
@@ -41,12 +41,12 @@ Simulator core가 담당하지 않는 것:
 
 ## Scenario Plugins
 
-ManSim은 `scenario.type` 값을 registry에서 해석해 scenario plugin을 실행합니다. 기존 `scenario=mfg_basic` command는 계속 동작하며 내부적으로 `factory_mfg_basic` manufacturing plugin을 사용합니다.
+ManSim은 `scenario.type` 값을 registry에서 해석해 scenario plugin을 실행합니다. 제조 시나리오는 `scenario=factory_mfg_basic`으로 직접 실행합니다.
 
-| Scenario | Alias | Purpose |
-| --- | --- | --- |
-| `factory_mfg_basic` | `mfg_basic`, `manufacturing`, `factory` | Warehouse -> Station 1 -> Station 2 -> Inspection 제조 공정입니다. 기존 ManSim factory flow와 artifact schema를 유지합니다. |
-| `shipyard_basic` | `shipyard` | 중앙 고정 ship hull silhouette의 exterior surface tile별 용접, 표면처리, 도장, 검사를 수행합니다. 핵심 KPI는 `makespan_min`입니다. |
+| Scenario | Purpose |
+| --- | --- |
+| `factory_mfg_basic` | Warehouse -> Station 1 -> Station 2 -> Inspection 제조 공정입니다. 기존 ManSim factory flow와 artifact schema를 유지합니다. |
+| `shipyard_basic` | 중앙 고정 ship hull silhouette의 exterior surface tile별 용접, 표면처리, 도장, 검사를 수행합니다. 핵심 KPI는 `makespan_min`입니다. |
 
 ## HumanoidSim Boundary
 
@@ -286,6 +286,8 @@ Repair에는 여러 worker가 같은 machine에 합류할 수 있습니다. 동�
 ### Battery
 
 Battery swap은 `MANAGE_ROBOT_POWER`로 표현합니다. Rolling horizon mode에서는 battery task도 다른 task와 동일하게 pool에 들어가며 window boundary에서 dispatch됩니다.
+
+Battery remaining은 worker별 budget으로 정산합니다. 기본 설정에서는 `availability=AVAILABLE`인 동안 `0.5`배 속도로 소모되고, `ASSIGNED`, `EXECUTING`, `WAITING`, `BLOCKED`, `DISABLED` 등 AVAILABLE이 아닌 상태에서는 `1.0`배 속도로 소모됩니다. 따라서 작업/이동/대기 중인 worker는 idle available 상태보다 2배 빠르게 배터리를 사용합니다. 배율은 scenario config의 `worker.battery_drain.available_rate_multiplier`와 `worker.battery_drain.non_available_rate_multiplier`에서 조정합니다.
 
 ### Product Handover
 

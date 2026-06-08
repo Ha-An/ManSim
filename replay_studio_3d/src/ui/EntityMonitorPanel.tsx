@@ -97,7 +97,41 @@ function progressPercent(value: number | undefined): string {
   return `${Math.round(value * 100)}%`;
 }
 
-function batteryProgress(entity: BaseEntityState): number | undefined {
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+}
+
+function numericField(record: Record<string, unknown> | undefined, key: string): number | undefined {
+  const value = Number(record?.[key]);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function batteryProgress(entity: BaseEntityState, currentTime: number): number | undefined {
+  const humanoidState = asRecord(entity.attributes.humanoid_state);
+  const metadata = asRecord(humanoidState?.metadata);
+  const remainingAtSnapshot = numericField(metadata, "battery_remaining_min");
+  const snapshotTime = numericField(humanoidState, "timestamp_s");
+  let periodMin = numericField(metadata, "battery_period_min");
+
+  if (periodMin === undefined || periodMin <= 0) {
+    const lowThresholdMin = numericField(metadata, "low_threshold_min");
+    const lowThresholdRatio = numericField(metadata, "low_threshold_ratio") ?? 0.2;
+    if (lowThresholdMin !== undefined && lowThresholdMin > 0 && lowThresholdRatio > 0) {
+      periodMin = lowThresholdMin / lowThresholdRatio;
+    }
+  }
+
+  if (
+    remainingAtSnapshot !== undefined &&
+    snapshotTime !== undefined &&
+    periodMin !== undefined &&
+    periodMin > 0
+  ) {
+    const power = String(humanoidState?.power ?? "").toUpperCase();
+    const elapsed = power === "CHARGING" ? 0 : Math.max(0, currentTime - snapshotTime);
+    return clamp((remainingAtSnapshot - elapsed) / periodMin, 0, 1);
+  }
+
   const batteryPct = Number(entity.attributes.battery_pct);
   if (!Number.isFinite(batteryPct)) return undefined;
   return clamp(batteryPct / 100, 0, 1);
@@ -141,21 +175,26 @@ function humanoidTaskContext(entity: BaseEntityState): Record<string, unknown> {
 }
 
 function workerIncident(entity: BaseEntityState): string {
-  const incident = entity.attributes.last_humanoid_incident ?? entity.attributes.incident_bubble;
   const recovery = entity.attributes.current_recovery_context;
   const recoveryCode =
-    recovery && typeof recovery === "object" && typeof (recovery as Record<string, unknown>).incident_code === "string"
+    recovery &&
+    typeof recovery === "object" &&
+    (recovery as Record<string, unknown>).active === true &&
+    typeof (recovery as Record<string, unknown>).incident_code === "string"
       ? String((recovery as Record<string, unknown>).incident_code).trim()
       : "";
   const reason = (entity.attributes.humanoid_state as Record<string, unknown> | undefined)?.reason;
   const metadata = reason && typeof reason === "object" ? (reason as Record<string, unknown>).metadata : undefined;
+  const availability = String((entity.attributes.humanoid_state as Record<string, unknown> | undefined)?.availability ?? "").toUpperCase();
+  const canShowReasonIncident = availability === "BLOCKED" || availability === "WAITING";
   const reasonCode =
-    metadata && typeof metadata === "object" && typeof (metadata as Record<string, unknown>).incident_code === "string"
+    canShowReasonIncident &&
+    metadata &&
+    typeof metadata === "object" &&
+    typeof (metadata as Record<string, unknown>).incident_code === "string"
       ? String((metadata as Record<string, unknown>).incident_code)
       : "";
-  if (!incident || typeof incident !== "object") return recoveryCode || reasonCode || "-";
-  const code = (incident as Record<string, unknown>).code;
-  return typeof code === "string" && code.trim() ? code.trim() : recoveryCode || reasonCode || "-";
+  return recoveryCode || reasonCode || "-";
 }
 
 function cargoItemType(entity: BaseEntityState): string {
@@ -334,7 +373,7 @@ function WorkerPortraitModel({ worker, currentTime }: { worker: BaseEntityState;
   const cargoId = cargoItemId(worker);
   const cargoType = cargoItemType(worker) || cargoId;
   const availability = humanoidStateValue(worker, "availability");
-  const walkSwing = moving ? Math.sin(currentTime * 9.5) * 0.42 : 0;
+  const walkSwing = moving ? Math.sin(currentTime * 9.5) * 0.72 : 0;
   const workSwing = !moving && availability === "EXECUTING" ? Math.sin(currentTime * 8.5) * 0.34 : 0;
   const color = workerColor(worker);
 
@@ -514,7 +553,7 @@ export function EntityMonitorPanel({
                   </div>
                   <div className="worker-monitor-state">{availability}</div>
                 </div>
-                <Meter label="BATTERY" value={batteryProgress(worker)} kind="battery" />
+                <Meter label="BATTERY" value={batteryProgress(worker, currentTime)} kind="battery" />
                 <Meter label="TASK" value={taskWindowProgress(worker, currentTime)} kind="task" />
                 <div className="worker-monitor-grid">
                   <div><span className="worker-monitor-key">Availability</span><span className="worker-monitor-value">{availability}</span></div>

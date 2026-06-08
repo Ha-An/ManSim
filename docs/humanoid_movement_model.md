@@ -11,7 +11,7 @@ Humanoid State/Task/Primitive 전체 설명은 [humanoid_worker_model.md](humano
 - map 구현: `manufacturing_sim/simulation/scenarios/manufacturing/grid_map.py`
 - 이동 실행: `manufacturing_sim/simulation/scenarios/manufacturing/world.py`
 - traffic 감지/예약: `manufacturing_sim/simulation/scenarios/manufacturing/traffic.py`
-- 기본 설정: `configs/scenario/mfg_basic.yaml`
+- 기본 설정: `configs/scenario/factory_mfg_basic.yaml`
 
 `movement.warehouse_to_station_min` 같은 zone 기반 이동 시간은 tile map이 꺼졌을 때 쓰는 fallback 값입니다. 기본값은 `map.enabled=true`이므로 실제 worker 이동은 tile path를 따릅니다.
 

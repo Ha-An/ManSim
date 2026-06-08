@@ -407,7 +407,6 @@ function workerTrafficConflict(entity: BaseEntityState, currentTime: number): st
 }
 
 function workerHumanoidIncident(entity: BaseEntityState): string {
-  const incident = entity.attributes.last_humanoid_incident ?? entity.attributes.incident_bubble;
   const recoveryContext = activeRecoveryContext(entity);
   const recoveryIncidentCode =
     recoveryContext && typeof recoveryContext.incident_code === "string" && recoveryContext.incident_code.trim()
@@ -415,16 +414,16 @@ function workerHumanoidIncident(entity: BaseEntityState): string {
       : "";
   const reason = humanoidState(entity).reason;
   const reasonMetadata = reason && typeof reason === "object" ? (reason as Record<string, unknown>).metadata : undefined;
+  const availability = humanoidStateValue(entity, "availability").toUpperCase();
+  const canShowReasonIncident = availability === "BLOCKED" || availability === "WAITING";
   const reasonIncidentCode =
-    reasonMetadata && typeof reasonMetadata === "object" && typeof (reasonMetadata as Record<string, unknown>).incident_code === "string"
+    canShowReasonIncident &&
+    reasonMetadata &&
+    typeof reasonMetadata === "object" &&
+    typeof (reasonMetadata as Record<string, unknown>).incident_code === "string"
       ? String((reasonMetadata as Record<string, unknown>).incident_code)
       : "";
-  if (!incident || typeof incident !== "object") {
-    return recoveryIncidentCode || reasonIncidentCode || "-";
-  }
-  const row = incident as Record<string, unknown>;
-  const code = typeof row.code === "string" && row.code.trim() ? row.code.trim() : recoveryIncidentCode || reasonIncidentCode;
-  return code || "-";
+  return recoveryIncidentCode || reasonIncidentCode || "-";
 }
 
 function machineActiveWorkers(entity: BaseEntityState): string {

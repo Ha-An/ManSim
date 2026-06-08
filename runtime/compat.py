@@ -14,6 +14,17 @@ def _to_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(base_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def build_legacy_experiment_cfg(cfg: DictConfig) -> dict[str, Any]:
     scenario_cfg = _to_dict(cfg.get("scenario", {}))
     decision_cfg = _to_dict(cfg.get("decision", {}))
@@ -22,6 +33,8 @@ def build_legacy_experiment_cfg(cfg: DictConfig) -> dict[str, Any]:
     worker_cfg = _to_dict(cfg.get("worker", {}))
 
     experiment_cfg = dict(scenario_cfg)
+    scenario_worker_cfg = _to_dict(scenario_cfg.get("worker", {}))
+    merged_worker_cfg = _deep_merge(scenario_worker_cfg, worker_cfg)
     global_seed = cfg.get("seed", None)
     if global_seed is not None:
         experiment_cfg["seed"] = int(global_seed)
@@ -43,5 +56,5 @@ def build_legacy_experiment_cfg(cfg: DictConfig) -> dict[str, Any]:
     experiment_cfg["decision"] = decision_cfg
     experiment_cfg["heuristic_rules"] = heuristic_cfg
     experiment_cfg["humanoidsim"] = humanoidsim_cfg
-    experiment_cfg["worker"] = worker_cfg
+    experiment_cfg["worker"] = merged_worker_cfg
     return experiment_cfg

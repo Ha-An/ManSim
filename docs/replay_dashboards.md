@@ -11,13 +11,19 @@ Hub는 다음 view로 연결합니다.
 - KPI dashboard
 - Gantt chart
 - task-priority dashboard
-- factory Replay Studio 2D
-- factory Replay Studio 3D
-- OpenClaw workspace dashboard
-- manager Replay Studio view
-- LLM Wiki dashboard
-- Graphify knowledge graph dashboard
+- Replay Studio 3D
 - Series dashboard
+
+Manager-only views are shown only for manager modes such as `openclaw_adaptive_priority`, and only when the corresponding artifact exists.
+
+- Manager Replay
+- Reasoning dashboard
+
+Knowledge views are hidden unless LLM knowledge is explicitly enabled in config. They are not shown for ordinary scripted or rolling-horizon runs just because placeholder artifacts exist.
+
+- Knowledge dashboard
+- LLM Wiki dashboard
+- Graphify Knowledge Graph dashboard
 
 ## KPI Dashboard
 
@@ -68,7 +74,9 @@ Worker collaboration KPI는 명시적 collaboration event만 사용합니다. �
 
 `rolling_horizon_dedicated_roles`는 같은 event를 사용하되 `role_owner_agent_id`, `allowed_worker_ids`, `role_policy=dedicated_roles`를 함께 기록합니다. 3D Replay Studio의 Task Pool 패널은 rolling horizon 계열 mode에서 pool, dispatched, requeued, skipped 상태를 같은 stable task id 기준으로 보여줍니다.
 
-## Factory Replay Studio 2D
+## Legacy Replay Studio 2D
+
+The shared Results Hub no longer exposes the legacy 2D Replay Studio. The artifacts can still be generated for backward compatibility, but the supported visual replay entry point is Replay Studio 3D.
 
 2D Replay Studio는 다음 파일을 사용합니다.
 

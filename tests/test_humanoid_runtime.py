@@ -383,6 +383,8 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         self.assertEqual("BLOCKED", recovery_task_starts[0]["details"]["humanoid_state"]["availability"])
         recovery_end = next(event for event in events if event["event_type"] == "HUMANOID_RECOVERY_END")
         self.assertEqual("AVAILABLE", recovery_end["details"]["humanoid_state"]["availability"])
+        self.assertNotIn("incident_code", recovery_end["details"]["humanoid_state"]["metadata"])
+        self.assertNotIn("recovery_context", recovery_end["details"]["humanoid_state"]["metadata"])
 
     def test_interrupt_incident_still_executes_recovery_timeline(self) -> None:
         env = simpy.Environment()
@@ -819,6 +821,33 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         self.assertEqual("AVAILABLE", worker.humanoid_state["availability"])
         wait_end = next(event for event in events if event["event_type"] == "BATTERY_SWAP_WAIT_END")
         self.assertEqual("AVAILABLE", wait_end["details"]["humanoid_state"]["availability"])
+
+    def test_battery_swap_wait_end_is_idempotent_after_receiver_release(self) -> None:
+        events: list[dict] = []
+        world = ManufacturingWorld.__new__(ManufacturingWorld)
+        world.env = SimpleNamespace(now=25.0)
+        world.logger = SimpleNamespace(log=lambda **payload: events.append(payload))
+        world.day_for_time = lambda _t: 1  # type: ignore[method-assign]
+        world.worker_display_location = lambda worker: worker.location  # type: ignore[method-assign]
+        world.agent_display_location = lambda worker: worker.location  # type: ignore[method-assign]
+        world.battery_remaining = lambda _worker: 42.0  # type: ignore[method-assign]
+        world.product_transport_session_by_worker = {}
+        world.product_transport_sessions = {}
+        worker = Worker(worker_id="A3", location="Station2")
+        world.agents = {"A3": worker}
+        world.humanoid_runtime = HumanoidTaskRuntime(world, {"humanoidsim": {"enabled": True}})
+
+        world._start_battery_swap_wait(worker, "A1")
+        world.env.now = 31.0
+        world._end_battery_swap_wait(worker, "A1")
+        world.env.now = 37.0
+        world._end_battery_swap_wait(worker, "A1")
+
+        self.assertIsNone(worker.awaiting_battery_from)
+        self.assertEqual(
+            1,
+            sum(1 for event in events if event["event_type"] == "BATTERY_SWAP_WAIT_END"),
+        )
 
     def test_battery_swap_wait_does_not_downgrade_blocked_worker(self) -> None:
         events: list[dict] = []

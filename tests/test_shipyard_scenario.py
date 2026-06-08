@@ -23,9 +23,9 @@ class ShipyardScenarioTests(unittest.TestCase):
         cfg["seed"] = 2026
         return cfg
 
-    def test_scenario_aliases(self) -> None:
-        self.assertEqual(scenario_type({"name": "mfg_basic"}), "factory_mfg_basic")
-        self.assertEqual(scenario_type({"type": "shipyard"}), "shipyard_basic")
+    def test_scenario_types(self) -> None:
+        self.assertEqual(scenario_type({"name": "factory_mfg_basic"}), "factory_mfg_basic")
+        self.assertEqual(scenario_type({"type": "shipyard_basic"}), "shipyard_basic")
 
     def test_shipyard_map_surface_tiles_are_valid(self) -> None:
         cfg = self._load_cfg()
@@ -39,6 +39,13 @@ class ShipyardScenarioTests(unittest.TestCase):
         self.assertEqual((4, 5, 18, 8), (grid.zones["PaintSupply"].x, grid.zones["PaintSupply"].y, grid.zones["PaintSupply"].width, grid.zones["PaintSupply"].height))
         self.assertEqual(2, grid.cart_count)
         self.assertEqual(6, len(grid.cart_parking_spots))
+        self.assertEqual(12, len(grid.cart_parking_tiles()))
+        for spot in grid.cart_parking_spots.values():
+            self.assertEqual(2, len(spot.footprint_tiles))
+            self.assertFalse(set(spot.footprint_tiles).intersection(grid.cart_route_tiles))
+            self.assertTrue(
+                any(neighbor in grid.cart_route_tiles for tile in spot.footprint_tiles for neighbor in grid._adjacent_tiles(tile))
+            )
         self.assertEqual(grid.cart_parking_spots["CART-PARK-01"].tile, grid.initial_cart_tile("CART-01"))
         self.assertEqual(grid.cart_parking_spots["CART-PARK-04"].tile, grid.initial_cart_tile("CART-02"))
         self.assertTrue(grid.cart_route_tiles)
@@ -75,6 +82,29 @@ class ShipyardScenarioTests(unittest.TestCase):
                 self.assertEqual(["WELD_SEAM", "PREPARE_SURFACE"], world._allowed_task_codes("A2"))
                 self.assertIn("OPERATE_VEHICLE_TRANSPORT", world._allowed_task_codes("A3"))
                 self.assertIn("PAINT_SURFACE", world._allowed_task_codes("A3"))
+            finally:
+                logger.close()
+
+    def test_shipyard_non_available_worker_drains_battery_twice_as_fast(self) -> None:
+        cfg = self._load_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                env = simpy.Environment()
+                world = ShipyardWorld(env=env, cfg=cfg, logger=logger)
+                worker = world.workers["A1"]
+
+                self.assertAlmostEqual(world.battery_period_min, world._worker_battery_remaining_min("A1"), places=3)
+                env.run(until=10.0)
+                available_rate = world.battery_available_rate_multiplier
+                non_available_rate = world.battery_non_available_rate_multiplier
+                self.assertAlmostEqual(world.battery_period_min - 10.0 * available_rate, world._worker_battery_remaining_min("A1"), places=3)
+
+                worker.humanoid_state["availability"] = "EXECUTING"
+                env.run(until=20.0)
+                expected = world.battery_period_min - 10.0 * available_rate - 10.0 * non_available_rate
+                self.assertAlmostEqual(expected, world._worker_battery_remaining_min("A1"), places=3)
+                self.assertAlmostEqual(2.0, non_available_rate / available_rate, places=3)
             finally:
                 logger.close()
 
@@ -152,12 +182,46 @@ class ShipyardScenarioTests(unittest.TestCase):
                 env = simpy.Environment()
                 world = ShipyardWorld(env=env, cfg=cfg, logger=logger)
                 worker = world.workers["A2"]
-                env.run(until=200)
+                low_at = ((world.battery_period_min - world._battery_low_threshold_min()) / world.battery_available_rate_multiplier) + 1.0
+                env.run(until=low_at)
                 world._emit_worker_state(worker)
                 self.assertEqual("POWER_LOW", worker.humanoid_state["power"])
-                env.run(until=230)
+                critical_at = ((world.battery_period_min - world._battery_critical_threshold_min()) / world.battery_available_rate_multiplier) + 1.0
+                env.run(until=critical_at)
                 world._emit_worker_state(worker)
                 self.assertEqual("POWER_CRITICAL", worker.humanoid_state["power"])
+            finally:
+                logger.close()
+
+    def test_shipyard_low_battery_immediately_registers_power_task(self) -> None:
+        cfg = self._load_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                env = simpy.Environment()
+                world = ShipyardWorld(env=env, cfg=cfg, logger=logger)
+                worker = world.workers["A3"]
+                world._ensure_worker_battery_accounting(worker, 0.0)
+                worker.battery_remaining_budget_min = world.battery_period_min * 0.1
+                worker.battery_last_accounted_at = 0.0
+
+                world._emit_worker_state(worker)
+
+                battery_entries = [
+                    entry
+                    for entry in world.rolling_horizon_pending.values()
+                    if entry["task"].task_code == "MANAGE_ROBOT_POWER"
+                    and entry["task"].assigned_robot_id == "A3"
+                ]
+                self.assertEqual(1, len(battery_entries))
+                event = next(
+                    row
+                    for row in logger.events
+                    if row["type"] == "ROLLING_HORIZON_CANDIDATE_COLLECTED"
+                    and row["details"].get("task_code") == "MANAGE_ROBOT_POWER"
+                )
+                self.assertEqual("worker_low_battery", event["details"].get("collection_trigger"))
+                self.assertTrue(event["details"].get("immediate_trigger"))
             finally:
                 logger.close()
 
@@ -168,7 +232,7 @@ class ShipyardScenarioTests(unittest.TestCase):
             try:
                 world = ShipyardWorld(env=simpy.Environment(), cfg=cfg, logger=logger)
                 for worker in world.workers.values():
-                    worker.last_battery_swap = -195.0
+                    worker.last_battery_swap = -350.0
 
                 world._rolling_horizon_start_window(0.0)
                 world._rolling_horizon_collect_candidates()

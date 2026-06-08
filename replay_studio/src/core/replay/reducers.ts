@@ -148,6 +148,31 @@ function clearHumanoidTaskAttributes(entity: BaseEntityState): void {
   delete entity.attributes.current_execution_status;
 }
 
+function isActiveRecoveryContext(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  return (value as Record<string, unknown>).active === true;
+}
+
+function clearResolvedHumanoidIncidentAttributes(entity: BaseEntityState, rawAttributes: unknown): void {
+  if (!rawAttributes || typeof rawAttributes !== "object") return;
+  const raw = rawAttributes as Record<string, unknown>;
+  const humanoidState = raw.humanoid_state;
+  if (!humanoidState || typeof humanoidState !== "object") return;
+
+  const stateMetadata = (humanoidState as Record<string, unknown>).metadata;
+  const stateRecoveryContext =
+    stateMetadata && typeof stateMetadata === "object"
+      ? (stateMetadata as Record<string, unknown>).recovery_context
+      : undefined;
+  if (isActiveRecoveryContext(raw.current_recovery_context) || isActiveRecoveryContext(stateRecoveryContext)) return;
+
+  // Replay state is merged over time; clear stale incident/recovery display
+  // fields when the next HumanoidSim state no longer carries active recovery.
+  delete entity.attributes.current_recovery_context;
+  delete entity.attributes.incident_bubble;
+  delete entity.attributes.last_humanoid_incident;
+}
+
 function upsertResource(next: DomainState, resourceId: string): ResourceState {
   const existing = next.resources[resourceId];
   if (existing) {
@@ -247,6 +272,7 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       }
       clearStaleMachineWaitAttributes(entity, rawAttributes);
       const humanoidState = rawAttributes && typeof rawAttributes === "object" ? (rawAttributes as Record<string, unknown>).humanoid_state : undefined;
+      clearResolvedHumanoidIncidentAttributes(entity, rawAttributes);
       if (
         humanoidState &&
         typeof humanoidState === "object" &&

@@ -42,8 +42,20 @@ rolling_horizon:
   worker_task_priority: {}
   aging:
     rank_boost_per_window: 1
+  immediate_task_triggers:
+    enabled: true
+    # Event-triggered tasks are queued ahead of normal rolling-horizon work.
+    # A running worker is not interrupted; the urgent task starts immediately
+    # after the current task finishes.
+    queue_policy: next_after_current
+    protect_from_window_requeue: true
+    event_task_codes:
+      worker_low_battery:
+        - MANAGE_ROBOT_POWER
+      machine_broken:
+        - REPAIR_MACHINE
 
 battery:
-  low_threshold_ratio: 0.20
+  low_threshold_ratio: 0.30
   delivery_provider_agent_ids: [A3]
   delivery_receiver_agent_ids: [A1, A2]

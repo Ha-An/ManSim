@@ -42,6 +42,16 @@ def _format_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _scenario_type(experiment_cfg: dict[str, Any]) -> str:
+    raw = str(
+        experiment_cfg.get("scenario_type")
+        or experiment_cfg.get("type")
+        or experiment_cfg.get("name")
+        or "factory_mfg_basic"
+    ).strip().lower()
+    return raw or "factory_mfg_basic"
+
+
 def _write_progress(output_root: Path, payload: dict[str, Any]) -> None:
     progress_path = output_root / "progress.json"
     progress_path.write_text(__import__("json").dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
@@ -284,6 +294,7 @@ def run(
 
     decision_cfg = experiment_cfg.get("decision", {}) if isinstance(experiment_cfg.get("decision", {}), dict) else {}
     decision_mode = normalize_decision_mode(str(decision_cfg.get("mode", "adaptive_priority")))
+    scenario_kind = _scenario_type(experiment_cfg)
 
     total_days = int(experiment_cfg["horizon"]["num_days"])
     sim_total_min = float(total_days) * float(experiment_cfg["horizon"].get("minutes_per_day", 0))
@@ -297,6 +308,7 @@ def run(
     base_seed = int(series_cfg.get("base_seed", run_seed) or run_seed)
 
     run_meta: dict[str, Any] = {
+        "scenario_type": scenario_kind,
         "decision_mode": decision_mode,
         "run_index": run_index,
         "total_runs": total_runs,
@@ -612,6 +624,7 @@ def run(
         run_meta["wall_clock_human"] = _format_duration(elapsed_wall_sec)
 
         kpi = world.finalize_kpis()
+        kpi["scenario_type"] = scenario_kind
         kpi["wall_clock_sec"] = round(elapsed_wall_sec, 3)
         kpi["wall_clock_human"] = _format_duration(elapsed_wall_sec)
         kpi["run_meta"] = run_meta
@@ -811,4 +824,3 @@ def run(
         "llm_graph_path": str(run_meta.get("llm_graph_path", "")).strip(),
         "llm_wiki_dashboard_path": str(run_meta.get("llm_wiki_dashboard_path", "")).strip(),
     }
-

@@ -111,6 +111,9 @@ class Worker:
     humanoid_state: dict[str, Any] = field(default_factory=default_humanoid_state_payload)
     process_ref: Any = None
     last_battery_swap: float = 0.0
+    battery_remaining_budget_min: Optional[float] = None
+    battery_last_accounted_at: float = 0.0
+    battery_accounting_swap_at: float = 0.0
     suspended_task: Any = None
     battery_service_owner: Optional[str] = None
     awaiting_battery_from: Optional[str] = None

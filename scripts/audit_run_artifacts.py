@@ -56,8 +56,8 @@ AVAILABILITY_STATES = {
     "DISABLED",
 }
 
-MANUFACTURING_SCENARIOS = {"", "mfg_basic", "factory_mfg_basic", "manufacturing", "factory"}
-SHIPYARD_SCENARIOS = {"shipyard", "shipyard_basic"}
+MANUFACTURING_SCENARIOS = {"", "factory_mfg_basic"}
+SHIPYARD_SCENARIOS = {"shipyard_basic"}
 SHIPYARD_KPI_KEYS = [
     "makespan_min",
     "surface_tile_count",

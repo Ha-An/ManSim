@@ -28,6 +28,9 @@ movement:
 
 worker:
   battery_swap_period_min: 240
+  battery_drain:
+    available_rate_multiplier: 0.5
+    non_available_rate_multiplier: 1.0
   battery_pickup_time_min: 4
   battery_delivery_extra_min: 3
 

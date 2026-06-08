@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "replay_studio" / "
 from replay_studio.examples.export_mansim_run import (
     build_initial_state,
     build_humanoid_task_window_index,
+    convert_events,
     humanoid_task_window,
 )
 
@@ -64,6 +65,41 @@ class ReplayExportTests(unittest.TestCase):
         self.assertEqual(10.0, window["started_at"])
         self.assertEqual(20.0, window["ended_at"])
         self.assertEqual("REPAIR_MACHINE", window["task_code"])
+
+    def test_output_buffer_queue_pop_uses_visible_queue_alias(self) -> None:
+        raw_events = [
+            {
+                "t": 10.0,
+                "type": "ITEM_MOVED",
+                "entity_id": "INT-S1-1",
+                "location": "Station1",
+                "details": {"from": "S1M1", "to": "output_buffer_station_1", "item_type": "intermediate"},
+            },
+            {
+                "t": 11.0,
+                "type": "QUEUE_POP",
+                "entity_id": "output_buffer_station_1",
+                "location": "Station1",
+                "details": {"item_id": "INT-S1-1", "queue": "output"},
+            },
+            {
+                "t": 12.0,
+                "type": "ITEM_MOVED",
+                "entity_id": "INT-S1-1",
+                "location": "Station2",
+                "details": {"from": "output_buffer_station_1", "to": "intermediate_queue_2", "item_type": "intermediate"},
+            },
+        ]
+        events = convert_events(raw_events, {"regions": [], "nodes": []}, battery_period_min=200.0, repair_total_min=30.0)
+        output_queue_sizes = [
+            event["payload"]["attributes"]["queue_size"]
+            for event in events
+            if event["event_type"] == "state_changed"
+            and event["entity_refs"].get("primary") == "station_1_output_queue"
+            and "queue_size" in event["payload"].get("attributes", {})
+        ]
+
+        self.assertEqual([1, 0], output_queue_sizes)
 
 
 if __name__ == "__main__":

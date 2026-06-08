@@ -15,7 +15,7 @@ from manufacturing_sim.simulation.scenarios.manufacturing.world import Manufactu
 
 
 def _load_cfg() -> dict:
-    cfg_path = Path(__file__).resolve().parents[1] / "configs" / "scenario" / "mfg_basic.yaml"
+    cfg_path = Path(__file__).resolve().parents[1] / "configs" / "scenario" / "factory_mfg_basic.yaml"
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     cfg["horizon"]["num_days"] = 1
     cfg["humanoidsim"] = {"enabled": True, "validation_mode": "warn"}

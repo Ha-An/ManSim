@@ -40,8 +40,9 @@ def machine_lifecycle(env: simpy.Environment, world: ManufacturingWorld, machine
         try:
             yield env.timeout(machine.process_time_min)
         except simpy.Interrupt as intr:
-            machine.total_processing_min += max(0.0, env.now - start_t)
-            world.abort_machine_cycle(machine, cycle_id, str(intr.cause))
+            elapsed_min = max(0.0, env.now - start_t)
+            machine.total_processing_min += elapsed_min
+            world.abort_machine_cycle(machine, cycle_id, str(intr.cause), elapsed_min=elapsed_min)
             continue
         machine.total_processing_min += machine.process_time_min
         world.complete_machine_cycle(machine, cycle_id)
@@ -172,4 +173,5 @@ def snapshot_loop(env: simpy.Environment, world: ManufacturingWorld):
         if world.terminated:
             return
         world.capture_snapshot()
+        world.log_periodic_worker_state_observations()
         yield env.timeout(world.snapshot_interval)

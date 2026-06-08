@@ -19,7 +19,6 @@ ARTIFACT_LABELS = {
     "gantt.html": "Gantt",
     "operations_replay.html": "Operations Replay",
     "manager_replay_dashboard.html": "Manager Replay",
-    "replay_studio": "Replay Studio",
     "replay_studio_3d": "Replay Studio 3D",
     "task_priority_dashboard.html": "Task Priority",
     "knowledge_dashboard.html": "Knowledge",
@@ -47,14 +46,35 @@ def _total_runs(run: dict[str, Any] | None) -> int:
         return 1
 
 
+def _is_manager_mode(run: dict[str, Any] | None) -> bool:
+    return _decision_mode(run) in {"llm_planner", "openclaw_adaptive_priority"}
+
+
+def _knowledge_enabled(run: dict[str, Any] | None) -> bool:
+    if not isinstance(run, dict) or not _is_manager_mode(run):
+        return False
+    run_meta = run.get("run_meta", {}) if isinstance(run.get("run_meta", {}), dict) else {}
+    llm = run_meta.get("llm", {}) if isinstance(run_meta.get("llm", {}), dict) else {}
+    knowledge = llm.get("knowledge", {}) if isinstance(llm.get("knowledge", {}), dict) else {}
+    graphify = knowledge.get("graphify", {}) if isinstance(knowledge.get("graphify", {}), dict) else {}
+    return bool(knowledge.get("enabled", False) or graphify.get("enabled", False))
+
+
 def _show_task_priority(run: dict[str, Any] | None) -> bool:
     mode = _decision_mode(run)
-    return mode in {"adaptive_priority", "fixed_priority", "fixed_task_assignment", "openclaw_adaptive_priority"}
+    if mode not in {"adaptive_priority", "fixed_priority", "fixed_task_assignment", "openclaw_adaptive_priority"} or not isinstance(run, dict):
+        return False
+    artifacts = run.get("artifacts", {}) if isinstance(run.get("artifacts", {}), dict) else {}
+    dashboard_path = str(artifacts.get("task_priority_dashboard.html", "")).strip()
+    return bool(dashboard_path) and Path(dashboard_path).exists()
 
 
 def _show_reasoning(run: dict[str, Any] | None) -> bool:
-    mode = _decision_mode(run)
-    return mode in {"llm_planner", "openclaw_adaptive_priority"}
+    if not _is_manager_mode(run) or not isinstance(run, dict):
+        return False
+    artifacts = run.get("artifacts", {}) if isinstance(run.get("artifacts", {}), dict) else {}
+    dashboard_path = str(artifacts.get("reasoning_dashboard.html", "")).strip()
+    return bool(dashboard_path) and Path(dashboard_path).exists()
 
 
 def _show_manager_replay(run: dict[str, Any] | None) -> bool:
@@ -62,21 +82,22 @@ def _show_manager_replay(run: dict[str, Any] | None) -> bool:
     if mode != "openclaw_adaptive_priority":
         return False
     artifacts = run.get("artifacts", {}) if isinstance(run.get("artifacts", {}), dict) else {}
-    payload_path = str(artifacts.get("manager_replay.json", "")).strip()
-    return bool(payload_path) and Path(payload_path).exists()
+    dashboard_path = str(artifacts.get("manager_replay_dashboard.html", "")).strip()
+    return bool(dashboard_path) and Path(dashboard_path).exists()
 
 
 def _show_knowledge(run: dict[str, Any] | None) -> bool:
-    mode = _decision_mode(run)
-    if mode == "llm_planner":
-        return True
-    if mode == "openclaw_adaptive_priority":
-        return _total_runs(run) > 1
-    return False
+    if not _knowledge_enabled(run) or not isinstance(run, dict):
+        return False
+    artifacts = run.get("artifacts", {}) if isinstance(run.get("artifacts", {}), dict) else {}
+    dashboard_path = str(artifacts.get("knowledge_dashboard.html", "")).strip()
+    return bool(dashboard_path) and Path(dashboard_path).exists()
 
 
 def _show_llm_wiki(run: dict[str, Any] | None) -> bool:
     if not isinstance(run, dict):
+        return False
+    if not _knowledge_enabled(run):
         return False
     artifacts = run.get("artifacts", {}) if isinstance(run.get("artifacts", {}), dict) else {}
     for artifact in ("llm_wiki_dashboard.html", "graphify_graph.html"):
@@ -228,25 +249,14 @@ def _nav_links(*, manifest: dict[str, Any] | None, current_page_path: Path, curr
         target = artifacts.get(artifact, "")
         href = rel_href(current_page_path, target)
         items.append((ARTIFACT_LABELS.get(artifact, artifact), href, artifact == current_artifact))
-    replay_studio_href = build_replay_studio_url(
-        port=int(manifest.get("replay_studio_preferred_port", 5173) or 5173) if isinstance(manifest, dict) else 5173,
-        manifest_path=manifest_path,
-        run_id=str(run.get("id", "")).strip(),
-    )
-    items.insert(2, (ARTIFACT_LABELS["replay_studio"], replay_studio_href, current_artifact == "replay_studio"))
     replay_studio_3d_href = build_replay_studio_3d_url(
         port=int(manifest.get("replay_studio_3d_preferred_port", 5174) or 5174) if isinstance(manifest, dict) else 5174,
         manifest_path=manifest_path,
         run_id=str(run.get("id", "")).strip(),
     )
-    items.insert(3, (ARTIFACT_LABELS["replay_studio_3d"], replay_studio_3d_href, current_artifact == "replay_studio_3d"))
+    items.insert(2, (ARTIFACT_LABELS["replay_studio_3d"], replay_studio_3d_href, current_artifact == "replay_studio_3d"))
     if _show_manager_replay(run):
-        href = build_replay_studio_url(
-            port=int(manifest.get("replay_studio_preferred_port", 5173) or 5173) if isinstance(manifest, dict) else 5173,
-            manifest_path=manifest_path,
-            run_id=str(run.get("id", "")).strip(),
-            view="manager",
-        )
+        href = rel_href(current_page_path, artifacts.get("manager_replay_dashboard.html", ""))
         items.append((ARTIFACT_LABELS.get("manager_replay_dashboard.html", "Manager Replay"), href, current_artifact == "manager_replay_dashboard.html"))
     if _show_task_priority(run):
         target = artifacts.get("task_priority_dashboard.html", "")
