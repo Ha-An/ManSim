@@ -23,6 +23,7 @@ from dashboards import (
     export_llm_graph_dashboard,
     export_manager_replay,
     export_operations_replay,
+    export_pre_run_diagnostics_dashboard,
     export_reasoning_dashboard,
     export_replay_dashboard,
     export_results_dashboard,
@@ -319,6 +320,8 @@ def _export_run_dashboards(
     daily_rows = daily_payload.get("days", []) if isinstance(daily_payload.get("days", []), list) else []
     run_meta = _load_json(output_dir / "run_meta.json") or {}
     reflection = _load_json(Path(str(result.get("run_reflection_path", output_dir / "run_reflection.json")))) or {}
+    pre_run_diagnostics_json_path = Path(str(result.get("pre_run_diagnostics_path", output_dir / "pre_run_diagnostics.json")))
+    pre_run_diagnostics = _load_json(pre_run_diagnostics_json_path) if pre_run_diagnostics_json_path.exists() else None
 
     export_kpi_dashboard(
         kpi=kpi,
@@ -335,6 +338,15 @@ def _export_run_dashboards(
         manifest_path=manifest_path,
         current_run_id=current_run_id,
     )
+    pre_run_diagnostics_dashboard_path: Path | None = None
+    if isinstance(pre_run_diagnostics, dict):
+        pre_run_diagnostics_dashboard_path = export_pre_run_diagnostics_dashboard(
+            diagnostics=pre_run_diagnostics,
+            output_dir=output_dir,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            current_run_id=current_run_id,
+        )
     replay_path = export_replay_dashboard(output_dir=output_dir, events=events)
     operations_replay_path = export_operations_replay(output_dir=output_dir, events=events)
     manager_replay_path = export_manager_replay(output_dir=output_dir)
@@ -390,6 +402,8 @@ def _export_run_dashboards(
         "results_dashboard_path": str(results_path.resolve()),
         "replay_dashboard_path": str(replay_path.resolve()),
         "operations_replay_dashboard_path": str(operations_replay_path.resolve()),
+        "pre_run_diagnostics_path": str(pre_run_diagnostics_json_path.resolve()) if pre_run_diagnostics_json_path.exists() else "",
+        "pre_run_diagnostics_dashboard_path": str(pre_run_diagnostics_dashboard_path.resolve()) if pre_run_diagnostics_dashboard_path is not None and pre_run_diagnostics_dashboard_path.exists() else "",
         "manager_replay_dashboard_path": str(manager_replay_path.resolve()) if manager_replay_path is not None else "",
         "manager_replay_json_path": str(manager_replay_json_path.resolve()) if manager_replay_json_path.exists() else "",
         "replay_studio_log_path": str(replay_studio_log_path.resolve()),
@@ -678,6 +692,8 @@ def main(cfg: DictConfig) -> None:
             "completed_product_lead_time_avg_min": float(kpi.get("completed_product_lead_time_avg_min", 0.0) or 0.0),
             "kpi_dashboard_path": str(result.get("kpi_dashboard_path", "")),
             "gantt_path": str(result.get("gantt_path", "")),
+            "pre_run_diagnostics_path": exported.get("pre_run_diagnostics_path", str(result.get("pre_run_diagnostics_path", ""))),
+            "pre_run_diagnostics_dashboard_path": exported.get("pre_run_diagnostics_dashboard_path", str(result.get("pre_run_diagnostics_dashboard_path", ""))),
             "task_priority_dashboard_path": str(result.get("task_priority_dashboard_path", "")),
             "orchestration_intelligence_dashboard_path": str(result.get("orchestration_intelligence_dashboard_path", "")),
             "llm_trace_path": str(result.get("llm_trace_path", "")),

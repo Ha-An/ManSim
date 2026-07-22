@@ -108,6 +108,14 @@ Shipyard dedicated roles 기본값:
 
 A1과 A2는 battery station으로 직접 이동해 self swap을 수행하지 않습니다. A1/A2가 설정된 low threshold 이하로 내려가면 A3가 `transfer_kind=battery_delivery`인 battery delivery task를 pool에서 받아 수행합니다. threshold와 provider/receiver 목록은 `decision.battery` 설정에서 조정합니다.
 
+### `bottleneck_aware_dispatch`
+
+`bottleneck_aware_dispatch`는 factory throughput 비교 실험용 즉시 dispatch mode입니다. Worker가 task를 요청할 때 현재 가능한 후보를 bottleneck relief, downstream progress, machine continuity, travel/execution time, resource risk, battery risk로 scoring하고 가장 높은 후보를 선택합니다. 선택된 task에는 `selection_meta.score_components`가 기록되어 왜 그 task가 선택되었는지 확인할 수 있습니다.
+
+### `rolling_horizon_throughput_optimizer`
+
+`rolling_horizon_throughput_optimizer`는 rolling horizon pool/window/requeue 구조를 유지하되 window dispatch를 OR-Tools CP-SAT로 결정합니다. Objective는 task별 throughput score와 urgent bonus를 최대화하고 worker queue load와 load imbalance를 penalty로 둡니다. 비교 실험 재현성을 위해 기본 `num_search_workers=1`이며 CP-SAT `random_seed`는 별도 값이 없으면 ManSim run seed를 사용합니다. 이 mode는 OR-Tools가 필수이며, solver가 `OPTIMAL` 또는 `FEASIBLE` status를 반환하지 않으면 fallback 없이 run을 실패시킵니다.
+
 ### `fixed_task_assignment`
 
 worker별 허용 task family를 강제하는 scripted mode입니다.

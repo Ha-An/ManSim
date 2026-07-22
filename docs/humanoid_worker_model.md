@@ -65,7 +65,7 @@ Concrete material instance는 task 실행 중 `PRIMITIVE_IDENTIFY_ITEM` 단계�
 
 ## ManSim Task Subset
 
-ManSim v0.4.3에서 factory flow에 연결된 HumanoidSim task subset은 다음과 같습니다.
+ManSim v0.5.0에서 factory flow에 연결된 HumanoidSim task subset은 다음과 같습니다.
 
 | Task code | 역할 |
 | --- | --- |
@@ -79,7 +79,7 @@ ManSim v0.4.3에서 factory flow에 연결된 HumanoidSim task subset은 다음�
 | `REPAIR_MACHINE` | breakdown machine 수리 |
 | `PREVENTIVE_MAINTENANCE` | idle machine preventive maintenance |
 | `INSPECT_MACHINE` | repair/maintenance 중 machine 상태 진단 child task |
-| `HANDOVER_ITEM` | product 공동 운반 helper 합류 |
+| `HANDOVER_ITEM` | product 공동 운반 helper 합류. ManSim task type은 기존 이름을 유지하고, HumanoidSim execution task code는 robot-robot 전용 `HANDOVER_ITEM_TO_ROBOT`를 사용합니다. |
 | `COLLECT_WASTE_OR_SCRAP` | inspection scrap queue의 불량품 batch를 ScrapDisposal로 운반 |
 | `UPDATE_INVENTORY_RECORD` | inventory 기록 step |
 

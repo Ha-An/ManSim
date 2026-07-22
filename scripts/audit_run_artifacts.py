@@ -181,6 +181,308 @@ def _is_worker_id(value: Any) -> bool:
     return len(text) > 1 and text[0] == "A" and text[1:].isdigit()
 
 
+def _tile_tuple(value: Any) -> tuple[int, int] | None:
+    if isinstance(value, dict) and "x" in value and "y" in value:
+        try:
+            return int(value["x"]), int(value["y"])
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        try:
+            return int(value[0]), int(value[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _layout_spatial_contract(layout: dict[str, Any]) -> tuple[int, int, float, set[tuple[int, int]]]:
+    grid = layout.get("grid", {}) if isinstance(layout.get("grid", {}), dict) else {}
+    width = int(grid.get("width_tiles", 0) or 0)
+    height = int(grid.get("height_tiles", 0) or 0)
+    tile_time = float(grid.get("tile_time_min", 0.0) or 0.0)
+    blocked = {
+        tile
+        for raw in grid.get("walls", [])
+        if (tile := _tile_tuple(raw)) is not None
+    }
+    doors = {
+        tile
+        for raw in grid.get("doors", [])
+        if (tile := _tile_tuple(raw)) is not None
+    }
+    blocked.difference_update(doors)
+    for footprint in grid.get("object_footprints", []):
+        if not isinstance(footprint, dict) or not bool(footprint.get("blocking", False)):
+            continue
+        try:
+            x = int(footprint.get("x", 0))
+            y = int(footprint.get("y", 0))
+            footprint_width = int(footprint.get("width", 0))
+            footprint_height = int(footprint.get("height", 0))
+        except (TypeError, ValueError):
+            continue
+        blocked.update(
+            (tile_x, tile_y)
+            for tile_x in range(x, x + max(0, footprint_width))
+            for tile_y in range(y, y + max(0, footprint_height))
+        )
+    blocked.difference_update(doors)
+    return width, height, tile_time, blocked
+
+
+def _path_spatial_issues(
+    raw_path: Any,
+    *,
+    width: int,
+    height: int,
+    blocked: set[tuple[int, int]],
+) -> tuple[list[tuple[int, int]], list[str]]:
+    if not isinstance(raw_path, list):
+        return [], ["path is not a list"]
+    path: list[tuple[int, int]] = []
+    issues: list[str] = []
+    for index, raw_tile in enumerate(raw_path):
+        tile = _tile_tuple(raw_tile)
+        if tile is None:
+            issues.append(f"invalid tile at index {index}: {raw_tile}")
+            continue
+        path.append(tile)
+        if width > 0 and height > 0 and not (0 <= tile[0] < width and 0 <= tile[1] < height):
+            issues.append(f"out-of-bounds tile {tile}")
+        if tile in blocked:
+            issues.append(f"blocking tile {tile}")
+    for source, target in zip(path, path[1:]):
+        distance = abs(source[0] - target[0]) + abs(source[1] - target[1])
+        if distance != 1:
+            issues.append(f"non-adjacent edge {source}->{target} (distance={distance})")
+    return path, issues
+
+
+def check_spatial_continuity(
+    run_dir: Path,
+    events: list[dict[str, Any]],
+    audit: Audit,
+    *,
+    allow_open_moves: bool = False,
+) -> None:
+    """Validate that recorded grid movement is contiguous and obstacle-safe."""
+    layout = _load_json(run_dir / "replay_studio_layout.json", audit)
+    if not isinstance(layout, dict):
+        return
+    width, height, tile_time, blocked = _layout_spatial_contract(layout)
+    if width <= 0 or height <= 0:
+        audit.error("layout grid has invalid dimensions for spatial audit")
+        return
+
+    move_path_count = 0
+    tile_segment_count = 0
+    state_motion_path_count = 0
+    item_floor_tile_count = 0
+    issue_count = 0
+    issue_examples: list[str] = []
+    active_segments: dict[tuple[str, str, int], tuple[tuple[int, int], tuple[int, int]]] = {}
+    completed_segments: set[tuple[str, str, int]] = set()
+    last_move_tile: dict[tuple[str, str], tuple[int, int]] = {}
+
+    def record(event: dict[str, Any], message: str) -> None:
+        nonlocal issue_count
+        issue_count += 1
+        if len(issue_examples) < 10:
+            issue_examples.append(f"t={round(_event_time(event), 3)} {event.get('entity_id', '')} {message}")
+
+    for event in events:
+        event_type = str(event.get("type") or event.get("event_type") or "")
+        details = event.get("details", {})
+        details = details if isinstance(details, dict) else {}
+        worker_id = str(event.get("entity_id") or "")
+
+        if event_type == "AGENT_MOVE_START" and _is_worker_id(worker_id):
+            move_path_count += 1
+            path, issues = _path_spatial_issues(
+                details.get("path_tiles"), width=width, height=height, blocked=blocked
+            )
+            for issue in issues:
+                record(event, f"move path: {issue}")
+            from_tile = _tile_tuple(details.get("from_tile"))
+            to_tile = _tile_tuple(details.get("to_tile"))
+            if path:
+                if from_tile is not None and path[0] != from_tile:
+                    record(event, f"move path starts at {path[0]}, expected {from_tile}")
+                if to_tile is not None and path[-1] != to_tile:
+                    record(event, f"move path ends at {path[-1]}, expected {to_tile}")
+                try:
+                    multiplier = float(details.get("effective_time_multiplier", 1.0) or 1.0)
+                    duration = float(details.get("duration", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    multiplier, duration = 1.0, -1.0
+                expected_duration = max(0, len(path) - 1) * tile_time * multiplier
+                if duration >= 0.0 and abs(duration - expected_duration) > max(0.002, tile_time * 0.02):
+                    record(event, f"move duration {duration} does not match path duration {round(expected_duration, 6)}")
+            elif from_tile != to_tile:
+                record(event, "move between distinct tiles has no path_tiles")
+
+        if event_type == "WORKER_STATE_CHANGED" and _is_worker_id(worker_id):
+            motion = details.get("motion")
+            if isinstance(motion, dict) and isinstance(motion.get("path_tiles"), list):
+                state_motion_path_count += 1
+                _path, issues = _path_spatial_issues(
+                    motion.get("path_tiles"), width=width, height=height, blocked=blocked
+                )
+                for issue in issues:
+                    record(event, f"worker state motion: {issue}")
+
+        if event_type == "ITEM_STATE_CHANGED" and details.get("tile") is not None:
+            item_floor_tile_count += 1
+            tile = _tile_tuple(details.get("tile"))
+            if tile is None:
+                record(event, f"item has invalid floor tile {details.get('tile')}")
+            elif not (0 <= tile[0] < width and 0 <= tile[1] < height):
+                record(event, f"item floor tile is out of bounds: {tile}")
+            elif tile in blocked:
+                record(event, f"item floor tile is blocked: {tile}")
+
+        if event_type == "AGENT_MOVE_TILE_START" and _is_worker_id(worker_id):
+            tile_segment_count += 1
+            move_id = str(details.get("move_id") or "")
+            try:
+                segment_index = int(details.get("segment_index", 0) or 0)
+            except (TypeError, ValueError):
+                segment_index = 0
+            key = (worker_id, move_id, segment_index)
+            source = _tile_tuple(details.get("from_tile"))
+            target = _tile_tuple(details.get("to_tile"))
+            pair_path, issues = _path_spatial_issues(
+                [details.get("from_tile"), details.get("to_tile")],
+                width=width,
+                height=height,
+                blocked=blocked,
+            )
+            for issue in issues:
+                record(event, f"tile segment: {issue}")
+            if source is not None and target is not None and len(pair_path) == 2:
+                if key in active_segments or key in completed_segments:
+                    record(event, f"duplicate tile segment start {move_id}:{segment_index}")
+                active_segments[key] = (source, target)
+                previous = last_move_tile.get((worker_id, move_id))
+                if previous is not None and previous != source:
+                    record(event, f"move segment chain jumps {previous}->{source} for {move_id}")
+
+        elif event_type == "AGENT_MOVE_TILE_END" and _is_worker_id(worker_id):
+            move_id = str(details.get("move_id") or "")
+            try:
+                segment_index = int(details.get("segment_index", 0) or 0)
+            except (TypeError, ValueError):
+                segment_index = 0
+            key = (worker_id, move_id, segment_index)
+            source = _tile_tuple(details.get("from_tile"))
+            target = _tile_tuple(details.get("to_tile"))
+            started_pair = active_segments.pop(key, None)
+            if started_pair is None:
+                record(event, f"tile segment end has no matching start {move_id}:{segment_index}")
+            elif started_pair != (source, target):
+                record(event, f"tile segment end {source}->{target} differs from start {started_pair}")
+            completed_segments.add(key)
+            if target is not None:
+                last_move_tile[(worker_id, move_id)] = target
+
+        elif event_type == "AGENT_MOVE_END" and _is_worker_id(worker_id):
+            move_id = str(details.get("move_id") or "")
+            target = _tile_tuple(details.get("to_tile"))
+            previous = last_move_tile.get((worker_id, move_id))
+            if previous is not None and target is not None and previous != target:
+                record(event, f"move end tile {target} differs from final segment tile {previous}")
+
+    if active_segments:
+        message = f"open tile movement segments at horizon: {len(active_segments)}"
+        if allow_open_moves:
+            audit.warn(message)
+        else:
+            audit.error(message)
+    if issue_count:
+        audit.error(f"spatial continuity violations: {issue_count} examples={issue_examples}")
+    audit.note(
+        "spatial continuity "
+        f"move_paths={move_path_count} tile_segments={tile_segment_count} "
+        f"state_motion_paths={state_motion_path_count} item_floor_tiles={item_floor_tile_count} "
+        f"blocked_tiles={len(blocked)}"
+    )
+
+
+def check_item_transport_continuity(events: list[dict[str, Any]], audit: Audit) -> None:
+    """Require physical item moves to be backed by a worker carry/drop transition."""
+    events_by_time: dict[float, list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        events_by_time[round(_event_time(event), 6)].append(event)
+
+    carry_count = 0
+    moved_count = 0
+    issue_count = 0
+    examples: list[str] = []
+
+    def record(t: float, message: str) -> None:
+        nonlocal issue_count
+        issue_count += 1
+        if len(examples) < 10:
+            examples.append(f"t={t} {message}")
+
+    for t, timestamp_events in events_by_time.items():
+        worker_cargo: dict[str, set[str]] = defaultdict(set)
+        carry_transitions: set[tuple[str, str]] = set()
+        pick_events: set[tuple[str, str]] = set()
+        drop_events: set[tuple[str, str]] = set()
+        stationary_item_states: set[str] = set()
+
+        for event in timestamp_events:
+            event_type = str(event.get("type") or event.get("event_type") or "")
+            details = event.get("details", {})
+            details = details if isinstance(details, dict) else {}
+            entity_id = str(event.get("entity_id") or "")
+            if event_type == "WORKER_CARGO_CHANGED" and _is_worker_id(entity_id):
+                cargo = details.get("cargo", {})
+                cargo = cargo if isinstance(cargo, dict) else {}
+                item_ids = cargo.get("item_ids", [])
+                if isinstance(item_ids, list):
+                    worker_cargo[entity_id].update(str(item_id) for item_id in item_ids if str(item_id))
+            elif event_type == "ITEM_STATE_CHANGED":
+                item_state = str(details.get("item_state") or "")
+                ref = str(details.get("ref") or "")
+                if item_state == "CARRIED_BY_WORKER" and _is_worker_id(ref):
+                    carry_transitions.add((entity_id, ref))
+                elif item_state != "CARRIED_BY_WORKER":
+                    stationary_item_states.add(entity_id)
+            elif event_type == "AGENT_PICK_ITEM" and _is_worker_id(entity_id):
+                item_id = str(details.get("item_id") or "")
+                if item_id:
+                    pick_events.add((item_id, entity_id))
+            elif event_type == "AGENT_DROP_ITEM" and _is_worker_id(entity_id):
+                item_id = str(details.get("item_id") or "")
+                if item_id:
+                    drop_events.add((item_id, entity_id))
+
+        for item_id, worker_id in carry_transitions:
+            carry_count += 1
+            if item_id not in worker_cargo.get(worker_id, set()):
+                record(t, f"item {item_id} is assigned to {worker_id} without matching worker cargo")
+        for item_id, worker_id in pick_events:
+            if (item_id, worker_id) not in carry_transitions:
+                record(t, f"pickup {item_id} by {worker_id} has no carried item state")
+
+        dropped_item_ids = {item_id for item_id, _worker_id in drop_events}
+        for event in timestamp_events:
+            if str(event.get("type") or event.get("event_type") or "") != "ITEM_MOVED":
+                continue
+            moved_count += 1
+            item_id = str(event.get("entity_id") or "")
+            if item_id not in dropped_item_ids:
+                record(t, f"item move {item_id} has no matching worker drop")
+            if item_id not in stationary_item_states:
+                record(t, f"item move {item_id} has no destination item state")
+
+    if issue_count:
+        audit.error(f"item transport continuity violations: {issue_count} examples={examples}")
+    audit.note(f"item transport continuity carried={carry_count} moved={moved_count}")
+
+
 def check_required_files(run_dir: Path, audit: Audit) -> None:
     for name in REQUIRED_ARTIFACTS:
         path = run_dir / name
@@ -309,17 +611,43 @@ def check_event_log_consistency(events: list[dict[str, Any]], audit: Audit, *, a
     non_upper_incident_codes: set[str] = set()
     rolling_missing_task_id = 0
     rolling_missing_task_code = 0
+    last_worker_tile_and_battery: dict[str, tuple[Any, float | None]] = {}
+    zero_battery_tile_moves: list[tuple[float, str, Any, Any]] = []
+    eps = 1e-6
 
     for event in events:
         event_type = str(event.get("type") or event.get("event_type") or "")
         details = event.get("details", {})
         details = details if isinstance(details, dict) else {}
         state = details.get("humanoid_state")
+        worker_id = str(event.get("entity_id", "")).strip()
         if isinstance(state, dict):
             if state.get("availability") == "AVAILABLE" and state.get("task_context"):
                 available_with_task_context += 1
             if state.get("availability") == "BLOCKED" and not state.get("reason"):
                 blocked_without_reason += 1
+        if event_type == "WORKER_STATE_CHANGED" and _is_worker_id(worker_id):
+            tile = details.get("tile")
+            battery_raw = details.get("battery_remaining_min")
+            battery: float | None
+            try:
+                battery = float(battery_raw) if battery_raw is not None else None
+            except (TypeError, ValueError):
+                battery = None
+            previous = last_worker_tile_and_battery.get(worker_id)
+            if (
+                previous is not None
+                and tile is not None
+                and previous[0] is not None
+                and tile != previous[0]
+                and battery is not None
+                and previous[1] is not None
+                and battery <= eps
+                and previous[1] <= eps
+            ):
+                zero_battery_tile_moves.append((_event_time(event), worker_id, previous[0], tile))
+            if tile is not None:
+                last_worker_tile_and_battery[worker_id] = (tile, battery)
 
         if event_type == "HUMANOID_TASK_START":
             task_starts[(event.get("entity_id"), details.get("instance_id"), details.get("task_code"), details.get("task_path") or "")] += 1
@@ -410,6 +738,12 @@ def check_event_log_consistency(events: list[dict[str, Any]], audit: Audit, *, a
         audit.error(f"rolling task events missing stable task_id: {rolling_missing_task_id}")
     if rolling_missing_task_code:
         audit.error(f"rolling task events missing task_code: {rolling_missing_task_code}")
+    if zero_battery_tile_moves:
+        examples = [
+            f"t={round(t, 3)} {worker_id} {from_tile}->{to_tile}"
+            for t, worker_id, from_tile, to_tile in zero_battery_tile_moves[:5]
+        ]
+        audit.error(f"worker tile changed while battery was already depleted: {len(zero_battery_tile_moves)} examples={examples}")
 
 
 def check_replay_log(run_dir: Path, audit: Audit, scenario_type: str = "") -> None:
@@ -438,6 +772,31 @@ def check_replay_log(run_dir: Path, audit: Audit, scenario_type: str = "") -> No
     stale_machine_overlay_count = 0
     self_traffic_conflicts: list[str] = []
     missing_humanoid_state_workers: Counter[str] = Counter()
+    replay_spatial_issue_count = 0
+    replay_spatial_examples: list[str] = []
+    replay_move_count = 0
+    layout = _load_json(run_dir / "replay_studio_layout.json", audit)
+    width, height, _tile_time, blocked = _layout_spatial_contract(layout if isinstance(layout, dict) else {})
+    viewport = layout.get("viewport", {}) if isinstance(layout, dict) and isinstance(layout.get("viewport", {}), dict) else {}
+    viewport_width = float(viewport.get("width", 0.0) or 0.0)
+    viewport_height = float(viewport.get("height", 0.0) or 0.0)
+
+    def replay_position_tile(value: Any) -> tuple[int, int] | None:
+        if not isinstance(value, dict) or width <= 0 or height <= 0 or viewport_width <= 0 or viewport_height <= 0:
+            return None
+        try:
+            x = float(value.get("x"))
+            y = float(value.get("y"))
+        except (TypeError, ValueError):
+            return None
+        return int(x / (viewport_width / width)), int(y / (viewport_height / height))
+
+    def record_replay_spatial(event: dict[str, Any], message: str) -> None:
+        nonlocal replay_spatial_issue_count
+        replay_spatial_issue_count += 1
+        if len(replay_spatial_examples) < 10:
+            replay_spatial_examples.append(f"{event.get('event_id', '')}: {message}")
+
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -447,6 +806,32 @@ def check_replay_log(run_dir: Path, audit: Audit, scenario_type: str = "") -> No
         payload = payload if isinstance(payload, dict) else {}
         attrs = payload.get("attributes", {})
         attrs = attrs if isinstance(attrs, dict) else {}
+        if event.get("event_type") == "entity_moved" and _is_worker_id(refs.get("primary")):
+            replay_move_count += 1
+            raw_path = payload.get("path")
+            if not isinstance(raw_path, list) or len(raw_path) < 2:
+                record_replay_spatial(event, "worker entity_moved has no two-point path")
+            else:
+                path = [replay_position_tile(point) for point in raw_path]
+                if any(tile is None for tile in path):
+                    record_replay_spatial(event, "worker entity_moved has invalid position")
+                else:
+                    tiles = [tile for tile in path if tile is not None]
+                    for tile in tiles:
+                        if not (0 <= tile[0] < width and 0 <= tile[1] < height):
+                            record_replay_spatial(event, f"worker path tile is out of bounds: {tile}")
+                        elif tile in blocked:
+                            record_replay_spatial(event, f"worker path crosses blocking tile: {tile}")
+                    for source, target in zip(tiles, tiles[1:]):
+                        distance = abs(source[0] - target[0]) + abs(source[1] - target[1])
+                        if distance != 1:
+                            record_replay_spatial(event, f"worker path jumps {source}->{target}")
+                    from_tile = replay_position_tile(payload.get("from"))
+                    to_tile = replay_position_tile(payload.get("to"))
+                    if from_tile is not None and tiles and tiles[0] != from_tile:
+                        record_replay_spatial(event, f"path starts at {tiles[0]}, expected {from_tile}")
+                    if to_tile is not None and tiles and tiles[-1] != to_tile:
+                        record_replay_spatial(event, f"path ends at {tiles[-1]}, expected {to_tile}")
         if event.get("event_type") == "state_changed" and "machine_state" in attrs:
             machine_state = str(attrs.get("machine_state") or "").upper()
             if attrs.get("wait_visual") and machine_state != "DONE_WAIT_UNLOAD":
@@ -470,7 +855,12 @@ def check_replay_log(run_dir: Path, audit: Audit, scenario_type: str = "") -> No
         audit.error(f"replay has self traffic conflicts: {self_traffic_conflicts[:10]}")
     if missing_humanoid_state_workers:
         audit.warn(f"some worker state_changed events lack humanoid_state: {dict(missing_humanoid_state_workers)}")
-    audit.note(f"replay events={len(events)}")
+    if replay_spatial_issue_count:
+        audit.error(
+            f"replay spatial continuity violations: {replay_spatial_issue_count} "
+            f"examples={replay_spatial_examples}"
+        )
+    audit.note(f"replay events={len(events)} worker_moves={replay_move_count}")
 
 
 def check_layout(run_dir: Path, audit: Audit, scenario_type: str = "") -> None:
@@ -502,7 +892,10 @@ def audit_run(run_dir: Path) -> Audit:
     events = _iter_events(run_dir / "events.jsonl", audit)
     scenario_type = _scenario_type(run_dir)
     check_kpi(run_dir, audit)
-    check_event_log_consistency(events, audit, allow_open_tasks=_allows_open_runtime_events(run_dir))
+    allow_open_runtime = _allows_open_runtime_events(run_dir)
+    check_event_log_consistency(events, audit, allow_open_tasks=allow_open_runtime)
+    check_spatial_continuity(run_dir, events, audit, allow_open_moves=allow_open_runtime)
+    check_item_transport_continuity(events, audit)
     check_gantt(run_dir, events, audit, scenario_type)
     check_replay_log(run_dir, audit, scenario_type)
     check_layout(run_dir, audit, scenario_type)

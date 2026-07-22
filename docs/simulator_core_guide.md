@@ -1,6 +1,6 @@
 ﻿# Simulator Core Guide
 
-이 문서는 `manufacturing_sim/` 아래의 제조 simulator core를 설명합니다. Humanoid State/Task/Primitive 상세는 [humanoid_worker_model.md](humanoid_worker_model.md), 이동 경로계획과 traffic 상세는 [humanoid_movement_model.md](humanoid_movement_model.md), Replay/Dashboard 상세는 [replay_dashboards.md](replay_dashboards.md)에 분리되어 있습니다.
+이 문서는 ManSim `v0.5.0`의 `manufacturing_sim/` 아래 제조 simulator core를 설명합니다. Humanoid State/Task/Primitive 상세는 [humanoid_worker_model.md](humanoid_worker_model.md), 이동 경로계획과 traffic 상세는 [humanoid_movement_model.md](humanoid_movement_model.md), Replay/Dashboard 상세는 [replay_dashboards.md](replay_dashboards.md)에 분리되어 있습니다.
 
 ## Core Responsibility
 
@@ -239,7 +239,7 @@ Task 정의와 hierarchy는 HumanoidSim이 소유하지만, ManSim에서 **언�
 | `INSPECT_PRODUCT` | Inspection input queue에 product가 있고 inspection owner가 없을 때 생성됩니다. 후보에는 inspection 대상 product id가 포함됩니다. |
 | `REPAIR_MACHINE` | Machine이 broken이고, 해당 worker가 repair team에 아직 없으며, repair team capacity가 남아 있을 때 생성됩니다. Dedicated roles mode에서는 collaboration 없이 단독 repair로 제한됩니다. |
 | `PREVENTIVE_MAINTENANCE` | Machine의 마지막 PM 이후 시간이 `pm_interval_target_min` 이상이고, machine이 broken/processing 상태가 아니며, output이 비어 있고 pm owner가 없을 때 생성됩니다. |
-| `HANDOVER_ITEM` | Product 공동 운반 session이 active이고 carrier가 max보다 적으며, 후보 worker가 아직 carrier가 아니고 source carrier와 남은 path가 유효할 때 생성됩니다. Dedicated roles mode에서는 협업을 배제하기 위해 pool에 넣지 않습니다. |
+| `HANDOVER_ITEM` | Product 공동 운반 session이 active이고 carrier가 max보다 적으며, 후보 worker가 아직 carrier가 아니고 source carrier와 남은 path가 유효할 때 생성됩니다. ManSim의 task type은 `HANDOVER_ITEM`로 유지되지만 HumanoidSim 실행 task code는 robot-robot protocol인 `HANDOVER_ITEM_TO_ROBOT`에 바인딩됩니다. Dedicated roles mode에서는 협업을 배제하기 위해 pool에 넣지 않습니다. |
 | `COLLECT_WASTE_OR_SCRAP` | Inspection scrap queue에 scrap item이 있고 scrap disposal owner가 없을 때 생성됩니다. Worker는 `quality.scrap_transport.max_carry_count` 이하의 batch를 `scrap_disposal_bin`으로 운반합니다. |
 
 World는 같은 concrete item, material shelf slot, material supply station, machine resource가 동시에 여러 unresolved opportunity에 중복으로 잡히지 않도록 item/resource signature를 사용합니다. Rolling horizon mode에서는 이 signature가 `opportunity_id`와 exclusive resource key로 저장되어, 이미 pool 또는 dispatch queue에 있는 같은 자원을 다시 배정하지 않습니다.
@@ -291,7 +291,7 @@ Battery remaining은 worker별 budget으로 정산합니다. 기본 설정에서
 
 ### Product Handover
 
-Product transport session이 active이고 carrier가 1명인 경우, 다른 available worker가 `HANDOVER_ITEM` 후보를 받을 수 있습니다. Helper가 합류하면 다음 tile segment부터 product 이동 multiplier가 carrier 수로 나뉩니다.
+Product transport session이 active이고 carrier가 1명인 경우, 다른 available worker가 `HANDOVER_ITEM` 후보를 받을 수 있습니다. Helper가 합류하면 HumanoidSim의 `HANDOVER_ITEM_TO_ROBOT` sequence(`SYNC_WITH_ROBOT`, `EXECUTE_ROBOT_COLLABORATION_ACTION`)를 거쳐 다음 tile segment부터 product 이동 multiplier가 carrier 수로 나뉩니다.
 
 ## Movement And Traffic
 
@@ -374,6 +374,32 @@ Rolling horizon KPI:
 - `rolling_horizon.max_queue_length_by_worker`
 - `rolling_horizon.task_code_priority_order`
 - `rolling_horizon.rank_boost_per_window`
+- `throughput_optimizer_window_count`
+- `throughput_optimizer_solved_count`
+- `throughput_optimizer_failed_count`
+- `throughput_optimizer_objective_avg`
+- `bottleneck_score_avg`
+
+Factory throughput policy modes:
+
+- `bottleneck_aware_dispatch`는 rolling pool 없이 실행 가능한 task 후보를 즉시 scoring합니다. Score는 bottleneck relief, downstream progress, machine continuity에서 얻는 benefit에서 travel/execution time, resource risk, battery risk penalty를 뺀 값입니다. 선택된 task의 `selection_meta.score_components`에 계산 breakdown이 남습니다.
+- `rolling_horizon_throughput_optimizer`는 기존 rolling horizon pool과 stable task id를 사용하지만 window dispatch를 OR-Tools CP-SAT로 풉니다. OR-Tools가 없거나 solver status가 설정된 `accept_statuses`에 없으면 fallback 없이 run을 실패시킵니다. Dispatch event에는 `optimizer_status`, `optimizer_objective`, `optimizer_score`, `sequence_position`, `score_components`가 포함됩니다.
+
+Operational Task Complexity KPI:
+
+- `operational_task_complexity` / `otc`
+- `cumulative_operational_complexity_over_n_days`
+- `operational_complexity_period_days`
+- `operational_task_complexity_details`
+
+Operational Task Complexity는 HumanoidSim primitive 정의의 `metadata.operational_complexity.difficulty_weight`를 사용합니다. HumanoidSim은 task를 primitive leaf step까지 전개해 `C_task(t)=sum_k a_tk*d_k`를 계산하고, ManSim은 run 중 완료된 top-level task instance 수 `N_t`를 곱해 `C_cum=sum_t N_t*C_task(t)`를 집계합니다. Hub의 `OTC`는 `C_cum / n_days`이며, pool에만 있었거나 dispatch 직전 skipped 된 task는 실행 부담으로 보지 않아 집계에서 제외합니다.
+
+Factory Pre-Run Diagnostics:
+
+- `pre_run_diagnostics.json`
+- `pre_run_diagnostics.html`
+
+이 진단은 simulation 결과를 사용하지 않고 factory scenario config, rolling-horizon role policy, HumanoidSim task complexity, tile map topology, service tile 수, battery 설정을 입력으로 사용합니다. 지표는 worker OTC imbalance, resource conflict potential, traffic contention index, service tile scarcity, robot interaction load, power coordination risk 여섯 개이며, Hub의 `Pre-Run Diagnostics` 메뉴에서 각 값과 계산 과정을 확인할 수 있습니다.
 
 Traffic, transport, production, shelf/scrap KPI는 `kpi.json`에 함께 기록됩니다.
 

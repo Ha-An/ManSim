@@ -10,7 +10,14 @@ from .scripted import FixedTaskAssignmentDecisionModule, ScriptedDecisionModule
 
 def build_decision_module(*, experiment_cfg: dict[str, Any], decision_mode: str) -> Any:
     decision_cfg = experiment_cfg.get("decision", {}) if isinstance(experiment_cfg.get("decision", {}), dict) else {}
-    if decision_mode in {"adaptive_priority", "fixed_priority", "rolling_horizon_aging_priority", "rolling_horizon_dedicated_roles"}:
+    if decision_mode in {
+        "adaptive_priority",
+        "fixed_priority",
+        "bottleneck_aware_dispatch",
+        "rolling_horizon_aging_priority",
+        "rolling_horizon_dedicated_roles",
+        "rolling_horizon_throughput_optimizer",
+    }:
         return ScriptedDecisionModule(experiment_cfg)
     if decision_mode == "fixed_task_assignment":
         return FixedTaskAssignmentDecisionModule(experiment_cfg)

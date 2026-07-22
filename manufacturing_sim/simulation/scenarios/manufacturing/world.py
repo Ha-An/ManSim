@@ -39,6 +39,13 @@ from manufacturing_sim.simulation.scenarios.manufacturing.traffic import (
     TrafficPlan,
     TrafficSegment,
 )
+from manufacturing_sim.simulation.scenarios.manufacturing.throughput_policy import (
+    ThroughputOptimizerFailed,
+    cp_sat_status_name,
+    require_cp_sat,
+    score_task_for_throughput,
+)
+from manufacturing_sim.simulation.operational_complexity import build_operational_task_complexity_metrics
 
 
 TASK_ID_PREFIX_BY_TASK_CODE: dict[str, str] = {
@@ -92,6 +99,7 @@ class ManufacturingWorld:
         self.decision_mode = normalize_decision_mode(str(decision_cfg.get("mode", "adaptive_priority")))
 
         seed = int(cfg.get("seed", 7))
+        self.seed = seed
         self.rng = random.Random(seed)
 
         horizon_cfg = cfg["horizon"]
@@ -192,6 +200,11 @@ class ManufacturingWorld:
         self.inventory_targets = cfg["inventory_targets"]
         self.dispatcher_cfg = cfg["dispatcher"]
         self.heuristic_rules = cfg.get("heuristic_rules", {}) if isinstance(cfg.get("heuristic_rules", {}), dict) else {}
+        self.throughput_policy_cfg = (
+            decision_cfg.get("throughput_policy", {})
+            if isinstance(decision_cfg.get("throughput_policy", {}), dict)
+            else {}
+        )
         self._init_rolling_horizon(decision_cfg)
         llm_cfg = decision_cfg.get("llm", {}) if isinstance(decision_cfg.get("llm", {}), dict) else {}
         orchestration_cfg = llm_cfg.get("orchestration", {}) if isinstance(llm_cfg.get("orchestration", {}), dict) else {}
@@ -346,13 +359,21 @@ class ManufacturingWorld:
         self.rolling_horizon_enabled = self.decision_mode in {
             "rolling_horizon_aging_priority",
             "rolling_horizon_dedicated_roles",
+            "rolling_horizon_throughput_optimizer",
         }
         self.rolling_horizon_dedicated_roles_enabled = self.decision_mode == "rolling_horizon_dedicated_roles"
+        self.rolling_horizon_throughput_optimizer_enabled = self.decision_mode == "rolling_horizon_throughput_optimizer"
         self.rolling_horizon_window_min = max(0.1, float(rolling_cfg.get("window_min", 5.0) or 5.0))
         self.rolling_horizon_dispatch_policy = (
             str(rolling_cfg.get("dispatch_policy", "aging_priority")).strip().lower()
             or "aging_priority"
         )
+        optimizer_cfg = rolling_cfg.get("optimizer", {}) if isinstance(rolling_cfg.get("optimizer", {}), dict) else {}
+        self.rolling_horizon_optimizer_cfg = optimizer_cfg
+        self.rolling_horizon_optimizer_cp_model = None
+        if self.rolling_horizon_throughput_optimizer_enabled:
+            self.rolling_horizon_optimizer_cp_model = require_cp_sat()
+            self.rolling_horizon_dispatch_policy = "throughput_optimizer"
         self.rolling_horizon_battery_low_ratio = max(
             0.0,
             min(1.0, float(battery_cfg.get("low_threshold_ratio", 0.20) or 0.20)),
@@ -496,7 +517,12 @@ class ManufacturingWorld:
             "requeued_task_count": 0,
             "max_worker_queue_length": 0,
             "immediate_dispatched_task_count": 0,
+            "throughput_optimizer_window_count": 0,
+            "throughput_optimizer_solved_count": 0,
+            "throughput_optimizer_failed_count": 0,
         }
+        self.throughput_optimizer_objective_values: list[float] = []
+        self.throughput_score_values: list[float] = []
         self.rolling_horizon_max_queue_length_by_worker: dict[str, int] = defaultdict(int)
         self.rolling_horizon_dedicated_role_metrics: dict[str, Any] = {
             "role_violation_count": 0,
@@ -1866,7 +1892,7 @@ class ManufacturingWorld:
         )
         conflicts = self.traffic_monitor.begin_segment(segment)
         recovery_requested = self._log_traffic_conflicts(agent, conflicts)
-        if self.traffic_emit_tile_step_events:
+        if self.traffic_emit_tile_step_events and not recovery_requested:
             self._update_battery_accounting(agent, started_at)
             self.logger.log(
                 t=started_at,
@@ -2216,6 +2242,7 @@ class ManufacturingWorld:
             "EXECUTE_MAINTENANCE_ACTION",
             "EXECUTE_SYSTEM_ACTION",
             "EXECUTE_HUMAN_COLLABORATION_ACTION",
+            "EXECUTE_ROBOT_COLLABORATION_ACTION",
         )
         if primitive in internal_manipulation:
             for fallback in semantic_fallbacks:
@@ -4093,6 +4120,21 @@ class ManufacturingWorld:
             "by_task": task_details,
         }
 
+    def _operational_task_complexity_metrics(self) -> dict[str, Any]:
+        completed_task_counts: dict[str, int] = defaultdict(int)
+        for rec in self.task_records:
+            if rec.get("status") != "completed":
+                continue
+            task_code = str(rec.get("humanoid_task_code", "") or "").strip().upper()
+            if task_code:
+                completed_task_counts[task_code] += 1
+        catalog = getattr(getattr(self, "humanoid_runtime", None), "catalog", None)
+        return build_operational_task_complexity_metrics(
+            dict(completed_task_counts),
+            num_days=float(self.num_days or 1),
+            catalog=catalog,
+        )
+
     def _traffic_metrics(self) -> dict[str, Any]:
         by_type: dict[str, int] = defaultdict(int)
         by_pair: dict[str, int] = defaultdict(int)
@@ -4685,7 +4727,7 @@ class ManufacturingWorld:
         }
 
     def _machine_setup_time_metrics(self) -> dict[str, float]:
-        totals_by_machine: dict[str, float] = {machine_id: 0.0 for machine_id in self.machines.keys()}
+        intervals_by_machine: dict[str, list[tuple[float, float]]] = {machine_id: [] for machine_id in self.machines.keys()}
         active_setup: dict[str, tuple[str, float]] = {}
         sim_end = float(self.env.now)
 
@@ -4694,7 +4736,7 @@ class ManufacturingWorld:
             details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
             machine_id = str(event.get("entity_id", "")).strip()
             t = float(event.get("t", 0.0) or 0.0)
-            if machine_id not in totals_by_machine:
+            if machine_id not in intervals_by_machine:
                 continue
             if event_type == "MACHINE_SETUP_START":
                 setup_id = str(details.get("setup_id", "")).strip() or f"{machine_id}@{t}"
@@ -4706,11 +4748,21 @@ class ManufacturingWorld:
                     continue
                 active_machine_id, start_t = active
                 if t >= start_t:
-                    totals_by_machine[active_machine_id] += t - start_t
+                    intervals_by_machine[active_machine_id].append((start_t, t))
 
         for active_machine_id, start_t in active_setup.values():
             if sim_end >= start_t:
-                totals_by_machine[active_machine_id] += sim_end - start_t
+                intervals_by_machine[active_machine_id].append((start_t, sim_end))
+
+        totals_by_machine: dict[str, float] = {}
+        for machine_id, intervals in intervals_by_machine.items():
+            merged: list[list[float]] = []
+            for start_t, end_t in sorted((float(start), float(end)) for start, end in intervals if end > start):
+                if not merged or start_t > merged[-1][1]:
+                    merged.append([start_t, end_t])
+                else:
+                    merged[-1][1] = max(merged[-1][1], end_t)
+            totals_by_machine[machine_id] = sum(max(0.0, end_t - start_t) for start_t, end_t in merged)
 
         return {machine_id: round(float(total), 3) for machine_id, total in totals_by_machine.items()}
 
@@ -4834,37 +4886,6 @@ class ManufacturingWorld:
                 state_name = state_name_map.get(str(raw_state).strip(), "")
                 if machine_id in by_machine and state_name:
                     by_machine[machine_id][state_name] += final_duration
-
-        exact_machine_time = self._machine_time_metrics().get("time_by_machine", {})
-        exact_setup_time = self._machine_setup_time_metrics()
-        exact_broken_repair = self._machine_broken_repair_state_metrics()
-        exact_broken_time = exact_broken_repair.get("broken_by_machine", {})
-        exact_repair_time = exact_broken_repair.get("repair_by_machine", {})
-        approximate_only_states = ("idle", "wait_input", "done_wait_unload")
-        for machine_id in sorted(by_machine.keys()):
-            exact_metrics = exact_machine_time.get(machine_id, {}) if isinstance(exact_machine_time.get(machine_id, {}), dict) else {}
-            exact_processing = float(exact_metrics.get("processing_min", 0.0) or 0.0)
-            exact_broken = float(exact_broken_time.get(machine_id, 0.0) or 0.0)
-            exact_pm = float(exact_metrics.get("pm_min", 0.0) or 0.0)
-            exact_setup = float(exact_setup_time.get(machine_id, 0.0) or 0.0)
-            exact_under_repair = float(exact_repair_time.get(machine_id, 0.0) or 0.0)
-            by_machine[machine_id]["processing"] = exact_processing
-            by_machine[machine_id]["broken"] = exact_broken
-            by_machine[machine_id]["pm"] = exact_pm
-            by_machine[machine_id]["setup"] = exact_setup
-            by_machine[machine_id]["under_repair"] = exact_under_repair
-
-            snapshot_remaining = sum(
-                float(by_machine[machine_id].get(state_name, 0.0))
-                for state_name in approximate_only_states
-            )
-            exact_remaining = max(0.0, total_time - exact_processing - exact_broken - exact_pm - exact_setup - exact_under_repair)
-            if snapshot_remaining > 0.0:
-                scale = exact_remaining / snapshot_remaining
-                for state_name in approximate_only_states:
-                    by_machine[machine_id][state_name] = float(by_machine[machine_id].get(state_name, 0.0)) * scale
-            else:
-                by_machine[machine_id]["wait_input"] = exact_remaining
 
         util_by_machine: dict[str, dict[str, float]] = {}
         for machine_id in sorted(by_machine.keys()):
@@ -5632,21 +5653,20 @@ class ManufacturingWorld:
         agent.current_move_started_at = None
 
     def _close_current_move_segment(self, agent: Agent, *, logical_destination: str | None = None) -> None:
+        """Cancel an in-flight tile segment without claiming arrival.
+
+        This path is used before the segment timeout completes (incident,
+        battery depletion, or process interruption). A tile-end event would
+        make Replay move the worker to a tile that the grid never committed.
+        """
         move_id = str(agent.current_move_id or "")
         segment_index = int(agent.current_move_segment_index or 0)
         from_tile = agent.current_move_segment_from_tile
         to_tile = agent.current_move_segment_to_tile
         if not move_id or segment_index <= 0 or from_tile is None or to_tile is None:
             return
-        self._traffic_end_segment(
-            agent,
-            move_id=move_id,
-            segment_index=segment_index,
-            from_tile=from_tile,
-            to_tile=to_tile,
-            ended_at=float(self.env.now),
-            logical_destination=str(logical_destination or agent.current_move_logical_destination or agent.in_transit_to or ""),
-        )
+        if self.traffic_monitor is not None:
+            self.traffic_monitor.cancel_segment(agent.agent_id, move_id, segment_index)
         agent.current_move_segment_index = 0
         agent.current_move_segment_from_tile = None
         agent.current_move_segment_to_tile = None
@@ -6984,6 +7004,50 @@ class ManufacturingWorld:
     def _rolling_horizon_dedicated_roles_active(self) -> bool:
         return bool(self._rolling_horizon_active() and getattr(self, "rolling_horizon_dedicated_roles_enabled", False))
 
+    def _rolling_horizon_throughput_optimizer_active(self) -> bool:
+        return bool(self._rolling_horizon_active() and getattr(self, "rolling_horizon_throughput_optimizer_enabled", False))
+
+    def _throughput_score_payload(self, agent: Agent, task: Task) -> dict[str, Any]:
+        return score_task_for_throughput(self, agent, task, self.throughput_policy_cfg)
+
+    def _throughput_score(self, agent: Agent, task: Task) -> float:
+        payload = self._throughput_score_payload(agent, task)
+        return float(payload.get("total", 0.0) or 0.0)
+
+    def _select_bottleneck_aware_task(self, candidates: list[Task], agent: Agent) -> Task | None:
+        scored: list[tuple[float, float, float, str, Task, dict[str, Any]]] = []
+        for task in candidates:
+            payload = self._throughput_score_payload(agent, task)
+            score = float(payload.get("total", 0.0) or 0.0)
+            scored.append(
+                (
+                    -score,
+                    float(self.travel_time(agent.location, task.location)),
+                    float(self._task_estimated_duration(agent, task)),
+                    str(task.task_id),
+                    task,
+                    payload,
+                )
+            )
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        _neg_score, _travel, _duration, _task_id, task, payload = scored[0]
+        components = payload.get("components", {}) if isinstance(payload.get("components", {}), dict) else {}
+        task = self._annotate_task_selection(
+            task,
+            decision_source="bottleneck_aware_dispatch",
+            decision_rule="bottleneck_aware_score",
+            rationale="Selected the feasible task with the highest bottleneck/throughput relief score.",
+            candidate_count=len(candidates),
+            score_hint=float(payload.get("total", 0.0) or 0.0),
+            decision_focus=[self._task_priority_key(task)],
+            fallback_reason="bottleneck_aware_score",
+        )
+        task.selection_meta["score_components"] = dict(components)
+        self.throughput_score_values.append(float(payload.get("total", 0.0) or 0.0))
+        return task
+
     def _rolling_horizon_task_code(self, task: Task) -> str:
         return str(task.task_code or task.task_type or "").strip().upper()
 
@@ -7753,6 +7817,346 @@ class ManufacturingWorld:
         if dispatched_opportunity_ids or stale_opportunity_ids:
             self._rolling_horizon_rebuild_pending_resource_index()
 
+    def _rolling_horizon_log_pending_skip(
+        self,
+        entry: dict[str, Any],
+        *,
+        window_index: int,
+        resource_keys: list[str],
+        reason: str,
+    ) -> None:
+        opportunity_id = str(entry.get("opportunity_id", "")).strip()
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="ROLLING_HORIZON_TASK_SKIPPED",
+            entity_id=opportunity_id,
+            location=str(entry.get("location", "CoordinationReview")),
+            details={
+                "window_index": window_index,
+                "opportunity_id": opportunity_id,
+                "task_id": str(entry.get("task_id", "")),
+                "task_code": str(entry.get("task_code", "")),
+                "priority_key": str(entry.get("priority_key", "")),
+                "task_type": str(entry.get("task_type", "")),
+                "base_priority_rank": int(entry.get("base_priority_rank", 9999) or 9999),
+                "effective_priority_rank": self._rolling_horizon_effective_rank(entry),
+                "waited_window_count": self._rolling_horizon_waited_window_count(entry),
+                "task_signature": dict(entry.get("task_signature", {})),
+                "rolling_task_signature": dict(entry.get("rolling_task_signature", {})),
+                "exclusive_resource_keys": list(resource_keys),
+                "role_policy": str(entry.get("role_policy", "")),
+                "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
+                "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
+                "reason": reason,
+            },
+        )
+        self.rolling_horizon_metrics["stale_skipped_task_count"] += 1
+        if self._rolling_horizon_dedicated_roles_active():
+            for worker_id in entry.get("workers", set()):
+                self.rolling_horizon_dedicated_role_metrics["skipped_by_worker"][str(worker_id)] += 1
+
+    def _rolling_horizon_optimizer_accept_statuses(self, cp_model: Any) -> set[int]:
+        configured = self.rolling_horizon_optimizer_cfg.get("accept_statuses", ["OPTIMAL", "FEASIBLE"])
+        if isinstance(configured, str):
+            configured = [configured]
+        if not isinstance(configured, list):
+            configured = ["OPTIMAL", "FEASIBLE"]
+        out: set[int] = set()
+        for value in configured:
+            name = str(value or "").strip().upper()
+            if hasattr(cp_model, name):
+                out.add(int(getattr(cp_model, name)))
+        return out or {int(getattr(cp_model, "OPTIMAL")), int(getattr(cp_model, "FEASIBLE"))}
+
+    def _rolling_horizon_dispatch_window_with_optimizer(self, window_index: int) -> None:
+        cp_model = self.rolling_horizon_optimizer_cp_model or require_cp_sat()
+        self.rolling_horizon_metrics["throughput_optimizer_window_count"] += 1
+        optimizer_cfg = self.rolling_horizon_optimizer_cfg
+        max_tasks_per_worker = max(1, int(optimizer_cfg.get("max_tasks_per_worker_per_window", 8) or 8))
+        time_limit_s = max(0.01, float(optimizer_cfg.get("time_limit_s", 5.0) or 5.0))
+        num_search_workers = max(1, int(optimizer_cfg.get("num_search_workers", 1) or 1))
+        configured_solver_seed = optimizer_cfg.get("random_seed")
+        solver_seed = int(self.seed if configured_solver_seed is None else configured_solver_seed)
+        objective_scale = max(1, int(optimizer_cfg.get("objective_scale", 100) or 100))
+        assignment_reward = float(optimizer_cfg.get("assignment_reward", 1000.0) or 1000.0)
+        urgent_bonus = float(optimizer_cfg.get("urgent_bonus", 250.0) or 250.0)
+        queue_load_penalty = float(optimizer_cfg.get("queue_load_penalty", 12.0) or 12.0)
+        load_imbalance_penalty = float(optimizer_cfg.get("load_imbalance_penalty", 10.0) or 10.0)
+
+        opportunities = sorted(
+            self.rolling_horizon_pending.values(),
+            key=lambda entry: (
+                self._rolling_horizon_effective_rank(entry),
+                float(entry.get("first_seen_min", 0.0) or 0.0),
+                str(entry.get("task_code", "")),
+                str(entry.get("opportunity_id", "")),
+            ),
+        )
+        stale_opportunity_ids: set[str] = set()
+        committed_resource_keys: set[str] = set(self._rolling_horizon_queued_resource_index().keys())
+        committed_resource_keys.update(self._rolling_horizon_active_resource_index().keys())
+        assignment_rows: list[dict[str, Any]] = []
+        rows_by_opportunity: dict[str, list[int]] = defaultdict(list)
+        rows_by_worker: dict[str, list[int]] = defaultdict(list)
+        rows_by_resource_key: dict[str, list[int]] = defaultdict(list)
+
+        for entry in opportunities:
+            opportunity_id = str(entry.get("opportunity_id", "")).strip()
+            resource_keys = [str(key or "").strip() for key in entry.get("exclusive_resource_keys", []) if str(key or "").strip()]
+            if any(key in committed_resource_keys for key in resource_keys):
+                stale_opportunity_ids.add(opportunity_id)
+                self._rolling_horizon_log_pending_skip(
+                    entry,
+                    window_index=window_index,
+                    resource_keys=resource_keys,
+                    reason="resource_already_committed",
+                )
+                continue
+            tasks_by_worker = entry.get("tasks_by_worker", {})
+            if not isinstance(tasks_by_worker, dict):
+                continue
+            saw_available_resource = False
+            for worker_id, task in tasks_by_worker.items():
+                worker_id = str(worker_id)
+                agent = self.agents.get(worker_id)
+                if agent is None or not isinstance(task, Task):
+                    continue
+                if self._rolling_horizon_self_battery_swap_due(agent) and not self._rolling_horizon_is_self_battery_swap(task, agent):
+                    continue
+                if not self._task_item_dependencies_available(task, agent):
+                    continue
+                saw_available_resource = True
+                if not self._rolling_horizon_worker_available(agent):
+                    continue
+                if not self._rolling_horizon_task_allowed_for_worker(worker_id, task):
+                    self.rolling_horizon_dedicated_role_metrics["role_violation_count"] += 1
+                    continue
+                if self._rolling_horizon_opportunity_id(task) != opportunity_id:
+                    continue
+                score_payload = self._throughput_score_payload(agent, task)
+                row_index = len(assignment_rows)
+                queue_length = len(self.rolling_horizon_dispatch_queues.get(worker_id, ()))
+                assignment_rows.append(
+                    {
+                        "entry": entry,
+                        "opportunity_id": opportunity_id,
+                        "worker_id": worker_id,
+                        "task": task,
+                        "resource_keys": resource_keys,
+                        "queue_length": int(queue_length),
+                        "score": float(score_payload.get("total", 0.0) or 0.0),
+                        "score_components": dict(score_payload.get("components", {})) if isinstance(score_payload.get("components", {}), dict) else {},
+                        "effective_rank": self._rolling_horizon_effective_rank(entry),
+                    }
+                )
+                rows_by_opportunity[opportunity_id].append(row_index)
+                rows_by_worker[worker_id].append(row_index)
+                for key in resource_keys:
+                    rows_by_resource_key[key].append(row_index)
+            if not saw_available_resource:
+                stale_opportunity_ids.add(opportunity_id)
+                self._rolling_horizon_log_pending_skip(
+                    entry,
+                    window_index=window_index,
+                    resource_keys=resource_keys,
+                    reason="stale_or_unavailable_resource",
+                )
+
+        if not assignment_rows:
+            for opportunity_id in stale_opportunity_ids:
+                self.rolling_horizon_pending.pop(opportunity_id, None)
+            if stale_opportunity_ids:
+                self._rolling_horizon_rebuild_pending_resource_index()
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="ROLLING_HORIZON_DISPATCH",
+                entity_id=f"RH-{window_index:05d}",
+                location="CoordinationReview",
+                details={
+                    "window_index": window_index,
+                    "dispatch_policy": self.rolling_horizon_dispatch_policy,
+                    "candidate_count": len(self.rolling_horizon_pending),
+                    "dispatch_count": 0,
+                    "optimizer_status": "NOT_SOLVED",
+                    "reason": "no_feasible_optimizer_rows",
+                },
+            )
+            return
+
+        model = cp_model.CpModel()
+        variables = [model.NewBoolVar(f"x_{idx}") for idx in range(len(assignment_rows))]
+        for row_indexes in rows_by_opportunity.values():
+            model.Add(sum(variables[idx] for idx in row_indexes) <= 1)
+        for row_indexes in rows_by_resource_key.values():
+            model.Add(sum(variables[idx] for idx in row_indexes) <= 1)
+
+        worker_counts: dict[str, Any] = {}
+        for worker_id in sorted(self.agents.keys()):
+            row_indexes = rows_by_worker.get(worker_id, [])
+            count_var = model.NewIntVar(0, max_tasks_per_worker, f"count_{worker_id}")
+            model.Add(count_var == sum(variables[idx] for idx in row_indexes))
+            model.Add(count_var <= max_tasks_per_worker)
+            worker_counts[worker_id] = count_var
+        max_load = model.NewIntVar(0, max_tasks_per_worker, "max_load")
+        min_load = model.NewIntVar(0, max_tasks_per_worker, "min_load")
+        if worker_counts:
+            model.AddMaxEquality(max_load, list(worker_counts.values()))
+            model.AddMinEquality(min_load, list(worker_counts.values()))
+        else:
+            model.Add(max_load == 0)
+            model.Add(min_load == 0)
+
+        objective_terms: list[Any] = []
+        for idx, row in enumerate(assignment_rows):
+            entry = row["entry"]
+            urgent = bool(entry.get("immediate_trigger", False) or entry.get("urgent_dispatch", False))
+            coefficient = (
+                assignment_reward
+                + float(row["score"])
+                + (urgent_bonus if urgent else 0.0)
+                - queue_load_penalty * float(row["queue_length"])
+            )
+            objective_terms.append(int(round(coefficient * objective_scale)) * variables[idx])
+        objective_terms.append(-int(round(load_imbalance_penalty * objective_scale)) * (max_load - min_load))
+        model.Maximize(sum(objective_terms))
+
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = time_limit_s
+        solver.parameters.num_search_workers = num_search_workers
+        solver.parameters.random_seed = solver_seed
+        status = solver.Solve(model)
+        status_name = cp_sat_status_name(cp_model, status)
+        accepted = self._rolling_horizon_optimizer_accept_statuses(cp_model)
+        if int(status) not in accepted:
+            self.rolling_horizon_metrics["throughput_optimizer_failed_count"] += 1
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="ROLLING_HORIZON_OPTIMIZER_FAILED",
+                entity_id=f"RH-{window_index:05d}",
+                location="CoordinationReview",
+                details={
+                    "window_index": window_index,
+                    "dispatch_policy": self.rolling_horizon_dispatch_policy,
+                    "optimizer_status": status_name,
+                    "candidate_count": len(self.rolling_horizon_pending),
+                    "assignment_row_count": len(assignment_rows),
+                    "time_limit_s": time_limit_s,
+                    "num_search_workers": num_search_workers,
+                    "random_seed": solver_seed,
+                },
+            )
+            raise ThroughputOptimizerFailed(
+                f"rolling_horizon_throughput_optimizer failed at window {window_index}: {status_name}"
+            )
+
+        self.rolling_horizon_metrics["throughput_optimizer_solved_count"] += 1
+        objective_value = float(solver.ObjectiveValue()) / float(objective_scale)
+        self.throughput_optimizer_objective_values.append(objective_value)
+        selected_rows = [
+            {**row, "row_index": idx}
+            for idx, row in enumerate(assignment_rows)
+            if int(solver.Value(variables[idx])) == 1
+        ]
+        selected_rows.sort(
+            key=lambda row: (
+                str(row["worker_id"]),
+                -float(row["score"]),
+                int(row["effective_rank"]),
+                float(row["entry"].get("first_seen_min", 0.0) or 0.0),
+                str(row["entry"].get("task_id", "")),
+            )
+        )
+        sequence_by_worker: dict[str, int] = defaultdict(int)
+        dispatch_count = 0
+        dispatched_opportunity_ids: set[str] = set()
+        for row in selected_rows:
+            entry = row["entry"]
+            worker_id = str(row["worker_id"])
+            resource_keys = list(row.get("resource_keys", []))
+            if any(key in committed_resource_keys for key in resource_keys):
+                continue
+            sequence_by_worker[worker_id] += 1
+            effective_rank = self._rolling_horizon_effective_rank(entry)
+            queue_entry = {
+                "window_index": window_index,
+                "first_window_index": int(entry.get("first_window_index", window_index) or window_index),
+                "first_seen_min": float(entry.get("first_seen_min", self.env.now) or self.env.now),
+                "opportunity_id": str(entry.get("opportunity_id", "")),
+                "task_id": str(entry.get("task_id", "")),
+                "task_code": str(entry.get("task_code", "")),
+                "priority_key": str(entry.get("priority_key", "")),
+                "task_type": str(entry.get("task_type", "")),
+                "location": str(entry.get("location", "CoordinationReview")),
+                "base_priority_rank": int(entry.get("base_priority_rank", 9999) or 9999),
+                "effective_priority_rank": effective_rank,
+                "waited_window_count": self._rolling_horizon_waited_window_count(entry),
+                "task_signature": dict(entry.get("task_signature", {})),
+                "rolling_task_signature": dict(entry.get("rolling_task_signature", {})),
+                "target_type": str(entry.get("target_type", "")),
+                "target_id": str(entry.get("target_id", "")),
+                "target_station": entry.get("target_station"),
+                "shareable": bool(entry.get("shareable", False)),
+                "capacity": int(entry.get("capacity", 1) or 1),
+                "exclusive_resource_keys": list(entry.get("exclusive_resource_keys", [])),
+                "role_policy": str(entry.get("role_policy", "")),
+                "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
+                "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
+                "assigned_worker_id": worker_id,
+                "queue_length_before": int(row.get("queue_length", 0) or 0),
+                "assigned_at_min": round(float(self.env.now), 3),
+                "optimizer_status": status_name,
+                "optimizer_objective": round(objective_value, 3),
+                "optimizer_score": round(float(row.get("score", 0.0) or 0.0), 3),
+                "score_components": dict(row.get("score_components", {})),
+                "sequence_position": int(row.get("queue_length", 0) or 0) + sequence_by_worker[worker_id],
+            }
+            self.rolling_horizon_dispatch_queues[worker_id].append(queue_entry)
+            dispatched_opportunity_ids.add(str(entry.get("opportunity_id", "")))
+            committed_resource_keys.update(resource_keys)
+            dispatch_count += 1
+            self.rolling_horizon_metrics["dispatched_task_count"] += 1
+            self.throughput_score_values.append(float(row.get("score", 0.0) or 0.0))
+            self._rolling_horizon_refresh_queue_metrics()
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="ROLLING_HORIZON_DISPATCH",
+                entity_id=str(entry.get("opportunity_id", "")),
+                location=str(entry.get("location", "CoordinationReview")),
+                details={
+                    **queue_entry,
+                    "assigned_worker_id": worker_id,
+                    "dispatch_policy": self.rolling_horizon_dispatch_policy,
+                    "candidate_worker_count": len(rows_by_opportunity.get(str(entry.get("opportunity_id", "")), [])),
+                },
+            )
+
+        for opportunity_id in dispatched_opportunity_ids | stale_opportunity_ids:
+            self.rolling_horizon_pending.pop(opportunity_id, None)
+        if dispatched_opportunity_ids or stale_opportunity_ids:
+            self._rolling_horizon_rebuild_pending_resource_index()
+
+        if dispatch_count == 0:
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="ROLLING_HORIZON_DISPATCH",
+                entity_id=f"RH-{window_index:05d}",
+                location="CoordinationReview",
+                details={
+                    "window_index": window_index,
+                    "dispatch_policy": self.rolling_horizon_dispatch_policy,
+                    "candidate_count": len(self.rolling_horizon_pending),
+                    "dispatch_count": 0,
+                    "optimizer_status": status_name,
+                    "optimizer_objective": round(objective_value, 3),
+                    "reason": "optimizer_selected_no_assignments",
+                },
+            )
+
     def _rolling_horizon_dispatch_window(self) -> None:
         window_index = int(self.rolling_horizon_window_index)
         self.rolling_horizon_metrics["window_count"] += 1
@@ -7771,6 +8175,10 @@ class ManufacturingWorld:
                     "dispatch_count": 0,
                 },
             )
+            return
+
+        if self._rolling_horizon_throughput_optimizer_active():
+            self._rolling_horizon_dispatch_window_with_optimizer(window_index)
             return
 
         opportunities = sorted(
@@ -8114,20 +8522,37 @@ class ManufacturingWorld:
             if stable_task_id:
                 task.task_id = stable_task_id
                 self._sync_task_instance_id(task)
-            return self._annotate_task_selection(
+            score_hint = (
+                float(queue_entry.get("optimizer_score"))
+                if queue_entry.get("optimizer_score") is not None
+                else -float(queue_entry.get("effective_priority_rank", self._rolling_horizon_priority(task)) or 0.0)
+            )
+            if self._rolling_horizon_throughput_optimizer_active():
+                rationale = "Rolling horizon throughput optimizer selected this queued task with OR-Tools CP-SAT."
+                focus = ["throughput_optimizer", self._task_priority_key(task)]
+            elif not self._rolling_horizon_dedicated_roles_active():
+                rationale = "Rolling horizon dispatch selected the task by aged HumanoidSim task-code rank."
+                focus = [self._task_priority_key(task)]
+            else:
+                rationale = "Dedicated-role rolling horizon dispatch selected the task from the worker's configured HumanoidSim task-code list."
+                focus = [self._task_priority_key(task)]
+            selected = self._annotate_task_selection(
                 task,
                 decision_source=self.decision_mode,
                 decision_rule=self.rolling_horizon_dispatch_policy,
-                rationale=(
-                    "Rolling horizon dispatch selected the task by aged HumanoidSim task-code rank."
-                    if not self._rolling_horizon_dedicated_roles_active()
-                    else "Dedicated-role rolling horizon dispatch selected the task from the worker's configured HumanoidSim task-code list."
-                ),
+                rationale=rationale,
                 candidate_count=len(candidates),
-                score_hint=-float(queue_entry.get("effective_priority_rank", self._rolling_horizon_priority(task)) or 0.0),
-                decision_focus=[self._task_priority_key(task)],
+                score_hint=score_hint,
+                decision_focus=focus,
                 fallback_reason=fallback_reason,
             )
+            if isinstance(queue_entry.get("score_components", {}), dict):
+                selected.selection_meta["score_components"] = dict(queue_entry.get("score_components", {}))
+            if queue_entry.get("optimizer_status") is not None:
+                selected.selection_meta["optimizer_status"] = str(queue_entry.get("optimizer_status"))
+            if queue_entry.get("sequence_position") is not None:
+                selected.selection_meta["sequence_position"] = int(queue_entry.get("sequence_position") or 0)
+            return selected
         return None
 
 
@@ -8525,6 +8950,12 @@ class ManufacturingWorld:
                 decision_focus=[item for item in focus if item],
                 fallback_reason="mailbox",
             ))
+
+        if self.decision_mode == "bottleneck_aware_dispatch":
+            task = self._select_bottleneck_aware_task(candidates, agent)
+            if task is not None:
+                self._resolve_selection_blocker(agent.agent_id, reason="bottleneck_aware_selected")
+                return self._finalize_selected_task(agent, task)
 
         scored_candidates = sorted(candidates, key=lambda task: self._task_sort_key(task, agent))
         task = scored_candidates[0]
@@ -8935,6 +9366,19 @@ class ManufacturingWorld:
             current_tile = agent.tile
             if current_tile is None:
                 return
+            if self._should_interrupt_for_battery(agent, eps):
+                if agent.reserved_tile is not None:
+                    grid.release_reservation(agent.agent_id, agent.reserved_tile)
+                    agent.reserved_tile = None
+                self._close_current_move_segment(agent, logical_destination=logical_dst)
+                if move_id:
+                    self._traffic_complete_plan(move_id)
+                    self._log_interrupted_move(agent, reason="battery_depleted", logical_destination=logical_dst)
+                self._clear_current_move(agent)
+                self._clear_in_transit(agent)
+                if not agent.discharged:
+                    self.discharge_agent(agent, reason="battery_depleted", interrupt_process=False)
+                raise simpy.Interrupt("battery_depleted")
             destination_tiles = grid.destination_tiles(dst, worker_id=agent.agent_id, from_tile=current_tile, ignore_dynamic=ignore_dynamic)
             if current_tile in destination_tiles:
                 break
@@ -9693,7 +10137,9 @@ class ManufacturingWorld:
                 return False
             self._set_humanoid_primitive_hint(agent, "ANNOUNCE_INTENT")
             yield self.env.timeout(max(0.0, float(getattr(self.humanoid_runtime, "default_primitive_min_duration", 0.0) or 0.0)))
-            self._set_humanoid_primitive_hint(agent, "EXECUTE_HUMAN_COLLABORATION_ACTION")
+            self._set_humanoid_primitive_hint(agent, "SYNC_WITH_ROBOT")
+            yield self.env.timeout(max(0.0, float(getattr(self.humanoid_runtime, "default_primitive_min_duration", 0.0) or 0.0)))
+            self._set_humanoid_primitive_hint(agent, "EXECUTE_ROBOT_COLLABORATION_ACTION")
             if not self._join_product_transport_session(agent, session_id, task=task):
                 return False
             done_event = session.get("done_event")
@@ -9847,6 +10293,14 @@ class ManufacturingWorld:
                     yield from self._dock_agent_at_target(agent, task, reason="unload_output_alignment")
                     self._set_humanoid_primitive_hint(agent, "PLACE")
                     self.output_buffers[machine.station].append(output_id)
+                    output_item_type = "product" if machine.station == self.last_processing_station else "intermediate"
+                    self._set_item_state(
+                        output_id,
+                        ItemState.IN_OUTPUT_BUFFER,
+                        location=f"Station{machine.station}",
+                        ref=f"output_buffer_station_{machine.station}",
+                        item_type=output_item_type,
+                    )
                     self._clear_agent_carrying(agent, destination=f"output_buffer_station_{machine.station}")
                     self._set_humanoid_primitive_hint(agent, "RELEASE")
                     self.logger.log(
@@ -9911,8 +10365,6 @@ class ManufacturingWorld:
                             return False
                         self._set_humanoid_primitive_hint(agent, "LIFT")
 
-                    agent.battery_swap_critical = True
-                    target_agent.battery_swap_critical = True
                     self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                     handover_location = yield from self._move_agent_to_in_transit_position(
                         agent,
@@ -9951,7 +10403,16 @@ class ManufacturingWorld:
                         if target_agent.process_ref is not None and target_agent.process_ref.is_alive:
                             target_agent.process_ref.interrupt("battery_swap_wait")
 
-                    yield self.env.timeout(float(self.agent_cfg["battery_delivery_extra_min"]))
+                    # The battery exception is intentionally scoped to the
+                    # physical handoff only. Navigation to the receiver and the
+                    # spent-battery return trip must still obey normal depletion.
+                    agent.battery_swap_critical = True
+                    target_agent.battery_swap_critical = True
+                    try:
+                        yield self.env.timeout(float(self.agent_cfg["battery_delivery_extra_min"]))
+                    finally:
+                        agent.battery_swap_critical = False
+                        target_agent.battery_swap_critical = False
 
                     handover_location = yield from self._ensure_battery_handover_contact(
                         agent,
@@ -10013,6 +10474,12 @@ class ManufacturingWorld:
                         self._end_battery_swap_wait(target_agent, agent.agent_id)
                     if target_agent.suspended_task is not None and target_agent.suspended_task.task_type == "BATTERY_SWAP":
                         target_agent.suspended_task = None
+                    # The atomic battery-swap exception only covers the physical
+                    # handoff. The provider's spent-battery return trip should obey
+                    # normal depletion rules; otherwise replay can show a worker
+                    # moving with zero battery.
+                    agent.battery_swap_critical = False
+                    target_agent.battery_swap_critical = False
                     self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
                     yield from self.move_agent(agent, "battery_rack", emit_move_events=True)
                     if not self._confirm_object_service_tile(agent, "battery_rack", task, "battery_delivery_return"):
@@ -11247,6 +11714,7 @@ class ManufacturingWorld:
         humanoid_unavailable_ratio_avg = mean(humanoid_unavailable_ratio_by_worker.values()) if humanoid_unavailable_ratio_by_worker else 0.0
         humanoid_primitive_minutes = self._humanoid_primitive_minutes()
         humanoid_task_taxonomy = self._humanoid_task_taxonomy_metrics(dict(humanoid_task_totals))
+        operational_complexity_metrics = self._operational_task_complexity_metrics()
         traffic_metrics = self._traffic_metrics()
         humanoid_incident_metrics = self._humanoid_incident_metrics()
         transport_metrics = self._transport_metrics()
@@ -11334,6 +11802,7 @@ class ManufacturingWorld:
             "humanoid_unavailable_ratio_avg": round(float(humanoid_unavailable_ratio_avg), 6),
             "humanoid_primitive_minutes": humanoid_primitive_minutes,
             "humanoid_task_taxonomy": humanoid_task_taxonomy,
+            **operational_complexity_metrics,
             **humanoid_incident_metrics,
             **traffic_metrics,
             **transport_metrics,
@@ -11345,9 +11814,15 @@ class ManufacturingWorld:
             "rolling_horizon_stale_skipped_task_count": int(self.rolling_horizon_metrics.get("stale_skipped_task_count", 0)),
             "rolling_horizon_requeued_task_count": int(self.rolling_horizon_metrics.get("requeued_task_count", 0)),
             "rolling_horizon_max_worker_queue_length": int(self.rolling_horizon_metrics.get("max_worker_queue_length", 0)),
+            "throughput_optimizer_window_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_window_count", 0)),
+            "throughput_optimizer_solved_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_solved_count", 0)),
+            "throughput_optimizer_failed_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_failed_count", 0)),
+            "throughput_optimizer_objective_avg": round(float(mean(self.throughput_optimizer_objective_values)) if self.throughput_optimizer_objective_values else 0.0, 3),
+            "bottleneck_score_avg": round(float(mean(self.throughput_score_values)) if self.throughput_score_values else 0.0, 3),
             "rolling_horizon": {
                 "enabled": bool(self._rolling_horizon_active()),
                 "dedicated_roles": bool(self._rolling_horizon_dedicated_roles_active()),
+                "throughput_optimizer": bool(self._rolling_horizon_throughput_optimizer_active()),
                 "window_min": round(float(self.rolling_horizon_window_min), 3),
                 "dispatch_policy": self.rolling_horizon_dispatch_policy,
                 "window_count": int(self.rolling_horizon_metrics.get("started_window_count", 0)),
@@ -11358,6 +11833,11 @@ class ManufacturingWorld:
                 "stale_skipped_task_count": int(self.rolling_horizon_metrics.get("stale_skipped_task_count", 0)),
                 "requeued_task_count": int(self.rolling_horizon_metrics.get("requeued_task_count", 0)),
                 "empty_window_count": int(self.rolling_horizon_metrics.get("empty_window_count", 0)),
+                "throughput_optimizer_window_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_window_count", 0)),
+                "throughput_optimizer_solved_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_solved_count", 0)),
+                "throughput_optimizer_failed_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_failed_count", 0)),
+                "throughput_optimizer_objective_avg": round(float(mean(self.throughput_optimizer_objective_values)) if self.throughput_optimizer_objective_values else 0.0, 3),
+                "bottleneck_score_avg": round(float(mean(self.throughput_score_values)) if self.throughput_score_values else 0.0, 3),
                 "pending_candidate_count": int(len(self.rolling_horizon_pending)),
                 "queued_dispatch_count": int(sum(len(queue) for queue in self.rolling_horizon_dispatch_queues.values())),
                 "max_worker_queue_length": int(self.rolling_horizon_metrics.get("max_worker_queue_length", 0)),

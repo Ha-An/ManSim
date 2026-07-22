@@ -1,8 +1,6 @@
 hydra-core>=1.3.2
 omegaconf>=2.3.0
 simpy>=4.1.1
+ortools>=9.10.4067
 plotly>=5.24.0
 pandas>=2.2.0
-streamlit>=1.40.0
-graphifyy>=0.7.9
-openai>=2.35.1

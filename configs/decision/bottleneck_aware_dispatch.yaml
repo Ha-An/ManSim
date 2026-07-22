@@ -1,0 +1,17 @@
+# Immediate bottleneck-aware dispatch for factory_mfg_basic.
+# The worker receives the feasible task with the highest throughput relief score.
+mode: bottleneck_aware_dispatch
+
+throughput_policy:
+  score:
+    travel_time_penalty: 0.80
+    resource_risk_penalty: 8.0
+    battery_risk_penalty: 25.0
+    bottleneck_relief_weight: 1.0
+    downstream_progress_weight: 1.0
+    machine_continuity_weight: 1.0
+  factory_mfg_basic:
+    enabled: true
+
+battery:
+  low_threshold_ratio: 0.30

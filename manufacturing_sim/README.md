@@ -2,6 +2,8 @@
 
 `manufacturing_sim`은 ManSim의 simulator-core package입니다. Factory state, SimPy process loop, humanoid task execution, event logging, KPI aggregation을 담당하며 LLM manager UI나 dashboard rendering 자체는 포함하지 않습니다.
 
+이 문서는 ManSim `v0.5.0` simulator core 기준입니다.
+
 ## 책임 범위
 
 - world state transition
@@ -23,6 +25,9 @@
 - `simulation/scenarios/manufacturing/processes.py`: SimPy process orchestration
 - `simulation/scenarios/manufacturing/logging.py`: `events.jsonl` event writer
 - `simulation/scenarios/manufacturing/run.py`: manufacturing scenario entrypoint
+- `simulation/scenarios/manufacturing/throughput_policy.py`: bottleneck score와 OR-Tools optimizer 입력 계산
+- `simulation/operational_complexity.py`: HumanoidSim task complexity 기반 OTC 집계
+- `simulation/pre_run_diagnostics.py`: factory 실행 전 multi-humanoid 운영 지표 계산
 
 ## Humanoid Runtime
 
@@ -40,8 +45,10 @@ Worker는 `HumanoidSim`의 `HumanoidStateSnapshot`과 `TaskSpec -> child Task ->
 `world.py`는 여러 decision mode가 같은 task execution runtime을 공유하도록 구성되어 있습니다.
 
 - `adaptive_priority`: 즉시 dispatch scripted baseline
+- `bottleneck_aware_dispatch`: factory bottleneck/throughput score 기반 즉시 dispatch
 - `rolling_horizon_aging_priority`: rolling window pool + task-code aging rank
 - `rolling_horizon_dedicated_roles`: rolling window pool + worker별 HumanoidSim task allowlist
+- `rolling_horizon_throughput_optimizer`: OR-Tools CP-SAT 기반 rolling horizon throughput optimizer
 - `openclaw_adaptive_priority`: OpenClaw manager loop가 priority를 조정하는 optional mode
 
 Dedicated roles mode에서는 `HANDOVER_ITEM`을 수집하지 않고, `REPAIR_MACHINE`은 A2 단독 task로 제한합니다. A1/A2 low battery는 A3의 battery delivery task로 처리합니다.

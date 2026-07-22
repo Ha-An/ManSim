@@ -21,7 +21,7 @@ TASK_CODE_BY_PRIORITY_KEY: dict[str, str] = {
     "inspect_product": "INSPECT_PRODUCT",
     "repair_machine": "REPAIR_MACHINE",
     "preventive_maintenance": "PREVENTIVE_MAINTENANCE",
-    "handover_item": "HANDOVER_ITEM",
+    "handover_item": "HANDOVER_ITEM_TO_ROBOT",
     "scrap_disposal": "COLLECT_WASTE_OR_SCRAP",
 }
 
@@ -35,7 +35,7 @@ DOMAIN_ACTION_CALLS: dict[str, set[str]] = {
     "INSPECT_PRODUCT": {"EXECUTE_QUALITY_ACTION"},
     "REPAIR_MACHINE": {"EXECUTE_MAINTENANCE_ACTION"},
     "PREVENTIVE_MAINTENANCE": {"EXECUTE_MAINTENANCE_ACTION"},
-    "HANDOVER_ITEM": {"EXECUTE_HUMAN_COLLABORATION_ACTION"},
+    "HANDOVER_ITEM_TO_ROBOT": {"EXECUTE_ROBOT_COLLABORATION_ACTION"},
     "COLLECT_WASTE_OR_SCRAP": set(),
 }
 
@@ -57,6 +57,7 @@ SUPPORTED_PRIMITIVE_CALLS: set[str] = {
     "CONFIRM_OPERATOR_STATE",
     "CREATE_OR_UPDATE_RECORD",
     "EXECUTE_HUMAN_COLLABORATION_ACTION",
+    "EXECUTE_ROBOT_COLLABORATION_ACTION",
     "EXECUTE_MACHINE_ACTION",
     "EXECUTE_MAINTENANCE_ACTION",
     "EXECUTE_QUALITY_ACTION",
@@ -74,6 +75,7 @@ SUPPORTED_PRIMITIVE_CALLS: set[str] = {
     "REACH_TO",
     "RECORD_RESULT",
     "RELEASE",
+    "SYNC_WITH_ROBOT",
     "UPDATE_RECORD",
     "VERIFY_TRANSACTION",
     "VERIFY_LEVEL_OR_QUANTITY",
@@ -329,6 +331,9 @@ class HumanoidTaskRuntime:
                 )
                 return
             if event_type == "HUMANOID_TASK_END":
+                current_availability = str((worker.humanoid_state or {}).get("availability", "")).strip().upper()
+                if current_availability == "DISABLED":
+                    return
                 self.transition_state(
                     worker,
                     "blocked",
@@ -653,7 +658,7 @@ class HumanoidTaskRuntime:
             }
         if task_code == "PREVENTIVE_MAINTENANCE":
             return {"asset": str(payload.get("machine_id", "")), "checklist": {"station": payload.get("station"), "priority_key": priority_key}}
-        if task_code == "HANDOVER_ITEM":
+        if task_code == "HANDOVER_ITEM_TO_ROBOT":
             item_id = str(payload.get("item_id") or payload.get("transfer_item_id") or "")
             item_type = str(payload.get("item_type") or "product")
             recipient_id = str(payload.get("recipient_agent_id") or agent.agent_id)

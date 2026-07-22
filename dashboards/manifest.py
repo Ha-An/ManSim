@@ -90,6 +90,8 @@ def _artifact_map(output_dir: Path, row: dict[str, Any]) -> dict[str, str]:
         "results_dashboard.html": _pick(row.get("results_dashboard_path", ""), "results_dashboard.html"),
         "kpi_dashboard.html": _pick(row.get("kpi_dashboard_path", ""), "kpi_dashboard.html"),
         "gantt.html": _pick(row.get("gantt_path", ""), "gantt.html"),
+        "pre_run_diagnostics.html": _pick_optional(row.get("pre_run_diagnostics_dashboard_path", ""), "pre_run_diagnostics.html"),
+        "pre_run_diagnostics.json": _pick_optional(row.get("pre_run_diagnostics_path", ""), "pre_run_diagnostics.json"),
         "task_priority_dashboard.html": _pick(row.get("task_priority_dashboard_path", ""), "task_priority_dashboard.html"),
         "knowledge_dashboard.html": _pick(row.get("knowledge_dashboard_path", ""), "knowledge_dashboard.html"),
         "llm_wiki_dashboard.html": _pick_optional(row.get("llm_wiki_dashboard_path", ""), "llm_wiki_dashboard.html"),
@@ -147,14 +149,17 @@ def build_dashboard_manifest(
         last_day = daily_rows[-1] if daily_rows else {}
         llm_meta = run_meta.get("llm", {}) if isinstance(run_meta.get("llm", {}), dict) else {}
         transport = llm_meta.get("transport_metrics", {}) if isinstance(llm_meta.get("transport_metrics", {}), dict) else {}
+        scenario_type = _normalize_label(kpi.get("scenario_type") or run_meta.get("scenario_type") or row.get("scenario_type"))
         runs.append(
             {
                 "id": run_id,
                 "label": run_id,
                 "run_index": run_index,
+                "scenario_type": scenario_type,
                 "output_dir": str(output_dir.resolve()),
                 "artifacts": _artifact_map(output_dir, row),
                 "kpi": {
+                    "scenario_type": scenario_type,
                     "total_products": _safe_int(kpi.get("total_products"), _safe_int(row.get("total_products"))),
                     "downstream_closure_ratio": _safe_float(kpi.get("downstream_closure_ratio"), _safe_float(row.get("downstream_closure_ratio"))),
                     "machine_broken_ratio": _safe_float(kpi.get("machine_broken_ratio")),
@@ -190,7 +195,7 @@ def build_dashboard_manifest(
         )
 
     manifest: dict[str, Any] = {
-        "version": "v0.4",
+        "version": "v0.5",
         "series_root": str(root_output_dir.resolve()),
         "single_run": len(runs) <= 1,
         "streamlit_preferred_port": int(streamlit_port),

@@ -316,8 +316,17 @@ export function applyEvent(domain: DomainState, event: ReplayEvent): DomainState
       if (typeof event.payload.label === "string") entity.label = event.payload.label;
       if (typeof event.payload.state === "string") entity.state = event.payload.state as BaseEntityState["state"];
       entity.position = asXY(event.payload.position) ?? entity.position;
-      mergePayloadAttributes(entity, event.payload);
       const rawAttributes = event.payload.attributes;
+      const priorTaskWindow = entity.attributes.task_window;
+      const preserveTaskWindow =
+        rawAttributes !== null &&
+        typeof rawAttributes === "object" &&
+        (rawAttributes as Record<string, unknown>).task_window === null &&
+        hasActiveHumanoidTaskContext(rawAttributes);
+      mergePayloadAttributes(entity, event.payload);
+      if (preserveTaskWindow && priorTaskWindow !== undefined) {
+        entity.attributes.task_window = priorTaskWindow;
+      }
       if (rawAttributes && typeof rawAttributes === "object" && (rawAttributes as Record<string, unknown>).motion === null) {
         delete entity.attributes.motion;
       }

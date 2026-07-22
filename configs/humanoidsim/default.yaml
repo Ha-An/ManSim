@@ -55,6 +55,8 @@ profiles:
       - vehicle_operation
       - equipment_interaction
       - human_collaboration
+      - robot_collaboration
+      - synchronization
       - handover
       - safe_interaction
       - high_risk_task

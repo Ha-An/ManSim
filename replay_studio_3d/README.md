@@ -1,69 +1,72 @@
 # Replay Studio 3D
 
-Replay Studio 3D??기존 `replay_studio/`?� 분리???�립 ?�험 ?�입?�다. 기존 2D Replay Studio 코드�?직접 import?��? ?�고, 같�? `replay_studio_log.json` artifact�??�어 Three.js 기반 3D factory replay�??�더링합?�다.
+Replay Studio 3D는 ManSim v0.5 run이 생성한 `replay_studio_log.json`, `replay_studio_layout.json`, `dashboard_manifest.json`을 읽는 React + Three.js viewer입니다. Simulation core와 분리되어 있으며 event stream을 재생해 factory와 shipyard 상태를 복원합니다.
 
-## 목표
+## Supported Views
 
-- 기존 `replay_studio_log.json` v1.0??그�?�??�습?�다.
-- factory layout, tile grid, object footprint, worker motion path�?3D�??�현?�니??
-- worker, machine, queue, shelf, inspection table, item??procedural block model�??�더링합?�다.
-- Results Hub??`Replay Studio 3D` 메뉴?�서 ?�재 run log�??????�습?�다.
-- ?�택??worker???�높??1?�칭 ?�면???�체 3D �??��? ?�쪽 ?�단 PiP�??�께 ?�시?�니??
-- `rolling_horizon_aging_priority` run?�서??3D �??�단??rolling window�?Task Pool???�시?�니??
+- Factory: worker, machine, queue, warehouse shelf, inspection table, item lineage와 machine input/output 상태
+- Shipyard: surface work tile, cart route, 2-tile cart, parking tile, cart inventory와 작업 진행 상태
+- Worker: 이동/작업 animation, cargo, battery/state/task monitor, 선택 worker의 first-person PiP
+- Rolling horizon: task pool, dispatch/start/complete/skip/requeue 상태와 stable task id
+- Incident and traffic: active incident, recovery context, movement path와 tile/edge conflict
 
-## ?�행
+오른쪽 monitor는 scenario에 따라 항목이 달라집니다.
+
+- Factory: `WORKER`, `MACHINE`, `ITEM`
+- Shipyard: `WORKER`, `TILE`, `CART`, `ITEM`
+
+## Run Locally
+
+Node.js 20.19 이상과 npm이 필요하며 Node.js 24를 권장합니다. 저장소의 `package-lock.json`과 동일한 dependency를 설치하려면 `npm ci`를 사용합니다.
 
 ```powershell
 cd C:\Github\ManSim\replay_studio_3d
-npm install
+npm ci
 npm run dev
 ```
 
-기본 URL:
+기본 URL은 `http://127.0.0.1:5174`입니다.
+
+특정 replay log를 직접 열 수 있습니다.
 
 ```text
-http://127.0.0.1:5174
+http://127.0.0.1:5174/?log=C:\Github\ManSim\outputs\YYYY-MM-DD\HH-MM-SS\replay_studio_log.json
 ```
 
-?�정 run log ?�기:
+Hub와 같은 manifest를 사용하려면 다음 query를 사용합니다.
 
 ```text
-http://127.0.0.1:5174/?log=C:\Github\ManSim\outputs\2026-05-11\23-49-32\replay_studio_log.json
+http://127.0.0.1:5174/?manifest=C:\Github\ManSim\outputs\YYYY-MM-DD\HH-MM-SS\dashboard_manifest.json&run=run_01
 ```
 
-dashboard manifest?�서 run ?�택:
+## Replay Contract
+
+Viewer는 simulation artifact를 관찰하는 계층입니다. Worker 위치, battery, item state, task 상태를 renderer에서 임의로 보정하지 않습니다.
+
+- event는 `timestamp`, `sequence_index`, `event_id` 순서로 재생합니다.
+- worker 이동은 motion payload의 tile path와 durative window를 보간합니다.
+- item은 material, intermediate, product, battery만 monitor 대상으로 사용하고 lineage를 함께 표시합니다.
+- worker cargo와 cart inventory는 replay event에 기록된 state만 표시합니다.
+- ship work tile과 cart route/parking은 layout의 grid tile 목록을 사용합니다.
+- rolling task table은 event에 기록된 stable task id와 status transition을 사용합니다.
+
+## Coordinates And Rendering
+
+`layout.grid.width_tiles`, `layout.grid.height_tiles`, `layout.viewport`를 사용해 replay 좌표를 Three.js world 좌표로 변환합니다.
 
 ```text
-http://127.0.0.1:5174/?manifest=C:\Github\ManSim\outputs\dashboard_manifest.json&run=23-49-32
+worldX = point.x / tileWidth - grid.width_tiles / 2
+worldZ = point.y / tileHeight - grid.height_tiles / 2
 ```
 
-## 좌표 변??
-- `layout.grid.width_tiles`, `layout.grid.height_tiles`�?3D world ?�기�??�용?�니??
-- `layout.viewport`??replay log??2D 좌표�?tile 좌표�?변?�하??기�??�니??
-- 변?�식:
-  - `worldX = point.x / tileWidth - grid.width_tiles / 2`
-  - `worldZ = point.y / tileHeight - grid.height_tiles / 2`
-  - `Y`축�? ?�이?�니??
-- `layout.grid.object_footprints`가 ?�는 object??footprint 중심�?tile ?�기�?그�?�??�용?�니??
+`layout.grid.object_footprints`가 있는 entity는 footprint 중심과 크기를 사용합니다. Worker와 cart는 현재 path heading을 기준으로 방향을 정하고, first-person camera는 선택 worker의 eye-height pose와 마지막 유효 heading을 사용합니다.
 
-## 3D ?�현 규칙
+## Verification
 
-- Worker: blocky humanoid robot
-- Worker 1?�칭 ?�면: ?�택??worker???�높??camera, ?�동 방향 기�? ?�야, cargo foreground
-- Rolling Horizon Task Pool: rolling window마다 pool???�인 task opportunity, dispatch, skip ?�태�??�간?�별로 ?�시
-- Machine: block machine, status panel, process progress
-- Queue/buffer: platform, item count, item type�?shape/color
-- Charger: charging rack block
-- Item: material/intermediate/product/battery/scrap???�상�?모양?�로 구분
-- Wall: voxel block
-- Door: amber floor plate
-- Traffic conflict: worker ?�이 직선 ?�결 ?�??tile/edge highlight�??�시
-
-## 검�?
 ```powershell
 npm run test
 npm run build
 npm run test:visual
 ```
 
-`test:visual`?� Playwright�?3D canvas가 비어 ?��? ?��?지, replay object가 ?�더링되?��?, worker monitor?� 1?�칭 viewport가 ?�시?�는지 ?�인?�니??
+`test:visual`은 Playwright로 desktop/mobile viewport, nonblank canvas, 3D scene framing, first-person PiP와 주요 artifact rendering을 확인합니다.

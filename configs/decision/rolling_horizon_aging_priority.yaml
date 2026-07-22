@@ -49,4 +49,4 @@ rolling_horizon:
         - REPAIR_MACHINE
 
 battery:
-  low_threshold_ratio: 0.20
+  low_threshold_ratio: 0.30

@@ -121,6 +121,36 @@ class TrafficMonitorTests(unittest.TestCase):
         self.assertEqual(["NEAR_MISS"], [conflict.conflict_type for conflict in conflicts])
         self.assertFalse(conflicts[0].collision)
 
+    def test_cancelled_segment_does_not_create_physical_conflict_history(self) -> None:
+        monitor = TrafficMonitor(near_miss_headway_min=0.05)
+        monitor.begin_segment(
+            TrafficSegment(
+                move_id="A1-move-1",
+                worker_id="A1",
+                segment_index=1,
+                from_tile=(1, 1),
+                to_tile=(2, 1),
+                started_at=0.0,
+                ended_at=0.1,
+            )
+        )
+        monitor.cancel_segment("A1", "A1-move-1", 1)
+
+        conflicts = monitor.begin_segment(
+            TrafficSegment(
+                move_id="A2-move-1",
+                worker_id="A2",
+                segment_index=1,
+                from_tile=(1, 1),
+                to_tile=(2, 1),
+                started_at=0.02,
+                ended_at=0.12,
+            )
+        )
+
+        self.assertEqual([], conflicts)
+        self.assertEqual([], monitor.recent_segments)
+
 
 if __name__ == "__main__":
     unittest.main()

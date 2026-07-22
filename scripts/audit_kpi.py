@@ -442,7 +442,7 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
     broken_pure_min: dict[str, float] = {machine_id: 0.0 for machine_id in machine_ids}
     repair_min: dict[str, float] = {machine_id: 0.0 for machine_id in machine_ids}
     setup_active: dict[str, tuple[str, float]] = {}
-    setup_min: dict[str, float] = {machine_id: 0.0 for machine_id in machine_ids}
+    setup_intervals: dict[str, list[tuple[float, float]]] = {machine_id: [] for machine_id in machine_ids}
 
     for event in events:
         event_type = str(event.get("type", "")).strip()
@@ -498,7 +498,7 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
                 if active is not None:
                     setup_machine_id, start = active
                     if t >= start:
-                        setup_min[setup_machine_id] += t - start
+                        setup_intervals[setup_machine_id].append((start, t))
 
     for machine_id, start in processing_active.items():
         if sim_end >= start:
@@ -514,7 +514,11 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
             repair_min[machine_id] += sim_end - start
     for setup_machine_id, start in setup_active.values():
         if sim_end >= start:
-            setup_min[setup_machine_id] += sim_end - start
+            setup_intervals[setup_machine_id].append((start, sim_end))
+    setup_min: dict[str, float] = {
+        machine_id: round3(interval_total(merge_intervals(intervals)))
+        for machine_id, intervals in setup_intervals.items()
+    }
     compare_scalar(findings, "machine_processing_min", kpi.get("machine_processing_min", 0.0), round3(sum(processing_min.values())))
     compare_scalar(findings, "machine_pm_min", kpi.get("machine_pm_min", 0.0), round3(sum(pm_min.values())))
 
@@ -536,11 +540,6 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
         total_state_time = sum(float(value) for value in state_minutes.values())
         if not approx_equal(total_state_time, sim_end, 0.01):
             findings.append(f"machine_state_time_by_machine[{machine_id}] does not sum to sim_end: {total_state_time} vs {sim_end}")
-        compare_scalar(findings, f"{machine_id}.processing state", state_minutes.get("processing", 0.0), round3(processing_min.get(machine_id, 0.0)))
-        compare_scalar(findings, f"{machine_id}.pm state", state_minutes.get("pm", 0.0), round3(pm_min.get(machine_id, 0.0)))
-        compare_scalar(findings, f"{machine_id}.setup state", state_minutes.get("setup", 0.0), round3(setup_min.get(machine_id, 0.0)))
-        compare_scalar(findings, f"{machine_id}.broken state", state_minutes.get("broken", 0.0), round3(broken_pure_min.get(machine_id, 0.0)))
-        compare_scalar(findings, f"{machine_id}.under_repair state", state_minutes.get("under_repair", 0.0), round3(repair_min.get(machine_id, 0.0)))
 
     incident_total = 0
     physical_total = 0

@@ -1,15 +1,17 @@
-# ManSim vNext root config (Hydra)
+# ManSim v0.5 root config (Hydra)
 # Override with `decision=...`, `scenario=...`, or dotted Hydra keys.
 defaults:
   - scenario: factory_mfg_basic
   # Decision modes:
   # - fixed_priority: fixed scripted baseline
   # - adaptive_priority: adaptive scripted baseline
+  # - bottleneck_aware_dispatch: immediate bottleneck/throughput scoring mode
   # - fixed_task_assignment: worker task-family allowlist mode
   # - llm_planner: legacy commitment-driven LLM mode
   # - openclaw_adaptive_priority: OpenClaw manager-only priority-driven LLM mode
   # - rolling_horizon_aging_priority: rolling task pool with waited-window priority aging
   # - rolling_horizon_dedicated_roles: rolling task pool with worker-specific HumanoidSim task roles
+  # - rolling_horizon_throughput_optimizer: OR-Tools CP-SAT rolling throughput optimizer
   - decision: rolling_horizon_dedicated_roles
   - heuristic_rules: default
   - humanoidsim: default

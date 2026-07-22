@@ -23,6 +23,8 @@ export interface RollingTaskPoolEntry {
   baseRank?: number;
   effectiveRank?: number;
   waitedWindows?: number;
+  optimizerScore?: number;
+  sequencePosition?: number;
   target: string;
   status: RollingTaskStatus;
   workerIds: string[];
@@ -63,6 +65,8 @@ interface MutableEntry {
   baseRank?: number;
   effectiveRank?: number;
   waitedWindows?: number;
+  optimizerScore?: number;
+  sequencePosition?: number;
   target: string;
   status: RollingTaskStatus;
   workerIds: Set<string>;
@@ -193,6 +197,8 @@ function makeEntry(event: ReplayEvent, status: RollingTaskStatus): MutableEntry 
     baseRank: asNumber(payload.base_priority_rank),
     effectiveRank: asNumber(payload.effective_priority_rank),
     waitedWindows: asNumber(payload.waited_window_count),
+    optimizerScore: asNumber(payload.optimizer_score),
+    sequencePosition: asNumber(payload.sequence_position),
     target: compactTarget(payload),
     status,
     workerIds,
@@ -224,6 +230,7 @@ export function isRollingHorizonReplay(log: ReplayLog | null): boolean {
   return (
     mode === "rolling_horizon_aging_priority" ||
     mode === "rolling_horizon_dedicated_roles" ||
+    mode === "rolling_horizon_throughput_optimizer" ||
     mode === "rolling_horizon_fixed_priority" ||
     log.events.some((event) => ROLLING_EVENT_TYPES.has(event.event_type))
   );
@@ -314,6 +321,8 @@ export function buildRollingTaskPoolModel(events: ReplayEvent[], currentTime: nu
       entry.baseRank = asNumber(event.payload.base_priority_rank) ?? entry.baseRank;
       entry.effectiveRank = asNumber(event.payload.effective_priority_rank) ?? entry.effectiveRank;
       entry.waitedWindows = asNumber(event.payload.waited_window_count) ?? entry.waitedWindows;
+      entry.optimizerScore = asNumber(event.payload.optimizer_score) ?? entry.optimizerScore;
+      entry.sequencePosition = asNumber(event.payload.sequence_position) ?? entry.sequencePosition;
       const workerId = asText(event.payload.worker_id);
       const assignedWorkerId = asText(event.payload.assigned_worker_id);
       if (workerId) entry.workerIds.add(workerId);
@@ -348,6 +357,8 @@ export function buildRollingTaskPoolModel(events: ReplayEvent[], currentTime: nu
       globalEntry.baseRank = asNumber(event.payload.base_priority_rank) ?? globalEntry.baseRank;
       globalEntry.effectiveRank = asNumber(event.payload.effective_priority_rank) ?? globalEntry.effectiveRank;
       globalEntry.waitedWindows = asNumber(event.payload.waited_window_count) ?? globalEntry.waitedWindows;
+      globalEntry.optimizerScore = asNumber(event.payload.optimizer_score) ?? globalEntry.optimizerScore;
+      globalEntry.sequencePosition = asNumber(event.payload.sequence_position) ?? globalEntry.sequencePosition;
       const workerId = asText(event.payload.worker_id);
       const assignedWorkerId = asText(event.payload.assigned_worker_id);
       if (workerId) globalEntry.workerIds.add(workerId);
@@ -410,6 +421,7 @@ export function buildRollingTaskPoolModel(events: ReplayEvent[], currentTime: nu
   }
   for (const entry of entries) {
     if (entry.status === "started") entry.plannedOrder = 0;
+    if (entry.sequencePosition !== undefined && entry.status === "dispatched") entry.plannedOrder = entry.sequencePosition;
   }
 
   const outputEntries = entries.map((entry) => ({
@@ -422,6 +434,8 @@ export function buildRollingTaskPoolModel(events: ReplayEvent[], currentTime: nu
       baseRank: entry.baseRank,
       effectiveRank: entry.effectiveRank,
       waitedWindows: entry.waitedWindows,
+      optimizerScore: entry.optimizerScore,
+      sequencePosition: entry.sequencePosition,
       target: entry.target,
       status: entry.status,
       workerIds: [...entry.workerIds].sort(),
@@ -533,7 +547,13 @@ export function RollingTaskPoolPanel({
                     <td>{formatTime(entry.updatedAt, timeUnit)}</td>
                     <td>{entry.taskCode}</td>
                     <td>{entry.target}</td>
-                    <td title={entry.effectiveRank !== undefined ? `rank ${entry.effectiveRank}, base ${entry.baseRank ?? "-"}, waited ${entry.waitedWindows ?? 0}` : undefined}>
+                    <td title={
+                      entry.optimizerScore !== undefined
+                        ? `score ${entry.optimizerScore.toFixed(2)}, rank ${entry.effectiveRank ?? "-"}, base ${entry.baseRank ?? "-"}, waited ${entry.waitedWindows ?? 0}`
+                        : entry.effectiveRank !== undefined
+                          ? `rank ${entry.effectiveRank}, base ${entry.baseRank ?? "-"}, waited ${entry.waitedWindows ?? 0}`
+                          : undefined
+                    }>
                       {entry.plannedOrder ?? "-"}
                     </td>
                     <td>{entry.status === "dispatched" || entry.status === "started" ? entry.assignedWorkerId ?? "-" : "-"}</td>

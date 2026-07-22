@@ -78,6 +78,18 @@ SELECTED_TASK_ARGS = {
             "max_carriers": 2,
         },
     },
+    "HANDOVER_ITEM_TO_ROBOT": {
+        "item": {"entity_type": "product", "entity_id": "PRODUCT-1"},
+        "recipient": {"entity_type": "robot", "entity_id": "A1"},
+        "handover_spec": {
+            "mode": "product_collaboration_join",
+            "source_agent_id": "A2",
+            "recipient_agent_id": "A1",
+            "transport_session_id": "PTX-000001",
+            "destination": "warehouse_buffer",
+            "max_carriers": 2,
+        },
+    },
     "COLLECT_WASTE_OR_SCRAP": {
         "item": {"entity_type": "scrap_batch", "entity_ids": ["SCRAP-1"]},
         "waste_or_scrap": {"entity_type": "scrap_batch", "entity_ids": ["SCRAP-1"]},
@@ -101,6 +113,9 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
         for task_code in sorted(set(TASK_CODE_BY_PRIORITY_KEY.values())):
             with self.subTest(task_code=task_code):
                 self.assertIsNotNone(self.catalog.get(task_code))
+
+    def test_robot_handover_priority_uses_robot_handover_task(self) -> None:
+        self.assertEqual("HANDOVER_ITEM_TO_ROBOT", TASK_CODE_BY_PRIORITY_KEY["handover_item"])
 
     def test_default_config_sets_assignment_min_duration(self) -> None:
         cfg_path = Path(__file__).resolve().parents[1] / "configs" / "humanoidsim" / "default.yaml"

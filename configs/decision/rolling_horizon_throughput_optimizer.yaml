@@ -1,0 +1,41 @@
+# Rolling horizon dispatch optimized with OR-Tools CP-SAT.
+# OR-Tools is required for this mode; no deterministic fallback is used.
+mode: rolling_horizon_throughput_optimizer
+
+rolling_horizon:
+  window_min: 5.0
+  dispatch_policy: throughput_optimizer
+  immediate_task_triggers:
+    enabled: true
+    queue_policy: next_after_current
+    protect_from_window_requeue: true
+    event_task_codes:
+      worker_low_battery:
+        - MANAGE_ROBOT_POWER
+      machine_broken:
+        - REPAIR_MACHINE
+  optimizer:
+    time_limit_s: 5.0
+    num_search_workers: 1
+    random_seed: null
+    max_tasks_per_worker_per_window: 8
+    accept_statuses: [OPTIMAL, FEASIBLE]
+    assignment_reward: 1000.0
+    urgent_bonus: 250.0
+    queue_load_penalty: 12.0
+    load_imbalance_penalty: 10.0
+    objective_scale: 100
+
+throughput_policy:
+  score:
+    travel_time_penalty: 0.80
+    resource_risk_penalty: 8.0
+    battery_risk_penalty: 25.0
+    bottleneck_relief_weight: 1.0
+    downstream_progress_weight: 1.0
+    machine_continuity_weight: 1.0
+  factory_mfg_basic:
+    enabled: true
+
+battery:
+  low_threshold_ratio: 0.30

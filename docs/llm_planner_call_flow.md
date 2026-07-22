@@ -68,7 +68,7 @@ planner returns structured action outputs such as:
 - `detector_alignment`
 
 중요
-- v0.4에서 planner의 authoritative 실행 출력은 `commitments`입니다.
+- Legacy `llm_planner` 경로에서 planner의 authoritative 실행 출력은 `commitments`입니다.
 - planner 응답이 inert/invalid이면 deterministic fallback commitment synthesizer가 대신 실행 plan을 만듭니다.
 
 ## 6. Worker Execution

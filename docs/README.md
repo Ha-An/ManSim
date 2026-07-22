@@ -4,6 +4,7 @@
 
 ## 현재 기준
 
+- ManSim release: `v0.5.0`
 - 기본 scenario: `factory_mfg_basic`
 - 기본 decision mode: `rolling_horizon_dedicated_roles`
 - 기본 horizon: 5일 run
@@ -14,13 +15,17 @@
 
 ## 추천 읽기 순서
 
-1. [simulator_core_guide.md](simulator_core_guide.md): scenario registry, factory/shipyard world, task generation, artifact export
-2. [decision_logic.md](decision_logic.md): decision mode, rolling horizon pool/dispatch, dedicated roles
-3. [humanoid_worker_model.md](humanoid_worker_model.md): ManSim worker가 HumanoidSim state/task/incident를 사용하는 방식
-4. [humanoid_movement_model.md](humanoid_movement_model.md): pathfinding, reservation, traffic wait, replay interpolation
-5. [replay_dashboards.md](replay_dashboards.md): Results Hub, KPI, Gantt, 3D Replay Studio
-6. [llm_wiki_curator.md](llm_wiki_curator.md): optional LLM Wiki, Curator, Graphify
-7. [openclaw_adaptive_priority_call_flow.md](openclaw_adaptive_priority_call_flow.md): OpenClaw manager loop
+1. [installation.md](installation.md): Python/Node.js 요구사항, 전체 설치, 첫 실행, 문제 해결
+2. [simulator_core_guide.md](simulator_core_guide.md): scenario registry, factory/shipyard world, task generation, artifact export
+3. [decision_logic.md](decision_logic.md): decision mode, rolling horizon pool/dispatch, dedicated roles
+4. [humanoid_worker_model.md](humanoid_worker_model.md): ManSim worker가 HumanoidSim state/task/incident를 사용하는 방식
+5. [humanoid_movement_model.md](humanoid_movement_model.md): pathfinding, reservation, traffic wait, replay interpolation
+6. [replay_dashboards.md](replay_dashboards.md): Results Hub, KPI, Gantt, 3D Replay Studio
+7. [llm_wiki_curator.md](llm_wiki_curator.md): optional LLM Wiki, Curator, Graphify
+8. [openclaw_adaptive_priority_call_flow.md](openclaw_adaptive_priority_call_flow.md): OpenClaw manager loop
+9. [v0.5_release_notes.md](v0.5_release_notes.md): v0.5 변경 사항, 검증 범위, 호환성
+
+정책 비교 실험은 [Factory Policy Comparison README](../experiments/factory_policy_comparison/README.md)에서 별도로 설명합니다.
 
 ## Scenario 문서 기준
 
@@ -66,3 +71,4 @@ Run이 끝난 뒤 다음 두 audit를 기본으로 사용합니다.
 - machine `BROKEN`/`UNDER_REPAIR`/PM/setup/processing 시간 일관성
 - rolling horizon task id, requeue, skip, dispatch 일관성
 - replay worker position/state 보존
+- battery가 이미 방전된 worker의 추가 tile 이동 금지

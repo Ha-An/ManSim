@@ -119,6 +119,7 @@ def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) 
     payload = run_meta if isinstance(run_meta, dict) else {}
     scenario_type = str(kpi.get("scenario_type") or payload.get("scenario_type") or "").strip()
     scenario_label = scenario_type or "-"
+    decision_mode = str(payload.get("decision_mode") or kpi.get("decision_mode") or "").strip().lower()
     if scenario_type == "shipyard_basic":
         output_card = (
             "Completed Surface Tiles",
@@ -141,6 +142,16 @@ def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) 
         input_wait_card = ("Product Input Wait", _format_value(_safe_float(kpi.get("product_input_wait_avg_min")), "minutes"), "Average waiting time before inspection/product intake clears.")
     cards = [
         ("Scenario", scenario_label, "Scenario plugin used for this run."),
+        (
+            "OTC",
+            _format_value(_safe_float(kpi.get("operational_task_complexity", kpi.get("otc", 0.0))), "float"),
+            "Daily average operational task complexity from HumanoidSim primitive difficulty weights.",
+        ),
+        (
+            "Cumulative Complexity",
+            _format_value(_safe_float(kpi.get("cumulative_operational_complexity_over_n_days", 0.0)), "float"),
+            "Sum of executed task instance complexity over the configured simulation days.",
+        ),
         output_card,
         ("Closure Ratio", _format_value(_safe_float(kpi.get("downstream_closure_ratio")), "ratio"), "How much downstream output was actually closed."),
         lead_time_card,
@@ -152,6 +163,29 @@ def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) 
         ("Executed Until", _format_executed_until(kpi, payload), "How far the simulation actually progressed before completion or termination."),
         ("Termination Reason", str(kpi.get("termination_reason", "")).strip() or ("completed_horizon" if not bool(kpi.get("terminated", False)) else "-"), "Why the run stopped. Completed runs show completed_horizon."),
     ]
+    if decision_mode in {"bottleneck_aware_dispatch", "rolling_horizon_throughput_optimizer"}:
+        cards.append(
+            (
+                "Bottleneck Score",
+                _format_value(_safe_float(kpi.get("bottleneck_score_avg", 0.0)), "float"),
+                "Average bottleneck/throughput relief score for selected or optimized tasks.",
+            )
+        )
+    if decision_mode == "rolling_horizon_throughput_optimizer":
+        cards.extend(
+            [
+                (
+                    "Optimizer Solved",
+                    _format_value(_safe_float(kpi.get("throughput_optimizer_solved_count", 0)), "count"),
+                    "Rolling windows solved by OR-Tools with accepted status.",
+                ),
+                (
+                    "Optimizer Objective",
+                    _format_value(_safe_float(kpi.get("throughput_optimizer_objective_avg", 0.0)), "float"),
+                    "Average CP-SAT objective value over solved windows.",
+                ),
+            ]
+        )
     return "<section class='section'><div class='grid cards-4'>" + "".join(
         f"<div class='card'><div class='label'>{html.escape(label)}</div><div class='value'>{html.escape(value)}</div><div class='sub'>{html.escape(sub)}</div></div>"
         for label, value, sub in cards

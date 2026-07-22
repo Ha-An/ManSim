@@ -205,6 +205,10 @@ class TrafficMonitor:
         self.recent_segments.append(segment)
         self._prune(segment.ended_at)
 
+    def cancel_segment(self, worker_id: str, move_id: str, segment_index: int) -> None:
+        """Remove a reserved segment that never produced physical movement."""
+        self.active_segments.pop((worker_id, move_id, segment_index), None)
+
     def _conflicts_between(self, segment: TrafficSegment, other: TrafficSegment, *, active: bool) -> list[TrafficConflict]:
         gap = _interval_gap(segment.started_at, segment.ended_at, other.started_at, other.ended_at)
         overlap = gap == 0.0

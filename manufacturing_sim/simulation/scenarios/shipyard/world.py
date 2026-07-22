@@ -10,6 +10,7 @@ from humanoidsim import default_humanoid_state, expand_task_steps, transition_hu
 
 from manufacturing_sim.simulation.scenarios.manufacturing.entities import Task, Worker
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
+from manufacturing_sim.simulation.operational_complexity import build_operational_task_complexity_metrics
 from manufacturing_sim.simulation.scenarios.shipyard.grid_map import ShipyardTileGridMap
 
 
@@ -113,6 +114,7 @@ class ShipyardWorld:
         self.decision_module = decision_module
         self.map = ShipyardTileGridMap.from_world_config(cfg)
         self.minutes_per_day = float(cfg.get("horizon", {}).get("minutes_per_day", 240))
+        self.num_days = int(cfg.get("horizon", {}).get("num_days", 1) or 1)
         factory_cfg = cfg.get("factory", {}) if isinstance(cfg.get("factory", {}), dict) else {}
         worker_cfg = cfg.get("worker", {}) if isinstance(cfg.get("worker", {}), dict) else {}
         decision_cfg = cfg.get("decision", {}) if isinstance(cfg.get("decision", {}), dict) else {}
@@ -2414,6 +2416,26 @@ class ShipyardWorld:
         state_metrics = self._humanoid_state_metrics(sim_time)
         cart_busy_total = sum(cart.busy_total_min + (max(0.0, float(self.env.now) - cart.busy_started_at) if cart.busy_started_at is not None else 0.0) for cart in self.carts.values())
         cart_util = round(cart_busy_total / max(1e-9, sim_time * max(1, len(self.carts))), 6) if self.carts else 0.0
+        completed_task_counts: dict[str, int] = {}
+        for event in self.logger.events:
+            if str(event.get("event_type", "")) != "AGENT_TASK_END":
+                continue
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            if str(details.get("status", "")).strip().lower() != "completed":
+                continue
+            task_code = str(details.get("task_code") or details.get("task_type") or "").strip().upper()
+            if task_code:
+                completed_task_counts[task_code] = completed_task_counts.get(task_code, 0) + 1
+        humanoid_task_minutes: dict[str, float] = {}
+        for worker_rows in self.worker_task_minutes.values():
+            for task_code, minutes in worker_rows.items():
+                code = str(task_code).strip().upper()
+                humanoid_task_minutes[code] = round(humanoid_task_minutes.get(code, 0.0) + float(minutes or 0.0), 3)
+        operational_complexity_metrics = build_operational_task_complexity_metrics(
+            completed_task_counts,
+            num_days=float(self.num_days or 1),
+            catalog=None,
+        )
         kpi = {
             "scenario_type": "shipyard_basic",
             "makespan_min": round(makespan, 3) if makespan is not None else None,
@@ -2443,6 +2465,7 @@ class ShipyardWorld:
             },
             "worker_utilization_by_worker": worker_util,
             "worker_task_minutes": self.worker_task_minutes,
+            "humanoid_task_minutes": humanoid_task_minutes,
             "incident_count_by_code": dict(self.incident_count_by_code),
             "total_products": completed_count,
             "downstream_closure_ratio": surface_ratio,
@@ -2483,6 +2506,7 @@ class ShipyardWorld:
                 "pending_candidate_count": int(len(self.rolling_horizon_pending)),
                 "queued_dispatch_count": int(sum(len(queue) for queue in self.rolling_horizon_dispatch_queues.values())),
             },
+            **operational_complexity_metrics,
             "terminated": self.terminated,
             "termination_reason": self.termination_reason or ("completed_horizon" if not self.terminated else "all_ship_surface_tiles_complete"),
             # Compatibility aliases for existing hub/audit code.

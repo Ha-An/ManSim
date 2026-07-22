@@ -15,6 +15,7 @@ from agents.factory import build_decision_module
 from agents.modes import format_decision_mode_label, is_fixed_priority_mode, normalize_decision_mode
 from manufacturing_sim.simulation.scenarios.manufacturing.entities import ItemState, MachineState, Task
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
+from manufacturing_sim.simulation.scenarios.manufacturing.throughput_policy import ThroughputOptimizerUnavailable
 from manufacturing_sim.simulation.scenarios.manufacturing.world import ManufacturingWorld
 
 
@@ -48,6 +49,84 @@ class RollingHorizonDecisionTests(unittest.TestCase):
         module = build_decision_module(experiment_cfg={"decision": {"mode": "rolling_horizon_dedicated_roles"}}, decision_mode="rolling_horizon_dedicated_roles")
         self.assertEqual("rolling_horizon_dedicated_roles", module.decision_mode)
         self.assertTrue(module.static_priority_policy)
+
+    def test_mode_registry_recognizes_throughput_policy_modes(self) -> None:
+        self.assertEqual("bottleneck_aware_dispatch", normalize_decision_mode("bottleneck_aware_dispatch"))
+        self.assertTrue(is_fixed_priority_mode("bottleneck_aware_dispatch"))
+        self.assertEqual("Bottleneck-Aware Dispatch", format_decision_mode_label("bottleneck_aware_dispatch"))
+        bottleneck_module = build_decision_module(
+            experiment_cfg={"decision": {"mode": "bottleneck_aware_dispatch"}},
+            decision_mode="bottleneck_aware_dispatch",
+        )
+        self.assertEqual("bottleneck_aware_dispatch", bottleneck_module.decision_mode)
+
+        self.assertEqual("rolling_horizon_throughput_optimizer", normalize_decision_mode("rolling_horizon_throughput_optimizer"))
+        self.assertTrue(is_fixed_priority_mode("rolling_horizon_throughput_optimizer"))
+        self.assertEqual("Rolling Horizon Throughput Optimizer", format_decision_mode_label("rolling_horizon_throughput_optimizer"))
+        optimizer_module = build_decision_module(
+            experiment_cfg={"decision": {"mode": "rolling_horizon_throughput_optimizer"}},
+            decision_mode="rolling_horizon_throughput_optimizer",
+        )
+        self.assertEqual("rolling_horizon_throughput_optimizer", optimizer_module.decision_mode)
+        self.assertTrue(optimizer_module.static_priority_policy)
+
+    def test_throughput_optimizer_requires_ortools_at_world_start(self) -> None:
+        cfg = _load_cfg("rolling_horizon_throughput_optimizer")
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                with patch(
+                    "manufacturing_sim.simulation.scenarios.manufacturing.world.require_cp_sat",
+                    side_effect=ThroughputOptimizerUnavailable("missing ortools"),
+                ):
+                    with self.assertRaises(ThroughputOptimizerUnavailable):
+                        ManufacturingWorld(simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=4))
+            finally:
+                logger.close()
+
+    def test_throughput_optimizer_defaults_to_deterministic_solver_settings(self) -> None:
+        cfg = _load_cfg("rolling_horizon_throughput_optimizer")
+        self.assertEqual(1, cfg["decision"]["rolling_horizon"]["optimizer"]["num_search_workers"])
+        self.assertIsNone(cfg["decision"]["rolling_horizon"]["optimizer"]["random_seed"])
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=4))
+                self.assertEqual(int(cfg.get("seed", 7)), world.seed)
+            finally:
+                logger.close()
+
+    def test_bottleneck_score_prefers_broken_machine_repair(self) -> None:
+        cfg = _load_cfg("bottleneck_aware_dispatch")
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=4))
+                machine = world.machines["S1M1"]
+                machine.broken = True
+                machine.state = MachineState.BROKEN
+                repair = Task(
+                    task_id="RM-test",
+                    task_type="REPAIR_MACHINE",
+                    priority_key="repair_machine",
+                    priority=120.0,
+                    location="Station1",
+                    payload={"machine_id": machine.machine_id, "station": machine.station},
+                    task_code="REPAIR_MACHINE",
+                )
+                transfer = Task(
+                    task_id="TR-test",
+                    task_type="TRANSFER",
+                    priority_key="inter_station_transfer",
+                    priority=90.0,
+                    location="Station1",
+                    payload={"transfer_kind": "inter_station", "from_station": 1},
+                    task_code="TRANSFER",
+                )
+                agent = world.agents["A1"]
+                self.assertGreater(world._throughput_score(agent, repair), world._throughput_score(agent, transfer))
+            finally:
+                logger.close()
 
     def test_general_task_waits_until_window_boundary(self) -> None:
         cfg = _load_cfg()

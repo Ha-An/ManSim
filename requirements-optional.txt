@@ -1,0 +1,7 @@
+# Optional legacy UI, LLM manager, and knowledge-graph integrations.
+# The six-policy factory comparison does not require these packages.
+-r requirements.txt
+
+streamlit>=1.40.0
+graphifyy>=0.7.9
+openai>=2.35.1

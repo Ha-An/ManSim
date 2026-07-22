@@ -6,10 +6,13 @@ ManSim은 정적 HTML dashboard와 Replay Studio용 JSON payload를 함께 expor
 
 `results_dashboard.html`은 run별 메인 진입점입니다. 내부적으로 `dashboard_manifest.json`을 사용하며, manifest에는 run metadata와 artifact path가 들어 있습니다.
 
+ManSim v0.5 run이 생성하는 manifest의 version은 `v0.5`입니다. Hub는 scenario별로 복제되지 않고 모든 scenario가 같은 renderer와 manifest contract를 공유합니다.
+
 Hub는 다음 view로 연결합니다.
 
 - KPI dashboard
 - Gantt chart
+- Pre-Run Diagnostics
 - task-priority dashboard
 - Replay Studio 3D
 - Series dashboard
@@ -28,6 +31,10 @@ Knowledge views are hidden unless LLM knowledge is explicitly enabled in config.
 ## KPI Dashboard
 
 `kpi_dashboard.html`은 생산, 설비, worker, worker collaboration, movement/traffic safety, incident, shelf/scrap 지표를 보여줍니다.
+
+Results Hub는 run summary 카드에 `OTC`와 `Cumulative Complexity`를 표시합니다. KPI dashboard의 Operational Task Complexity 섹션은 HumanoidSim primitive difficulty weight를 기준으로 완료된 task instance의 복잡도 기여도를 task code와 primitive code별로 나누어 보여줍니다.
+
+Factory run에서 생성되는 `pre_run_diagnostics.html`은 simulation 결과가 아니라 run 시작 전 설정과 layout에서 계산한 사전 지표입니다. Worker OTC imbalance, resource conflict potential, traffic contention index, service tile scarcity, robot interaction load, power coordination risk의 값과 입력 snapshot, 계산 과정을 표시합니다.
 
 Worker Metrics는 `HumanoidSim` Availability State를 기준으로 합니다.
 
@@ -60,7 +67,7 @@ Worker collaboration KPI는 명시적 collaboration event만 사용합니다. �
 
 ## Decision / Dispatch KPI
 
-`rolling_horizon_aging_priority`와 `rolling_horizon_dedicated_roles` run에서는 Decision / Dispatch 영역에 rolling window 기반 dispatch 결과가 표시됩니다.
+`rolling_horizon_aging_priority`, `rolling_horizon_dedicated_roles`, `rolling_horizon_throughput_optimizer` run에서는 Decision / Dispatch 영역에 rolling window 기반 dispatch 결과가 표시됩니다.
 
 - `rolling_horizon_window_count`: rolling window start 수
 - `rolling_horizon_candidate_collected_count`: 수집된 unique task opportunity 수
@@ -69,10 +76,17 @@ Worker collaboration KPI는 명시적 collaboration event만 사용합니다. �
 - `rolling_horizon_stale_skipped_task_count`: dispatch 직전 stale/resource-preempted 상태로 skip된 task 수
 - `rolling_horizon.pending_candidate_count`: run 종료 시 unresolved pool task 수
 - `rolling_horizon.max_worker_queue_length`: run 중 worker dispatch queue 최대 길이
+- `throughput_optimizer_window_count`: OR-Tools optimizer를 호출한 rolling window 수
+- `throughput_optimizer_solved_count`: `OPTIMAL` 또는 `FEASIBLE` status로 dispatch를 만든 window 수
+- `throughput_optimizer_failed_count`: fallback 없이 실패한 optimizer window 수
+- `throughput_optimizer_objective_avg`: solver objective 평균
+- `bottleneck_score_avg`: bottleneck/throughput relief score 평균
 
 `rolling_horizon_aging_priority`는 HumanoidSim task code rank와 waited window count만 사용합니다. 예상 processing time, bottleneck bonus, deadline bonus는 사용하지 않습니다.
 
 `rolling_horizon_dedicated_roles`는 같은 event를 사용하되 `role_owner_agent_id`, `allowed_worker_ids`, `role_policy=dedicated_roles`를 함께 기록합니다. 3D Replay Studio의 Task Pool 패널은 rolling horizon 계열 mode에서 pool, dispatched, requeued, skipped 상태를 같은 stable task id 기준으로 보여줍니다.
+
+`rolling_horizon_throughput_optimizer`는 OR-Tools CP-SAT로 window dispatch를 결정합니다. 3D Replay Studio의 Task Pool 패널은 `sequence_position`을 `Seq` 열에 표시하고, tooltip에는 optimizer score와 rank 정보를 함께 표시합니다.
 
 ## Legacy Replay Studio 2D
 

@@ -25,6 +25,8 @@ PRIMARY_METRICS = [
     ("Humanoid Executing Ratio", "humanoid_execution_ratio_avg", "ratio", True, "Average share of worker-minutes with availability=EXECUTING."),
     ("Humanoid Blocked Ratio", "humanoid_blocked_ratio_avg", "ratio", False, "Average share of worker-minutes with availability=BLOCKED."),
     ("Humanoid Unavailable Ratio", "humanoid_unavailable_ratio_avg", "ratio", False, "Average share of worker-minutes with availability=DISABLED or OFFLINE."),
+    ("OTC", "operational_task_complexity", "float", False, "Daily average task complexity based on HumanoidSim primitive difficulty weights."),
+    ("Cumulative Complexity", "cumulative_operational_complexity_over_n_days", "float", False, "Sum of executed task instance complexity over the configured simulation days."),
     ("Humanoid Incidents", "humanoid_incident_total", "count", False, "HumanoidSim incident events emitted by workers."),
     ("Handover Items", "handover_item_count", "count", True, "HANDOVER_ITEM executions where a humanoid joined product transport."),
     ("Shared Carry Time", "shared_product_carry_time_min", "minutes", True, "Product carry minutes after a second carrier joined."),
@@ -48,6 +50,11 @@ PRIMARY_METRICS = [
     ("Rolling Stale Skips", "rolling_horizon_stale_skipped_task_count", "count", False, "Rolling-horizon assignments skipped because the task became infeasible before execution."),
     ("Rolling Requeues", "rolling_horizon_requeued_task_count", "count", False, "Queued rolling-horizon tasks returned to the pool at a later window boundary."),
     ("Rolling Max Queue", "rolling_horizon_max_worker_queue_length", "count", True, "Largest number of not-yet-started rolling tasks queued for one worker."),
+    ("Optimizer Windows", "throughput_optimizer_window_count", "count", True, "Rolling-horizon windows solved by the throughput optimizer."),
+    ("Optimizer Solved", "throughput_optimizer_solved_count", "count", True, "Throughput optimizer windows with accepted OR-Tools status."),
+    ("Optimizer Failed", "throughput_optimizer_failed_count", "count", False, "Throughput optimizer windows that failed without fallback."),
+    ("Optimizer Objective", "throughput_optimizer_objective_avg", "float", True, "Average scaled CP-SAT objective value for solved windows."),
+    ("Bottleneck Score", "bottleneck_score_avg", "float", True, "Average selected task bottleneck/throughput relief score."),
     ("Product Lead Time", "completed_product_lead_time_avg_min", "minutes", False, "Average accepted-product completion time."),
 ]
 
@@ -57,10 +64,23 @@ METRIC_GROUPS = {
     "item": ["total_products", "disposed_scrap_count", "warehouse_material_shelf_count", "downstream_closure_ratio", "throughput_per_sim_hour", "completed_product_lead_time_avg_min"],
     "machine": ["machine_utilization", "machine_broken_ratio", "machine_pm_ratio", "wall_clock_sec"],
     "worker": ["humanoid_execution_ratio_avg", "humanoid_blocked_ratio_avg", "humanoid_unavailable_ratio_avg", "worker_local_response_total", "commitment_dispatch_total"],
+    "complexity": ["operational_task_complexity", "cumulative_operational_complexity_over_n_days"],
     "incidents": ["humanoid_incident_total", "humanoid_blocked_ratio_avg", "worker_local_response_total", "coordination_incident_total"],
     "collaboration": ["handover_item_count", "shared_product_carry_time_min", "shared_product_carry_ratio", "repair_helper_join_count", "repair_collaboration_time_min", "repair_collaboration_ratio", "repair_team_size_avg"],
     "traffic": ["collision_count", "near_miss_count", "edge_conflict_count", "path_overlap_count"],
-    "decision": ["rolling_horizon_window_count", "rolling_horizon_dispatched_task_count", "rolling_horizon_requeued_task_count", "rolling_horizon_max_worker_queue_length", "rolling_horizon_stale_skipped_task_count", "commitment_dispatch_total"],
+    "decision": [
+        "rolling_horizon_window_count",
+        "rolling_horizon_dispatched_task_count",
+        "rolling_horizon_requeued_task_count",
+        "rolling_horizon_max_worker_queue_length",
+        "rolling_horizon_stale_skipped_task_count",
+        "throughput_optimizer_window_count",
+        "throughput_optimizer_solved_count",
+        "throughput_optimizer_failed_count",
+        "throughput_optimizer_objective_avg",
+        "bottleneck_score_avg",
+        "commitment_dispatch_total",
+    ],
 }
 
 
@@ -411,9 +431,15 @@ def _rolling_horizon_table(kpi: dict[str, Any]) -> str:
     rows = [
         ("Enabled", "yes" if bool(payload.get("enabled", False)) else "no"),
         ("Dedicated Roles", "yes" if bool(payload.get("dedicated_roles", False)) else "no"),
+        ("Throughput Optimizer", "yes" if bool(payload.get("throughput_optimizer", False)) else "no"),
         ("Window", f"{_safe_float(payload.get('window_min')):.1f} min"),
         ("Priority Scope", "HumanoidSim task_code"),
         ("Dispatch Policy", str(payload.get("dispatch_policy", "-"))),
+        ("Optimizer Windows", str(_safe_int(payload.get("throughput_optimizer_window_count")))),
+        ("Optimizer Solved", str(_safe_int(payload.get("throughput_optimizer_solved_count")))),
+        ("Optimizer Failed", str(_safe_int(payload.get("throughput_optimizer_failed_count")))),
+        ("Optimizer Objective Avg", f"{_safe_float(payload.get('throughput_optimizer_objective_avg')):.3f}"),
+        ("Bottleneck Score Avg", f"{_safe_float(payload.get('bottleneck_score_avg')):.3f}"),
         ("Pending Candidates", str(_safe_int(payload.get("pending_candidate_count")))),
         ("Queued Dispatches", str(_safe_int(payload.get("queued_dispatch_count")))),
         ("Requeued Tasks", str(_safe_int(payload.get("requeued_task_count")))),
@@ -423,7 +449,33 @@ def _rolling_horizon_table(kpi: dict[str, Any]) -> str:
         ("A1 Battery Deliveries", str(_safe_int(dedicated_summary.get("battery_delivery_from_provider_count")))),
     ]
     body = "".join(f"<tr><td>{html.escape(label)}</td><td>{html.escape(value)}</td></tr>" for label, value in rows)
-    return "<div class='panel'><h2>Rolling Horizon Dispatch</h2><p class='muted'>This section is populated for rolling_horizon_aging_priority and rolling_horizon_dedicated_roles.</p><table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>" + body + "</tbody></table></div>"
+    return "<div class='panel'><h2>Rolling Horizon Dispatch</h2><p class='muted'>This section is populated for rolling horizon modes, including the OR-Tools throughput optimizer.</p><table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>" + body + "</tbody></table></div>"
+
+
+def _operational_complexity_table(kpi: dict[str, Any]) -> str:
+    details = (
+        kpi.get("operational_task_complexity_details", {})
+        if isinstance(kpi.get("operational_task_complexity_details", {}), dict)
+        else {}
+    )
+    rows = [
+        ("OTC", f"{_safe_float(kpi.get('operational_task_complexity', kpi.get('otc', 0.0))):.3f}"),
+        ("Cumulative Operational Complexity", f"{_safe_float(kpi.get('cumulative_operational_complexity_over_n_days', 0.0)):.3f}"),
+        ("Period Days", f"{_safe_float(kpi.get('operational_complexity_period_days', 0.0)):.3f}"),
+        ("Executed Task Instances", str(_safe_int(details.get("task_instance_count", 0)))),
+        ("Formula", str(details.get("formula", "OTC=sum_t(N_t/n*C_task(t))"))),
+    ]
+    body = "".join(f"<tr><td>{html.escape(label)}</td><td>{html.escape(value)}</td></tr>" for label, value in rows)
+    missing = details.get("missing_task_codes", [])
+    missing_text = ", ".join(str(code) for code in missing) if isinstance(missing, list) and missing else "none"
+    return (
+        "<div class='panel'><h2>Operational Task Complexity</h2>"
+        "<p class='muted'>OTC uses HumanoidSim primitive difficulty weights and counts only executed task instances.</p>"
+        "<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>"
+        + body
+        + f"<tr><td>Missing Task Codes</td><td>{html.escape(missing_text)}</td></tr>"
+        + "</tbody></table></div>"
+    )
 
 
 def _humanoid_incident_recovery_table(kpi: dict[str, Any]) -> str:
@@ -512,6 +564,17 @@ def export_kpi_dashboard(
     task_by_level = task_taxonomy.get("by_level", {}) if isinstance(task_taxonomy.get("by_level", {}), dict) else {}
     task_by_category = task_taxonomy.get("by_category", {}) if isinstance(task_taxonomy.get("by_category", {}), dict) else {}
     primitive_minutes = kpi.get("humanoid_primitive_minutes", {}) if isinstance(kpi.get("humanoid_primitive_minutes", {}), dict) else {}
+    otc_details = (
+        kpi.get("operational_task_complexity_details", {})
+        if isinstance(kpi.get("operational_task_complexity_details", {}), dict)
+        else {}
+    )
+    otc_by_task = otc_details.get("by_task", {}) if isinstance(otc_details.get("by_task", {}), dict) else {}
+    otc_by_primitive = (
+        otc_details.get("primitive_complexity_contribution_by_code", {})
+        if isinstance(otc_details.get("primitive_complexity_contribution_by_code", {}), dict)
+        else {}
+    )
 
     machine_state_by_machine = kpi.get("machine_state_time_by_machine", {}) if isinstance(kpi.get("machine_state_time_by_machine", {}), dict) else {}
     machine_util_by_machine = kpi.get("machine_utilization_by_machine", {}) if isinstance(kpi.get("machine_utilization_by_machine", {}), dict) else {}
@@ -731,6 +794,51 @@ def export_kpi_dashboard(
     primitive_fig.add_trace(go.Bar(name="Primitive", x=[key for key, _ in primitive_pairs], y=[value for _, value in primitive_pairs], marker_color="#577590"))
     _common_layout(primitive_fig, y_title="Minutes", x_title="Primitive call code", height=430)
     _add_panel("humanoid_primitive_minutes", "Humanoid Primitive Minutes", primitive_fig, "Primitive time is paired from HUMANOID_STEP_START/END events.")
+
+    otc_task_pairs = sorted(
+        (
+            (
+                str(task_code),
+                _safe_float(payload.get("cumulative_complexity", 0.0) if isinstance(payload, dict) else 0.0),
+                _safe_int(payload.get("instance_count", 0) if isinstance(payload, dict) else 0),
+            )
+            for task_code, payload in otc_by_task.items()
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    otc_task_fig = go.Figure()
+    otc_task_fig.add_trace(
+        go.Bar(
+            name="Cumulative complexity",
+            x=[task_code for task_code, _value, _count in otc_task_pairs],
+            y=[value for _task_code, value, _count in otc_task_pairs],
+            text=[f"{value:.1f} / {count}x" for _task_code, value, count in otc_task_pairs],
+            textposition="outside",
+            marker_color="#7b2cbf",
+        )
+    )
+    _common_layout(otc_task_fig, y_title="Complexity", x_title="Humanoid task code", height=430)
+    _add_panel("otc_by_task", "Operational Complexity by Task", otc_task_fig, "Cumulative contribution = task instance count x HumanoidSim task complexity.")
+
+    otc_primitive_pairs = sorted(
+        ((str(key), _safe_float(value)) for key, value in otc_by_primitive.items()),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:30]
+    otc_primitive_fig = go.Figure()
+    otc_primitive_fig.add_trace(
+        go.Bar(
+            name="Primitive contribution",
+            x=[key for key, _value in otc_primitive_pairs],
+            y=[value for _key, value in otc_primitive_pairs],
+            text=[f"{value:.1f}" for _key, value in otc_primitive_pairs],
+            textposition="outside",
+            marker_color="#bc6c25",
+        )
+    )
+    _common_layout(otc_primitive_fig, y_title="Complexity", x_title="Primitive call code", height=430)
+    _add_panel("otc_by_primitive", "Operational Complexity by Primitive", otc_primitive_fig, "Top primitive-level contributions after multiplying task occurrence counts by primitive difficulty weights.")
 
     transport_fig = go.Figure()
     transport_pairs = sorted(((str(key), _safe_float(value)) for key, value in item_transport_time.items()), key=lambda item: item[0])
@@ -1063,9 +1171,14 @@ def export_kpi_dashboard(
         )
 
     current_run = _find_run(manifest, current_run_id)
-    subtitle = "Quantitative run view with stable KPI cards, machine/worker utilization, and detailed charts."
+    scenario_label = scenario_type or "-"
+    subtitle = f"Quantitative run view for scenario {scenario_label}, with stable KPI cards, machine/worker utilization, and detailed charts."
     if isinstance(current_run, dict):
-        subtitle = f"Quantitative view for {str(current_run.get('label', current_run_id or 'selected run'))}. KPI cards and tables stay fixed above the charts, and the charts are split by topic so each one has its own legend."
+        subtitle = (
+            f"Quantitative view for {str(current_run.get('label', current_run_id or 'selected run'))} "
+            f"under scenario {scenario_label}. KPI cards and tables stay fixed above the charts, "
+            "and the charts are split by topic so each one has its own legend."
+        )
     item_section = _group_section(
         "Shipyard Surface Metrics" if is_shipyard else "Item Metrics",
         "Ship exterior surface-tile completion, rework, quality, and makespan." if is_shipyard else "Production outcome, downstream closure, item flow, and queue waiting time.",
@@ -1104,6 +1217,16 @@ def export_kpi_dashboard(
         + panel_figures["humanoid_state_mobility"]
         + panel_figures["humanoid_state_power"]
         + panel_figures["humanoid_state_manipulation"]
+        + "</div>",
+    )
+    complexity_section = _group_section(
+        "Operational Task Complexity",
+        "OTC combines executed task instance counts with HumanoidSim primitive difficulty weights.",
+        _summary_cards(kpi, METRIC_GROUPS["complexity"]),
+        "<div class='grid cards-2'>"
+        + _operational_complexity_table(kpi)
+        + panel_figures["otc_by_task"]
+        + panel_figures["otc_by_primitive"]
         + "</div>",
     )
     incident_section = _group_section(
@@ -1153,6 +1276,7 @@ def export_kpi_dashboard(
         + item_section
         + machine_section
         + worker_section
+        + complexity_section
         + decision_section
         + incident_section
         + collaboration_section

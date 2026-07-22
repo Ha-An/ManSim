@@ -17,6 +17,7 @@ ARTIFACT_LABELS = {
     "results_dashboard.html": "Results Hub",
     "kpi_dashboard.html": "KPI",
     "gantt.html": "Gantt",
+    "pre_run_diagnostics.html": "Pre-Run Diagnostics",
     "operations_replay.html": "Operations Replay",
     "manager_replay_dashboard.html": "Manager Replay",
     "replay_studio_3d": "Replay Studio 3D",
@@ -83,6 +84,14 @@ def _show_manager_replay(run: dict[str, Any] | None) -> bool:
         return False
     artifacts = run.get("artifacts", {}) if isinstance(run.get("artifacts", {}), dict) else {}
     dashboard_path = str(artifacts.get("manager_replay_dashboard.html", "")).strip()
+    return bool(dashboard_path) and Path(dashboard_path).exists()
+
+
+def _show_pre_run_diagnostics(run: dict[str, Any] | None) -> bool:
+    if not isinstance(run, dict):
+        return False
+    artifacts = run.get("artifacts", {}) if isinstance(run.get("artifacts", {}), dict) else {}
+    dashboard_path = str(artifacts.get("pre_run_diagnostics.html", "")).strip()
     return bool(dashboard_path) and Path(dashboard_path).exists()
 
 
@@ -255,6 +264,10 @@ def _nav_links(*, manifest: dict[str, Any] | None, current_page_path: Path, curr
         run_id=str(run.get("id", "")).strip(),
     )
     items.insert(2, (ARTIFACT_LABELS["replay_studio_3d"], replay_studio_3d_href, current_artifact == "replay_studio_3d"))
+    if _show_pre_run_diagnostics(run):
+        target = artifacts.get("pre_run_diagnostics.html", "")
+        href = rel_href(current_page_path, target)
+        items.insert(3, (ARTIFACT_LABELS["pre_run_diagnostics.html"], href, current_artifact == "pre_run_diagnostics.html"))
     if _show_manager_replay(run):
         href = rel_href(current_page_path, artifacts.get("manager_replay_dashboard.html", ""))
         items.append((ARTIFACT_LABELS.get("manager_replay_dashboard.html", "Manager Replay"), href, current_artifact == "manager_replay_dashboard.html"))

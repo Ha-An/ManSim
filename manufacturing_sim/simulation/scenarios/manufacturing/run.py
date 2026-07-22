@@ -17,7 +17,9 @@ from dashboards.legacy import (
     export_orchestration_intelligence_dashboard,
     export_task_priority_dashboard,
 )
+from dashboards.pre_run_diagnostics import export_pre_run_diagnostics_dashboard
 from agents.modes import is_llm_mode, normalize_decision_mode
+from manufacturing_sim.simulation.pre_run_diagnostics import build_factory_pre_run_diagnostics
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
 from manufacturing_sim.simulation.scenarios.manufacturing.world import ManufacturingWorld
 
@@ -438,6 +440,8 @@ def run(
     env = simpy.Environment()
     world = ManufacturingWorld(env=env, cfg=experiment_cfg, logger=event_logger, decision_module=decision_module)
     world.bootstrap()
+    pre_run_diagnostics = build_factory_pre_run_diagnostics(world=world, cfg=experiment_cfg)
+    event_logger.write_json("pre_run_diagnostics.json", pre_run_diagnostics)
 
     progress_lock = Lock()
     progress_stop = ThreadEvent()
@@ -518,6 +522,7 @@ def run(
     last_summary: dict[str, Any] | None = None
     llm_trace_path: str = ""
     dashboard_path: Path | None = None
+    pre_run_diagnostics_dashboard_path: Path | None = None
     task_priority_dashboard_path: Path | None = None
     orchestration_intelligence_dashboard_path: Path | None = None
     gantt_path = output_root / "gantt.html"
@@ -712,6 +717,18 @@ def run(
                             artifact_status["errors"]["openclaw_workspace_dashboard"] = f"{type(exc).__name__}: {exc}"
 
             try:
+                pre_run_diagnostics_dashboard_path = export_pre_run_diagnostics_dashboard(
+                    diagnostics=pre_run_diagnostics,
+                    output_dir=output_root,
+                )
+                if pre_run_diagnostics_dashboard_path is not None and Path(pre_run_diagnostics_dashboard_path).exists():
+                    artifact_status["generated"]["pre_run_diagnostics"] = str(pre_run_diagnostics_dashboard_path)
+                else:
+                    artifact_status["errors"]["pre_run_diagnostics"] = "pre-run diagnostics export returned no HTML path"
+            except BaseException as exc:
+                artifact_status["errors"]["pre_run_diagnostics"] = f"{type(exc).__name__}: {exc}"
+
+            try:
                 export_gantt(events=event_logger.events, output_dir=output_root)
                 if gantt_path.exists():
                     artifact_status["generated"]["gantt"] = str(gantt_path)
@@ -807,6 +824,8 @@ def run(
         "events_path": str(output_root / "events.jsonl"),
         "gantt_path": str(output_root / "gantt.html"),
         "kpi_dashboard_path": str(dashboard_path) if dashboard_path else "",
+        "pre_run_diagnostics_path": str(output_root / "pre_run_diagnostics.json"),
+        "pre_run_diagnostics_dashboard_path": str(pre_run_diagnostics_dashboard_path) if pre_run_diagnostics_dashboard_path else "",
         "task_priority_dashboard_path": str(task_priority_dashboard_path) if task_priority_dashboard_path else "",
         "orchestration_intelligence_dashboard_path": str(orchestration_intelligence_dashboard_path) if orchestration_intelligence_dashboard_path else "",
         "llm_trace_path": llm_trace_path,
