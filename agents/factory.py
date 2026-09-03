@@ -13,8 +13,13 @@ def build_decision_module(*, experiment_cfg: dict[str, Any], decision_mode: str)
     if decision_mode in {
         "adaptive_priority",
         "fixed_priority",
+        "immediate_shared",
+        "immediate_dedicated_roles",
+        "simulation_based_adp",
+        "random_feasible_dispatch",
         "bottleneck_aware_dispatch",
         "rolling_horizon_aging_priority",
+        "rolling_horizon_shared",
         "rolling_horizon_dedicated_roles",
         "rolling_horizon_throughput_optimizer",
     }:

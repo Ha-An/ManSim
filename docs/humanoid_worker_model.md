@@ -61,11 +61,11 @@ ManSim task 후보가 항상 concrete item id를 미리 고정하는 것은 아�
 
 Concrete material instance는 task 실행 중 `PRIMITIVE_IDENTIFY_ITEM` 단계에서 warehouse shelf를 스캔해 선택합니다. 이 시점에 ManSim runtime이 `source_slot_id`, `transfer_item_id`, `material_item_id`를 task payload에 채우고, 이후 child `TRANSFER`가 해당 material을 운반합니다.
 
-반면 `LOAD_MACHINE`, `INSPECT_PRODUCT`, 일반 `TRANSFER`는 현재 scenario에서 queue item 자체가 task 대상이므로 후보 단계에서 concrete item id를 유지합니다. `SETUP_MACHINE`은 item 운반을 하지 않고, 이미 적재된 input을 바탕으로 fixture, recipe, program 준비만 수행합니다.
+반면 `LOAD_MACHINE`, `LOAD_UNLOAD_TRANSFER_INTERFACE`, `INSPECT_PRODUCT`, 일반 `TRANSFER`는 현재 scenario에서 queue 또는 desk item 자체가 task 대상이므로 후보 단계에서 concrete item id를 유지합니다. `SETUP_MACHINE`은 item 운반을 하지 않고, 이미 적재된 input을 바탕으로 fixture, recipe, program 준비만 수행합니다.
 
 ## ManSim Task Subset
 
-ManSim v0.5.0에서 factory flow에 연결된 HumanoidSim task subset은 다음과 같습니다.
+ManSim v0.6.0에서 factory flow에 연결된 HumanoidSim task subset은 다음과 같습니다.
 
 | Task code | 역할 |
 | --- | --- |
@@ -75,7 +75,8 @@ ManSim v0.5.0에서 factory flow에 연결된 HumanoidSim task subset은 다음�
 | `LOAD_MACHINE` | material/intermediate queue item을 machine input slot에 적재 |
 | `SETUP_MACHINE` | machine input이 적재된 뒤 fixture, recipe, program 준비 |
 | `UNLOAD_MACHINE` | machine output을 station output buffer로 이동 |
-| `INSPECT_PRODUCT` | inspection table에서 product 검사 후 output/scrap queue로 이동 |
+| `LOAD_UNLOAD_TRANSFER_INTERFACE` | inspection input queue와 desk 사이의 load, 또는 desk와 판정별 output/scrap queue 사이의 unload |
+| `INSPECT_PRODUCT` | desk에 staged된 product를 검사·분류·기록하며 item은 운반하지 않음 |
 | `REPAIR_MACHINE` | breakdown machine 수리 |
 | `PREVENTIVE_MAINTENANCE` | idle machine preventive maintenance |
 | `INSPECT_MACHINE` | repair/maintenance 중 machine 상태 진단 child task |
@@ -93,7 +94,7 @@ HumanoidSim catalog의 모든 task가 ManSim에서 실행되는 것은 아닙니
 | --- | --- |
 | A1 | `REPLENISH_MATERIAL` |
 | A2 | `REPAIR_MACHINE`, `LOAD_MACHINE`, `SETUP_MACHINE`, `UNLOAD_MACHINE` |
-| A3 | `MANAGE_ROBOT_POWER`, `TRANSFER`, `INSPECT_PRODUCT`, `COLLECT_WASTE_OR_SCRAP`, `PREVENTIVE_MAINTENANCE` |
+| A3 | `MANAGE_ROBOT_POWER`, `TRANSFER`, `LOAD_UNLOAD_TRANSFER_INTERFACE`, `INSPECT_PRODUCT`, `COLLECT_WASTE_OR_SCRAP`, `PREVENTIVE_MAINTENANCE` |
 
 이 mode에서 `HANDOVER_ITEM`은 협업 task이므로 pool에 수집하지 않습니다. `REPAIR_MACHINE`은 A2 단독 작업으로 제한되어 repair helper join이 발생하지 않습니다. A1/A2는 battery station으로 직접 self swap을 가지 않고, 20% 이하일 때 A3의 battery delivery 대상이 됩니다.
 

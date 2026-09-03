@@ -12,16 +12,25 @@ import simpy
 import yaml
 
 from agents.factory import build_decision_module
-from agents.modes import format_decision_mode_label, is_fixed_priority_mode, normalize_decision_mode
+from agents.modes import (
+    format_decision_mode_label,
+    is_fixed_priority_mode,
+    is_rolling_horizon_mode,
+    normalize_decision_mode,
+)
 from manufacturing_sim.simulation.scenarios.manufacturing.entities import ItemState, MachineState, Task
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
 from manufacturing_sim.simulation.scenarios.manufacturing.throughput_policy import ThroughputOptimizerUnavailable
 from manufacturing_sim.simulation.scenarios.manufacturing.world import ManufacturingWorld
+from manufacturing_sim.simulation.rolling_horizon import strict_periodic_rolling_horizon_loop
 
 
 def _load_cfg(decision_name: str = "rolling_horizon_aging_priority") -> dict:
     root = Path(__file__).resolve().parents[1]
     cfg = yaml.safe_load((root / "configs" / "scenario" / "factory_mfg_basic.yaml").read_text(encoding="utf-8"))
+    cfg["task_primitive_timing"] = yaml.safe_load(
+        (root / "configs" / "task_primitive_timing" / "factory_mfg_basic.yaml").read_text(encoding="utf-8")
+    )
     cfg["decision"] = yaml.safe_load(
         (root / "configs" / "decision" / f"{decision_name}.yaml").read_text(encoding="utf-8")
     )
@@ -33,6 +42,26 @@ def _load_cfg(decision_name: str = "rolling_horizon_aging_priority") -> dict:
 
 
 class RollingHorizonDecisionTests(unittest.TestCase):
+    def test_mode_registry_recognizes_four_mfg_flow_shop_representatives(self) -> None:
+        expected = {
+            "immediate_shared": ("Immediate Shared", False),
+            "immediate_dedicated_roles": ("Immediate Dedicated Roles", False),
+            "rolling_horizon_shared": ("Rolling Horizon Shared", True),
+            "rolling_horizon_dedicated_roles": ("Rolling Horizon Dedicated Roles", True),
+        }
+        for mode, (label, rolling) in expected.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(mode, normalize_decision_mode(mode))
+                self.assertTrue(is_fixed_priority_mode(mode))
+                self.assertEqual(rolling, is_rolling_horizon_mode(mode))
+                self.assertEqual(label, format_decision_mode_label(mode))
+                module = build_decision_module(
+                    experiment_cfg={"decision": {"mode": mode}},
+                    decision_mode=mode,
+                )
+                self.assertEqual(mode, module.decision_mode)
+                self.assertTrue(module.static_priority_policy)
+
     def test_mode_registry_recognizes_rolling_horizon_aging_priority(self) -> None:
         self.assertEqual("rolling_horizon_aging_priority", normalize_decision_mode("rolling_horizon_aging_priority"))
         self.assertEqual("rolling_horizon_aging_priority", normalize_decision_mode("rolling_horizon_fixed_priority"))
@@ -96,6 +125,24 @@ class RollingHorizonDecisionTests(unittest.TestCase):
             finally:
                 logger.close()
 
+    def test_legacy_scheduler_fields_are_tolerated_but_runtime_is_strict(self) -> None:
+        cfg = _load_cfg()
+        cfg["decision"]["rolling_horizon"]["scheduler_mode"] = "worker_triggered"
+        cfg["decision"]["rolling_horizon"]["candidate_collection_mode"] = "polling"
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=4))
+                self.assertEqual("worker_triggered", world.rolling_horizon_configured_scheduler_mode)
+                self.assertEqual("polling", world.rolling_horizon_configured_candidate_collection_mode)
+                self.assertEqual("strict_periodic", world.rolling_horizon_scheduler_mode)
+                self.assertEqual(
+                    "event_with_boundary_reconciliation",
+                    world.rolling_horizon_candidate_collection_mode,
+                )
+            finally:
+                logger.close()
+
     def test_bottleneck_score_prefers_broken_machine_repair(self) -> None:
         cfg = _load_cfg("bottleneck_aware_dispatch")
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,11 +188,14 @@ class RollingHorizonDecisionTests(unittest.TestCase):
                 for station in world.stations:
                     world.material_queues[station].clear()
 
+                world.env.process(strict_periodic_rolling_horizon_loop(world.env, world))
+                world.env.run(until=0.000001)
+
                 self.assertIsNone(world.select_task_for_agent(world.agents["A1"]))
                 self.assertGreater(len(world.rolling_horizon_pending), 0)
                 self.assertTrue(any(event["type"] == "ROLLING_HORIZON_CANDIDATE_COLLECTED" for event in logger.events))
 
-                world.env.run(until=5.0)
+                world.env.run(until=5.000001)
                 selected = None
                 for agent_id in sorted(world.agents.keys()):
                     selected = world.select_task_for_agent(world.agents[agent_id])
@@ -156,6 +206,71 @@ class RollingHorizonDecisionTests(unittest.TestCase):
                 assert selected is not None
                 self.assertEqual("rolling_horizon_aging_priority", selected.selection_meta.get("decision_source"))
                 self.assertTrue(any(event["type"] == "ROLLING_HORIZON_DISPATCH" for event in logger.events))
+            finally:
+                logger.close()
+
+    def test_strict_coordinator_dispatches_exactly_without_worker_polling(self) -> None:
+        cfg = _load_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                env = simpy.Environment()
+                world = ManufacturingWorld(env, cfg, logger, SimpleNamespace(worker_queue_limit=4))
+                world._ensure_material_shelf_slots()
+                world._restock_material_shelf(reason="initial_fill", target_fill=world.material_shelf_initial_fill)
+                for station in world.stations:
+                    world.material_queues[station].clear()
+                for agent in world.agents.values():
+                    agent.current_task_id = "BUSY-UNTIL-8"
+                    agent.humanoid_state["availability"] = "EXECUTING"
+
+                env.process(strict_periodic_rolling_horizon_loop(env, world))
+                env.run(until=15.000001)
+
+                periodic_dispatches = [
+                    event
+                    for event in logger.events
+                    if event["type"] == "ROLLING_HORIZON_DISPATCH"
+                    and event["details"].get("scheduled_boundary_min") is not None
+                ]
+                boundary_times = sorted({float(event["details"]["scheduled_boundary_min"]) for event in periodic_dispatches})
+                self.assertEqual([5.0, 10.0, 15.0], boundary_times)
+                self.assertTrue(all(float(event["details"]["boundary_lag_min"]) == 0.0 for event in periodic_dispatches))
+                self.assertEqual(3, world.rolling_horizon_metrics["strict_boundary_count"])
+                self.assertEqual(0, world.rolling_horizon_metrics["late_boundary_count"])
+            finally:
+                logger.close()
+
+    def test_boundary_observes_normal_priority_machine_failure_at_same_time(self) -> None:
+        cfg = _load_cfg("rolling_horizon_dedicated_roles")
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                env = simpy.Environment()
+                world = ManufacturingWorld(env, cfg, logger, SimpleNamespace(worker_queue_limit=4))
+                machine = world.machines["S1M1"]
+
+                def break_at_boundary():
+                    yield env.timeout(5.0)
+                    world.break_machine(machine, reason="same_boundary_test")
+
+                env.process(strict_periodic_rolling_horizon_loop(env, world))
+                env.process(break_at_boundary())
+                env.run(until=5.000001)
+
+                broken_event = next(event for event in logger.events if event["type"] == "MACHINE_BROKEN")
+                repair_dispatch = next(
+                    event
+                    for event in logger.events
+                    if event["type"] == "ROLLING_HORIZON_DISPATCH"
+                    and event["details"].get("task_code") == "REPAIR_MACHINE"
+                    and event["details"].get("target_id") == machine.machine_id
+                )
+                self.assertEqual(5.0, broken_event["t"])
+                self.assertEqual(5.0, repair_dispatch["t"])
+                self.assertEqual(5.0, repair_dispatch["details"].get("scheduled_boundary_min"))
+                self.assertEqual(0.0, repair_dispatch["details"].get("boundary_lag_min"))
+                self.assertFalse(repair_dispatch["details"].get("urgent_dispatch", False))
             finally:
                 logger.close()
 
@@ -498,7 +613,7 @@ class RollingHorizonDecisionTests(unittest.TestCase):
             finally:
                 logger.close()
 
-    def test_low_battery_waits_for_rolling_window(self) -> None:
+    def test_low_battery_bypasses_rolling_window_without_preemption(self) -> None:
         cfg = _load_cfg()
         with tempfile.TemporaryDirectory() as tmp:
             logger = EventLogger(Path(tmp))
@@ -509,20 +624,15 @@ class RollingHorizonDecisionTests(unittest.TestCase):
                 agent.battery_remaining_budget_min = world._battery_mandatory_threshold(agent) - 1.0
                 agent.battery_last_accounted_at = 0.0
 
-                task = world.select_task_for_agent(agent)
-
-                self.assertIsNone(task)
-                self.assertTrue(
-                    any(entry.get("task_code") == "MANAGE_ROBOT_POWER" for entry in world.rolling_horizon_pending.values())
-                )
-
-                world.env.run(until=5.0)
+                world._emit_low_battery_alert_if_needed(agent)
+                self.assertTrue(world.rolling_horizon_dispatch_queues[agent.agent_id])
                 task = world.select_task_for_agent(agent)
 
                 self.assertIsNotNone(task)
                 assert task is not None
                 self.assertEqual("BATTERY_SWAP", task.task_type)
                 self.assertEqual("rolling_horizon_aging_priority", task.selection_meta.get("decision_source"))
+                self.assertTrue(task.selection_meta.get("urgent_dispatch"))
             finally:
                 logger.close()
 
@@ -574,33 +684,150 @@ class RollingHorizonDecisionTests(unittest.TestCase):
             finally:
                 logger.close()
 
-    def test_machine_broken_event_queues_urgent_repair_task_next(self) -> None:
+    def test_machine_broken_event_waits_for_next_periodic_boundary(self) -> None:
         cfg = _load_cfg("rolling_horizon_dedicated_roles")
         with tempfile.TemporaryDirectory() as tmp:
             logger = EventLogger(Path(tmp))
             try:
                 world = ManufacturingWorld(simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=4))
                 machine = world.machines["S1M1"]
+                world.env.process(strict_periodic_rolling_horizon_loop(world.env, world))
+                world.env.run(until=0.000001)
 
                 world.break_machine(machine, reason="unit_test")
+                world.env.run(until=0.000002)
 
+                self.assertFalse(
+                    any(
+                        entry.get("task_code") == "REPAIR_MACHINE"
+                        for queue in world.rolling_horizon_dispatch_queues.values()
+                        for entry in queue
+                    )
+                )
+                pending_repairs = [
+                    entry
+                    for entry in world.rolling_horizon_pending.values()
+                    if entry.get("task_code") == "REPAIR_MACHINE"
+                    and entry.get("target_id") == machine.machine_id
+                ]
+                self.assertEqual(1, len(pending_repairs))
+                self.assertFalse(pending_repairs[0].get("immediate_trigger", False))
+
+                world.env.run(until=5.000001)
                 repair_entries = [
                     entry
                     for entry in world.rolling_horizon_dispatch_queues["A2"]
                     if entry.get("task_code") == "REPAIR_MACHINE"
-                    and entry.get("rolling_task_signature", {}).get("machine_id") == machine.machine_id
+                    and entry.get("target_id") == machine.machine_id
                 ]
                 self.assertEqual(1, len(repair_entries))
-                self.assertTrue(repair_entries[0].get("urgent_dispatch"))
-                self.assertEqual("machine_broken", repair_entries[0].get("collection_trigger"))
-                event = next(
+                self.assertFalse(repair_entries[0].get("urgent_dispatch", False))
+                dispatch_event = next(
                     row
                     for row in logger.events
-                    if row["type"] == "ROLLING_HORIZON_CANDIDATE_COLLECTED"
+                    if row["type"] == "ROLLING_HORIZON_DISPATCH"
                     and row["details"].get("task_code") == "REPAIR_MACHINE"
                 )
-                self.assertEqual("machine_broken", event["details"].get("collection_trigger"))
-                self.assertTrue(event["details"].get("immediate_trigger"))
+                self.assertEqual(5.0, dispatch_event["details"].get("scheduled_boundary_min"))
+                self.assertEqual(0.0, dispatch_event["details"].get("boundary_lag_min"))
+            finally:
+                logger.close()
+
+    def test_machine_break_invalidates_unstarted_work_before_periodic_repair(self) -> None:
+        cfg = _load_cfg("rolling_horizon_dedicated_roles")
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=4))
+                machine = world.machines["S1M1"]
+                machine_key = f"machine:{machine.machine_id}"
+                pending_entry = {
+                    "opportunity_id": "RHOPP-PENDING-SETUP",
+                    "task_id": "SET-TEST-PENDING",
+                    "task_code": "SETUP_MACHINE",
+                    "task_type": "SETUP_MACHINE",
+                    "priority_key": "setup_machine",
+                    "location": "Station1",
+                    "target_type": "machine",
+                    "target_id": machine.machine_id,
+                    "rolling_task_signature": {
+                        "task_code": "SETUP_MACHINE",
+                        "task_type": "SETUP_MACHINE",
+                        "target_type": "machine",
+                        "target_id": machine.machine_id,
+                        "machine_id": machine.machine_id,
+                    },
+                    "exclusive_resource_keys": [machine_key],
+                    "workers": {"A2"},
+                }
+                queued_entry = {
+                    **pending_entry,
+                    "opportunity_id": "RHOPP-QUEUED-LOAD",
+                    "task_id": "LOAD-TEST-QUEUED",
+                    "task_code": "LOAD_MACHINE",
+                    "task_type": "LOAD_MACHINE",
+                    "priority_key": "load_machine",
+                    "rolling_task_signature": {
+                        **pending_entry["rolling_task_signature"],
+                        "task_code": "LOAD_MACHINE",
+                        "task_type": "LOAD_MACHINE",
+                    },
+                    "assigned_worker_id": "A2",
+                }
+                queued_entry.pop("workers", None)
+                world.rolling_horizon_pending[pending_entry["opportunity_id"]] = pending_entry
+                world.rolling_horizon_pending_resource_index[machine_key] = pending_entry["opportunity_id"]
+                world.rolling_horizon_dispatch_queues["A2"].append(queued_entry)
+
+                active_worker = world.agents["A1"]
+                active_worker.current_task_id = "SET-ACTIVE"
+                active_worker.current_task_type = "SETUP_MACHINE"
+                active_worker.current_task_code = "SETUP_MACHINE"
+                active_worker.current_task_payload = {"machine_id": machine.machine_id, "station": machine.station}
+
+                world.env.process(strict_periodic_rolling_horizon_loop(world.env, world))
+                world.env.run(until=0.000001)
+                world.break_machine(machine, reason="unit_test_with_existing_work")
+                world.env.run(until=0.000002)
+
+                self.assertNotIn(pending_entry["opportunity_id"], world.rolling_horizon_pending)
+                self.assertFalse(
+                    any(entry.get("task_code") != "REPAIR_MACHINE" for entry in world.rolling_horizon_dispatch_queues["A2"])
+                )
+                self.assertFalse(world.rolling_horizon_dispatch_queues["A2"])
+                self.assertTrue(
+                    any(
+                        entry.get("task_code") == "REPAIR_MACHINE"
+                        and entry.get("target_id") == machine.machine_id
+                        for entry in world.rolling_horizon_pending.values()
+                    )
+                )
+
+                world.env.run(until=5.000001)
+                repair_entries = [
+                    entry
+                    for entry in world.rolling_horizon_dispatch_queues["A2"]
+                    if entry.get("task_code") == "REPAIR_MACHINE"
+                    and entry.get("target_id") == machine.machine_id
+                ]
+                self.assertEqual(1, len(repair_entries))
+                self.assertFalse(repair_entries[0].get("urgent_dispatch", False))
+                invalidated = [
+                    event
+                    for event in logger.events
+                    if event["type"] == "ROLLING_HORIZON_TASK_SKIPPED"
+                    and event["details"].get("reason") == "machine_broken_invalidated"
+                ]
+                self.assertGreaterEqual(len(invalidated), 2)
+                broken_t = next(event["t"] for event in logger.events if event["type"] == "MACHINE_BROKEN")
+                dispatch_t = next(
+                    event["t"]
+                    for event in logger.events
+                    if event["type"] == "ROLLING_HORIZON_DISPATCH"
+                    and event["details"].get("task_code") == "REPAIR_MACHINE"
+                )
+                self.assertLess(broken_t, dispatch_t)
+                self.assertEqual(5.0, dispatch_t)
             finally:
                 logger.close()
 
@@ -624,6 +851,35 @@ class RollingHorizonDecisionTests(unittest.TestCase):
                 self.assertTrue(world.rolling_horizon_dispatch_queues["A3"])
                 self.assertEqual(urgent_id, world.rolling_horizon_dispatch_queues["A3"][0]["opportunity_id"])
                 self.assertNotIn(urgent_id, world.rolling_horizon_pending)
+            finally:
+                logger.close()
+
+    def test_stale_urgent_battery_dispatch_is_removed_at_boundary(self) -> None:
+        cfg = _load_cfg("rolling_horizon_dedicated_roles")
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=4))
+                provider = world.agents["A3"]
+                world._ensure_battery_accounting(provider, 0.0)
+                provider.battery_remaining_budget_min = world.battery_swap_period_min * 0.25
+                provider.battery_last_accounted_at = 0.0
+                world._emit_low_battery_alert_if_needed(provider)
+                self.assertTrue(world.rolling_horizon_dispatch_queues["A3"])
+
+                provider.battery_remaining_budget_min = world.battery_swap_period_min
+                provider.battery_last_accounted_at = float(world.env.now)
+                requeued = world._rolling_horizon_requeue_unstarted_dispatches(1)
+
+                self.assertEqual(0, requeued)
+                self.assertFalse(world.rolling_horizon_dispatch_queues["A3"])
+                self.assertTrue(
+                    any(
+                        event["type"] == "ROLLING_HORIZON_TASK_SKIPPED"
+                        and event["details"].get("reason") == "urgent_condition_no_longer_active"
+                        for event in logger.events
+                    )
+                )
             finally:
                 logger.close()
 
@@ -726,8 +982,8 @@ class RollingHorizonDecisionTests(unittest.TestCase):
                 for station in world.stations:
                     world.material_queues[station].clear()
 
-                self.assertIsNone(world.select_task_for_agent(world.agents["A1"]))
-                world.env.run(until=5.0)
+                world.env.process(strict_periodic_rolling_horizon_loop(world.env, world))
+                world.env.run(until=5.000001)
 
                 selected_tasks = []
                 for agent_id in sorted(world.agents.keys()):
@@ -881,7 +1137,7 @@ class RollingHorizonDecisionTests(unittest.TestCase):
             finally:
                 logger.close()
 
-    def test_machine_abort_retains_wip_on_machine_and_resets_setup(self) -> None:
+    def test_machine_abort_retains_wip_sample_and_remaining_progress(self) -> None:
         cfg = _load_cfg()
         with tempfile.TemporaryDirectory() as tmp:
             logger = EventLogger(Path(tmp))
@@ -891,18 +1147,27 @@ class RollingHorizonDecisionTests(unittest.TestCase):
                 machine.input_material = "MAT-WIP-1"
                 machine.input_intermediate = None
                 machine.setup_ready = True
-                machine.broken = True
-                machine.state = MachineState.PROCESSING
                 world._set_item_state("MAT-WIP-1", ItemState.PROCESSING, location=f"Station{machine.station}", ref=machine.machine_id, item_type="material")
+                cycle_id = world.start_machine_cycle(machine)
+                sampled_process_min = machine.cycle_sampled_process_min
+                distribution = world.processing_time_distribution[machine.station]
+                self.assertGreaterEqual(sampled_process_min, distribution.minimum)
+                self.assertLessEqual(sampled_process_min, distribution.maximum)
+                machine.broken = True
 
-                world.abort_machine_cycle(machine, "CYCLE-test", "machine_breakdown", elapsed_min=3.5)
+                world.abort_machine_cycle(machine, cycle_id, "machine_breakdown", elapsed_min=3.5)
 
                 self.assertEqual("MAT-WIP-1", machine.input_material)
-                self.assertFalse(machine.setup_ready)
+                self.assertTrue(machine.setup_ready)
+                self.assertAlmostEqual(sampled_process_min - 3.5, machine.cycle_remaining_process_min)
                 self.assertEqual(ItemState.LOADED_ON_MACHINE, world.items["MAT-WIP-1"].state)
                 aborted = [event for event in logger.events if event["type"] == "MACHINE_ABORTED"]
-                self.assertEqual("restart_after_repair", aborted[-1]["details"]["progress_policy"])
+                self.assertEqual("resume_after_repair", aborted[-1]["details"]["progress_policy"])
                 self.assertEqual("MAT-WIP-1", aborted[-1]["details"]["retained_input_material"])
+                machine.broken = False
+                self.assertEqual(cycle_id, world.start_machine_cycle(machine))
+                self.assertAlmostEqual(sampled_process_min, machine.cycle_sampled_process_min)
+                self.assertAlmostEqual(sampled_process_min - 3.5, machine.cycle_remaining_process_min)
             finally:
                 logger.close()
 
@@ -1020,8 +1285,8 @@ class RollingHorizonDecisionTests(unittest.TestCase):
                     )
                 )
 
-                world.env.run(until=5.0)
-                world._rolling_horizon_update()
+                world.env.process(strict_periodic_rolling_horizon_loop(world.env, world))
+                world.env.run(until=5.000001)
                 queue = list(world.rolling_horizon_dispatch_queues[provider_id])
 
                 self.assertTrue(queue)

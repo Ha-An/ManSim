@@ -14,7 +14,21 @@ def machine_lifecycle(env: simpy.Environment, world: ManufacturingWorld, machine
     machine = world.machines[machine_id]
     while True:
         if machine.broken:
-            world._set_machine_state(machine, MachineState.BROKEN, reason="broken_wait")
+            # ``broken`` remains true while repair is active, but the observable
+            # machine state must stay UNDER_REPAIR until the team leaves or the
+            # repair completes. Reasserting BROKEN here made replay state flicker
+            # and split repair time into misleading broken-wait intervals.
+            target_state = (
+                MachineState.UNDER_REPAIR
+                if world._repair_team_size(machine) > 0
+                else MachineState.BROKEN
+            )
+            if machine.state != target_state:
+                world._set_machine_state(
+                    machine,
+                    target_state,
+                    reason="repair_active" if target_state == MachineState.UNDER_REPAIR else "broken_wait",
+                )
             yield env.timeout(1)
             continue
 
@@ -35,16 +49,17 @@ def machine_lifecycle(env: simpy.Environment, world: ManufacturingWorld, machine
             continue
 
         cycle_id = world.start_machine_cycle(machine)
+        process_duration = max(0.0, float(machine.cycle_remaining_process_min))
         start_t = env.now
         machine.active_process = env.active_process
         try:
-            yield env.timeout(machine.process_time_min)
+            yield env.timeout(process_duration)
         except simpy.Interrupt as intr:
             elapsed_min = max(0.0, env.now - start_t)
             machine.total_processing_min += elapsed_min
             world.abort_machine_cycle(machine, cycle_id, str(intr.cause), elapsed_min=elapsed_min)
             continue
-        machine.total_processing_min += machine.process_time_min
+        machine.total_processing_min += process_duration
         world.complete_machine_cycle(machine, cycle_id)
 
 
@@ -55,7 +70,7 @@ def machine_failure_monitor(env: simpy.Environment, world: ManufacturingWorld, m
         if lam <= 0.0:
             yield env.timeout(60)
             continue
-        ttf = max(1.0, world.rng.expovariate(lam))
+        ttf = world.sample_machine_failure_delay(machine, lam)
         yield env.timeout(ttf)
         world.break_machine(machine, reason="stochastic")
 
@@ -69,8 +84,14 @@ def worker_work_loop(env: simpy.Environment, world: ManufacturingWorld, worker_i
         agent.process_ref = env.active_process
         try:
             if agent.discharged:
-                yield env.timeout(1)
-                continue
+                recovery_task = world.mandatory_task_for_agent(agent)
+                if recovery_task is None or recovery_task.task_type != "BATTERY_CHARGE":
+                    yield env.timeout(1)
+                    continue
+                task = recovery_task
+                resumed_task = False
+            else:
+                task = None
             if agent.awaiting_battery_from is not None:
                 # Assisted battery swap in progress: receiver must stay paused.
                 yield env.timeout(1)
@@ -83,13 +104,21 @@ def worker_work_loop(env: simpy.Environment, world: ManufacturingWorld, worker_i
                 continue
 
             resumed_task = False
-            if agent.suspended_task is not None:
-                task = agent.suspended_task
-                resumed_task = True
-            else:
-                task = world.select_task_for_agent(agent)
             if task is None:
-                yield env.timeout(1)
+                if agent.suspended_task is not None:
+                    task = agent.suspended_task
+                    resumed_task = True
+                else:
+                    task = world.select_task_for_agent(agent)
+            if task is None:
+                if world._adp_active():
+                    dispatch_event = world.adp_dispatch_event(agent.agent_id)
+                    yield dispatch_event | world.termination_event
+                elif world._rolling_horizon_active():
+                    dispatch_event = world.rolling_horizon_dispatch_event(agent.agent_id)
+                    yield dispatch_event | world.termination_event
+                else:
+                    yield env.timeout(1)
                 continue
 
             start_t = env.now
@@ -110,6 +139,15 @@ def worker_work_loop(env: simpy.Environment, world: ManufacturingWorld, worker_i
                 status = "interrupted"
                 reason = str(intr.cause)
                 world.handle_task_interruption(agent, task, reason)
+
+            # Keep the exclusive desk owner until the outgoing worker has
+            # physically cleared its sole service tile. This also applies to
+            # recoverable interruptions after a desk state transition (for
+            # example, an item drop recovered during RELEASE). Suspended tasks
+            # retain their position and owner because the same worker resumes.
+            try:
+                if not world.terminated and agent.suspended_task is not task:
+                    yield from world.vacate_completed_task_service_tile(agent, task)
             finally:
                 if not world.logger.closed:
                     world.finish_agent_task(agent, task, start_t, status, reason)
@@ -142,6 +180,10 @@ def worker_battery_monitor(env: simpy.Environment, world: ManufacturingWorld, wo
     while True:
         if world.terminated:
             return
+        if agent.charging_started_at is not None:
+            world.battery_remaining(agent)
+            yield env.timeout(world._battery_monitor_sleep_min(agent, eps))
+            continue
         if agent.discharged:
             yield env.timeout(1)
             continue
@@ -154,6 +196,13 @@ def worker_battery_monitor(env: simpy.Environment, world: ManufacturingWorld, wo
         world._sync_humanoid_power_state(agent)
         world._emit_low_battery_alert_if_needed(agent)
         if remaining <= eps:
+            if (
+                world.battery_direct_charge_enabled
+                and agent.current_task_type == "BATTERY_CHARGE"
+                and world._worker_at_assigned_charging_dock(agent)
+            ):
+                yield env.timeout(eps)
+                continue
             world.discharge_agent(agent, reason="battery_depleted")
             yield env.timeout(0)
             continue

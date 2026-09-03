@@ -1,0 +1,22 @@
+# Five-policy throughput comparison. Set this path or pass --adp-checkpoint.
+adp_checkpoint_path: ""
+scenario: mfg_flow_shop
+horizon_days: 5
+makespan_max_sim_days: 30
+minutes_per_day: 480
+objective_modes: [maximize_throughput]
+seeds: [2026, 2027, 2028, 2029, 2030]
+worker_counts: [3, 4, 5, 6]
+modes:
+  - immediate_shared
+  - immediate_dedicated_roles
+  - rolling_horizon_shared
+  - rolling_horizon_dedicated_roles
+  - simulation_based_adp
+common_overrides:
+  - runtime.ui.auto_open_results=false
+  - runtime.ui.auto_start_replay_studio_3d=false
+metrics:
+  productivity: [total_products, throughput_per_sim_hour, avg_daily_products]
+  robot: [humanoid_execution_ratio_avg, humanoid_blocked_ratio_avg, agent_discharged_ratio]
+  adp: [adp_decision_count, adp_wait_count, adp_avg_candidate_count, adp_inference_latency_ms_avg]

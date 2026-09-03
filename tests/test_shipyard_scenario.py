@@ -19,7 +19,9 @@ class ShipyardScenarioTests(unittest.TestCase):
     def _load_cfg(self) -> dict:
         cfg = yaml.safe_load(Path("configs/scenario/shipyard_basic.yaml").read_text(encoding="utf-8"))
         decision = yaml.safe_load(Path("configs/decision/rolling_horizon_dedicated_roles.yaml").read_text(encoding="utf-8"))
+        timing = yaml.safe_load(Path("configs/task_primitive_timing/shipyard_basic.yaml").read_text(encoding="utf-8"))
         cfg["decision"] = decision
+        cfg["task_primitive_timing"] = timing
         cfg["seed"] = 2026
         return cfg
 
@@ -64,6 +66,13 @@ class ShipyardScenarioTests(unittest.TestCase):
                 all(abs(a[0] - b[0]) + abs(a[1] - b[1]) == 1 for a, b in zip(route, route[1:])),
                 route,
             )
+            blocked_route = grid.find_cart_route_path(
+                grid.initial_cart_tile("CART-01"),
+                source_tile,
+                blocked_tiles=set(grid.cart_route_tiles),
+                footprint_tiles=2,
+            )
+            self.assertEqual([], blocked_route)
         for work_tile in grid.work_tiles.values():
             self.assertIn(work_tile.tile, grid.ship_hull_tiles)
             self.assertTrue(work_tile.service_tiles)
@@ -209,11 +218,12 @@ class ShipyardScenarioTests(unittest.TestCase):
 
                 battery_entries = [
                     entry
-                    for entry in world.rolling_horizon_pending.values()
+                    for entry in world.rolling_horizon_dispatch_queues["A3"]
                     if entry["task"].task_code == "MANAGE_ROBOT_POWER"
                     and entry["task"].assigned_robot_id == "A3"
                 ]
                 self.assertEqual(1, len(battery_entries))
+                self.assertTrue(battery_entries[0].get("urgent_dispatch"))
                 event = next(
                     row
                     for row in logger.events
@@ -325,6 +335,7 @@ class ShipyardScenarioTests(unittest.TestCase):
     def test_shipyard_one_day_run_generates_kpis(self) -> None:
         cfg = self._load_cfg()
         cfg["horizon"]["num_days"] = 1
+        cfg["runtime"] = {"artifacts": {"export_events": True}}
         with tempfile.TemporaryDirectory() as tmp:
             result = run(experiment_cfg=cfg, output_dir=Path(tmp))
             kpi = result["kpi"]
@@ -335,6 +346,8 @@ class ShipyardScenarioTests(unittest.TestCase):
             self.assertIn("operational_task_complexity", kpi)
             self.assertIn("cumulative_operational_complexity_over_n_days", kpi)
             self.assertIn("operational_task_complexity_details", kpi)
+            self.assertGreater(kpi["operational_task_complexity_details"]["task_instance_count"], 0)
+            self.assertEqual(kpi["run_meta"]["mansim_version"], "0.6.0")
             events_text = (Path(tmp) / "events.jsonl").read_text(encoding="utf-8")
             self.assertIn("CART_BATCH_LOADED", events_text)
             self.assertIn("SHIP_TILE_STATE_CHANGED", events_text)

@@ -2,6 +2,10 @@
 # A fixed ship silhouette sits in the center of a 100x70 tile map. Humanoids
 # repair exterior surface tiles; each tile goes through welding, surface
 # preparation, painting, and inspection.
+defaults:
+  - /task_primitive_timing: shipyard_basic
+  - _self_
+
 name: shipyard_basic
 type: shipyard_basic
 
@@ -17,11 +21,8 @@ map:
   enabled: true
   width_tiles: 100
   height_tiles: 70
-  tile_time_min: 0.12
 
 movement:
-  default_min: 4.0
-  to_battery_station_min: 5.0
   traffic:
     enabled: true
     mode: strict_reservation
@@ -31,8 +32,6 @@ worker:
   battery_drain:
     available_rate_multiplier: 0.5
     non_available_rate_multiplier: 1.0
-  battery_pickup_time_min: 4
-  battery_delivery_extra_min: 3
 
 quality:
   defect_prob: 0.08
@@ -60,16 +59,3 @@ shipyard:
     length_tiles: 62
     beam_tiles: 24
     target_count: 120
-  operations:
-    OPERATE_VEHICLE_TRANSPORT:
-      default_min: 0.8
-    TRANSFER:
-      default_min: 0.35
-    WELD_SEAM:
-      default_min: 1.0
-    PREPARE_SURFACE:
-      default_min: 0.5
-    PAINT_SURFACE:
-      default_min: 0.8
-    VERIFY_SHIP_SECTION:
-      default_min: 0.4

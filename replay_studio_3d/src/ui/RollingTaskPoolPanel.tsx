@@ -19,6 +19,9 @@ export interface RollingTaskPoolEntry {
   opportunityId: string;
   taskId?: string;
   taskCode: string;
+  roleNumber?: number;
+  roleTaskCode?: string;
+  roleDisplayName?: string;
   taskType?: string;
   baseRank?: number;
   effectiveRank?: number;
@@ -61,6 +64,9 @@ interface MutableEntry {
   opportunityId: string;
   taskId?: string;
   taskCode: string;
+  roleNumber?: number;
+  roleTaskCode?: string;
+  roleDisplayName?: string;
   taskType?: string;
   baseRank?: number;
   effectiveRank?: number;
@@ -193,6 +199,9 @@ function makeEntry(event: ReplayEvent, status: RollingTaskStatus): MutableEntry 
     opportunityId: opportunityId(event),
     taskId: asText(payload.task_id),
     taskCode: asText(payload.task_code) ?? "-",
+    roleNumber: asNumber(payload.role_number),
+    roleTaskCode: asText(payload.role_task_code),
+    roleDisplayName: asText(payload.role_display_name),
     taskType: asText(payload.task_type),
     baseRank: asNumber(payload.base_priority_rank),
     effectiveRank: asNumber(payload.effective_priority_rank),
@@ -229,6 +238,7 @@ export function isRollingHorizonReplay(log: ReplayLog | null): boolean {
   const mode = String(log.metadata.decision_mode ?? "").trim().toLowerCase();
   return (
     mode === "rolling_horizon_aging_priority" ||
+    mode === "rolling_horizon_shared" ||
     mode === "rolling_horizon_dedicated_roles" ||
     mode === "rolling_horizon_throughput_optimizer" ||
     mode === "rolling_horizon_fixed_priority" ||
@@ -323,6 +333,9 @@ export function buildRollingTaskPoolModel(events: ReplayEvent[], currentTime: nu
       entry.waitedWindows = asNumber(event.payload.waited_window_count) ?? entry.waitedWindows;
       entry.optimizerScore = asNumber(event.payload.optimizer_score) ?? entry.optimizerScore;
       entry.sequencePosition = asNumber(event.payload.sequence_position) ?? entry.sequencePosition;
+      entry.roleNumber = asNumber(event.payload.role_number) ?? entry.roleNumber;
+      entry.roleTaskCode = asText(event.payload.role_task_code) ?? entry.roleTaskCode;
+      entry.roleDisplayName = asText(event.payload.role_display_name) ?? entry.roleDisplayName;
       const workerId = asText(event.payload.worker_id);
       const assignedWorkerId = asText(event.payload.assigned_worker_id);
       if (workerId) entry.workerIds.add(workerId);
@@ -359,6 +372,9 @@ export function buildRollingTaskPoolModel(events: ReplayEvent[], currentTime: nu
       globalEntry.waitedWindows = asNumber(event.payload.waited_window_count) ?? globalEntry.waitedWindows;
       globalEntry.optimizerScore = asNumber(event.payload.optimizer_score) ?? globalEntry.optimizerScore;
       globalEntry.sequencePosition = asNumber(event.payload.sequence_position) ?? globalEntry.sequencePosition;
+      globalEntry.roleNumber = asNumber(event.payload.role_number) ?? globalEntry.roleNumber;
+      globalEntry.roleTaskCode = asText(event.payload.role_task_code) ?? globalEntry.roleTaskCode;
+      globalEntry.roleDisplayName = asText(event.payload.role_display_name) ?? globalEntry.roleDisplayName;
       const workerId = asText(event.payload.worker_id);
       const assignedWorkerId = asText(event.payload.assigned_worker_id);
       if (workerId) globalEntry.workerIds.add(workerId);
@@ -430,6 +446,9 @@ export function buildRollingTaskPoolModel(events: ReplayEvent[], currentTime: nu
       opportunityId: entry.opportunityId,
       taskId: entry.taskId,
       taskCode: entry.taskCode,
+      roleNumber: entry.roleNumber,
+      roleTaskCode: entry.roleTaskCode,
+      roleDisplayName: entry.roleDisplayName,
       taskType: entry.taskType,
       baseRank: entry.baseRank,
       effectiveRank: entry.effectiveRank,
@@ -478,6 +497,22 @@ export function RollingTaskPoolPanel({
 }) {
   const model = buildRollingTaskPoolModel(events, currentTime);
   const focus = model.focusWindow;
+  const schedulerEvent = [...events]
+    .reverse()
+    .find(
+      (event) =>
+        event.timestamp <= currentTime &&
+        event.event_type === "rolling_horizon_window_started" &&
+        asText(event.payload.scheduler_mode),
+    );
+  const schedulerMode = asText(schedulerEvent?.payload.scheduler_mode);
+  const schedulerWindowMin = asNumber(schedulerEvent?.payload.window_min);
+  const schedulerLabel =
+    schedulerMode === "strict_periodic"
+      ? `Strict periodic / ${schedulerWindowMin ?? 5} min`
+      : schedulerMode
+        ? schedulerMode.replace(/_/g, " ")
+        : "";
   void decisionMode;
 
   return (
@@ -486,6 +521,7 @@ export function RollingTaskPoolPanel({
         <div>
           <span className="rolling-pool-kicker">Rolling Horizon</span>
           <strong>Task Pool</strong>
+          {schedulerLabel ? <span className="rolling-pool-kicker">{schedulerLabel}</span> : null}
         </div>
         <div className="rolling-pool-stats">
           <span>Window {focus?.windowIndex ?? "-"}</span>
@@ -545,7 +581,11 @@ export function RollingTaskPoolPanel({
                     <td title={entry.opportunityId}>{entry.taskId || entry.opportunityId.replace(/^RHOPP-/, "")}</td>
                     <td>{formatTime(entry.collectedAt, timeUnit)}</td>
                     <td>{formatTime(entry.updatedAt, timeUnit)}</td>
-                    <td>{entry.taskCode}</td>
+                    <td title={entry.roleDisplayName ?? entry.taskCode}>
+                      {entry.roleNumber !== undefined
+                        ? `#${entry.roleNumber} ${entry.roleDisplayName ?? entry.roleTaskCode ?? entry.taskCode}`
+                        : entry.taskCode}
+                    </td>
                     <td>{entry.target}</td>
                     <td title={
                       entry.optimizerScore !== undefined

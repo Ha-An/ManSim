@@ -51,7 +51,9 @@ def _render_supported_body(diagnostics: dict[str, Any]) -> str:
     order = diagnostics.get("metric_order", []) if isinstance(diagnostics.get("metric_order", []), list) else list(metrics)
     cards = "".join(_metric_card(code, metrics.get(code, {})) for code in order if isinstance(metrics.get(code, {}), dict))
     details = "".join(_metric_detail(code, metrics.get(code, {})) for code in order if isinstance(metrics.get(code, {}), dict))
-    inputs_html = _json_block(diagnostics.get("inputs", {}))
+    inputs = diagnostics.get("inputs", {}) if isinstance(diagnostics.get("inputs", {}), dict) else {}
+    inputs_html = _json_block(inputs)
+    role_assignment_html = _render_mfg_flow_shop_role_assignment(inputs.get("mfg_flow_shop_task_policy"))
     return f"""
 <section class="section panel">
   <h2>Scenario</h2>
@@ -63,10 +65,77 @@ def _render_supported_body(diagnostics: dict[str, Any]) -> str:
 <section class="section grid cards-2">
   {details}
 </section>
+{role_assignment_html}
 <section class="section panel">
   <h2>Input Snapshot</h2>
   <p class="muted">These inputs are read before the run from scenario config, decision config, map topology, service targets, battery settings, and HumanoidSim task complexity.</p>
   {inputs_html}
+</section>
+"""
+
+
+def _render_mfg_flow_shop_role_assignment(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return ""
+    rules = value.get("rules", []) if isinstance(value.get("rules", []), list) else []
+    workers = value.get("workers", {}) if isinstance(value.get("workers", {}), dict) else {}
+    owners = value.get("owner_by_rule", {}) if isinstance(value.get("owner_by_rule", {}), dict) else {}
+    balance = value.get("balance", {}) if isinstance(value.get("balance", {}), dict) else {}
+
+    rule_rows = []
+    for row in rules:
+        if not isinstance(row, dict):
+            continue
+        owner = owners.get(str(row.get("rule_id", "")), "-")
+        owner_text = ", ".join(str(item) for item in owner) if isinstance(owner, list) else str(owner)
+        rule_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('role_number', '-')))}</td>"
+            f"<td><code class='inline'>{html.escape(str(row.get('rule_id', '-')))}</code></td>"
+            f"<td>{html.escape(str(row.get('display_name', '-')))}</td>"
+            f"<td>{html.escape(str(row.get('task_code', '-')))}</td>"
+            f"<td>{html.escape(str(row.get('kind', '-')))}</td>"
+            f"<td>{_format_number(row.get('expected_count', 0))}</td>"
+            f"<td>{_format_number(row.get('expected_duration_min', 0))}</td>"
+            f"<td>{_format_number(row.get('expected_busy_min', 0))}</td>"
+            f"<td>{html.escape(owner_text or '-')}</td>"
+            f"<td>{html.escape(str(row.get('assignment_source', '-')))}</td>"
+            "</tr>"
+        )
+
+    worker_rows = []
+    for worker_id, payload in sorted(workers.items()):
+        if not isinstance(payload, dict):
+            continue
+        rule_ids = payload.get("assigned_rule_ids", []) if isinstance(payload.get("assigned_rule_ids", []), list) else []
+        role_numbers = payload.get("role_numbers", []) if isinstance(payload.get("role_numbers", []), list) else []
+        worker_rows.append(
+            "<tr>"
+            f"<td><strong>{html.escape(str(worker_id))}</strong></td>"
+            f"<td>{_format_number(payload.get('expected_busy_min', 0))}</td>"
+            f"<td>{html.escape(', '.join(str(item) for item in role_numbers) or '-')}</td>"
+            f"<td>{html.escape(', '.join(str(item) for item in rule_ids) or '-')}</td>"
+            "</tr>"
+        )
+
+    return f"""
+<section class="section panel">
+  <h2>Task Rule and Role Assignment</h2>
+  <p class="muted">Expected counts and durations are computed before simulation. Dedicated modes assign exclusive rules once with deterministic LPT; shared modes keep every exclusive rule available to all workers.</p>
+  <div class="grid cards-3" style="margin:14px 0;">
+    <div><div class="label">Mean Load</div><div class="value">{_format_number(balance.get('mean_expected_busy_min', 0))}</div><div class="sub">busy min</div></div>
+    <div><div class="label">Max Load</div><div class="value">{_format_number(balance.get('max_expected_busy_min', 0))}</div><div class="sub">busy min</div></div>
+    <div><div class="label">Load CV</div><div class="value">{_format_number(balance.get('coefficient_of_variation', 0))}</div><div class="sub">lower is more balanced</div></div>
+  </div>
+  <div style="overflow:auto;">
+    <table><thead><tr><th>No.</th><th>Rule</th><th>Role Name</th><th>Task</th><th>Kind</th><th>Count</th><th>Min/Task</th><th>Busy Min</th><th>Owner</th><th>Assigned By</th></tr></thead>
+    <tbody>{''.join(rule_rows)}</tbody></table>
+  </div>
+  <h3>Worker Loads</h3>
+  <div style="overflow:auto;">
+    <table><thead><tr><th>Worker</th><th>Expected Busy Min</th><th>Role Numbers</th><th>Assigned Roles</th></tr></thead>
+    <tbody>{''.join(worker_rows)}</tbody></table>
+  </div>
 </section>
 """
 

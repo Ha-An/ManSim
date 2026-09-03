@@ -1,0 +1,25 @@
+# Worker-3 held-out throughput comparison for the stabilized ADP policy.
+adp_checkpoint_path: ""
+scenario: mfg_flow_shop
+horizon_days: 5
+makespan_max_sim_days: 30
+minutes_per_day: 480
+objective_modes: [maximize_throughput]
+seeds: [50001, 50002, 50003, 50004, 50005]
+worker_counts: [3]
+modes:
+  - random_feasible_dispatch
+  - immediate_shared
+  - immediate_dedicated_roles
+  - rolling_horizon_shared
+  - rolling_horizon_dedicated_roles
+  - simulation_based_adp
+common_overrides:
+  - runtime.ui.auto_open_results=false
+  - runtime.ui.auto_start_replay_studio_3d=false
+  - runtime.ui.export_replay_artifacts=false
+metrics:
+  productivity: [total_products, throughput_per_sim_hour, avg_daily_products]
+  robot: [humanoid_execution_ratio_avg, humanoid_blocked_ratio_avg, agent_discharged_ratio]
+  flow: [buffer_overflow_attempt_count, buffer_reservation_failure_count, buffer_reservation_leak_count, machine_blocked_after_service_min, candidate_count_avg, candidate_count_max]
+  adp: [adp_decision_count, adp_wait_count, adp_candidate_available_wait_count, adp_no_candidate_unassigned_count, adp_candidate_available_wait_ratio, adp_no_candidate_unassigned_ratio, adp_avg_candidate_count, adp_inference_latency_ms_avg]

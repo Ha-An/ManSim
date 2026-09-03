@@ -6,11 +6,14 @@ from typing import Any
 
 
 class EventLogger:
-    def __init__(self, output_dir: Path) -> None:
+    def __init__(self, output_dir: Path, *, persist_events: bool = True) -> None:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.events_path = self.output_dir / "events.jsonl"
-        self._events_fp = self.events_path.open("w", encoding="utf-8")
+        self.persist_events = bool(persist_events)
+        self._events_fp = (
+            self.events_path.open("w", encoding="utf-8") if self.persist_events else None
+        )
         self.events: list[dict[str, Any]] = []
         self.closed = False
 
@@ -35,7 +38,8 @@ class EventLogger:
             "details": details or {},
         }
         self.events.append(event)
-        self._events_fp.write(json.dumps(event, ensure_ascii=True) + "\n")
+        if self._events_fp is not None:
+            self._events_fp.write(json.dumps(event, ensure_ascii=True) + "\n")
 
     def write_json(self, filename: str, payload: dict[str, Any]) -> None:
         path = self.output_dir / filename
@@ -45,6 +49,7 @@ class EventLogger:
     def close(self) -> None:
         if self.closed:
             return
-        self._events_fp.flush()
-        self._events_fp.close()
+        if self._events_fp is not None:
+            self._events_fp.flush()
+            self._events_fp.close()
         self.closed = True

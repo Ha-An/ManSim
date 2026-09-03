@@ -8,7 +8,15 @@ from pathlib import Path
 from dashboards.gantt import export_gantt
 
 
-def _state_event(t: float, worker_id: str, availability: str, *, task_code: str = "", primitive: str = "") -> dict:
+def _state_event(
+    t: float,
+    worker_id: str,
+    availability: str,
+    *,
+    task_code: str = "",
+    primitive: str = "",
+    power: str = "POWER_NORMAL",
+) -> dict:
     task_context = None
     if task_code or primitive:
         task_context = {
@@ -29,7 +37,7 @@ def _state_event(t: float, worker_id: str, availability: str, *, task_code: str 
                 "humanoid_id": worker_id,
                 "availability": availability,
                 "mobility": "NAVIGATING" if primitive == "NAVIGATE_TO" else "STATIONARY",
-                "power": "POWER_NORMAL",
+                "power": power,
                 "manipulation": "FREE",
                 "task_context": task_context,
                 "reason": None,
@@ -67,6 +75,61 @@ class GanttExportTests(unittest.TestCase):
         self.assertFalse(any(row["lane"] == "PRODUCT-1" for row in rows))
         self.assertNotIn("WORKING", {row["status"] for row in worker_rows})
         self.assertNotIn("MOVING", {row["status"] for row in worker_rows})
+
+    def test_charging_power_state_gets_a_distinct_worker_segment(self) -> None:
+        events = [
+            _state_event(0.0, "A1", "EXECUTING", task_code="MANAGE_ROBOT_POWER"),
+            _state_event(
+                2.0,
+                "A1",
+                "EXECUTING",
+                task_code="MANAGE_ROBOT_POWER",
+                primitive="EXECUTE_SYSTEM_ACTION",
+                power="CHARGING",
+            ),
+            _state_event(7.0, "A1", "EXECUTING", task_code="MANAGE_ROBOT_POWER"),
+            _state_event(8.0, "A1", "AVAILABLE"),
+        ]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            output_dir = Path(raw_dir)
+            export_gantt(events=events, output_dir=output_dir)
+            with (output_dir / "gantt_segments.csv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        worker_rows = [row for row in rows if row["entity_group"] == "Worker" and row["lane"] == "A1"]
+        charging_rows = [row for row in worker_rows if row["status"] == "CHARGING"]
+        self.assertEqual(1, len(charging_rows))
+        self.assertAlmostEqual(2.0, float(charging_rows[0]["start"]))
+        self.assertAlmostEqual(7.0, float(charging_rows[0]["end"]))
+
+    def test_machine_processing_includes_resume_and_open_horizon_segments(self) -> None:
+        def machine_event(t: float, event_type: str, cycle_id: str) -> dict:
+            return {
+                "t": t,
+                "day": 1,
+                "type": event_type,
+                "entity_id": "S1M1",
+                "location": "Station1",
+                "details": {"cycle_id": cycle_id},
+            }
+
+        events = [
+            machine_event(1.0, "MACHINE_START", "C1"),
+            machine_event(3.0, "MACHINE_ABORTED", "C1"),
+            machine_event(5.0, "MACHINE_RESUME", "C1"),
+            machine_event(8.0, "MACHINE_END", "C1"),
+            machine_event(9.0, "MACHINE_START", "C2"),
+            {"t": 12.0, "day": 1, "type": "RUN_END", "entity_id": "system", "details": {}},
+        ]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            output_dir = Path(raw_dir)
+            export_gantt(events=events, output_dir=output_dir)
+            with (output_dir / "gantt_segments.csv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        machine_rows = [row for row in rows if row["interval_type"] == "MACHINE_PROCESSING"]
+        intervals = [(float(row["start"]), float(row["end"])) for row in machine_rows]
+        self.assertEqual([(1.0, 3.0), (5.0, 8.0), (9.0, 12.0)], intervals)
 
 
 if __name__ == "__main__":

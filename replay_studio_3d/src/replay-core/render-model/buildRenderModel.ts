@@ -162,15 +162,21 @@ export function buildRenderModel(
       if (entity.entity_id === "warehouse_buffer" && hasCanonicalCompletedBuffer) return false;
       if (entity.entity_type === "cart_parking_spot") return false;
       const itemState = typeof entity.attributes.item_state === "string" ? entity.attributes.item_state.trim().toUpperCase() : "";
-      if (itemState && itemState !== "DROPPED") return false;
+      const visibleInspectionItemStates = new Set(["STAGED_FOR_INSPECTION", "INSPECTING", "INSPECTED_WAITING_UNLOAD"]);
+      if (itemState && itemState !== "DROPPED" && !visibleInspectionItemStates.has(itemState)) return false;
       if (options.visibleEntityTypes?.length && !options.visibleEntityTypes.includes(entity.entity_type)) return false;
       if (options.entityIdFilter && entity.entity_id !== options.entityIdFilter) return false;
       if (!matchesSearch(entity, options.searchQuery ?? "")) return false;
       return true;
     })
     .map((entity) => {
+      const itemRef = typeof entity.attributes.ref === "string" ? entity.attributes.ref.trim() : "";
+      const inspectionItemPosition = itemRef && resolvedLayout.positions[itemRef]
+        ? { x: resolvedLayout.positions[itemRef].x + 0.16, y: resolvedLayout.positions[itemRef].y - 0.08 }
+        : undefined;
       const basePosition =
         (isMobileEntity(entity) && entity.position ? { ...entity.position } : undefined) ??
+        inspectionItemPosition ??
         resolvedLayout.positions[entity.entity_id] ??
         { x: 0, y: 0 };
       return {

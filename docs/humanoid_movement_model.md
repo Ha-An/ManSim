@@ -63,10 +63,10 @@ current tile -> next tile -> ... -> destination service tile
 
 Worker는 path 전체를 한 번에 순간이동하지 않습니다. `_move_agent_grid()`가 path의 다음 tile인 `path[1]`로 한 칸씩 이동합니다.
 
-- 한 tile 이동 시간: `map.tile_time_min`
-- 현재 기본값: `0.1`분
-- item을 들고 있으면 tile segment 시간이 item weight multiplier만큼 길어집니다.
-- 각 tile segment마다 `AGENT_MOVE_TILE_START`, `AGENT_MOVE_TILE_END`를 기록합니다.
+- 한 tile 이동 시간은 scenario timing profile의 `movement.per_tile_min.distribution`에서 이동 시작 시 한 번 샘플링합니다.
+- Factory 기본 삼각분포는 `0.08/0.10/0.12`분이고 Shipyard 기본 삼각분포는 `0.096/0.12/0.144`분입니다.
+- 실제 segment 시간은 sampled tile time에 item/cart multiplier를 곱하며, 같은 task와 목적지 이동을 재개하면 기존 sample을 유지합니다.
+- 각 tile segment마다 `AGENT_MOVE_TILE_START`, `AGENT_MOVE_TILE_END`를 기록합니다. Horizon 또는 objective 종료가 segment 중간에 발생하면 `AGENT_MOVE_TILE_CANCELLED`를 기록하고 worker는 `from_tile`에 남습니다.
 - 전체 이동 시작/종료는 `AGENT_MOVE_START`, `AGENT_MOVE_END`로 기록합니다.
 
 Replay Studio는 `AGENT_MOVE_START`에서 export된 `entity_moved.payload.path`와 `durative.started_at/ended_at`을 읽어 worker 위치를 보간합니다. 화면에서 보이는 부드러운 이동은 simulator가 기록한 tile path와 duration을 시각화한 것입니다.
@@ -77,19 +77,20 @@ Replay Studio는 `AGENT_MOVE_START`에서 export된 `entity_moved.payload.path`�
 
 ```yaml
 movement:
-  item_transport:
-    weight_time_multiplier:
-      material: 1.0
-      intermediate: 1.5
-      product: 2.0
-      battery: 1.0
-    product_collaboration:
-      enabled: true
-      max_carriers: 2
-      divide_time_by_carrier_count: true
+  per_tile_min:
+    distribution:
+      type: triangular
+      min: 0.08
+      mode: 0.10
+      max: 0.12
+  multipliers:
+    material: 1.0
+    intermediate: 1.5
+    product: 2.0
+    battery: 1.0
 ```
 
-예를 들어 `map.tile_time_min=0.1`일 때 product를 혼자 들고 한 tile을 이동하면 `0.1 * 2.0 = 0.2`분이 걸립니다. 같은 product transport session에 helper가 `HANDOVER_ITEM`으로 합류하면 다음 tile segment부터 `0.1 * (2.0 / 2) = 0.1`분이 됩니다.
+예를 들어 sampled tile time이 `0.1`분이고 product multiplier가 `2.0`이면 한 edge 이동에 `0.2`분이 걸립니다. 같은 product transport session에 helper가 합류하면 collaboration 설정에 따라 다음 segment부터 운반 부담을 나눕니다.
 
 공동 운반은 현재 product에만 적용됩니다. Intermediate는 material보다 무겁지만 기본 구현에서는 공동 운반 대상이 아닙니다.
 
@@ -169,12 +170,19 @@ movement:
     mode: observe_conflicts
 ```
 
-tile 이동 속도 조정:
+tile 이동시간 분포 조정:
 
 ```yaml
-map:
-  tile_time_min: 0.1
+movement:
+  per_tile_min:
+    distribution:
+      type: triangular
+      min: 0.08
+      mode: 0.10
+      max: 0.12
 ```
+
+이 설정은 `configs/task_primitive_timing/<scenario>.yaml`에 둡니다. Traffic, map geometry, reservation 설정은 계속 `configs/scenario/<scenario>.yaml`에 둡니다.
 
 동적 점유 때문에 path가 오래 막힐 때 blocked event를 더 빨리 보고 싶다면:
 

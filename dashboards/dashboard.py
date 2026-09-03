@@ -8,7 +8,7 @@ from .shell import render_page_shell
 
 
 PRIMARY_METRICS = [
-    ("Ship Makespan", "makespan_min", "minutes", False, "Elapsed simulated minutes until every ship surface tile reaches COMPLETE."),
+    ("Makespan", "makespan_min", "minutes", False, "Elapsed simulated minutes until the scenario-specific completion condition is reached."),
     ("Completed Surface Tiles", "completed_surface_tile_count", "count", True, "Ship exterior tiles that completed welding, surface prep, painting, and inspection."),
     ("Surface Completion", "surface_tile_completion_ratio", "ratio", True, "Share of ship exterior surface tiles in COMPLETE state."),
     ("Ship Reworks", "rework_count", "count", False, "Ship surface tile inspection failures that required rework."),
@@ -37,6 +37,8 @@ PRIMARY_METRICS = [
     ("Repair Team Size Avg", "repair_team_size_avg", "float", True, "Time-weighted average repair team size while repair was active."),
     ("Worker Local Responses", "worker_local_response_total", "count", True, "Local recoveries or local reorder attempts taken by workers."),
     ("Worker Discharged Ratio", "agent_discharged_ratio", "ratio", False, "Battery-depletion event time ratio."),
+    ("Battery Charges", "battery_charge_count", "count", True, "Completed worker charging sessions at assigned charging docks."),
+    ("Battery Charge Time", "battery_charge_time_min", "minutes", False, "Total simulated minutes spent charging at assigned docks."),
     ("Traffic Collisions", "collision_count", "count", False, "Tile/edge traffic conflicts with overlapping movement windows."),
     ("Traffic Near Misses", "near_miss_count", "count", False, "Movement conflicts closer than the configured traffic headway."),
     ("Edge Conflicts", "edge_conflict_count", "count", False, "Workers crossing the same edge in opposite directions during overlapping windows."),
@@ -55,15 +57,44 @@ PRIMARY_METRICS = [
     ("Optimizer Failed", "throughput_optimizer_failed_count", "count", False, "Throughput optimizer windows that failed without fallback."),
     ("Optimizer Objective", "throughput_optimizer_objective_avg", "float", True, "Average scaled CP-SAT objective value for solved windows."),
     ("Bottleneck Score", "bottleneck_score_avg", "float", True, "Average selected task bottleneck/throughput relief score."),
+    ("ADP Decisions", "adp_decision_count", "count", True, "Event-driven joint worker-task decisions made by the ADP coordinator."),
+    ("ADP Unassigned", "adp_wait_count", "count", False, "Legacy total of WAIT selections and workers left unassigned because no candidate was available."),
+    ("ADP Candidate-Present Unassigned", "adp_candidate_available_wait_count", "count", False, "Worker-action slots left unassigned even though that worker had a feasible candidate edge before joint conflict resolution."),
+    ("ADP No-Candidate", "adp_no_candidate_unassigned_count", "count", False, "Workers left unassigned because no candidate task was available."),
+    ("ADP Candidate Avg", "adp_avg_candidate_count", "float", True, "Average candidate task count per ADP decision epoch."),
+    ("ADP Inference", "adp_inference_latency_ms_avg", "float", False, "Average ADP value-search latency in milliseconds."),
     ("Product Lead Time", "completed_product_lead_time_avg_min", "minutes", False, "Average accepted-product completion time."),
+    ("Average Daily Products", "avg_daily_products", "float", True, "Accepted products normalized by the configured throughput days."),
+    ("Buffer Overflow Attempts", "buffer_overflow_attempt_count", "count", False, "Rejected queue writes that would have exceeded finite buffer capacity."),
+    ("Buffer Reservation Failures", "buffer_reservation_failure_count", "count", False, "Task assignments that could not reserve a destination buffer slot."),
+    ("Buffer Reservation Leaks", "buffer_reservation_leak_count", "count", False, "Inbound reservations left behind after the owning task ended."),
+    ("Blocked After Service", "machine_blocked_after_service_min", "minutes", False, "Machine-minutes spent holding completed output because its output buffer was full."),
+    ("Candidate Tasks Avg", "candidate_count_avg", "float", True, "Average number of feasible task candidates observed per candidate scan."),
+    ("Candidate Tasks Max", "candidate_count_max", "count", True, "Largest feasible candidate set observed in one scan."),
+    ("Initial Batch Materials", "initial_batch_material_count", "count", True, "Material instances registered in the fixed makespan batch."),
+    ("Initial Batch Terminal", "initial_batch_terminal_material_count", "count", True, "Initial material instances represented by accepted or disposed terminal outputs."),
+    ("Batch Progress", "initial_batch_progress_ratio", "ratio", True, "Share of initial material lineage that reached a terminal outcome."),
+    ("Batch Accepted", "initial_batch_accepted_product_count", "count", True, "Accepted terminal outputs containing initial-batch materials."),
+    ("Batch Disposed Scrap", "initial_batch_disposed_scrap_count", "count", False, "Initial-batch outputs physically delivered to ScrapDisposal."),
+    ("Batch Yield", "initial_batch_yield_ratio", "ratio", True, "Accepted outputs divided by accepted plus disposed batch outputs."),
 ]
 
 PRIMARY_METRIC_LOOKUP = {key: (label, key, kind, higher_is_better, description) for (label, key, kind, higher_is_better, description) in PRIMARY_METRICS}
 METRIC_GROUPS = {
     "shipyard": ["makespan_min", "completed_surface_tile_count", "surface_tile_completion_ratio", "rework_count", "quality_pass_rate"],
     "item": ["total_products", "disposed_scrap_count", "warehouse_material_shelf_count", "downstream_closure_ratio", "throughput_per_sim_hour", "completed_product_lead_time_avg_min"],
+    "flow_makespan": ["makespan_min", "initial_batch_progress_ratio", "initial_batch_material_count", "initial_batch_terminal_material_count", "initial_batch_accepted_product_count", "initial_batch_disposed_scrap_count", "initial_batch_yield_ratio"],
+    "flow_throughput": ["total_products", "throughput_per_sim_hour", "avg_daily_products", "warehouse_material_restock_count", "disposed_scrap_count", "downstream_closure_ratio"],
     "machine": ["machine_utilization", "machine_broken_ratio", "machine_pm_ratio", "wall_clock_sec"],
-    "worker": ["humanoid_execution_ratio_avg", "humanoid_blocked_ratio_avg", "humanoid_unavailable_ratio_avg", "worker_local_response_total", "commitment_dispatch_total"],
+    "buffer": [
+        "buffer_overflow_attempt_count",
+        "buffer_reservation_failure_count",
+        "buffer_reservation_leak_count",
+        "machine_blocked_after_service_min",
+        "candidate_count_avg",
+        "candidate_count_max",
+    ],
+    "worker": ["humanoid_execution_ratio_avg", "humanoid_blocked_ratio_avg", "humanoid_unavailable_ratio_avg", "battery_charge_count", "battery_charge_time_min", "worker_local_response_total", "commitment_dispatch_total"],
     "complexity": ["operational_task_complexity", "cumulative_operational_complexity_over_n_days"],
     "incidents": ["humanoid_incident_total", "humanoid_blocked_ratio_avg", "worker_local_response_total", "coordination_incident_total"],
     "collaboration": ["handover_item_count", "shared_product_carry_time_min", "shared_product_carry_ratio", "repair_helper_join_count", "repair_collaboration_time_min", "repair_collaboration_ratio", "repair_team_size_avg"],
@@ -79,6 +110,12 @@ METRIC_GROUPS = {
         "throughput_optimizer_failed_count",
         "throughput_optimizer_objective_avg",
         "bottleneck_score_avg",
+        "adp_decision_count",
+        "adp_wait_count",
+        "adp_candidate_available_wait_count",
+        "adp_no_candidate_unassigned_count",
+        "adp_avg_candidate_count",
+        "adp_inference_latency_ms_avg",
         "commitment_dispatch_total",
     ],
 }
@@ -128,6 +165,11 @@ def _format_configured_horizon(run_meta: dict[str, Any] | None) -> str:
 
 def _format_executed_until(daily_summary: list[dict[str, Any]], run_meta: dict[str, Any] | None) -> str:
     payload = run_meta if isinstance(run_meta, dict) else {}
+    elapsed_min = _safe_float(payload.get("sim_elapsed_min", 0.0), 0.0)
+    if elapsed_min > 0:
+        minutes_per_day = _safe_float(payload.get("minutes_per_day", 0.0), 0.0)
+        day = max(1, int(max(0.0, elapsed_min - 1e-9) // minutes_per_day) + 1) if minutes_per_day > 0 else 0
+        return f"Day {day} / {elapsed_min:.1f}m" if day else f"{elapsed_min:.1f}m"
     minutes_per_day = _safe_float(payload.get("minutes_per_day", 0.0), 0.0)
     completed_days = max((_safe_int((row if isinstance(row, dict) else {}).get("day", 0), 0) for row in daily_summary), default=0)
     if completed_days > 0 and minutes_per_day > 0:
@@ -265,8 +307,13 @@ def _summary_cards(kpi: dict[str, Any], metric_keys: list[str] | None = None) ->
 
 def _run_horizon_cards(kpi: dict[str, Any], daily_summary: list[dict[str, Any]], run_meta: dict[str, Any] | None) -> str:
     payload = run_meta if isinstance(run_meta, dict) else {}
+    objective_mode = str(kpi.get("objective_mode") or payload.get("objective_mode") or "").strip().lower()
     cards = [
-        ("Configured Horizon", _format_configured_horizon(payload), "Configured simulation horizon from run metadata."),
+        (
+            "Makespan Safety Limit" if objective_mode == "minimize_makespan" else "Configured Horizon",
+            _format_configured_horizon(payload),
+            "Maximum allowed duration for an incomplete batch." if objective_mode == "minimize_makespan" else "Configured simulation horizon from run metadata.",
+        ),
         ("Executed Until", _format_executed_until(daily_summary, payload), "How far the run actually progressed before stop."),
         (
             "Termination Reason",
@@ -421,6 +468,47 @@ def _traffic_table(kpi: dict[str, Any]) -> str:
     return "<div class='panel'><h2>Traffic Conflicts by Worker Pair</h2><p class='muted'>Pairs are recorded directly from AGENT_TRAFFIC_CONFLICT events.</p><table><thead><tr><th>Worker Pair</th><th>Conflicts</th></tr></thead><tbody>" + rows + "</tbody></table></div>"
 
 
+def _finite_buffer_table(kpi: dict[str, Any]) -> str:
+    capacities = kpi.get("buffer_capacities", {}) if isinstance(kpi.get("buffer_capacities", {}), dict) else {}
+    occupancy = kpi.get("buffer_max_occupancy", {}) if isinstance(kpi.get("buffer_max_occupancy", {}), dict) else {}
+    reservations = (
+        kpi.get("buffer_max_reserved_slots", {})
+        if isinstance(kpi.get("buffer_max_reserved_slots", {}), dict)
+        else {}
+    )
+    combined = (
+        kpi.get("buffer_max_committed_plus_reserved", {})
+        if isinstance(kpi.get("buffer_max_committed_plus_reserved", {}), dict)
+        else {}
+    )
+    rows = []
+    for buffer_id in sorted(capacities):
+        capacity = _safe_int(capacities.get(buffer_id))
+        max_combined = _safe_int(combined.get(buffer_id))
+        status = "OK" if capacity > 0 and max_combined <= capacity else "VIOLATION"
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(buffer_id))}</td>"
+            f"<td>{capacity}</td>"
+            f"<td>{_safe_int(occupancy.get(buffer_id))}</td>"
+            f"<td>{_safe_int(reservations.get(buffer_id))}</td>"
+            f"<td>{max_combined}</td>"
+            f"<td>{status}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='6'>This scenario does not use finite production buffers.</td></tr>")
+    return (
+        "<div class='panel'><h2>Finite Buffer Capacity</h2>"
+        "<p class='muted'>A destination slot is reserved when a task enters a worker queue. "
+        "The committed-plus-reserved maximum must never exceed capacity.</p>"
+        "<table><thead><tr><th>Buffer</th><th>Capacity</th><th>Max Occupancy</th>"
+        "<th>Max Inbound Reserved</th><th>Max Combined</th><th>Status</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
+    )
+
+
 def _rolling_horizon_table(kpi: dict[str, Any]) -> str:
     payload = kpi.get("rolling_horizon", {}) if isinstance(kpi.get("rolling_horizon", {}), dict) else {}
     dedicated_summary = (
@@ -433,6 +521,11 @@ def _rolling_horizon_table(kpi: dict[str, Any]) -> str:
         ("Dedicated Roles", "yes" if bool(payload.get("dedicated_roles", False)) else "no"),
         ("Throughput Optimizer", "yes" if bool(payload.get("throughput_optimizer", False)) else "no"),
         ("Window", f"{_safe_float(payload.get('window_min')):.1f} min"),
+        ("Scheduler", str(payload.get("scheduler_mode", "-"))),
+        ("Candidate Collection", str(payload.get("candidate_collection_mode", "-"))),
+        ("Strict Boundaries", str(_safe_int(payload.get("strict_boundary_count")))),
+        ("Late Boundaries", str(_safe_int(payload.get("late_boundary_count")))),
+        ("Max Boundary Lag", f"{_safe_float(payload.get('max_boundary_lag_min')):.6f} min"),
         ("Priority Scope", "HumanoidSim task_code"),
         ("Dispatch Policy", str(payload.get("dispatch_policy", "-"))),
         ("Optimizer Windows", str(_safe_int(payload.get("throughput_optimizer_window_count")))),
@@ -449,7 +542,7 @@ def _rolling_horizon_table(kpi: dict[str, Any]) -> str:
         ("A1 Battery Deliveries", str(_safe_int(dedicated_summary.get("battery_delivery_from_provider_count")))),
     ]
     body = "".join(f"<tr><td>{html.escape(label)}</td><td>{html.escape(value)}</td></tr>" for label, value in rows)
-    return "<div class='panel'><h2>Rolling Horizon Dispatch</h2><p class='muted'>This section is populated for rolling horizon modes, including the OR-Tools throughput optimizer.</p><table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>" + body + "</tbody></table></div>"
+    return "<div class='panel'><h2>Rolling Horizon Dispatch</h2><p class='muted'>Strict-periodic modes dispatch independently at exact window boundaries; low-battery service is the only immediate queue exception.</p><table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>" + body + "</tbody></table></div>"
 
 
 def _operational_complexity_table(kpi: dict[str, Any]) -> str:
@@ -546,6 +639,7 @@ def export_kpi_dashboard(
     dashboard_path = output_dir / "kpi_dashboard.html"
     scenario_type = str(kpi.get("scenario_type", "")).strip()
     is_shipyard = scenario_type == "shipyard_basic"
+    objective_mode = str(kpi.get("objective_mode", "")).strip().lower()
 
     days = [int(d["day"]) for d in daily_summary]
     daily_products = [float(d.get("products", 0.0) or 0.0) for d in daily_summary]
@@ -1179,10 +1273,19 @@ def export_kpi_dashboard(
             f"under scenario {scenario_label}. KPI cards and tables stay fixed above the charts, "
             "and the charts are split by topic so each one has its own legend."
         )
+    item_metric_group = (
+        "shipyard"
+        if is_shipyard
+        else "flow_makespan"
+        if scenario_type == "mfg_flow_shop" and objective_mode == "minimize_makespan"
+        else "flow_throughput"
+        if scenario_type == "mfg_flow_shop"
+        else "item"
+    )
     item_section = _group_section(
-        "Shipyard Surface Metrics" if is_shipyard else "Item Metrics",
-        "Ship exterior surface-tile completion, rework, quality, and makespan." if is_shipyard else "Production outcome, downstream closure, item flow, and queue waiting time.",
-        _summary_cards(kpi, METRIC_GROUPS["shipyard"] if is_shipyard else METRIC_GROUPS["item"]),
+        "Shipyard Surface Metrics" if is_shipyard else "Makespan Batch Metrics" if item_metric_group == "flow_makespan" else "Throughput Metrics" if item_metric_group == "flow_throughput" else "Item Metrics",
+        "Ship exterior surface-tile completion, rework, quality, and makespan." if is_shipyard else "Fixed initial-batch completion, terminal outcomes, and yield." if item_metric_group == "flow_makespan" else "Fixed-horizon production, daily replenishment, and throughput." if item_metric_group == "flow_throughput" else "Production outcome, downstream closure, item flow, and queue waiting time.",
+        _summary_cards(kpi, METRIC_GROUPS[item_metric_group]),
         "<div class='grid cards-2'>"
         + panel_figures["daily_products"]
         + panel_figures["daily_scrap_rate"]
@@ -1201,6 +1304,16 @@ def export_kpi_dashboard(
         + panel_figures["machine_utilization"]
         + panel_figures["machine_state_minutes"]
         + "</div>",
+    )
+    buffer_section = (
+        _group_section(
+            "Finite Buffer Flow",
+            "Capacity, inbound reservations, blocked-after-service time, and candidate richness for the parallel-machine flow shop.",
+            _summary_cards(kpi, METRIC_GROUPS["buffer"]),
+            "<div class='grid cards-2'>" + _finite_buffer_table(kpi) + "</div>",
+        )
+        if scenario_type == "mfg_flow_shop"
+        else ""
     )
     worker_section = _group_section(
         "Worker Metrics",
@@ -1274,6 +1387,7 @@ def export_kpi_dashboard(
         _series_snapshot(manifest, current_run_id, kpi)
         + _run_horizon_cards(kpi, daily_summary, (current_run.get("run_meta", {}) if isinstance(current_run, dict) and isinstance(current_run.get("run_meta", {}), dict) else {}))
         + item_section
+        + buffer_section
         + machine_section
         + worker_section
         + complexity_section

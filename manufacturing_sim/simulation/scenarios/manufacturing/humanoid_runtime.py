@@ -13,12 +13,15 @@ TASK_CODE_BY_PRIORITY_KEY: dict[str, str] = {
     "material_supply": "REPLENISH_MATERIAL",
     "inter_station_transfer": "TRANSFER",
     "battery_swap": "MANAGE_ROBOT_POWER",
+    "battery_charge": "MANAGE_ROBOT_POWER",
     "battery_delivery_low_battery": "TRANSFER",
     "battery_delivery_discharged": "TRANSFER",
     "load_machine": "LOAD_MACHINE",
     "setup_machine": "SETUP_MACHINE",
     "unload_machine": "UNLOAD_MACHINE",
     "inspect_product": "INSPECT_PRODUCT",
+    "load_inspection_desk": "LOAD_UNLOAD_TRANSFER_INTERFACE",
+    "unload_inspection_desk": "LOAD_UNLOAD_TRANSFER_INTERFACE",
     "repair_machine": "REPAIR_MACHINE",
     "preventive_maintenance": "PREVENTIVE_MAINTENANCE",
     "handover_item": "HANDOVER_ITEM_TO_ROBOT",
@@ -27,24 +30,28 @@ TASK_CODE_BY_PRIORITY_KEY: dict[str, str] = {
 
 
 DOMAIN_ACTION_CALLS: dict[str, set[str]] = {
+    "REPLENISH_MATERIAL": {"GRASP"},
     "TRANSFER": {"GRASP"},
     "MANAGE_ROBOT_POWER": {"EXECUTE_SYSTEM_ACTION"},
     "LOAD_MACHINE": {"EXECUTE_MACHINE_ACTION"},
     "SETUP_MACHINE": {"EXECUTE_MACHINE_ACTION"},
     "UNLOAD_MACHINE": {"EXECUTE_MACHINE_ACTION"},
     "INSPECT_PRODUCT": {"EXECUTE_QUALITY_ACTION"},
+    "LOAD_UNLOAD_TRANSFER_INTERFACE": set(),
     "REPAIR_MACHINE": {"EXECUTE_MAINTENANCE_ACTION"},
-    "PREVENTIVE_MAINTENANCE": {"EXECUTE_MAINTENANCE_ACTION"},
+    "PREVENTIVE_MAINTENANCE": {"INSPECT_OR_DIAGNOSE"},
     "HANDOVER_ITEM_TO_ROBOT": {"EXECUTE_ROBOT_COLLABORATION_ACTION"},
-    "COLLECT_WASTE_OR_SCRAP": set(),
+    "COLLECT_WASTE_OR_SCRAP": {"GRASP"},
 }
 
 
-NESTED_DOMAIN_ACTION_CHILD_CALLS: dict[str, set[str]] = {
-    "REPLENISH_MATERIAL": {"TRANSFER"},
-    "PREVENTIVE_MAINTENANCE": {"INSPECT_MACHINE"},
-    "COLLECT_WASTE_OR_SCRAP": {"TRANSFER"},
+STEPWISE_DOMAIN_TASK_CODES = {
+    "LOAD_UNLOAD_TRANSFER_INTERFACE",
+    "INSPECT_PRODUCT",
 }
+
+
+NESTED_DOMAIN_ACTION_CHILD_CALLS: dict[str, set[str]] = {}
 
 
 SUPPORTED_PRIMITIVE_CALLS: set[str] = {
@@ -260,6 +267,8 @@ class HumanoidTaskRuntime:
         task_context = task or self._task_from_worker(worker)
         event_metadata = self._state_metadata(worker, reason=reason_code, task_id=getattr(task_context, "task_id", None), source=source)
         event_metadata["cargo_present"] = bool(worker.carrying_item_id or getattr(worker, "carrying_item_ids", []))
+        if task is not None:
+            event_metadata["destination"] = self._task_destination(task)
         event_metadata.update(dict(metadata or {}))
         transition_event = event_cls(
             event_type=event_type,
@@ -281,6 +290,35 @@ class HumanoidTaskRuntime:
                 f"primitive={transition_event.primitive_call_code}: {exc}"
             ) from exc
         worker.humanoid_state = self._normalize_state_payload(worker, snapshot.to_dict())
+
+    @staticmethod
+    def _task_destination(task: Task) -> str:
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        args = task.args if isinstance(task.args, dict) else {}
+        task_code = str(task.task_code or task.task_type or "").strip().upper()
+        if task_code in {
+            "LOAD_MACHINE",
+            "SETUP_MACHINE",
+            "UNLOAD_MACHINE",
+            "REPAIR_MACHINE",
+            "PREVENTIVE_MAINTENANCE",
+        }:
+            return str(payload.get("machine_id") or args.get("machine") or task.location or "")
+        if task_code == "MANAGE_ROBOT_POWER":
+            return str(
+                payload.get("charging_dock_id")
+                or payload.get("target_agent_id")
+                or args.get("station")
+                or task.location
+                or ""
+            )
+        return str(
+            payload.get("destination")
+            or payload.get("target_agent_id")
+            or args.get("destination")
+            or task.location
+            or ""
+        )
 
     def apply_transition_event(self, worker: Worker, transition_event: Any) -> None:
         if not self.enabled:
@@ -594,11 +632,22 @@ class HumanoidTaskRuntime:
                     "quantity": 1,
                 }
             )
+            rule = {"station": station}
+            if bool(getattr(self.world, "is_mfg_flow_shop", False)):
+                rule["supply_policy"] = "machine_demand"
+            else:
+                inventory_targets = getattr(self.world, "inventory_targets", {})
+                material_targets = (
+                    inventory_targets.get("material", {})
+                    if isinstance(inventory_targets, dict)
+                    else {}
+                )
+                rule["target_level"] = material_targets.get(f"station{station}")
             return {
                 "item": item_ref,
                 "source": "Warehouse",
                 "destination": f"material_queue_{station}",
-                "rule": {"station": station, "target_level": self.world.inventory_targets.get("material", {}).get(f"station{station}")},
+                "rule": rule,
             }
         if task_code == "TRANSFER":
             transfer_kind = str(payload.get("transfer_kind", "")).strip().lower()
@@ -621,7 +670,14 @@ class HumanoidTaskRuntime:
                 "destination": destination,
             }
         if task_code == "MANAGE_ROBOT_POWER":
-            return {"robot": agent.agent_id, "action": "swap_battery", "station": "battery_rack", "target_soc": 1.0}
+            action = str(payload.get("action") or "swap_battery").strip().lower()
+            station = str(payload.get("charging_dock_id") or payload.get("station") or "battery_rack")
+            return {
+                "robot": agent.agent_id,
+                "action": action,
+                "station": station,
+                "target_soc": float(payload.get("target_soc", 1.0) or 1.0),
+            }
         if task_code == "LOAD_MACHINE":
             item_id = str(payload.get("item_id") or payload.get("material_id") or payload.get("intermediate_id") or "")
             item_type = str(payload.get("item_type") or ("intermediate" if payload.get("load_slot") == "intermediate" else "material"))
@@ -643,12 +699,22 @@ class HumanoidTaskRuntime:
             }
         if task_code == "INSPECT_PRODUCT":
             return {
-                "target": payload.get("inspection_product_id") or "inspection_input_queue",
+                "target": payload.get("inspection_product_id") or "inspection_desk_item",
+                "workstation": str(payload.get("workstation") or self.world.inspection_workstation_id),
                 "inspection_plan": {
                     "station": self.world.inspection_queue_station,
                     "defect_prob": self.world.quality_cfg.get("defect_prob"),
                     "base_time_min": self.world.inspection_base_time_min,
                 },
+            }
+        if task_code == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+            item_id = str(payload.get("inspection_product_id") or payload.get("item_id") or "")
+            return {
+                "item": {"entity_type": "product", "entity_id": item_id},
+                "interface": str(payload.get("interface") or self.world.inspection_workstation_id),
+                "action": str(payload.get("interface_action") or payload.get("action") or ""),
+                "source": str(payload.get("source") or ""),
+                "destination": str(payload.get("destination") or ""),
             }
         if task_code == "REPAIR_MACHINE":
             return {
@@ -731,7 +797,7 @@ class HumanoidTaskRuntime:
             task = bound
 
         self._log_task_event("HUMANOID_TASK_START", agent, task, status="running")
-        executed_domain_action = False
+        executed_domain_action = str(task.task_code).strip().upper() in STEPWISE_DOMAIN_TASK_CODES
         success = True
         end_status = "failed"
         end_logged = False
@@ -799,9 +865,10 @@ class HumanoidTaskRuntime:
                 agent.current_primitive_call_code = call_code
                 active_step = step
                 active_context_task = context_task
+                self._prepare_step_timing(task, step)
                 self._log_step_event("HUMANOID_STEP_START", agent, context_task, step, status="running", parent_task=task)
-                step_ok = yield from self._execute_step(agent, task, step, executed_domain_action, allow_domain_action=not bool(active_children))
-                if not active_children and self._is_domain_action_step(task, call_code):
+                step_ok = yield from self._execute_step(agent, task, step, executed_domain_action, allow_domain_action=True)
+                if self._is_domain_action_step(task, call_code):
                     executed_domain_action = True
                 self._log_step_event("HUMANOID_STEP_END", agent, context_task, step, status="completed" if step_ok else "failed", parent_task=task)
                 active_step = None
@@ -878,6 +945,7 @@ class HumanoidTaskRuntime:
             agent.current_child_task_instance_id = None
             agent.current_task_path = None
             agent.current_task_depth = 0
+            task.payload.pop("_battery_charge_completed", None)
             if not end_logged and not agent.discharged:
                 self._log_task_event("HUMANOID_TASK_END", agent, task, status=end_status)
 
@@ -891,25 +959,64 @@ class HumanoidTaskRuntime:
         allow_domain_action: bool = True,
     ):
         call_code = str(step.get("call_code", ""))
+        step_path = str(step.get("path", ""))
+        timing_details = self._prepare_step_timing(task, step)
+        target_duration = float(timing_details.get("sampled_duration_min", 0.0) or 0.0)
+        task.payload["_active_primitive_timing"] = {
+            "task_code": task.task_code,
+            "step_path": step_path,
+            **timing_details,
+        }
         start_t = float(self.world.env.now)
         result = True
-        if allow_domain_action and self._is_domain_action_step(task, call_code) and not executed_domain_action:
-            result = bool((yield from self.world._execute_task_domain_action(agent, task)))
-        elif call_code in {"READ_MACHINE_STATE", "VERIFY_MACHINE_STATE"} and task.payload.get("machine_id"):
-            result = str(task.payload.get("machine_id")) in self.world.machines
-        elif call_code in {"CHECK_SAFETY_ZONE", "REACH_TO", "VERIFY_LOCKOUT_IF_REQUIRED"}:
-            result = True
-        elif call_code in {"LOCALIZE_OBJECT", "PRIMITIVE_IDENTIFY_ITEM"}:
-            result = not self.world._maybe_random_humanoid_step_incident(agent, task, step, call_code)
-        elif call_code in {"GRASP"}:
-            result = not self.world._maybe_random_humanoid_step_incident(agent, task, step, call_code)
-        elif call_code in {"LOG_RESULT", "UPDATE_RECORD", "CREATE_OR_UPDATE_RECORD", "RECORD_RESULT"}:
-            result = True
-        elapsed = max(0.0, float(self.world.env.now) - start_t)
-        remaining = self._primitive_min_duration(call_code) - elapsed
-        if remaining > 1e-9:
-            yield self.world.env.timeout(remaining)
+        try:
+            if str(task.task_code).strip().upper() in STEPWISE_DOMAIN_TASK_CODES:
+                result = bool((yield from self.world._execute_inspection_task_primitive(agent, task, step)))
+            elif allow_domain_action and self._is_domain_action_step(task, call_code) and not executed_domain_action:
+                result = bool((yield from self.world._execute_task_domain_action(agent, task)))
+            elif call_code in {"READ_MACHINE_STATE", "VERIFY_MACHINE_STATE"} and task.payload.get("machine_id"):
+                result = str(task.payload.get("machine_id")) in self.world.machines
+            elif call_code in {"CHECK_SAFETY_ZONE", "REACH_TO", "VERIFY_LOCKOUT_IF_REQUIRED"}:
+                result = True
+            elif call_code in {"LOCALIZE_OBJECT", "PRIMITIVE_IDENTIFY_ITEM"}:
+                result = not self.world._maybe_random_humanoid_step_incident(agent, task, step, call_code)
+            elif call_code in {"GRASP"}:
+                result = not self.world._maybe_random_humanoid_step_incident(agent, task, step, call_code)
+            elif call_code in {"LOG_RESULT", "UPDATE_RECORD", "CREATE_OR_UPDATE_RECORD", "RECORD_RESULT"}:
+                result = True
+            elapsed = max(0.0, float(self.world.env.now) - start_t)
+            domain_managed_duration = bool(task.payload.pop("_domain_action_duration_complete", False))
+            remaining = 0.0 if domain_managed_duration else target_duration - elapsed
+            if remaining > 1e-9:
+                yield self.world.env.timeout(remaining)
+        finally:
+            task.payload.pop("_active_primitive_timing", None)
         return bool(result)
+
+    def _prepare_step_timing(self, task: Task, step: dict[str, Any]) -> dict[str, Any]:
+        existing = step.get("_timing")
+        if isinstance(existing, dict):
+            return existing
+        call_code = str(step.get("call_code", ""))
+        step_path = str(step.get("path", ""))
+        duration_resolver = getattr(self.world, "resolve_primitive_duration", None)
+        if callable(duration_resolver):
+            target_duration = float(duration_resolver(task, step) or 0.0)
+        else:
+            target_duration = self._primitive_min_duration(call_code)
+        timing_entry = getattr(getattr(self.world, "timing", None), "step_entry", None)
+        timing_details: dict[str, Any] = {
+            "sampled_duration_min": target_duration,
+            "timing_model": "duration" if target_duration > 0.0 else "movement",
+        }
+        if callable(timing_entry):
+            entry = timing_entry(task.task_code, step_path)
+            distribution = entry.get("distribution")
+            timing_details["timing_model"] = str(entry.get("timing_model", "duration"))
+            if distribution is not None:
+                timing_details["distribution"] = distribution.to_dict()
+        step["_timing"] = timing_details
+        return timing_details
 
     def _finish_internal_primitive_before_interrupted_step(
         self,
@@ -999,6 +1106,11 @@ class HumanoidTaskRuntime:
         return isinstance(getattr(agent, "pending_recovery_incident", None), dict)
 
     def _execute_recovery_after_failure(self, agent: Worker, task: Task, step: dict[str, Any] | None = None):
+        incident = getattr(agent, "pending_recovery_incident", None)
+        if not str((task.payload or {}).get("failure_reason", "") or "").strip() and isinstance(incident, dict):
+            incident_code = str(incident.get("incident_code", "") or "").strip().upper()
+            if incident_code:
+                task.payload["failure_reason"] = incident_code
         self._ensure_pending_recovery_incident_for_failure(agent, task, step)
         result = yield from self._execute_pending_recovery_protocol(agent, task)
         return result
@@ -1259,6 +1371,8 @@ class HumanoidTaskRuntime:
             self._finish_internal_primitive_before_interrupted_step(agent, task, step, status=status)
         if str(step.get("call_level", "PRIMITIVE_SKILL") or "PRIMITIVE_SKILL") == "PRIMITIVE_SKILL":
             self.set_step_state(agent, task, step, event_type=event_type, status=status)
+            if bool(task.payload.get("_battery_charge_completed", False)):
+                self.world._sync_humanoid_power_state(agent)
         details = self._task_event_details(agent, task, status=status)
         details.update(
             {
@@ -1273,6 +1387,9 @@ class HumanoidTaskRuntime:
                 "error": error,
             }
         )
+        timing = step.get("_timing")
+        if isinstance(timing, dict):
+            details["timing"] = copy.deepcopy(timing)
         self.world.logger.log(
             t=self.world.env.now,
             day=self.world.day_for_time(self.world.env.now),

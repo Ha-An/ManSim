@@ -1,12 +1,187 @@
-# Rolling horizon with dedicated humanoid roles.
-# Task opportunities are still pooled by rolling window, but each worker only
-# sees the HumanoidSim task codes assigned below. Lower list position means
-# higher priority for that worker; unresolved tasks age upward by window count.
+# Policy axes for mfg_flow_shop:
+#   dispatch timing: rolling horizon (pool and dispatch every 5 minutes)
+#   role ownership:  dedicated (roles 1-16 have one fixed worker owner)
+# At each window, new and unstarted queued tasks are reconsidered, but each task
+# can be assigned only to its pre-run owner. Running tasks are not preempted.
 mode: rolling_horizon_dedicated_roles
 
+mfg_flow_shop_policy:
+  # Roles 1-16 are exclusive production rules. Role 17 is worker self-service,
+  # and role 18 is collaborative and available to every worker.
+  validation: error
+  task_rules:
+    - role_number: 1
+      id: replenish_s1_material
+      display_name: REPLENISH_MATERIAL (to Station 1)
+      task_code: REPLENISH_MATERIAL
+      kind: exclusive
+      owner: auto
+      match: {transfer_kind: material_supply, station: 1}
+    - role_number: 2
+      id: replenish_s2_material
+      display_name: REPLENISH_MATERIAL (to Station 2)
+      task_code: REPLENISH_MATERIAL
+      kind: exclusive
+      owner: auto
+      match: {transfer_kind: material_supply, station: 2}
+    - role_number: 3
+      id: transfer_s1_to_s2
+      display_name: TRANSFER (Station 1 to Station 2)
+      task_code: TRANSFER
+      kind: exclusive
+      owner: auto
+      match: {transfer_kind: inter_station, from_station: 1}
+    - role_number: 4
+      id: transfer_s2_to_inspection
+      display_name: TRANSFER (Station 2 to Inspection)
+      task_code: TRANSFER
+      kind: exclusive
+      owner: auto
+      match: {transfer_kind: inter_station, from_station: 2}
+    - role_number: 5
+      id: transfer_inspection_to_completed
+      display_name: TRANSFER (Inspection to CompletedProducts)
+      task_code: TRANSFER
+      kind: exclusive
+      owner: auto
+      match: {transfer_kind: inter_station, from_station: 4}
+    - role_number: 6
+      id: dispose_inspection_scrap
+      display_name: COLLECT_WASTE_OR_SCRAP
+      task_code: COLLECT_WASTE_OR_SCRAP
+      kind: exclusive
+      owner: auto
+      match: {priority_key: scrap_disposal}
+    - role_number: 7
+      id: load_s1_material
+      display_name: LOAD_MACHINE (Station 1, material)
+      task_code: LOAD_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 1, load_slot: material}
+    - role_number: 8
+      id: load_s2_material
+      display_name: LOAD_MACHINE (Station 2, material)
+      task_code: LOAD_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 2, load_slot: material}
+    - role_number: 9
+      id: load_s2_intermediate
+      display_name: LOAD_MACHINE (Station 2, intermediate)
+      task_code: LOAD_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 2, load_slot: intermediate}
+    - role_number: 10
+      id: setup_s1
+      display_name: SETUP_MACHINE (Station 1)
+      task_code: SETUP_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 1}
+    - role_number: 11
+      id: setup_s2
+      display_name: SETUP_MACHINE (Station 2)
+      task_code: SETUP_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 2}
+    - role_number: 12
+      id: unload_s1
+      display_name: UNLOAD_MACHINE (Station 1)
+      task_code: UNLOAD_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 1}
+    - role_number: 13
+      id: unload_s2
+      display_name: UNLOAD_MACHINE (Station 2)
+      task_code: UNLOAD_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 2}
+    - role_number: 14
+      id: load_inspection_desk
+      display_name: LOAD_UNLOAD_TRANSFER_INTERFACE (load inspection desk)
+      task_code: LOAD_UNLOAD_TRANSFER_INTERFACE
+      kind: exclusive
+      owner: auto
+      match: {interface_action: load}
+    - role_number: 15
+      id: inspect_product
+      display_name: INSPECT_PRODUCT
+      task_code: INSPECT_PRODUCT
+      kind: exclusive
+      owner: auto
+      match: {}
+    - role_number: 16
+      id: unload_inspection_desk
+      display_name: LOAD_UNLOAD_TRANSFER_INTERFACE (unload inspection desk)
+      task_code: LOAD_UNLOAD_TRANSFER_INTERFACE
+      kind: exclusive
+      owner: auto
+      match: {interface_action: unload}
+    - role_number: 17
+      id: battery_charge
+      display_name: MANAGE_ROBOT_POWER
+      task_code: MANAGE_ROBOT_POWER
+      kind: self_service
+      owner: auto
+      match: {priority_key: battery_charge}
+    - role_number: 18
+      id: repair_machine
+      display_name: REPAIR_MACHINE
+      task_code: REPAIR_MACHINE
+      kind: collaborative
+      owner: auto
+      match: {priority_key: repair_machine}
+
+  # The priority order is deliberately identical to the other three policies.
+  # It orders a worker's eligible tasks but does not override role ownership.
+  priority_order:
+    - battery_charge
+    - repair_machine
+    - dispose_inspection_scrap
+    - unload_inspection_desk
+    - unload_s2
+    - unload_s1
+    - transfer_inspection_to_completed
+    - inspect_product
+    - load_inspection_desk
+    - transfer_s2_to_inspection
+    - load_s2_intermediate
+    - load_s2_material
+    - setup_s2
+    - transfer_s1_to_s2
+    - load_s1_material
+    - setup_s1
+    - replenish_s2_material
+    - replenish_s1_material
+
+  # Build the role table once before simulation: longest expected workloads are
+  # assigned first to the currently least-loaded worker (deterministic LPT).
+  # No role is dynamically moved to another worker during the run.
+  dedicated_roles:
+    assignment_strategy: workload_balanced_lpt
+    generated_at: pre_run_once
+    overflow_policy: idle_extra_workers
+    # Optional per-rule inputs for experiments. Empty maps use model estimates.
+    expected_count_overrides: {}
+    expected_duration_overrides_min: {}
+
 rolling_horizon:
+  # mfg_flow_shop overrides the legacy generic dispatch policy with fixed
+  # granular priority. Aging is zero; only low battery bypasses a boundary.
   window_min: 5.0
+  scheduler_mode: strict_periodic
+  candidate_collection_mode: event_with_boundary_reconciliation
   dispatch_policy: dedicated_role_aging_priority
+  scenario_dispatch_policy:
+    mfg_flow_shop: dedicated_role_fixed_priority
+  # The maps below support other scenarios that also select this decision mode.
+  # They are not the mfg_flow_shop role table; mfg_flow_shop uses the 18 rules
+  # and the LPT ownership generated above.
   scenario_worker_task_priority:
     factory_mfg_basic:
       A1:
@@ -19,6 +194,7 @@ rolling_horizon:
       A3:
         - MANAGE_ROBOT_POWER
         - TRANSFER
+        - LOAD_UNLOAD_TRANSFER_INTERFACE
         - INSPECT_PRODUCT
         - COLLECT_WASTE_OR_SCRAP
         - PREVENTIVE_MAINTENANCE
@@ -42,6 +218,9 @@ rolling_horizon:
   worker_task_priority: {}
   aging:
     rank_boost_per_window: 1
+  scenario_aging:
+    mfg_flow_shop:
+      rank_boost_per_window: 0
   immediate_task_triggers:
     enabled: true
     # Event-triggered tasks are queued ahead of normal rolling-horizon work.
@@ -52,10 +231,10 @@ rolling_horizon:
     event_task_codes:
       worker_low_battery:
         - MANAGE_ROBOT_POWER
-      machine_broken:
-        - REPAIR_MACHINE
 
 battery:
+  # mfg_flow_shop uses direct self-charging, so delivery provider/receiver lists
+  # below are ignored there and remain only for compatible legacy scenarios.
   low_threshold_ratio: 0.30
   delivery_provider_agent_ids: [A3]
   delivery_receiver_agent_ids: [A1, A2]

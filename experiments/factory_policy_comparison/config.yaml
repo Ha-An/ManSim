@@ -1,30 +1,43 @@
-# Factory scenario policy comparison experiment.
-scenario: factory_mfg_basic
+# mfg_flow_shop policy, fleet-size, and objective comparison experiment.
+scenario: mfg_flow_shop
 horizon_days: 5
-minutes_per_day: 240
+makespan_max_sim_days: 30
+minutes_per_day: 480
 
-seeds: [2026, 2027, 2028, 2029, 2030]
-worker_counts: [3, 4, 5, 6, 7, 8]
+objective_modes:
+  - maximize_throughput
+  - minimize_makespan
+
+seeds: [2026]
+worker_counts: [3, 4, 5, 6]
 
 modes:
-  - fixed_priority
-  - adaptive_priority
-  - rolling_horizon_aging_priority
+  - immediate_shared
+  - immediate_dedicated_roles
+  - rolling_horizon_shared
   - rolling_horizon_dedicated_roles
-  - bottleneck_aware_dispatch
-  - rolling_horizon_throughput_optimizer
 
 common_overrides:
   - runtime.ui.auto_open_results=false
   - runtime.ui.auto_start_replay_studio_3d=false
 
 metrics:
-  productivity:
+  objective:
+    - objective_status
     - total_products
     - throughput_per_sim_hour
     - avg_daily_products
-    - completed_product_lead_time_avg_min
+    - warehouse_material_restock_count
+    - makespan_min
+    - makespan_status
+    - initial_batch_material_count
+    - initial_batch_terminal_material_count
+    - initial_batch_progress_ratio
+    - initial_batch_accepted_product_count
+    - initial_batch_disposed_scrap_count
+    - initial_batch_yield_ratio
   flow:
+    - completed_product_lead_time_avg_min
     - downstream_closure_ratio
     - avg_wip_material
     - avg_wip_intermediate
@@ -54,7 +67,3 @@ metrics:
     - rolling_horizon_stale_skipped_task_count
     - rolling_horizon_requeued_task_count
     - rolling_horizon_max_worker_queue_length
-    - throughput_optimizer_solved_count
-    - throughput_optimizer_failed_count
-    - throughput_optimizer_objective_avg
-    - bottleneck_score_avg

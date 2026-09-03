@@ -1,0 +1,76 @@
+scenario: mfg_flow_shop
+objective_mode: maximize_throughput
+horizon_days: 1
+worker_counts: [3]
+base_seed: 72026
+
+seed_partitions:
+  enforce_disjoint: true
+  training_evaluation: [72026]
+  screening_validation: [172026]
+  final_selection_validation: [172027]
+  held_out_test: [272026]
+
+diagnostics:
+  fixed_action_probe:
+    enabled: true
+    seeds: [372026]
+    decision_thresholds: [5]
+    candidates_per_state: 2
+
+algorithm:
+  return_estimator: monte_carlo
+  n_step_enabled: false
+  td_bootstrap_enabled: false
+  initial_policy: uniform_random_feasible_with_wait
+  allow_wait_action: true
+
+training:
+  initial_random_episodes: 2
+  policy_iterations: 1
+  episodes_per_iteration: 2
+  replay_scope: current_iteration
+  compact_episode_tensors: true
+  release_samples_after_update: true
+  validation_episode_fraction: 0.5
+  epsilon_start: 0.2
+  epsilon_end: 0.1
+  max_review_interval_min: 1.0
+  gamma: 1.0
+  batch_size: 64
+  learning_rate: 0.00005
+  loss_type: mse
+  gradient_clip: 0.5
+  max_epochs_per_iteration: 1
+  early_stopping_patience: 1
+
+validation:
+  combined_checkpoint_evaluation: true
+  screening_interval_iterations: 1
+  screening_include_initial: true
+  train_eval_seed_count: 1
+  screening_seed_count: 1
+  final_candidate_count: 1
+  final_selection_seed_count: 1
+
+model:
+  embedding_dim: 32
+  heads: 4
+  layers: 1
+  beam_width: 8
+
+rollout:
+  parallel: true
+  process_count: 2
+  wave_size: 2
+  device: cpu
+  start_method: spawn
+  torch_threads_per_process: 1
+  deterministic_result_merge: true
+
+runtime:
+  device: cpu
+  require_cuda_training: false
+  output_root: outputs/adp_training_smoke
+  auto_open_dashboard: false
+  retain_episode_events: false

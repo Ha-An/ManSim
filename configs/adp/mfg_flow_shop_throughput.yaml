@@ -1,0 +1,67 @@
+scenario: mfg_flow_shop
+objective_mode: maximize_throughput
+horizon_days: 5
+worker_counts: [3]
+base_seed: 2026
+
+seed_partitions:
+  enforce_disjoint: true
+  screening_validation: [102626, 102627, 102628, 102629, 102630, 102631, 102632, 102633, 102634, 102635]
+  final_selection_validation: [102646, 102647, 102648, 102649, 102650, 102651, 102652, 102653, 102654, 102655, 102656, 102657, 102658, 102659, 102660, 102661, 102662, 102663, 102664, 102665, 102666, 102667, 102668, 102669, 102670]
+  held_out_test: [50001, 50002, 50003, 50004, 50005]
+
+algorithm:
+  return_estimator: monte_carlo
+  n_step_enabled: false
+  td_bootstrap_enabled: false
+  initial_policy: uniform_random_feasible_no_wait
+  allow_wait_action: false
+
+training:
+  # Use fewer, more conservative policy updates with a larger on-policy MC batch.
+  initial_random_episodes: 100
+  policy_iterations: 15
+  episodes_per_iteration: 100
+  replay_scope: current_iteration
+  compact_episode_tensors: true
+  release_samples_after_update: true
+  validation_episode_fraction: 0.10
+  epsilon_start: 0.20
+  epsilon_end: 0.10
+  max_review_interval_min: 1.0
+  gamma: 1.0
+  batch_size: 512
+  learning_rate: 0.00005
+  loss_type: mse
+  gradient_clip: 0.5
+  max_epochs_per_iteration: 3
+  early_stopping_patience: 2
+
+validation:
+  # Spend the validation budget on more reliable checkpoint comparisons.
+  screening_interval_iterations: 2
+  screening_seed_count: 10
+  final_candidate_count: 3
+  final_selection_seed_count: 25
+
+model:
+  embedding_dim: 128
+  heads: 4
+  layers: 3
+  beam_width: 64
+
+rollout:
+  parallel: true
+  process_count: 20
+  wave_size: 20
+  device: cpu
+  start_method: spawn
+  torch_threads_per_process: 1
+  deterministic_result_merge: true
+
+runtime:
+  device: cuda:0
+  require_cuda_training: true
+  output_root: outputs/adp_training
+  auto_open_dashboard: true
+  retain_episode_events: false

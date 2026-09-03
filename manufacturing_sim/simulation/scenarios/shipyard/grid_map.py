@@ -588,7 +588,7 @@ class ShipyardTileGridMap:
         if start == goal:
             return [start]
         if start not in allowed or goal not in allowed:
-            return [start, goal]
+            return []
 
         def reconstruct(came_from: dict[Tile, Tile | None]) -> list[Tile] | None:
             if goal not in came_from:
@@ -623,7 +623,7 @@ class ShipyardTileGridMap:
         # though the lane anchor is connected. Preserve visible lane movement
         # instead of exporting a start->goal jump.
         path = search(enforce_footprint=False)
-        return path if path is not None else [start, goal]
+        return path if path is not None else []
 
     def tile_payload(self, tile: Tile | None) -> dict[str, int] | None:
         return None if tile is None else {"x": int(tile[0]), "y": int(tile[1])}

@@ -96,6 +96,11 @@ def _format_sim_time(run_meta: dict[str, Any] | None) -> str:
 
 def _format_executed_until(kpi: dict[str, Any], run_meta: dict[str, Any] | None) -> str:
     payload = run_meta if isinstance(run_meta, dict) else {}
+    elapsed_min = _safe_float(kpi.get("sim_elapsed_min", payload.get("sim_elapsed_min", 0.0)))
+    if elapsed_min > 0:
+        minutes_per_day = _safe_float(payload.get("minutes_per_day", 0.0))
+        day = max(1, int(max(0.0, elapsed_min - 1e-9) // minutes_per_day) + 1) if minutes_per_day > 0 else 0
+        return f"Day {day} / {elapsed_min:.1f}m" if day else f"{elapsed_min:.1f}m"
     daily_rows = []
     if isinstance(kpi.get("daily_summary_rows", []), list):
         daily_rows = kpi.get("daily_summary_rows", [])
@@ -120,7 +125,28 @@ def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) 
     scenario_type = str(kpi.get("scenario_type") or payload.get("scenario_type") or "").strip()
     scenario_label = scenario_type or "-"
     decision_mode = str(payload.get("decision_mode") or kpi.get("decision_mode") or "").strip().lower()
-    if scenario_type == "shipyard_basic":
+    objective_mode = str(kpi.get("objective_mode") or payload.get("objective_mode") or "").strip().lower()
+    if scenario_type == "mfg_flow_shop" and objective_mode == "minimize_makespan":
+        output_card = (
+            "Batch Makespan",
+            _format_optional_value(kpi.get("makespan_min"), "minutes"),
+            "Elapsed time until every initial material reaches an accepted product or disposed scrap.",
+        )
+        lead_time_card = (
+            "Batch Progress",
+            _format_value(_safe_float(kpi.get("initial_batch_progress_ratio")), "ratio"),
+            "Share of initial warehouse material lineage that reached a terminal outcome.",
+        )
+        input_wait_card = (
+            "Batch Yield",
+            _format_value(_safe_float(kpi.get("initial_batch_yield_ratio")), "ratio"),
+            "Accepted outputs divided by accepted plus disposed batch outputs.",
+        )
+    elif scenario_type == "mfg_flow_shop" and objective_mode == "maximize_throughput":
+        output_card = ("Total Products", _format_value(_safe_float(kpi.get("total_products")), "count"), "Accepted products completed during the configured horizon.")
+        lead_time_card = ("Throughput / Sim Hour", _format_value(_safe_float(kpi.get("throughput_per_sim_hour")), "float"), "Accepted products normalized by simulated hour.")
+        input_wait_card = ("Average Daily Products", _format_value(_safe_float(kpi.get("avg_daily_products")), "float"), "Accepted products normalized by configured throughput days.")
+    elif scenario_type == "shipyard_basic":
         output_card = (
             "Completed Surface Tiles",
             _format_value(_safe_float(kpi.get("completed_surface_tile_count", kpi.get("completed_section_count", kpi.get("total_products")))), "count"),
@@ -159,10 +185,55 @@ def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) 
         ("Machine Broken Ratio", _format_value(_safe_float(kpi.get("machine_broken_ratio")), "ratio"), "Share of machine time lost to breakdown."),
         ("Machine PM Ratio", _format_value(_safe_float(kpi.get("machine_pm_ratio")), "ratio"), "Share of machine time spent on preventive maintenance."),
         ("Wall Clock", str(payload.get("wall_clock_human", "")).strip() or str(kpi.get("wall_clock_human", "")).strip() or "-", "Actual elapsed execution time for this simulation run."),
-        ("Configured Horizon", _format_sim_time(payload), "Configured simulation horizon for this run."),
+        (
+            "Makespan Safety Limit" if objective_mode == "minimize_makespan" else "Configured Horizon",
+            _format_sim_time(payload),
+            "Maximum allowed simulation duration for an incomplete batch." if objective_mode == "minimize_makespan" else "Configured simulation horizon for this run.",
+        ),
         ("Executed Until", _format_executed_until(kpi, payload), "How far the simulation actually progressed before completion or termination."),
         ("Termination Reason", str(kpi.get("termination_reason", "")).strip() or ("completed_horizon" if not bool(kpi.get("terminated", False)) else "-"), "Why the run stopped. Completed runs show completed_horizon."),
     ]
+    if scenario_type == "mfg_flow_shop":
+        if objective_mode == "minimize_makespan":
+            cards.extend(
+                [
+                    ("Initial Materials", _format_value(_safe_float(kpi.get("initial_batch_material_count", 0)), "count"), "Material instances registered in the fixed batch at time zero."),
+                    ("Batch Accepted", _format_value(_safe_float(kpi.get("initial_batch_accepted_product_count", 0)), "count"), "Accepted terminal outputs containing initial batch materials."),
+                    ("Batch Disposed Scrap", _format_value(_safe_float(kpi.get("initial_batch_disposed_scrap_count", 0)), "count"), "Failed terminal outputs physically delivered to ScrapDisposal."),
+                ]
+            )
+        else:
+            cards.append(
+                ("Restocked Materials", _format_value(_safe_float(kpi.get("warehouse_material_restock_count", 0)), "count"), "Initial-fill and daily-boundary material additions."),
+            )
+        cards.extend(
+            [
+                (
+                    "Battery Charges",
+                    _format_value(_safe_float(kpi.get("battery_charge_count", 0)), "count"),
+                    "Completed direct-charging sessions at worker-assigned docks.",
+                ),
+                (
+                    "Battery Charge Time",
+                    _format_value(_safe_float(kpi.get("battery_charge_time_min", 0.0)), "minutes"),
+                    "Total simulated time spent charging; travel to the dock is excluded.",
+                ),
+                (
+                    "Finite Buffer Safety",
+                    "PASS"
+                    if _safe_int(kpi.get("buffer_overflow_attempt_count", 0)) == 0
+                    and _safe_int(kpi.get("buffer_reservation_failure_count", 0)) == 0
+                    and _safe_int(kpi.get("buffer_reservation_leak_count", 0)) == 0
+                    else "CHECK",
+                    "Requires zero overflow attempts, reservation failures, and stale inbound reservations.",
+                ),
+                (
+                    "Blocked After Service",
+                    _format_value(_safe_float(kpi.get("machine_blocked_after_service_min", 0.0)), "minutes"),
+                    "Machine-minutes holding completed output while a finite output buffer is full.",
+                ),
+            ]
+        )
     if decision_mode in {"bottleneck_aware_dispatch", "rolling_horizon_throughput_optimizer"}:
         cards.append(
             (
@@ -183,6 +254,65 @@ def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) 
                     "Optimizer Objective",
                     _format_value(_safe_float(kpi.get("throughput_optimizer_objective_avg", 0.0)), "float"),
                     "Average CP-SAT objective value over solved windows.",
+                ),
+            ]
+        )
+    if decision_mode in {"simulation_based_adp", "random_feasible_dispatch"}:
+        cards.extend(
+            [
+                (
+                    "ADP Decisions",
+                    _format_value(_safe_float(kpi.get("adp_decision_count", 0)), "count"),
+                    "Event-driven joint assignment decisions made during this run.",
+                ),
+                (
+                    "ADP WAIT / Unassigned",
+                    _format_value(_safe_float(kpi.get("adp_wait_count", 0)), "count"),
+                    "Legacy total combining chosen WAIT and no-candidate unassigned workers.",
+                ),
+                (
+                    "ADP Candidate-Present Unassigned",
+                    _format_value(
+                        _safe_float(kpi.get("adp_candidate_available_wait_count", 0)),
+                        "count",
+                    ),
+                    "WAIT outcomes where at least one feasible candidate edge was available.",
+                ),
+                (
+                    "ADP No-Candidate",
+                    _format_value(
+                        _safe_float(kpi.get("adp_no_candidate_unassigned_count", 0)),
+                        "count",
+                    ),
+                    "Unassigned workers for whom no candidate task was available.",
+                ),
+                (
+                    "ADP Inference",
+                    f"{_safe_float(kpi.get('adp_inference_latency_ms_avg', 0.0)):.3f} ms",
+                    "Average attention value-search latency per decision epoch.",
+                ),
+                (
+                    "ADP Checkpoint",
+                    str(kpi.get("adp_checkpoint_id", "")).strip() or "-",
+                    "Validated checkpoint loaded for this simulation run.",
+                ),
+            ]
+        )
+    rolling = kpi.get("rolling_horizon", {}) if isinstance(kpi.get("rolling_horizon", {}), dict) else {}
+    if bool(rolling.get("enabled", False)):
+        scheduler_mode = str(rolling.get("scheduler_mode", "strict_periodic")).strip() or "strict_periodic"
+        window_min = _safe_float(rolling.get("window_min", 0.0))
+        cards.extend(
+            [
+                (
+                    "Rolling Scheduler",
+                    f"{scheduler_mode.replace('_', ' ').title()} / {window_min:g} min",
+                    "Worker-independent periodic dispatch; low-battery service is the only immediate exception.",
+                ),
+                (
+                    "Boundary Timing",
+                    f"{_safe_int(rolling.get('strict_boundary_count', 0))} exact / {_safe_int(rolling.get('late_boundary_count', 0))} late",
+                    f"Maximum dispatch lag: {_safe_float(rolling.get('max_boundary_lag_min', 0.0)):.6f} min.",
                 ),
             ]
         )
@@ -240,6 +370,13 @@ def _config_section(run_meta: dict[str, Any] | None) -> str:
         ("Decision Mode", str(payload.get("decision_mode", "")).strip() or "-"),
         ("Worker Execution", str(payload.get("worker_execution_mode", "")).strip() or "-"),
     ]
+    if str(payload.get("scenario_type", "")).strip() == "mfg_flow_shop":
+        top_cards.extend(
+            [
+                ("Simulation Objective", str(payload.get("objective_mode", "")).strip() or "-"),
+                ("Objective Status", str(payload.get("objective_status", "")).strip() or "-"),
+            ]
+        )
 
     summary_cards = (
         "<div class='grid cards-4'>"

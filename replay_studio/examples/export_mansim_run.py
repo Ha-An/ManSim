@@ -333,6 +333,12 @@ def build_initial_state(
     entities: Dict[str, Dict[str, Any]] = {}
     material_slot_attrs = initial_material_slots or {}
     is_shipyard = str(layout.get("scenario_type", "")).strip().lower() == "shipyard_basic"
+    layout_nodes = [node for node in layout.get("nodes", []) if isinstance(node, dict)]
+    has_dedicated_charging_docks = any(
+        str(node.get("entity_id", "") or "").startswith("charging_dock_")
+        and str(node.get("entity_type", "") or "") == "charger"
+        for node in layout_nodes
+    )
 
     def add_entity(entity_id: str, entity_type: str, label: str, state: str, *, attributes: Dict[str, Any] | None = None) -> None:
         entities[entity_id] = {
@@ -348,6 +354,8 @@ def build_initial_state(
 
     if not is_shipyard:
         for queue_id, (entity_type, label) in QUEUE_META.items():
+            if queue_id == "battery_rack" and has_dedicated_charging_docks:
+                continue
             attributes = {"queue_size": 0}
             if queue_id in QUEUE_ITEM_TYPE:
                 attributes["item_type"] = QUEUE_ITEM_TYPE[queue_id]
@@ -361,9 +369,7 @@ def build_initial_state(
                 attributes = dict(initial_shelf_attributes or {"shelf_count": 0, "shelf_capacity": 0})
             add_entity(queue_id, entity_type, label, "waiting", attributes=attributes)
 
-    for node in layout.get("nodes", []):
-        if not isinstance(node, dict):
-            continue
+    for node in layout_nodes:
         entity_id = str(node.get("entity_id", "") or "")
         entity_type = str(node.get("entity_type", "") or "")
         if is_shipyard and entity_id and entity_id not in entities and entity_type != "worker":
@@ -373,6 +379,21 @@ def build_initial_state(
             if isinstance(node.get("tile"), dict):
                 attributes.setdefault("tile", node.get("tile"))
             add_entity(entity_id, entity_type, label, state, attributes=attributes)
+        if not is_shipyard and entity_type == "charger" and entity_id and entity_id not in entities:
+            assigned_worker_id = entity_id.removeprefix("charging_dock_") if entity_id.startswith("charging_dock_") else ""
+            attributes = dict(node.get("attributes", {}) if isinstance(node.get("attributes", {}), dict) else {})
+            attributes.update(
+                {
+                    "dock_kind": "dedicated_charging_dock",
+                    "assigned_worker_id": assigned_worker_id,
+                    "occupied_by": "",
+                    "charging": False,
+                }
+            )
+            if isinstance(node.get("tile"), dict):
+                attributes.setdefault("tile", node.get("tile"))
+            label = f"{assigned_worker_id} Charging Dock" if assigned_worker_id else entity_id.replace("_", " ").title()
+            add_entity(entity_id, "charger", label, "available", attributes=attributes)
         if entity_id.startswith("warehouse_material_slot_") and entity_id not in entities:
             add_entity(
                 entity_id,
@@ -1254,6 +1275,57 @@ def convert_events(
             push("state_changed", timestamp, {"primary": entity_id}, {"state": state, "attributes": attrs})
             continue
 
+        if raw_type == "INSPECTION_DESK_STATE_CHANGED" and entity_id:
+            desk_state = str(details.get("desk_state", "EMPTY") or "EMPTY").upper()
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": entity_id},
+                {
+                    "entity_type": "inspection_table",
+                    "state": "working" if desk_state == "INSPECTING" else "waiting" if desk_state != "EMPTY" else "idle",
+                    "attributes": {
+                        "inspection_desk_state": desk_state,
+                        "inspection_product_id": details.get("product_id") or None,
+                        "inspection_result": details.get("inspection_result") or None,
+                        "inspection_owner": details.get("owner_worker_id") or None,
+                    },
+                },
+            )
+            continue
+
+        if raw_type in {"INSPECTION_DESK_OCCUPIED", "INSPECTION_DESK_RELEASED"} and entity_id:
+            occupied = raw_type == "INSPECTION_DESK_OCCUPIED"
+            desk_state = str(details.get("desk_state", "") or "").strip().upper()
+            if not desk_state:
+                desk_state = "INSPECTING" if occupied else "EMPTY"
+            visual_state = (
+                "working"
+                if occupied or desk_state == "INSPECTING"
+                else "waiting"
+                if desk_state != "EMPTY"
+                else "idle"
+            )
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": entity_id},
+                {
+                    "entity_type": "inspection_table",
+                    "state": visual_state,
+                    "attributes": {
+                        "inspection_occupied": occupied,
+                        "inspection_owner": details.get("worker_id") if occupied else None,
+                        "active_worker_ids": details.get("active_worker_ids", []),
+                        "inspection_desk_state": desk_state,
+                        "inspection_result": details.get("inspection_result") or None,
+                        **({"inspection_product_id": details.get("product_id")} if details.get("product_id") else {}),
+                        "inspection_task_id": details.get("task_id") if occupied else None,
+                    },
+                },
+            )
+            continue
+
         if raw_type == "ITEM_STATE_CHANGED" and entity_id:
             item_state = str(details.get("item_state", "CREATED") or "CREATED").upper()
             item_tile = details.get("tile") if isinstance(details.get("tile"), dict) else None
@@ -1262,10 +1334,13 @@ def convert_events(
                 "item_state": item_state,
                 "item_type": details.get("item_type"),
                 "ref": details.get("ref"),
+                "inspection_result": details.get("inspection_result"),
             }
             for key in ("source_item_ids", "source_material_ids", "source_intermediate_ids", "transformed_from_item_ids"):
                 if isinstance(details.get(key), list):
                     item_attributes[key] = [str(item) for item in details.get(key, []) if str(item).strip()]
+            if str(details.get("transformed_to_item_id", "")).strip():
+                item_attributes["transformed_to_item_id"] = str(details.get("transformed_to_item_id")).strip()
             if item_tile is not None:
                 item_attributes["tile"] = item_tile
             payload: Dict[str, Any] = {
@@ -1567,6 +1642,37 @@ def convert_events(
                 },
                 suffix="b",
             )
+            continue
+
+        if raw_type in {"BATTERY_CHARGE_STARTED", "BATTERY_CHARGE_COMPLETED"}:
+            dock_id = str(details.get("charging_dock_id") or location or "").strip()
+            if dock_id:
+                charging = raw_type == "BATTERY_CHARGE_STARTED"
+                assigned_worker_id = dock_id.removeprefix("charging_dock_") if dock_id.startswith("charging_dock_") else str(entity_id or "")
+                attributes = {
+                    "dock_kind": "dedicated_charging_dock",
+                    "assigned_worker_id": assigned_worker_id,
+                    "occupied_by": str(entity_id or "") if charging else "",
+                    "charging": charging,
+                    "task_id": details.get("task_id"),
+                    "target_soc": details.get("target_soc"),
+                    "charge_duration_min": details.get("charge_duration_min"),
+                }
+                if charging:
+                    attributes["start_soc"] = details.get("start_soc")
+                    attributes["sampled_full_charge_min"] = details.get("sampled_full_charge_min")
+                push(
+                    "state_changed",
+                    timestamp,
+                    {"primary": dock_id, "related": [entity_id] if entity_id else []},
+                    {
+                        "entity_type": "charger",
+                        "label": f"{assigned_worker_id} Charging Dock" if assigned_worker_id else dock_id,
+                        "state": "charging" if charging else "available",
+                        "attributes": attributes,
+                    },
+                    suffix="dock",
+                )
             continue
 
         if raw_type == "AGENT_RECHARGED" and entity_id:
@@ -2076,6 +2182,16 @@ def load_scenario_config(run_dir: Path) -> Dict[str, Any]:
     return scenario_cfg
 
 
+def export_layout_only(run_dir: Path, output_layout: Path) -> None:
+    scenario_cfg = load_scenario_config(run_dir)
+    factory_cfg = scenario_cfg.get("factory", {}) if isinstance(scenario_cfg.get("factory", {}), dict) else {}
+    worker_count = max(1, int(factory_cfg.get("num_workers", 3) or 3))
+    worker_ids = [f"A{index}" for index in range(1, worker_count + 1)]
+    layout = build_layout(worker_ids, scenario_cfg)
+    output_layout.parent.mkdir(parents=True, exist_ok=True)
+    output_layout.write_text(json.dumps(layout, indent=2), encoding="utf-8")
+
+
 def export_run(run_dir: Path, output_log: Path, output_layout: Path) -> None:
     raw_events = load_jsonl(run_dir / "events.jsonl")
     run_meta = load_json(run_dir / "run_meta.json")
@@ -2131,10 +2247,15 @@ def export_run(run_dir: Path, output_log: Path, output_layout: Path) -> None:
 def main(argv: Iterable[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Convert an existing ManSim output run into replay_studio JSON.")
     parser.add_argument("--run-dir", required=True, help="Path to a ManSim output run directory containing events.jsonl and run_meta.json")
-    parser.add_argument("--output-log", required=True, help="Destination replay JSON file")
+    parser.add_argument("--output-log", help="Destination replay JSON file")
     parser.add_argument("--output-layout", required=True, help="Destination layout JSON file")
+    parser.add_argument("--layout-only", action="store_true", help="Export only the compact map layout")
     args = parser.parse_args(list(argv) if argv is not None else None)
-
+    if args.layout_only:
+        export_layout_only(Path(args.run_dir), Path(args.output_layout))
+        return
+    if not args.output_log:
+        parser.error("--output-log is required unless --layout-only is used")
     export_run(Path(args.run_dir), Path(args.output_log), Path(args.output_layout))
 
 

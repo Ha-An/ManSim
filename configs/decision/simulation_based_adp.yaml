@@ -1,0 +1,20 @@
+# Event-driven joint worker-task assignment using a learned post-decision value.
+# The mfg_flow_shop task taxonomy is inherited only for candidate validation;
+# priority_order is not consulted by random rollout or ADP action selection.
+defaults:
+  - immediate_shared
+  - _self_
+
+mode: simulation_based_adp
+
+adp:
+  checkpoint_path: ???
+  device: auto
+  training: false
+  force_random_policy: false
+  # WAIT is a regular action. An all-WAIT afterstate advances the encoded
+  # clock by max_review_interval_min so waiting is not treated as cost-free.
+  allow_wait_action: true
+  beam_width: 64
+  max_review_interval_min: 1.0
+  exploration_epsilon: 0.0

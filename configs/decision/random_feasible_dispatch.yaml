@@ -1,0 +1,19 @@
+# Event-driven random feasible baseline for worker-task joint assignment.
+# It uses the ADP coordinator and the same hard constraints, but no value
+# network, task priority, checkpoint, or PyTorch dependency. WAIT competes
+# uniformly with the currently conflict-free task choices for each worker.
+defaults:
+  - immediate_shared
+  - _self_
+
+mode: random_feasible_dispatch
+
+adp:
+  checkpoint_path: ""
+  device: cpu
+  training: false
+  force_random_policy: true
+  allow_wait_action: true
+  beam_width: 1
+  max_review_interval_min: 1.0
+  exploration_epsilon: 1.0

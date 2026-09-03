@@ -1,0 +1,113 @@
+# @package task_primitive_timing
+schema_version: 1
+scenario_type: shipyard_basic
+unit: min
+validation: strict
+
+templates:
+  standard: &standard {type: triangular, min: 0.08, mode: 0.10, max: 0.12}
+  cart_step: &cart_step {type: triangular, min: 0.064, mode: 0.080, max: 0.096}
+  transfer_step: &transfer_step {type: triangular, min: 0.040, mode: 0.050, max: 0.060}
+  weld_step: &weld_step {type: triangular, min: 0.114286, mode: 0.142857, max: 0.171428}
+  prepare_step: &prepare_step {type: triangular, min: 0.066667, mode: 0.083333, max: 0.100000}
+  paint_step: &paint_step {type: triangular, min: 0.106667, mode: 0.133333, max: 0.160000}
+  verify_step: &verify_step {type: triangular, min: 0.064, mode: 0.080, max: 0.096}
+  battery_swap: &battery_swap {type: triangular, min: 3.2, mode: 4.0, max: 4.8}
+
+movement:
+  model: per_tile_triangular
+  sample_scope: move
+  per_tile_min: {type: triangular, min: 0.096, mode: 0.120, max: 0.144}
+  multipliers:
+    material: 1.0
+    weld_wire: 1.0
+    paint_can: 1.0
+    battery: 1.0
+    cart: 1.0
+
+tasks:
+  OPERATE_VEHICLE_TRANSPORT:
+    steps:
+      OPERATE_VEHICLE_TRANSPORT/s01_verify_authorization: {call_code: VERIFY_AUTHORIZATION, distribution: *cart_step}
+      OPERATE_VEHICLE_TRANSPORT/s02_transfer/s01_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      OPERATE_VEHICLE_TRANSPORT/s02_transfer/s02_localize_object: {call_code: LOCALIZE_OBJECT, distribution: *cart_step}
+      OPERATE_VEHICLE_TRANSPORT/s02_transfer/s03_reach_to: {call_code: REACH_TO, distribution: *cart_step}
+      OPERATE_VEHICLE_TRANSPORT/s02_transfer/s04_grasp: {call_code: GRASP, distribution: *cart_step}
+      OPERATE_VEHICLE_TRANSPORT/s02_transfer/s05_lift: {call_code: LIFT, distribution: *cart_step}
+      OPERATE_VEHICLE_TRANSPORT/s02_transfer/s06_navigate_to_2: {call_code: NAVIGATE_TO, timing_model: movement}
+      OPERATE_VEHICLE_TRANSPORT/s02_transfer/s07_place: {call_code: PLACE, distribution: *cart_step}
+      OPERATE_VEHICLE_TRANSPORT/s02_transfer/s08_release: {call_code: RELEASE, distribution: *cart_step}
+      OPERATE_VEHICLE_TRANSPORT/s02_transfer/s09_verify_placement: {call_code: VERIFY_PLACEMENT, distribution: *cart_step}
+      OPERATE_VEHICLE_TRANSPORT/s03_park_or_release_vehicle: {call_code: PARK_OR_RELEASE_VEHICLE, distribution: *cart_step}
+      OPERATE_VEHICLE_TRANSPORT/s04_verify_placement: {call_code: VERIFY_PLACEMENT, distribution: *cart_step}
+
+  TRANSFER:
+    steps:
+      TRANSFER/s01_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      TRANSFER/s02_localize_object: {call_code: LOCALIZE_OBJECT, distribution: *transfer_step}
+      TRANSFER/s03_reach_to: {call_code: REACH_TO, distribution: *transfer_step}
+      TRANSFER/s04_grasp: {call_code: GRASP, distribution: *transfer_step}
+      TRANSFER/s05_lift: {call_code: LIFT, distribution: *transfer_step}
+      TRANSFER/s06_navigate_to_2: {call_code: NAVIGATE_TO, timing_model: movement}
+      TRANSFER/s07_place: {call_code: PLACE, distribution: *transfer_step}
+      TRANSFER/s08_release: {call_code: RELEASE, distribution: *transfer_step}
+      TRANSFER/s09_verify_placement: {call_code: VERIFY_PLACEMENT, distribution: *transfer_step}
+
+  WELD_SEAM:
+    steps:
+      WELD_SEAM/s01_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *weld_step}
+      WELD_SEAM/s02_localize_surface: {call_code: LOCALIZE_SURFACE, distribution: *weld_step}
+      WELD_SEAM/s03_fix_or_hold_part: {call_code: FIX_OR_HOLD_PART, distribution: *weld_step}
+      WELD_SEAM/s04_operate_tool: {call_code: OPERATE_TOOL, distribution: *weld_step}
+      WELD_SEAM/s05_process_feature_or_surface: {call_code: PROCESS_FEATURE_OR_SURFACE, distribution: *weld_step}
+      WELD_SEAM/s06_inspect_result: {call_code: INSPECT_RESULT, distribution: *weld_step}
+      WELD_SEAM/s07_record_result: {call_code: RECORD_RESULT, distribution: *weld_step}
+
+  PREPARE_SURFACE:
+    steps:
+      PREPARE_SURFACE/s01_localize_surface: {call_code: LOCALIZE_SURFACE, distribution: *prepare_step}
+      PREPARE_SURFACE/s02_primitive_prepare_surface: {call_code: PRIMITIVE_PREPARE_SURFACE, distribution: *prepare_step}
+      PREPARE_SURFACE/s03_operate_tool_or_dispenser: {call_code: OPERATE_TOOL_OR_DISPENSER, distribution: *prepare_step}
+      PREPARE_SURFACE/s04_primitive_apply_material: {call_code: PRIMITIVE_APPLY_MATERIAL, distribution: *prepare_step}
+      PREPARE_SURFACE/s05_verify_coverage_or_amount: {call_code: VERIFY_COVERAGE_OR_AMOUNT, distribution: *prepare_step}
+      PREPARE_SURFACE/s06_record_result: {call_code: RECORD_RESULT, distribution: *prepare_step}
+
+  PAINT_SURFACE:
+    steps:
+      PAINT_SURFACE/s01_localize_surface: {call_code: LOCALIZE_SURFACE, distribution: *paint_step}
+      PAINT_SURFACE/s02_primitive_prepare_surface: {call_code: PRIMITIVE_PREPARE_SURFACE, distribution: *paint_step}
+      PAINT_SURFACE/s03_operate_tool_or_dispenser: {call_code: OPERATE_TOOL_OR_DISPENSER, distribution: *paint_step}
+      PAINT_SURFACE/s04_primitive_apply_material: {call_code: PRIMITIVE_APPLY_MATERIAL, distribution: *paint_step}
+      PAINT_SURFACE/s05_verify_coverage_or_amount: {call_code: VERIFY_COVERAGE_OR_AMOUNT, distribution: *paint_step}
+      PAINT_SURFACE/s06_record_result: {call_code: RECORD_RESULT, distribution: *paint_step}
+
+  VERIFY_SHIP_SECTION:
+    steps:
+      VERIFY_SHIP_SECTION/s01_primitive_identify_item: {call_code: PRIMITIVE_IDENTIFY_ITEM, distribution: *verify_step}
+      VERIFY_SHIP_SECTION/s02_localize_object: {call_code: LOCALIZE_OBJECT, distribution: *verify_step}
+      VERIFY_SHIP_SECTION/s03_execute_quality_action: {call_code: EXECUTE_QUALITY_ACTION, distribution: *verify_step}
+      VERIFY_SHIP_SECTION/s04_classify_result: {call_code: CLASSIFY_RESULT, distribution: *verify_step}
+      VERIFY_SHIP_SECTION/s05_record_result: {call_code: RECORD_RESULT, distribution: *verify_step}
+
+  MANAGE_ROBOT_POWER:
+    steps:
+      MANAGE_ROBOT_POWER/s01_check_context: {call_code: CHECK_CONTEXT, distribution: *standard}
+      MANAGE_ROBOT_POWER/s02_execute_system_action: {call_code: EXECUTE_SYSTEM_ACTION, distribution: *battery_swap}
+      MANAGE_ROBOT_POWER/s03_verify_robot_state: {call_code: VERIFY_ROBOT_STATE, distribution: *standard}
+      MANAGE_ROBOT_POWER/s04_log_result: {call_code: LOG_RESULT, distribution: *standard}
+
+  COLLECT_WASTE_OR_SCRAP:
+    steps:
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s01_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s02_localize_object: {call_code: LOCALIZE_OBJECT, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s03_reach_to: {call_code: REACH_TO, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s04_grasp: {call_code: GRASP, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s05_lift: {call_code: LIFT, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s06_navigate_to_2: {call_code: NAVIGATE_TO, timing_model: movement}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s07_place: {call_code: PLACE, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s08_release: {call_code: RELEASE, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s09_verify_placement: {call_code: VERIFY_PLACEMENT, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s02_update_inventory_record/s01_read_context: {call_code: READ_CONTEXT, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s02_update_inventory_record/s02_create_or_update_record: {call_code: CREATE_OR_UPDATE_RECORD, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s02_update_inventory_record/s03_verify_transaction: {call_code: VERIFY_TRANSACTION, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s02_update_inventory_record/s04_log_result: {call_code: LOG_RESULT, distribution: *standard}

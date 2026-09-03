@@ -1,0 +1,156 @@
+# @package task_primitive_timing
+schema_version: 1
+scenario_type: factory_mfg_basic
+unit: min
+validation: strict
+
+templates:
+  standard: &standard {type: triangular, min: 0.08, mode: 0.10, max: 0.12}
+  setup: &setup {type: triangular, min: 2.4, mode: 3.0, max: 3.6}
+  unload: &unload {type: triangular, min: 1.6, mode: 2.0, max: 2.4}
+  inspection: &inspection {type: triangular, min: 8.0, mode: 10.0, max: 12.0}
+  repair: &repair {type: triangular, min: 16.0, mode: 20.0, max: 24.0}
+  preventive_maintenance: &preventive_maintenance {type: triangular, min: 24.0, mode: 30.0, max: 36.0}
+  battery_swap: &battery_swap {type: triangular, min: 4.0, mode: 5.0, max: 6.0}
+
+movement:
+  model: per_tile_triangular
+  sample_scope: move
+  per_tile_min: {type: triangular, min: 0.08, mode: 0.10, max: 0.12}
+  multipliers:
+    material: 1.0
+    intermediate: 1.5
+    product: 2.0
+    battery: 1.0
+    battery_fresh: 1.0
+    battery_spent: 1.0
+
+tasks:
+  REPLENISH_MATERIAL:
+    steps:
+      REPLENISH_MATERIAL/s01_check_request: {call_code: CHECK_REQUEST, distribution: *standard}
+      REPLENISH_MATERIAL/s02_primitive_identify_item: {call_code: PRIMITIVE_IDENTIFY_ITEM, distribution: *standard}
+      REPLENISH_MATERIAL/s03_transfer/s01_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      REPLENISH_MATERIAL/s03_transfer/s02_localize_object: {call_code: LOCALIZE_OBJECT, distribution: *standard}
+      REPLENISH_MATERIAL/s03_transfer/s03_reach_to: {call_code: REACH_TO, distribution: *standard}
+      REPLENISH_MATERIAL/s03_transfer/s04_grasp: {call_code: GRASP, distribution: *standard}
+      REPLENISH_MATERIAL/s03_transfer/s05_lift: {call_code: LIFT, distribution: *standard}
+      REPLENISH_MATERIAL/s03_transfer/s06_navigate_to_2: {call_code: NAVIGATE_TO, timing_model: movement}
+      REPLENISH_MATERIAL/s03_transfer/s07_place: {call_code: PLACE, distribution: *standard}
+      REPLENISH_MATERIAL/s03_transfer/s08_release: {call_code: RELEASE, distribution: *standard}
+      REPLENISH_MATERIAL/s03_transfer/s09_verify_placement: {call_code: VERIFY_PLACEMENT, distribution: *standard}
+      REPLENISH_MATERIAL/s04_verify_level_or_quantity: {call_code: VERIFY_LEVEL_OR_QUANTITY, distribution: *standard}
+      REPLENISH_MATERIAL/s05_update_record: {call_code: UPDATE_RECORD, distribution: *standard}
+
+  TRANSFER:
+    steps:
+      TRANSFER/s01_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      TRANSFER/s02_localize_object: {call_code: LOCALIZE_OBJECT, distribution: *standard}
+      TRANSFER/s03_reach_to: {call_code: REACH_TO, distribution: *standard}
+      TRANSFER/s04_grasp: {call_code: GRASP, distribution: *standard}
+      TRANSFER/s05_lift: {call_code: LIFT, distribution: *standard}
+      TRANSFER/s06_navigate_to_2: {call_code: NAVIGATE_TO, timing_model: movement}
+      TRANSFER/s07_place: {call_code: PLACE, distribution: *standard}
+      TRANSFER/s08_release: {call_code: RELEASE, distribution: *standard}
+      TRANSFER/s09_verify_placement: {call_code: VERIFY_PLACEMENT, distribution: *standard}
+
+  LOAD_MACHINE:
+    steps:
+      LOAD_MACHINE/s01_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *standard}
+      LOAD_MACHINE/s02_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      LOAD_MACHINE/s03_read_machine_state: {call_code: READ_MACHINE_STATE, distribution: *standard}
+      LOAD_MACHINE/s04_execute_machine_action: {call_code: EXECUTE_MACHINE_ACTION, distribution: *standard}
+      LOAD_MACHINE/s05_verify_machine_state: {call_code: VERIFY_MACHINE_STATE, distribution: *standard}
+      LOAD_MACHINE/s06_log_result: {call_code: LOG_RESULT, distribution: *standard}
+
+  SETUP_MACHINE:
+    steps:
+      SETUP_MACHINE/s01_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *standard}
+      SETUP_MACHINE/s02_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      SETUP_MACHINE/s03_read_machine_state: {call_code: READ_MACHINE_STATE, distribution: *standard}
+      SETUP_MACHINE/s04_execute_machine_action: {call_code: EXECUTE_MACHINE_ACTION, distribution: *setup}
+      SETUP_MACHINE/s05_verify_machine_state: {call_code: VERIFY_MACHINE_STATE, distribution: *standard}
+      SETUP_MACHINE/s06_log_result: {call_code: LOG_RESULT, distribution: *standard}
+
+  UNLOAD_MACHINE:
+    steps:
+      UNLOAD_MACHINE/s01_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *standard}
+      UNLOAD_MACHINE/s02_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      UNLOAD_MACHINE/s03_read_machine_state: {call_code: READ_MACHINE_STATE, distribution: *standard}
+      UNLOAD_MACHINE/s04_execute_machine_action: {call_code: EXECUTE_MACHINE_ACTION, distribution: *unload}
+      UNLOAD_MACHINE/s05_verify_machine_state: {call_code: VERIFY_MACHINE_STATE, distribution: *standard}
+      UNLOAD_MACHINE/s06_log_result: {call_code: LOG_RESULT, distribution: *standard}
+
+  LOAD_UNLOAD_TRANSFER_INTERFACE:
+    steps:
+      LOAD_UNLOAD_TRANSFER_INTERFACE/s01_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      LOAD_UNLOAD_TRANSFER_INTERFACE/s02_localize_object: {call_code: LOCALIZE_OBJECT, distribution: *standard}
+      LOAD_UNLOAD_TRANSFER_INTERFACE/s03_reach_to: {call_code: REACH_TO, distribution: *standard}
+      LOAD_UNLOAD_TRANSFER_INTERFACE/s04_grasp: {call_code: GRASP, distribution: *standard}
+      LOAD_UNLOAD_TRANSFER_INTERFACE/s05_lift: {call_code: LIFT, distribution: *standard}
+      LOAD_UNLOAD_TRANSFER_INTERFACE/s06_navigate_to_2: {call_code: NAVIGATE_TO, timing_model: movement}
+      LOAD_UNLOAD_TRANSFER_INTERFACE/s07_place: {call_code: PLACE, distribution: *standard}
+      LOAD_UNLOAD_TRANSFER_INTERFACE/s08_release: {call_code: RELEASE, distribution: *standard}
+      LOAD_UNLOAD_TRANSFER_INTERFACE/s09_verify_placement: {call_code: VERIFY_PLACEMENT, distribution: *standard}
+
+  INSPECT_PRODUCT:
+    steps:
+      INSPECT_PRODUCT/s01_navigate_to_workstation: {call_code: NAVIGATE_TO, timing_model: movement}
+      INSPECT_PRODUCT/s02_primitive_identify_item: {call_code: PRIMITIVE_IDENTIFY_ITEM, distribution: *standard}
+      INSPECT_PRODUCT/s03_localize_object: {call_code: LOCALIZE_OBJECT, distribution: *standard}
+      INSPECT_PRODUCT/s04_execute_quality_action: {call_code: EXECUTE_QUALITY_ACTION, distribution: *inspection}
+      INSPECT_PRODUCT/s05_classify_result: {call_code: CLASSIFY_RESULT, distribution: *standard}
+      INSPECT_PRODUCT/s06_record_result: {call_code: RECORD_RESULT, distribution: *standard}
+
+  REPAIR_MACHINE:
+    steps:
+      REPAIR_MACHINE/s01_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *standard}
+      REPAIR_MACHINE/s02_inspect_machine/s01_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *standard}
+      REPAIR_MACHINE/s02_inspect_machine/s02_verify_lockout_if_required: {call_code: VERIFY_LOCKOUT_IF_REQUIRED, distribution: *standard}
+      REPAIR_MACHINE/s02_inspect_machine/s03_inspect_or_diagnose: {call_code: INSPECT_OR_DIAGNOSE, distribution: *standard}
+      REPAIR_MACHINE/s02_inspect_machine/s04_log_result: {call_code: LOG_RESULT, distribution: *standard}
+      REPAIR_MACHINE/s03_execute_maintenance_action: {call_code: EXECUTE_MAINTENANCE_ACTION, distribution: *repair}
+      REPAIR_MACHINE/s04_verify_machine_state: {call_code: VERIFY_MACHINE_STATE, distribution: *standard}
+      REPAIR_MACHINE/s05_log_result: {call_code: LOG_RESULT, distribution: *standard}
+
+  PREVENTIVE_MAINTENANCE:
+    steps:
+      PREVENTIVE_MAINTENANCE/s01_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *standard}
+      PREVENTIVE_MAINTENANCE/s02_inspect_machine/s01_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *standard}
+      PREVENTIVE_MAINTENANCE/s02_inspect_machine/s02_verify_lockout_if_required: {call_code: VERIFY_LOCKOUT_IF_REQUIRED, distribution: *standard}
+      PREVENTIVE_MAINTENANCE/s02_inspect_machine/s03_inspect_or_diagnose: {call_code: INSPECT_OR_DIAGNOSE, distribution: *preventive_maintenance}
+      PREVENTIVE_MAINTENANCE/s02_inspect_machine/s04_log_result: {call_code: LOG_RESULT, distribution: *standard}
+      PREVENTIVE_MAINTENANCE/s03_log_result: {call_code: LOG_RESULT, distribution: *standard}
+
+  MANAGE_ROBOT_POWER:
+    steps:
+      MANAGE_ROBOT_POWER/s01_check_context: {call_code: CHECK_CONTEXT, distribution: *standard}
+      MANAGE_ROBOT_POWER/s02_execute_system_action: {call_code: EXECUTE_SYSTEM_ACTION, distribution: *battery_swap}
+      MANAGE_ROBOT_POWER/s03_verify_robot_state: {call_code: VERIFY_ROBOT_STATE, distribution: *standard}
+      MANAGE_ROBOT_POWER/s04_log_result: {call_code: LOG_RESULT, distribution: *standard}
+
+  HANDOVER_ITEM_TO_ROBOT:
+    steps:
+      HANDOVER_ITEM_TO_ROBOT/s01_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      HANDOVER_ITEM_TO_ROBOT/s02_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *standard}
+      HANDOVER_ITEM_TO_ROBOT/s03_announce_intent: {call_code: ANNOUNCE_INTENT, distribution: *standard}
+      HANDOVER_ITEM_TO_ROBOT/s04_sync_with_robot: {call_code: SYNC_WITH_ROBOT, distribution: *standard}
+      HANDOVER_ITEM_TO_ROBOT/s05_execute_robot_collaboration_action: {call_code: EXECUTE_ROBOT_COLLABORATION_ACTION, distribution: *standard}
+      HANDOVER_ITEM_TO_ROBOT/s06_verify_robot_state: {call_code: VERIFY_ROBOT_STATE, distribution: *standard}
+      HANDOVER_ITEM_TO_ROBOT/s07_log_result: {call_code: LOG_RESULT, distribution: *standard}
+
+  COLLECT_WASTE_OR_SCRAP:
+    steps:
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s01_navigate_to: {call_code: NAVIGATE_TO, timing_model: movement}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s02_localize_object: {call_code: LOCALIZE_OBJECT, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s03_reach_to: {call_code: REACH_TO, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s04_grasp: {call_code: GRASP, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s05_lift: {call_code: LIFT, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s06_navigate_to_2: {call_code: NAVIGATE_TO, timing_model: movement}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s07_place: {call_code: PLACE, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s08_release: {call_code: RELEASE, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s01_transfer/s09_verify_placement: {call_code: VERIFY_PLACEMENT, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s02_update_inventory_record/s01_read_context: {call_code: READ_CONTEXT, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s02_update_inventory_record/s02_create_or_update_record: {call_code: CREATE_OR_UPDATE_RECORD, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s02_update_inventory_record/s03_verify_transaction: {call_code: VERIFY_TRANSACTION, distribution: *standard}
+      COLLECT_WASTE_OR_SCRAP/s02_update_inventory_record/s04_log_result: {call_code: LOG_RESULT, distribution: *standard}

@@ -1,0 +1,151 @@
+# Parallel-machine flow-shop manufacturing scenario.
+defaults:
+  - /task_primitive_timing: mfg_flow_shop
+  - _self_
+
+name: mfg_flow_shop
+type: mfg_flow_shop
+
+horizon:
+  num_days: 5
+  # One simulation day represents an 8-hour production shift.
+  minutes_per_day: 480
+
+# Run-level objective. Throughput keeps the legacy fixed-horizon behavior.
+objective:
+  mode: maximize_throughput
+  makespan:
+    max_sim_days: 30
+    terminal_policy: product_or_disposed_scrap
+  throughput:
+    restock_interval_days: 1
+    restock_target_fill: 30
+
+factory:
+  num_workers: 3
+  # Station 1 and Station 2 each use two parallel machines.
+  machines_per_station: 2
+  processing_time:
+    station1: {distribution: triangular, min: 7.0, mode: 8.5, max: 11.0}
+    station2: {distribution: triangular, min: 10.0, mode: 12.5, max: 16.0}
+
+  # Finite line-side buffers. CompletedProducts and ScrapDisposal remain
+  # unbounded terminal stores.
+  buffers:
+    station1:
+      material_input_capacity: 4
+      output_capacity: 2
+    station2:
+      material_input_capacity: 4
+      intermediate_input_capacity: 4
+      output_capacity: 2
+    inspection:
+      input_capacity: 3
+      pass_output_capacity: 3
+      scrap_output_capacity: 3
+
+  # Exact HumanoidSim top-level task set used by this scenario.
+  enabled_task_codes:
+    - REPLENISH_MATERIAL
+    - TRANSFER
+    - LOAD_MACHINE
+    - SETUP_MACHINE
+    - UNLOAD_MACHINE
+    - LOAD_UNLOAD_TRANSFER_INTERFACE
+    - INSPECT_PRODUCT
+    - REPAIR_MACHINE
+    - MANAGE_ROBOT_POWER
+    - COLLECT_WASTE_OR_SCRAP
+
+  inspection:
+    workstation_id: inspection_desk
+    capacity: 1
+
+movement:
+  item_transport:
+    # A single worker transports every item, including products.
+    product_collaboration:
+      enabled: false
+      max_carriers: 1
+      divide_time_by_carrier_count: false
+  traffic:
+    enabled: true
+    mode: strict_reservation
+    fidelity: tile_edge
+    collision_effect: log_only
+    near_miss_headway_min: 0.05
+    emit_tile_step_events: true
+
+humanoid_incidents:
+  enabled: true
+  random:
+    OBJECT_RECOGNITION_FAILED:
+      enabled: true
+      probability: 0.002
+      trigger_primitives: [LOCALIZE_OBJECT, PRIMITIVE_IDENTIFY_ITEM]
+    GRIP_FAILED:
+      enabled: true
+      probability: 0.002
+      trigger_primitives: [GRASP]
+    ITEM_DROPPED:
+      enabled: true
+      probability_per_tile: 0.001
+      trigger_primitives: [NAVIGATE_TO]
+    UNKNOWN:
+      enabled: true
+      probability: 0.0005
+      trigger_primitives: ["*"]
+  natural:
+    RESOURCE_PREEMPTED: true
+    PATH_BLOCKED: true
+    TRAFFIC_WAIT: true
+    COLLISION: true
+    NEAR_MISS: true
+
+map:
+  enabled: true
+  width_tiles: 100
+  height_tiles: 70
+  blocked_replan_threshold_min: 5.0
+
+quality:
+  defect_prob: 0.10
+  scrap_transport:
+    max_carry_count: 3
+
+warehouse:
+  material_shelf:
+    capacity: 30
+    initial_fill: 30
+
+machine_failure:
+  mean_time_to_fail_min: 300
+  max_repair_agents: 3
+  preventive_maintenance:
+    enabled: false
+  # Legacy PM fields remain readable by the shared factory engine but are inert.
+  pm_effect_duration_min: 720
+  pm_lambda_multiplier: 0.5
+  pm_interval_target_min: 480
+
+worker:
+  battery_capacity_min: 200
+  battery_drain:
+    available_rate_multiplier: 0.5
+    non_available_rate_multiplier: 1.0
+  battery_service:
+    mode: dock_charge
+    low_threshold_ratio: 0.30
+    target_soc: 1.0
+    dock_assignment: dedicated
+    allow_battery_delivery: false
+    allow_battery_swap: false
+    finish_current_task_before_charge: true
+
+initial_inventory:
+  material:
+    station1: 0
+    station2: 0
+
+dispatcher:
+  snapshot_interval_min: 1

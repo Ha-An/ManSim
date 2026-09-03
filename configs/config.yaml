@@ -1,4 +1,4 @@
-# ManSim v0.5 root config (Hydra)
+# ManSim v0.6 root config (Hydra)
 # Override with `decision=...`, `scenario=...`, or dotted Hydra keys.
 defaults:
   - scenario: factory_mfg_basic

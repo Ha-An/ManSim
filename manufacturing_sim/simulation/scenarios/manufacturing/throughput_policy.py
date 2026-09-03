@@ -114,15 +114,18 @@ def score_task_for_throughput(world: Any, agent: Worker, task: Task, cfg: dict[s
             machine_continuity += 30.0
     elif task_code == "REPLENISH_MATERIAL" or priority_key == "material_supply":
         station_key = station if station is not None else 1
-        material_queues = getattr(world, "material_queues", {})
-        inventory_targets = getattr(world, "inventory_targets", {})
-        target = 0
-        try:
-            target = int((inventory_targets.get("material", {}) or {}).get(f"station{station_key}", 0))
-        except (AttributeError, TypeError, ValueError):
+        if bool(getattr(world, "is_mfg_flow_shop", False)):
+            shortage = 1.0
+        else:
+            material_queues = getattr(world, "material_queues", {})
+            inventory_targets = getattr(world, "inventory_targets", {})
             target = 0
-        queue_size = _queue_length(material_queues.get(station_key)) if isinstance(material_queues, dict) else 0
-        shortage = max(0, target - queue_size)
+            try:
+                target = int((inventory_targets.get("material", {}) or {}).get(f"station{station_key}", 0))
+            except (AttributeError, TypeError, ValueError):
+                target = 0
+            queue_size = _queue_length(material_queues.get(station_key)) if isinstance(material_queues, dict) else 0
+            shortage = max(0, target - queue_size)
         bottleneck_relief += 20.0 + 3.0 * shortage
     elif task_type == "TRANSFER":
         transfer_kind = str((task.payload or {}).get("transfer_kind", "")).strip().lower()
@@ -135,8 +138,16 @@ def score_task_for_throughput(world: Any, agent: Worker, task: Task, cfg: dict[s
         else:
             downstream_progress += 15.0
     elif task_type == "INSPECT_PRODUCT":
-        queue_size = _queue_length(getattr(world, "inspection_queue", []))
-        downstream_progress += 25.0 + 2.0 * queue_size
+        downstream_progress += 30.0
+        bottleneck_relief += 20.0
+    elif task_type == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+        action = str((task.payload or {}).get("interface_action") or (task.payload or {}).get("action") or "").strip().lower()
+        if action == "unload":
+            downstream_progress += 35.0
+            bottleneck_relief += 25.0
+        else:
+            downstream_progress += 20.0
+            bottleneck_relief += 15.0
     elif task_type == "PREVENTIVE_MAINTENANCE":
         bottleneck_relief += 8.0
         machine_continuity += 20.0

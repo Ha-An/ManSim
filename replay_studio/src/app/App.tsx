@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { demoSeed } from "../demo/demoSeed";
 import { buildRenderModel } from "../core/render-model/buildRenderModel";
 import { createReplayEngine, type ReplayEngine } from "../core/replay/replayEngine";
-import type { EntityType } from "../core/types/entity";
+import type { BaseEntityState, EntityType } from "../core/types/entity";
 import type { ReplayFrameState, ReplayLog } from "../core/types/replay";
 import {
   getRequestedView,

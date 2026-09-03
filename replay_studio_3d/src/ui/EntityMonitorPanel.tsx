@@ -330,7 +330,7 @@ function itemStageGroup(entity: BaseEntityState): "queue" | "carried" | "loaded"
   const state = itemState(entity);
   if (state === "CARRIED_BY_WORKER") return "carried";
   if (state === "COMPLETED") return "completed";
-  if (["LOADED_ON_MACHINE", "PROCESSING", "WAITING_MACHINE_UNLOAD", "WAITING_INSPECTION", "INSPECTING", "WAITING_INSPECTION_OUTPUT"].includes(state)) {
+  if (["LOADED_ON_MACHINE", "PROCESSING", "WAITING_MACHINE_UNLOAD", "WAITING_INSPECTION", "STAGED_FOR_INSPECTION", "INSPECTING", "INSPECTED_WAITING_UNLOAD", "WAITING_INSPECTION_OUTPUT"].includes(state)) {
     return "loaded";
   }
   return "queue";
@@ -405,6 +405,10 @@ function monitorLabel(mode: MonitorMode): string {
   if (mode === "tile") return "Tile";
   if (mode === "cart") return "Cart";
   return "Item";
+}
+
+function isInspectionDesk(entity: BaseEntityState): boolean {
+  return entity.entity_type === "inspection_table" || entity.entity_id.toLowerCase().includes("inspection_desk");
 }
 
 function MonitorSelect({
@@ -578,11 +582,12 @@ export function EntityMonitorPanel({
         <div className="worker-monitor-list">
           {machines.map((machine) => {
             const progress = machineProgress(machine, currentTime);
+            const inspectionDesk = isInspectionDesk(machine);
             return (
               <article className={`worker-monitor-card ${selectedEntity?.entity_id === machine.entity_id ? "selected" : ""}`} key={machine.entity_id}>
                 <div className="worker-monitor-header">
                   <div className="worker-monitor-identity">
-                    <div className="worker-monitor-thumb machine-thumb">MC</div>
+                    <div className="worker-monitor-thumb machine-thumb">{inspectionDesk ? "IN" : "MC"}</div>
                     <div>
                       <div className="worker-monitor-name">{machine.label}</div>
                       <div className="worker-monitor-location">{regionLabel(machine, regions)}</div>
@@ -592,13 +597,24 @@ export function EntityMonitorPanel({
                 </div>
                 {progress !== undefined && <Meter label="PROCESS" value={progress} kind="machine" />}
                 <div className="worker-monitor-grid">
-                  <div><span className="worker-monitor-key">Machine State</span><span className="worker-monitor-value">{statusLabel(machine)}</span></div>
-                  <div><span className="worker-monitor-key">Active Workers</span><span className="worker-monitor-value">{machineActiveWorkers(machine)}</span></div>
-                  <div><span className="worker-monitor-key">Loaded Material</span><span className="worker-monitor-value">{machineItemSummary(machine.attributes.input_material_id, items)}</span></div>
-                  {/^S2M/i.test(machine.entity_id) && (
-                    <div><span className="worker-monitor-key">Loaded Intermediate</span><span className="worker-monitor-value">{machineItemSummary(machine.attributes.input_intermediate_id, items)}</span></div>
+                  {inspectionDesk ? (
+                    <>
+                      <div><span className="worker-monitor-key">Desk State</span><span className="worker-monitor-value">{String(machine.attributes.inspection_desk_state ?? statusLabel(machine))}</span></div>
+                      <div><span className="worker-monitor-key">Occupant</span><span className="worker-monitor-value">{machineActiveWorkers(machine)}</span></div>
+                      <div><span className="worker-monitor-key">Product</span><span className="worker-monitor-value">{machineItemSummary(machine.attributes.inspection_product_id, items)}</span></div>
+                      <div><span className="worker-monitor-key">Result</span><span className="worker-monitor-value">{String(machine.attributes.inspection_result ?? "-")}</span></div>
+                    </>
+                  ) : (
+                    <>
+                      <div><span className="worker-monitor-key">Machine State</span><span className="worker-monitor-value">{statusLabel(machine)}</span></div>
+                      <div><span className="worker-monitor-key">Active Workers</span><span className="worker-monitor-value">{machineActiveWorkers(machine)}</span></div>
+                      <div><span className="worker-monitor-key">Loaded Material</span><span className="worker-monitor-value">{machineItemSummary(machine.attributes.input_material_id, items)}</span></div>
+                      {/^S2M/i.test(machine.entity_id) && (
+                        <div><span className="worker-monitor-key">Loaded Intermediate</span><span className="worker-monitor-value">{machineItemSummary(machine.attributes.input_intermediate_id, items)}</span></div>
+                      )}
+                      <div><span className="worker-monitor-key">Completed Output</span><span className="worker-monitor-value">{machineItemSummary(machine.attributes.output_item_id, items)}</span></div>
+                    </>
                   )}
-                  <div><span className="worker-monitor-key">Completed Output</span><span className="worker-monitor-value">{machineItemSummary(machine.attributes.output_item_id, items)}</span></div>
                 </div>
               </article>
             );

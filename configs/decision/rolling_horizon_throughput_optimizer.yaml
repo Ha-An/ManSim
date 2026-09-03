@@ -4,6 +4,8 @@ mode: rolling_horizon_throughput_optimizer
 
 rolling_horizon:
   window_min: 5.0
+  scheduler_mode: strict_periodic
+  candidate_collection_mode: event_with_boundary_reconciliation
   dispatch_policy: throughput_optimizer
   immediate_task_triggers:
     enabled: true
@@ -12,8 +14,6 @@ rolling_horizon:
     event_task_codes:
       worker_low_battery:
         - MANAGE_ROBOT_POWER
-      machine_broken:
-        - REPAIR_MACHINE
   optimizer:
     time_limit_s: 5.0
     num_search_workers: 1
@@ -35,6 +35,8 @@ throughput_policy:
     downstream_progress_weight: 1.0
     machine_continuity_weight: 1.0
   factory_mfg_basic:
+    enabled: true
+  mfg_flow_shop:
     enabled: true
 
 battery:

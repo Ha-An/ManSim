@@ -2,11 +2,19 @@
 
 ManSim은 정적 HTML dashboard와 Replay Studio용 JSON payload를 함께 export합니다. Replay와 dashboard는 simulation core가 남긴 artifact를 읽어 표시하는 관찰 계층이며, worker 위치나 state를 임의로 보정하지 않는 것을 원칙으로 합니다.
 
+대용량 실험의 기본 설정은 `runtime.artifacts.export_events=false`이므로 `events.jsonl`을 디스크에 저장하지 않습니다. KPI와 Gantt는 run 중 메모리에 유지되는 event에서 정상 생성됩니다. 이벤트 단위 forensic audit 또는 시각 Replay가 필요한 run만 다음 override로 활성화합니다.
+
+```powershell
+python main.py runtime.artifacts.export_events=true runtime.ui.export_replay_artifacts=true
+```
+
+이 설정은 artifact 보존 범위만 바꾸며 simulation 의사결정과 KPI 값에는 영향을 주지 않습니다.
+
 ## Results Hub
 
 `results_dashboard.html`은 run별 메인 진입점입니다. 내부적으로 `dashboard_manifest.json`을 사용하며, manifest에는 run metadata와 artifact path가 들어 있습니다.
 
-ManSim v0.5 run이 생성하는 manifest의 version은 `v0.5`입니다. Hub는 scenario별로 복제되지 않고 모든 scenario가 같은 renderer와 manifest contract를 공유합니다.
+ManSim v0.6 run은 `run_meta.json`에 `mansim_version=0.6.0`을 기록합니다. Hub는 scenario별로 복제되지 않고 모든 scenario가 같은 renderer와 manifest contract를 공유합니다.
 
 Hub는 다음 view로 연결합니다.
 
@@ -76,6 +84,10 @@ Worker collaboration KPI는 명시적 collaboration event만 사용합니다. �
 - `rolling_horizon_stale_skipped_task_count`: dispatch 직전 stale/resource-preempted 상태로 skip된 task 수
 - `rolling_horizon.pending_candidate_count`: run 종료 시 unresolved pool task 수
 - `rolling_horizon.max_worker_queue_length`: run 중 worker dispatch queue 최대 길이
+- `rolling_horizon.scheduler_mode`: effective scheduler (`strict_periodic`)
+- `rolling_horizon.strict_boundary_count`: 실제 처리된 정규 경계 수
+- `rolling_horizon.late_boundary_count`: 예정 시각보다 늦게 처리된 경계 수
+- `rolling_horizon.max_boundary_lag_min`: 최대 경계 지연 시간
 - `throughput_optimizer_window_count`: OR-Tools optimizer를 호출한 rolling window 수
 - `throughput_optimizer_solved_count`: `OPTIMAL` 또는 `FEASIBLE` status로 dispatch를 만든 window 수
 - `throughput_optimizer_failed_count`: fallback 없이 실패한 optimizer window 수
@@ -85,6 +97,8 @@ Worker collaboration KPI는 명시적 collaboration event만 사용합니다. �
 `rolling_horizon_aging_priority`는 HumanoidSim task code rank와 waited window count만 사용합니다. 예상 processing time, bottleneck bonus, deadline bonus는 사용하지 않습니다.
 
 `rolling_horizon_dedicated_roles`는 같은 event를 사용하되 `role_owner_agent_id`, `allowed_worker_ids`, `role_policy=dedicated_roles`를 함께 기록합니다. 3D Replay Studio의 Task Pool 패널은 rolling horizon 계열 mode에서 pool, dispatched, requeued, skipped 상태를 같은 stable task id 기준으로 보여줍니다.
+
+Task Pool 상단의 `Strict periodic / 5 min` 표시는 worker polling이 아니라 독립 coordinator가 정확한 경계에서 dispatch했음을 뜻합니다. 정규 dispatch event에는 `scheduled_boundary_min`, `actual_dispatch_min`, `boundary_lag_min`이 기록됩니다. 경계 밖 dispatch는 `collection_trigger=worker_low_battery`인 battery service만 허용됩니다.
 
 `rolling_horizon_throughput_optimizer`는 OR-Tools CP-SAT로 window dispatch를 결정합니다. 3D Replay Studio의 Task Pool 패널은 `sequence_position`을 `Seq` 열에 표시하고, tooltip에는 optimizer score와 rank 정보를 함께 표시합니다.
 
@@ -104,6 +118,10 @@ Replay는 event-sourced 방식입니다.
 3. 선택 checkpoint
 
 Renderer는 worker, machine, queue, battery station, inspection, material flow, movement, traffic conflict, incident, shared repair를 표시합니다. 이동 animation은 `AGENT_MOVE_START`에서 export된 `entity_moved.payload.path`와 durative window를 따릅니다. worker 사이를 임의 직선으로 연결하지 않습니다.
+
+`mfg_flow_shop` layout에서는 battery rack 대신 worker별 `charging_dock_A*`를 charger tile로 표시하고 worker는 그 tile에서만 `CHARGING` 상태가 됩니다. Inspection은 하나의 `inspection_desk`와 하나의 service tile로 표시되며 동시에 한 worker만 예약할 수 있습니다. Load 또는 inspection 완료 worker는 replay에서 인접 staging tile로 연속 이동한 뒤 service tile을 비우므로, 다음 단계 worker가 desk에 접근하는 과정도 확인할 수 있습니다.
+
+Hub와 KPI dashboard는 `mfg_flow_shop`의 objective에 따라 주요 지표를 바꿉니다. Makespan run은 fixed-batch progress, accepted/disposed output, yield, actual makespan과 safety-limit 상태를 표시하고, Throughput run은 total products, simulated-hour/day throughput과 material restock을 표시합니다. Replay와 Gantt의 시간축은 Makespan 조기 종료 시 실제 `sim_elapsed_min`까지만 사용합니다.
 
 Worker monitor는 다음 정보를 표시합니다.
 

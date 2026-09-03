@@ -785,6 +785,57 @@ function PlatformModel({
   );
 }
 
+function ChargingDockModel({
+  node,
+  grid,
+  mapper,
+  selected,
+  onSelect,
+}: {
+  node: RenderNode;
+  grid?: LayoutGridConfig;
+  mapper: CoordinateMapper;
+  selected: boolean;
+  onSelect?: SelectHandler;
+}) {
+  const entity = node.entity;
+  const footprint = footprintForEntity(grid, entity.entity_id);
+  const rect = footprint
+    ? mapper.footprintToWorldRect(footprint)
+    : { center: mapper.pointToWorld(node.position), width: 1, depth: 1 };
+  const assignedWorker = attrString(entity, "assigned_worker_id") || entity.entity_id.replace(/^charging_dock_/, "");
+  const charging = entity.state === "charging" || entity.attributes.charging === true;
+  const accent = charging ? "#34d399" : "#22d3ee";
+  const width = Math.max(0.82, rect.width * 0.94);
+  const depth = Math.max(0.82, rect.depth * 0.94);
+
+  return (
+    <group position={[rect.center.x, 0, rect.center.z]} onClick={(event) => stopSelect(event, entity.entity_id, onSelect)}>
+      <SelectionRing selected={selected} width={rect.width} depth={rect.depth} />
+      <Block position={[0, 0.08, 0]} size={[width, 0.16, depth]} color="#13263a" />
+      <Block position={[0, 0.18, 0]} size={[width * 0.82, 0.05, depth * 0.78]} color={accent} opacity={charging ? 0.92 : 0.68} />
+      <Block position={[-width * 0.43, 0.2, 0]} size={[0.08, 0.08, depth * 0.9]} color={accent} />
+      <Block position={[width * 0.43, 0.2, 0]} size={[0.08, 0.08, depth * 0.9]} color={accent} />
+      <group position={[-width * 0.31, 0, -depth * 0.34]}>
+        <Block position={[0, 0.64, 0]} size={[width * 0.25, 1.1, 0.18]} color="#29445f" />
+        <Block position={[0, 0.84, depth * 0.1]} size={[width * 0.16, 0.3, 0.05]} color={accent} />
+        <Block position={[0, 0.4, depth * 0.1]} size={[width * 0.11, 0.08, 0.05]} color="#d8f5ff" />
+      </group>
+      <Text rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.215, depth * 0.18]} fontSize={0.38} color="#e6fbff" anchorX="center" anchorY="middle">
+        {assignedWorker || "DOCK"}
+      </Text>
+      <Billboard position={[0, 1.48, -depth * 0.34]}>
+        <Text fontSize={0.5} color="#173252" anchorX="center" anchorY="middle" outlineWidth={0.035} outlineColor="#f8fbff">
+          {assignedWorker || "CHARGE"}
+        </Text>
+        <Text position={[0, -0.34, 0]} fontSize={0.25} color={charging ? "#047857" : "#0e7490"} anchorX="center" anchorY="middle" outlineWidth={0.024} outlineColor="#f8fbff">
+          {charging ? "CHARGING" : "DOCK"}
+        </Text>
+      </Billboard>
+    </group>
+  );
+}
+
 function ItemModel({
   node,
   mapper,
@@ -955,6 +1006,12 @@ function EntityModels({
         }
         if (node.entity.entity_type === "cart") {
           return <CartModel key={node.entity.entity_id} node={node} mapper={mapper} currentTime={currentTime} selected={selected} onSelect={onSelectEntity} />;
+        }
+        if (
+          node.entity.entity_type === "charger" &&
+          (node.entity.entity_id.startsWith("charging_dock_") || node.entity.attributes.dock_kind === "dedicated_charging_dock")
+        ) {
+          return <ChargingDockModel key={node.entity.entity_id} node={node} grid={grid} mapper={mapper} selected={selected} onSelect={onSelectEntity} />;
         }
         if (
           node.entity.entity_type === "queue" ||

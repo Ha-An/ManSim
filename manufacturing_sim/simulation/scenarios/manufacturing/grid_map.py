@@ -170,6 +170,7 @@ class TileGridMap:
         machines_per_station: int,
     ) -> "TileGridMap":
         map_cfg = cfg.get("map", {}) if isinstance(cfg.get("map", {}), dict) else {}
+        scenario_key = str(cfg.get("scenario_type") or cfg.get("type") or cfg.get("name") or "factory_mfg_basic").strip().lower()
         width = int(map_cfg.get("width_tiles", 100) or 100)
         height = int(map_cfg.get("height_tiles", 70) or 70)
         tile_time = float(map_cfg.get("tile_time_min", 0.1) or 0.1)
@@ -181,15 +182,52 @@ class TileGridMap:
         warehouse_cfg = cfg.get("warehouse", {}) if isinstance(cfg.get("warehouse", {}), dict) else {}
         shelf_cfg = warehouse_cfg.get("material_shelf", {}) if isinstance(warehouse_cfg.get("material_shelf", {}), dict) else {}
         material_shelf_capacity = max(0, int(shelf_cfg.get("capacity", 10) or 10))
+        factory_cfg = cfg.get("factory", {}) if isinstance(cfg.get("factory", {}), dict) else {}
+        worker_cfg = cfg.get("worker", {}) if isinstance(cfg.get("worker", {}), dict) else {}
+        battery_service_cfg = (
+            worker_cfg.get("battery_service", {})
+            if isinstance(worker_cfg.get("battery_service", {}), dict)
+            else {}
+        )
+        inspection_cfg = factory_cfg.get("inspection", {}) if isinstance(factory_cfg.get("inspection", {}), dict) else {}
+        num_workers = max(1, int(factory_cfg.get("num_workers", factory_cfg.get("num_agents", 3)) or 3))
+        inspection_workstation_id = (
+            str(inspection_cfg.get("workstation_id", "inspection_table")).strip() or "inspection_table"
+        )
         objects = cls._default_objects(
             zones,
             stations=stations,
             machines_per_station=machines_per_station,
             material_shelf_capacity=material_shelf_capacity,
+            num_workers=num_workers,
+            battery_service_mode=str(battery_service_cfg.get("mode", "battery_swap")).strip().lower(),
+            inspection_workstation_id=inspection_workstation_id,
+            scenario_key=scenario_key,
         )
         walls |= cls._object_wall_tiles(objects)
         service_tiles = cls._build_object_service_tiles(width, height, walls, objects)
         zone_service_tiles = cls._build_zone_service_tiles(width, height, zones, walls, objects)
+        desk_tiles = service_tiles.get(inspection_workstation_id, [])
+        if desk_tiles:
+            occupied_service_tiles = {
+                tile
+                for object_id, tiles in service_tiles.items()
+                if object_id != inspection_workstation_id
+                for tile in tiles
+            }
+            staging_tiles = [
+                tile
+                for tile in zone_service_tiles.get("Inspection", [])
+                if tile not in occupied_service_tiles and tile not in desk_tiles
+            ]
+            staging_tiles.sort(
+                key=lambda tile: (
+                    min(cls.manhattan(tile, desk_tile) for desk_tile in desk_tiles),
+                    tile[1],
+                    tile[0],
+                )
+            )
+            service_tiles["inspection_staging"] = staging_tiles[: max(2, num_workers)]
         return cls(
             width_tiles=width,
             height_tiles=height,
@@ -283,6 +321,10 @@ class TileGridMap:
         stations: Iterable[int],
         machines_per_station: int,
         material_shelf_capacity: int = 10,
+        num_workers: int = 3,
+        battery_service_mode: str = "battery_swap",
+        inspection_workstation_id: str = "inspection_table",
+        scenario_key: str = "factory_mfg_basic",
     ) -> dict[str, ObjectFootprint]:
         objects: dict[str, ObjectFootprint] = {}
 
@@ -360,7 +402,33 @@ class TileGridMap:
             add(f"warehouse_material_slot_{index:02d}", "material_slot", "Warehouse", rel_x, rel_y, 1, 1, blocking=True)
         add("completed_product_buffer", "buffer", "CompletedProducts", 9, 5, queue_width, queue_height)
         add("scrap_disposal_bin", "scrap_bin", "ScrapDisposal", 9, 4, queue_width, queue_height)
-        add("battery_rack", "charger", "BatteryStation", 4, 3, 5, 3)
+        if battery_service_mode == "dock_charge" or scenario_key == "mfg_flow_shop":
+            battery_zone = zones["BatteryStation"]
+            dock_slots = [
+                (rel_x, rel_y)
+                for rel_y in (3, 5, 7)
+                for rel_x in range(2, max(3, battery_zone.width - 1), 2)
+                if rel_x < battery_zone.width - 1 and rel_y < battery_zone.height - 1
+            ]
+            if int(num_workers) > len(dock_slots):
+                raise ValueError(
+                    f"BatteryStation can host at most {len(dock_slots)} dedicated charging docks; "
+                    f"factory.num_workers={num_workers}."
+                )
+            for index in range(1, int(num_workers) + 1):
+                rel_x, rel_y = dock_slots[index - 1]
+                add(
+                    f"charging_dock_A{index}",
+                    "charging_dock",
+                    "BatteryStation",
+                    rel_x,
+                    rel_y,
+                    1,
+                    1,
+                    blocking=False,
+                )
+        else:
+            add("battery_rack", "charger", "BatteryStation", 4, 3, 5, 3)
         for station in sorted(int(s) for s in stations):
             if station == 1:
                 zone_name = "Station1"
@@ -381,7 +449,10 @@ class TileGridMap:
         add("intermediate_queue_4", "queue", "Inspection", 3, 6, queue_width, queue_height)
         add("inspection_output_queue", "buffer", "Inspection", 15, 4, queue_width, queue_height)
         add("inspection_scrap_queue", "scrap_queue", "Inspection", 15, 8, queue_width, queue_height)
-        add("inspection_table", "inspection_table", "Inspection", 10, 14, 6, 4, blocking=False)
+        if inspection_workstation_id == "inspection_desk":
+            add("inspection_desk", "inspection_desk", "Inspection", 10, 14, 6, 2, blocking=True)
+        else:
+            add("inspection_table", "inspection_table", "Inspection", 10, 14, 6, 4, blocking=False)
         return objects
 
     @classmethod
@@ -399,6 +470,24 @@ class TileGridMap:
             if obj.object_type == "inspection_table":
                 center = obj.center()
                 out[obj.object_id] = [center] if 0 <= center[0] < width and 0 <= center[1] < height and center not in walls else []
+                continue
+            if obj.object_type == "inspection_desk":
+                service_tile = (obj.x + obj.width // 2, obj.y - 1)
+                out[obj.object_id] = [
+                    service_tile
+                    for _ in (0,)
+                    if 0 <= service_tile[0] < width
+                    and 0 <= service_tile[1] < height
+                    and service_tile not in blocked
+                ]
+                continue
+            if obj.object_type == "charging_dock":
+                center = obj.center()
+                out[obj.object_id] = [
+                    center
+                    for _ in (0,)
+                    if 0 <= center[0] < width and 0 <= center[1] < height and center not in walls
+                ]
                 continue
             if obj.object_type == "material_slot":
                 # Pickup is allowed only from a tile directly adjacent to the
@@ -460,12 +549,16 @@ class TileGridMap:
             text = text.split("->", 1)[0].strip()
         if "(" in text:
             text = text.split("(", 1)[0].strip()
+        if text in self.objects:
+            return text
         return self.LOCATION_ALIASES.get(text, text)
 
     def logical_location(self, location: str) -> str:
         normalized = self.normalize_location(location)
         if normalized in self.objects:
             return self.objects[normalized].zone
+        if normalized in self.service_tiles and self.service_tiles[normalized]:
+            return self.zone_for_tile(self.service_tiles[normalized][0]) or normalized
         if normalized in self.worker_tiles:
             return normalized
         return normalized
@@ -476,6 +569,10 @@ class TileGridMap:
             index = max(0, int(str(worker_id).lstrip("A")) - 1)
         except ValueError:
             index = 0
+        assigned_dock = f"charging_dock_{worker_id}"
+        dock = self.objects.get(assigned_dock)
+        if dock is not None and dock.object_type == "charging_dock":
+            return dock.center()
         warehouse = self.zones.get("Warehouse")
         station2 = self.zones.get("Station2")
         if warehouse is not None and station2 is not None:
@@ -495,6 +592,17 @@ class TileGridMap:
                 return corridor_slots[index % len(corridor_slots)]
         slots = self.zone_service_tiles.get("Warehouse") or [self.zones["Warehouse"].center()]
         return slots[index % len(slots)]
+
+    def charging_dock_for_worker(self, worker_id: str) -> str | None:
+        dock_id = f"charging_dock_{str(worker_id).strip()}"
+        dock = self.objects.get(dock_id)
+        return dock_id if dock is not None and dock.object_type == "charging_dock" else None
+
+    def zone_for_tile(self, tile: Tile) -> str | None:
+        for zone_name, zone in self.zones.items():
+            if zone.contains(tile):
+                return zone_name
+        return None
 
     def register_worker(self, worker_id: str, tile: Tile) -> Tile:
         previous = self.worker_tiles.get(worker_id)
@@ -764,10 +872,12 @@ class TileGridMap:
             "buffer": "buffer",
             "machine": "machine",
             "charger": "charger",
+            "charging_dock": "charger",
             "shelf": "shelf",
             "material_slot": "material_slot",
             "scrap_queue": "queue",
             "scrap_bin": "buffer",
+            "inspection_desk": "inspection_table",
         }
         for obj in self.objects.values():
             if obj.object_type in {"shelf_blocker", "shelf_wall", "shelf_low_wall"}:
@@ -789,11 +899,12 @@ class TileGridMap:
             )
         for worker_id in worker_ids:
             tile = self.initial_worker_tile(str(worker_id))
+            zone_name = self.zone_for_tile(tile) or "Warehouse"
             nodes.append(
                 {
                     "entity_id": str(worker_id),
                     "entity_type": "worker",
-                    "region_id": self.REGION_ID["Warehouse"],
+                    "region_id": self.REGION_ID[zone_name],
                     "position": self.tile_to_position(tile),
                     "tile": self.tile_payload(tile),
                 }

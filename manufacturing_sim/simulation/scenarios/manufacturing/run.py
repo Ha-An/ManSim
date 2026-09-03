@@ -19,9 +19,13 @@ from dashboards.legacy import (
 )
 from dashboards.pre_run_diagnostics import export_pre_run_diagnostics_dashboard
 from agents.modes import is_llm_mode, normalize_decision_mode
+from manufacturing_sim import __version__ as mansim_version
 from manufacturing_sim.simulation.pre_run_diagnostics import build_factory_pre_run_diagnostics
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
-from manufacturing_sim.simulation.scenarios.manufacturing.world import ManufacturingWorld
+from manufacturing_sim.simulation.scenarios.manufacturing.world import (
+    ManufacturingWorld,
+    resolve_manufacturing_objective,
+)
 
 
 def _utc_now_iso() -> str:
@@ -52,6 +56,38 @@ def _scenario_type(experiment_cfg: dict[str, Any]) -> str:
         or "factory_mfg_basic"
     ).strip().lower()
     return raw or "factory_mfg_basic"
+
+
+def _export_events_enabled(experiment_cfg: dict[str, Any]) -> bool:
+    runtime_cfg = experiment_cfg.get("runtime", {})
+    runtime_cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    artifacts_cfg = runtime_cfg.get("artifacts", {})
+    artifacts_cfg = artifacts_cfg if isinstance(artifacts_cfg, dict) else {}
+    return bool(artifacts_cfg.get("export_events", False))
+
+
+def _event_audit_signature(events: list[dict[str, Any]]) -> dict[str, Any]:
+    quality: list[str] = []
+    repair_samples: dict[str, list[float]] = {}
+    restock_times: list[float] = []
+    for event in events:
+        event_type = str(event.get("type", ""))
+        if event_type in {"INSPECT_PASS", "INSPECT_FAIL"}:
+            quality.append("P" if event_type == "INSPECT_PASS" else "F")
+        elif event_type == "MACHINE_REPAIR_START":
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            machine_id = str(event.get("entity_id", ""))
+            if machine_id and details.get("repair_total_min") is not None:
+                repair_samples.setdefault(machine_id, []).append(
+                    round(float(details["repair_total_min"]), 6)
+                )
+        elif event_type == "WAREHOUSE_MATERIAL_RESTOCK":
+            restock_times.append(round(float(event.get("t", 0.0)), 6))
+    return {
+        "quality": quality,
+        "repair_samples": repair_samples,
+        "restock_times": restock_times,
+    }
 
 
 def _write_progress(output_root: Path, payload: dict[str, Any]) -> None:
@@ -245,6 +281,7 @@ def _build_progress_payload(
     sim_total_min: float,
     elapsed_wall_sec: float,
     output_root: Path,
+    events_enabled: bool,
     message: str,
     finished_at_utc: str | None = None,
 ) -> dict[str, Any]:
@@ -262,7 +299,7 @@ def _build_progress_payload(
         "sim_total_min": round(float(sim_total_min), 3),
         "progress_ratio": round(progress_ratio, 6),
         "progress_percent": round(progress_ratio * 100.0, 2),
-        "events_path": str((output_root / "events.jsonl").resolve()),
+        "events_path": str((output_root / "events.jsonl").resolve()) if events_enabled else "",
         "message": message,
     }
 
@@ -292,13 +329,17 @@ def run(
     output_root = Path(output_dir or Path.cwd() / "outputs")
     output_root.mkdir(parents=True, exist_ok=True)
 
-    event_logger = logger or EventLogger(output_root)
+    event_logger = logger or EventLogger(
+        output_root,
+        persist_events=_export_events_enabled(experiment_cfg),
+    )
 
     decision_cfg = experiment_cfg.get("decision", {}) if isinstance(experiment_cfg.get("decision", {}), dict) else {}
     decision_mode = normalize_decision_mode(str(decision_cfg.get("mode", "adaptive_priority")))
     scenario_kind = _scenario_type(experiment_cfg)
 
-    total_days = int(experiment_cfg["horizon"]["num_days"])
+    objective = resolve_manufacturing_objective(experiment_cfg)
+    total_days = int(objective["run_day_limit"])
     sim_total_min = float(total_days) * float(experiment_cfg["horizon"].get("minutes_per_day", 0))
     wall_clock_started = perf_counter()
     started_at_utc = _utc_now_iso()
@@ -310,6 +351,7 @@ def run(
     base_seed = int(series_cfg.get("base_seed", run_seed) or run_seed)
 
     run_meta: dict[str, Any] = {
+        "mansim_version": mansim_version,
         "scenario_type": scenario_kind,
         "decision_mode": decision_mode,
         "run_index": run_index,
@@ -329,6 +371,14 @@ def run(
         "wall_clock_sec": 0.0,
         "wall_clock_human": "0s",
         "progress_path": str((output_root / "progress.json").resolve()),
+        "event_log": {
+            "enabled": bool(getattr(event_logger, "persist_events", True)),
+            "path": (
+                str((output_root / "events.jsonl").resolve())
+                if bool(getattr(event_logger, "persist_events", True))
+                else ""
+            ),
+        },
         "worker_execution_mode": (
             str((experiment_cfg.get("worker", {}) if isinstance(experiment_cfg.get("worker", {}), dict) else {}).get("execution_mode", "")).strip()
             if decision_mode == "llm_planner"
@@ -439,6 +489,24 @@ def run(
 
     env = simpy.Environment()
     world = ManufacturingWorld(env=env, cfg=experiment_cfg, logger=event_logger, decision_module=decision_module)
+    run_meta["rolling_horizon_scheduler"] = {
+        "enabled": bool(world.rolling_horizon_enabled),
+        "scheduler_mode": world.rolling_horizon_scheduler_mode,
+        "candidate_collection_mode": world.rolling_horizon_candidate_collection_mode,
+        "window_min": round(float(world.rolling_horizon_window_min), 6),
+        "first_dispatch_min": round(float(world.rolling_horizon_window_min), 6),
+    }
+    if world.is_mfg_flow_shop:
+        run_meta.update(world.objective_metadata())
+    run_meta["task_primitive_timing"] = {
+        "scenario_type": world.timing.scenario_type,
+        "profile_fingerprint": world.timing.profile_fingerprint,
+    }
+    run_meta["stochastic_streams"] = dict(world.stochastic_streams)
+    if world.mfg_flow_task_policy is not None:
+        run_meta["mfg_flow_shop_task_policy"] = world.mfg_flow_task_policy.summary()
+    if world._adp_active():
+        run_meta["simulation_based_adp"] = world.adp_coordinator.summary()
     world.bootstrap()
     pre_run_diagnostics = build_factory_pre_run_diagnostics(world=world, cfg=experiment_cfg)
     event_logger.write_json("pre_run_diagnostics.json", pre_run_diagnostics)
@@ -484,6 +552,7 @@ def run(
             sim_total_min=sim_total_min,
             elapsed_wall_sec=perf_counter() - wall_clock_started,
             output_root=output_root,
+            events_enabled=bool(getattr(event_logger, "persist_events", True)),
             message=message,
         )
         if log_line:
@@ -511,6 +580,7 @@ def run(
                     sim_total_min=sim_total_min,
                     elapsed_wall_sec=perf_counter() - wall_clock_started,
                     output_root=output_root,
+                    events_enabled=bool(getattr(event_logger, "persist_events", True)),
                     message=message,
                 ),
             )
@@ -536,6 +606,7 @@ def run(
 
             _emit_run_progress(status="running", message=f"starting day {day}", current_day=day)
 
+            world.prepare_objective_day(day)
             observation = world.build_observation(last_summary)
             strategy = decision_module.reflect(observation)
             job_plan = decision_module.propose_jobs(observation, strategy, {})
@@ -546,8 +617,15 @@ def run(
                 stop_event = env.any_of([world.termination_event, env.timeout(day_end - env.now)])
                 env.run(until=stop_event)
 
+            if world.terminated:
+                world.close_open_activity_at_horizon(reason=world.termination_reason)
+
             if day == total_days and not world.terminated:
-                world.close_open_activity_at_horizon(reason="horizon_reached")
+                if world.minimize_makespan_enabled:
+                    world.close_open_activity_at_horizon(reason="makespan_max_days_reached")
+                    world.terminate_at_objective_limit()
+                else:
+                    world.close_open_activity_at_horizon(reason="horizon_reached")
 
             day_summary = world.finalize_day(day)
             if world.terminated:
@@ -622,6 +700,9 @@ def run(
             if world.terminated:
                 break
 
+        if world.maximize_throughput_enabled and not world.termination_reason:
+            world.termination_reason = "completed_horizon"
+
         elapsed_wall_sec = perf_counter() - wall_clock_started
         finished_at_utc = _utc_now_iso()
         run_meta["finished_at_utc"] = finished_at_utc
@@ -632,6 +713,39 @@ def run(
         kpi["scenario_type"] = scenario_kind
         kpi["wall_clock_sec"] = round(elapsed_wall_sec, 3)
         kpi["wall_clock_human"] = _format_duration(elapsed_wall_sec)
+        if world._adp_active():
+            run_meta["simulation_based_adp"] = world.adp_coordinator.summary()
+        run_meta["rolling_horizon_scheduler"].update(
+            {
+                "strict_boundary_count": int(
+                    world.rolling_horizon_metrics.get("strict_boundary_count", 0)
+                ),
+                "late_boundary_count": int(
+                    world.rolling_horizon_metrics.get("late_boundary_count", 0)
+                ),
+                "max_boundary_lag_min": round(
+                    float(world.rolling_horizon_max_boundary_lag_min), 9
+                ),
+            }
+        )
+        if world.is_mfg_flow_shop:
+            for key in (
+                "objective_mode",
+                "objective_status",
+                "initial_batch_material_count",
+                "initial_batch_terminal_material_count",
+                "initial_batch_progress_ratio",
+                "initial_batch_expected_output_count",
+                "initial_batch_accepted_product_count",
+                "initial_batch_disposed_scrap_count",
+                "makespan_min",
+                "makespan_status",
+                "configured_max_sim_days",
+                "configured_throughput_days",
+                "sim_elapsed_min",
+            ):
+                run_meta[key] = kpi.get(key)
+        run_meta["event_audit_signature"] = _event_audit_signature(event_logger.events)
         kpi["run_meta"] = run_meta
 
         _emit_run_progress(
@@ -821,7 +935,11 @@ def run(
         "kpi": kpi,
         "daily_summary": world.daily_summaries,
         "output_dir": str(output_root),
-        "events_path": str(output_root / "events.jsonl"),
+        "events_path": (
+            str(output_root / "events.jsonl")
+            if bool(getattr(event_logger, "persist_events", True))
+            else ""
+        ),
         "gantt_path": str(output_root / "gantt.html"),
         "kpi_dashboard_path": str(dashboard_path) if dashboard_path else "",
         "pre_run_diagnostics_path": str(output_root / "pre_run_diagnostics.json"),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import shutil
 import subprocess
@@ -36,11 +37,14 @@ from experiments.factory_policy_comparison.summarize_results import summarize_re
 
 STATUS_FIELDS = [
     "run_id",
+    "objective_mode",
     "mode",
     "worker_count",
     "seed",
     "scenario",
     "horizon_days",
+    "makespan_max_sim_days",
+    "rolling_window_min",
     "run_dir",
     "status",
     "return_code",
@@ -56,10 +60,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--stamp", default=None, help="Result folder name. Defaults to current timestamp.")
     parser.add_argument("--modes", nargs="*", default=None, help="Optional subset of decision modes.")
+    parser.add_argument("--objectives", nargs="*", default=None, help="Optional subset of objective modes.")
     parser.add_argument("--seeds", nargs="*", type=int, default=None, help="Optional subset of seeds.")
     parser.add_argument("--worker-counts", nargs="*", type=int, default=None, help="Optional subset of worker counts.")
+    parser.add_argument("--adp-checkpoint", type=Path, default=None, help="Checkpoint for simulation_based_adp runs.")
     parser.add_argument("--days", type=int, default=None, help="Override horizon days.")
+    parser.add_argument("--makespan-max-days", type=int, default=None, help="Override the makespan safety limit.")
+    parser.add_argument(
+        "--rolling-window-min",
+        type=float,
+        default=None,
+        help="Override window_min for rolling-horizon modes only.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N mode/seed combinations.")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Number of independent simulation runs to execute concurrently.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without creating result files.")
     parser.add_argument("--skip-existing", action="store_true", help="Skip runs whose kpi.json already exists.")
     parser.add_argument("--force-rerun", action="store_true", help="Run selected specs even when output artifacts already exist.")
@@ -109,22 +128,80 @@ def compact_run_dir(run_dir: Path) -> None:
 
 def experiment_audit_failed(summary: dict[str, object]) -> bool:
     run_count = int(summary.get("run_count", 0) or 0)
+    expected_run_count = int(summary.get("expected_run_count", run_count) or 0)
     fairness_pass_count = int(summary.get("fairness_pass_count", 0) or 0)
     return (
         run_count == 0
+        or run_count != expected_run_count
+        or int(summary.get("unexpected_run_count", 0) or 0) > 0
         or fairness_pass_count != run_count
         or int(summary.get("artifact_audit_fail_count", 0) or 0) > 0
         or int(summary.get("kpi_audit_fail_count", 0) or 0) > 0
     )
 
 
+def validate_adp_held_out_seeds(checkpoint_path: Path, held_out_seeds: list[int]) -> dict[str, object]:
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("ADP comparison requires PyTorch from requirements-adp.txt") from exc
+    path = checkpoint_path.expanduser().resolve()
+    if not path.is_file():
+        raise RuntimeError(f"ADP checkpoint does not exist: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    manifest = payload.get("manifest", {}) if isinstance(payload, dict) else {}
+    partitions = manifest.get("seed_partitions", {}) if isinstance(manifest.get("seed_partitions", {}), dict) else {}
+    if not partitions:
+        raise RuntimeError("ADP checkpoint is missing required seed partition metadata")
+    if partitions.get("disjoint") is False:
+        raise RuntimeError("ADP checkpoint reports overlapping seed partitions")
+    used: set[int] = set()
+    for name in ("training", "screening_validation", "final_selection_validation"):
+        row = partitions.get(name, {}) if isinstance(partitions.get(name, {}), dict) else {}
+        used.update(int(value) for value in row.get("values", []) if str(value).strip())
+    overlap = sorted(used & {int(seed) for seed in held_out_seeds})
+    if overlap:
+        raise RuntimeError(f"held-out experiment seeds overlap ADP training/validation seeds: {overlap}")
+    held_out_row = (
+        partitions.get("held_out_test", {})
+        if isinstance(partitions.get("held_out_test", {}), dict)
+        else {}
+    )
+    declared_held_out = {int(value) for value in held_out_row.get("values", [])}
+    requested_held_out = {int(seed) for seed in held_out_seeds}
+    undeclared = sorted(requested_held_out - declared_held_out)
+    if undeclared:
+        raise RuntimeError(
+            f"experiment seeds are not declared in the checkpoint held-out partition: {undeclared}"
+        )
+    worker_range = manifest.get("worker_count_range", [])
+    if worker_range != [3, 3]:
+        raise RuntimeError(f"worker-3 ADP comparison requires worker_count_range=[3, 3], got {worker_range}")
+    return {
+        "checkpoint": str(path),
+        "checkpoint_id": str(manifest.get("checkpoint_id", "")),
+        "held_out_seed_count": len(held_out_seeds),
+        "overlap": overlap,
+        "seed_partitions_present": True,
+        "declared_held_out_seed_count": len(declared_held_out),
+    }
+
+
 def main() -> int:
     args = parse_args()
+    if args.jobs < 1:
+        raise ValueError("jobs must be at least 1")
     cfg = load_experiment_config(args.config)
     effective_cfg = replace(
         cfg,
         horizon_days=int(args.days if args.days is not None else cfg.horizon_days),
+        makespan_max_sim_days=int(
+            args.makespan_max_days if args.makespan_max_days is not None else cfg.makespan_max_sim_days
+        ),
         modes=[str(mode) for mode in (args.modes if args.modes is not None else cfg.modes)],
+        objective_modes=[
+            str(mode) for mode in (args.objectives if args.objectives is not None else cfg.objective_modes)
+        ],
         seeds=[int(seed) for seed in (args.seeds if args.seeds is not None else cfg.seeds)],
         worker_counts=[int(count) for count in (args.worker_counts if args.worker_counts is not None else cfg.worker_counts)],
     )
@@ -133,15 +210,42 @@ def main() -> int:
         cfg,
         output_root,
         modes=args.modes,
+        objective_modes=args.objectives,
         seeds=args.seeds,
         worker_counts=args.worker_counts,
         days=args.days,
+        makespan_max_days=args.makespan_max_days,
         limit=args.limit,
     )
+    if args.adp_checkpoint is not None:
+        specs = [replace(spec, adp_checkpoint_path=str(args.adp_checkpoint.resolve())) for spec in specs]
+    if specs:
+        effective_cfg = replace(
+            effective_cfg,
+            objective_modes=list(dict.fromkeys(spec.objective_mode for spec in specs)),
+            modes=list(dict.fromkeys(spec.mode for spec in specs)),
+            worker_counts=sorted({spec.worker_count for spec in specs}),
+            seeds=sorted({spec.seed for spec in specs}),
+        )
+
+    adp_preflight: dict[str, object] = {}
+    adp_specs = [spec for spec in specs if spec.mode == "simulation_based_adp"]
+    if adp_specs and not args.dry_run:
+        checkpoint_values = {str(spec.adp_checkpoint_path).strip() for spec in adp_specs}
+        if len(checkpoint_values) != 1 or not next(iter(checkpoint_values), ""):
+            raise RuntimeError("all simulation_based_adp runs must use one explicit checkpoint")
+        adp_preflight = validate_adp_held_out_seeds(
+            Path(next(iter(checkpoint_values))),
+            sorted({spec.seed for spec in specs}),
+        )
 
     if args.dry_run:
         for spec in specs:
-            command = build_run_command(spec, cfg.common_overrides)
+            command = build_run_command(
+                spec,
+                cfg.common_overrides,
+                rolling_window_min=args.rolling_window_min,
+            )
             print(" ".join(command))
         return 0
 
@@ -152,17 +256,26 @@ def main() -> int:
         {
             "scenario": cfg.scenario,
             "horizon_days": effective_cfg.horizon_days,
+            "makespan_max_sim_days": effective_cfg.makespan_max_sim_days,
             "minutes_per_day": cfg.minutes_per_day,
+            "objective_modes": list(dict.fromkeys(spec.objective_mode for spec in specs)),
             "modes": list(dict.fromkeys(spec.mode for spec in specs)),
             "worker_counts": sorted({spec.worker_count for spec in specs}),
             "seeds": sorted({spec.seed for spec in specs}),
             "run_count": len(specs),
+            "rolling_window_min": args.rolling_window_min,
+            "adp_preflight": adp_preflight,
         },
     )
 
     status_path = output_root / STATUS_CSV
+    pending_runs: list[tuple[object, list[str], str]] = []
     for spec in specs:
-        command = build_run_command(spec, cfg.common_overrides)
+        command = build_run_command(
+            spec,
+            cfg.common_overrides,
+            rolling_window_min=args.rolling_window_min,
+        )
         command_text = " ".join(command)
         dependency_ok, dependency_reason = check_optimizer_dependency(spec.mode)
         if not dependency_ok:
@@ -170,11 +283,14 @@ def main() -> int:
                 status_path,
                 {
                     "run_id": spec.run_id,
+                    "objective_mode": spec.objective_mode,
                     "mode": spec.mode,
                     "worker_count": spec.worker_count,
                     "seed": spec.seed,
                     "scenario": spec.scenario,
                     "horizon_days": spec.horizon_days,
+                    "makespan_max_sim_days": spec.makespan_max_sim_days,
+                    "rolling_window_min": args.rolling_window_min if spec.mode.startswith("rolling_horizon_") else "",
                     "run_dir": str(spec.run_dir.resolve()),
                     "status": "failed_dependency",
                     "return_code": "",
@@ -196,11 +312,14 @@ def main() -> int:
                     status_path,
                     {
                         "run_id": spec.run_id,
+                        "objective_mode": spec.objective_mode,
                         "mode": spec.mode,
                         "worker_count": spec.worker_count,
                         "seed": spec.seed,
                         "scenario": spec.scenario,
                         "horizon_days": spec.horizon_days,
+                        "makespan_max_sim_days": spec.makespan_max_sim_days,
+                        "rolling_window_min": args.rolling_window_min if spec.mode.startswith("rolling_horizon_") else "",
                         "run_dir": str(spec.run_dir.resolve()),
                         "status": "skipped_existing",
                         "return_code": "",
@@ -213,32 +332,55 @@ def main() -> int:
                 )
                 continue
 
+        pending_runs.append((spec, command, command_text))
+
+    def execute_run(item: tuple[object, list[str], str]) -> dict[str, object]:
+        spec, command, command_text = item
         started = time.perf_counter()
-        return_code, output = run_subprocess(command, cwd=REPO_ROOT, log_path=spec.run_dir / "experiment_stdout.log")
+        return_code, output = run_subprocess(
+            command,
+            cwd=REPO_ROOT,
+            log_path=spec.run_dir / "experiment_stdout.log",
+        )
         elapsed = round(time.perf_counter() - started, 3)
         status = "completed" if return_code == 0 and (spec.run_dir / "kpi.json").exists() else "failed"
-        reason = "" if status == "completed" else (output.strip().splitlines()[-1] if output.strip() else "missing kpi.json")
-        upsert_csv(
-            status_path,
-            {
+        reason = "" if status == "completed" else (
+            output.strip().splitlines()[-1] if output.strip() else "missing kpi.json"
+        )
+        if args.compact_after_run:
+            compact_run_dir(spec.run_dir)
+        return {
                 "run_id": spec.run_id,
+                "objective_mode": spec.objective_mode,
                 "mode": spec.mode,
                 "worker_count": spec.worker_count,
                 "seed": spec.seed,
                 "scenario": spec.scenario,
                 "horizon_days": spec.horizon_days,
+                "makespan_max_sim_days": spec.makespan_max_sim_days,
+                "rolling_window_min": args.rolling_window_min if spec.mode.startswith("rolling_horizon_") else "",
                 "run_dir": str(spec.run_dir.resolve()),
                 "status": status,
                 "return_code": return_code,
                 "elapsed_sec": elapsed,
                 "reason": reason,
                 "command": command_text,
-            },
-            STATUS_FIELDS,
-            key="run_id",
-        )
-        if args.compact_after_run:
-            compact_run_dir(spec.run_dir)
+        }
+
+    if args.jobs == 1:
+        completed_rows = (execute_run(item) for item in pending_runs)
+        for row in completed_rows:
+            upsert_csv(status_path, row, STATUS_FIELDS, key="run_id")
+    else:
+        with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+            futures = {executor.submit(execute_run, item): item[0] for item in pending_runs}
+            for future in as_completed(futures):
+                row = future.result()
+                upsert_csv(status_path, row, STATUS_FIELDS, key="run_id")
+                print(
+                    f"completed: {row['run_id']} status={row['status']} "
+                    f"elapsed_sec={row['elapsed_sec']}"
+                )
 
     postprocess_failed = False
     if not args.no_postprocess:

@@ -6,6 +6,8 @@ mode: rolling_horizon_aging_priority
 
 rolling_horizon:
   window_min: 5.0
+  scheduler_mode: strict_periodic
+  candidate_collection_mode: event_with_boundary_reconciliation
   dispatch_policy: aging_priority
   # Lower rank means higher priority. Each waited window improves the rank by
   # aging.rank_boost_per_window.
@@ -20,8 +22,20 @@ rolling_horizon:
       - SETUP_MACHINE
       - TRANSFER
       - REPLENISH_MATERIAL
+      - LOAD_UNLOAD_TRANSFER_INTERFACE
       - INSPECT_PRODUCT
       - PREVENTIVE_MAINTENANCE
+    mfg_flow_shop:
+      - MANAGE_ROBOT_POWER
+      - REPAIR_MACHINE
+      - COLLECT_WASTE_OR_SCRAP
+      - UNLOAD_MACHINE
+      - LOAD_MACHINE
+      - SETUP_MACHINE
+      - TRANSFER
+      - REPLENISH_MATERIAL
+      - LOAD_UNLOAD_TRANSFER_INTERFACE
+      - INSPECT_PRODUCT
     shipyard_basic:
       - MANAGE_ROBOT_POWER
       - OPERATE_VEHICLE_TRANSPORT
@@ -45,8 +59,6 @@ rolling_horizon:
     event_task_codes:
       worker_low_battery:
         - MANAGE_ROBOT_POWER
-      machine_broken:
-        - REPAIR_MACHINE
 
 battery:
   low_threshold_ratio: 0.30

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
 
 from omegaconf import OmegaConf
 
 from runtime.compat import build_legacy_experiment_cfg
+from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
 
 
 class RuntimeCompatTests(unittest.TestCase):
@@ -27,6 +30,7 @@ class RuntimeCompatTests(unittest.TestCase):
                 "decision": {},
                 "heuristic_rules": {},
                 "humanoidsim": {},
+                "runtime": {"artifacts": {"export_events": False}},
                 "seed": 2026,
             }
         )
@@ -40,6 +44,15 @@ class RuntimeCompatTests(unittest.TestCase):
         )
         self.assertEqual("commitment", experiment_cfg["worker"]["execution_mode"])
         self.assertEqual({"enabled": True}, experiment_cfg["worker"]["local_response"])
+        self.assertFalse(experiment_cfg["runtime"]["artifacts"]["export_events"])
+
+    def test_event_logger_can_keep_events_in_memory_without_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp), persist_events=False)
+            logger.log(t=1.0, day=1, event_type="TEST_EVENT")
+            logger.close()
+            self.assertEqual(1, len(logger.events))
+            self.assertFalse((Path(tmp) / "events.jsonl").exists())
 
 
 if __name__ == "__main__":

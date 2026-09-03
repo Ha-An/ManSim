@@ -128,6 +128,61 @@ def _pair_intervals(
     return intervals
 
 
+def _build_machine_processing_intervals(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build every active processing segment, including resumes and open WIP."""
+    active: dict[tuple[str, str], dict[str, Any]] = {}
+    intervals: list[dict[str, Any]] = []
+    sim_end = max((float(event.get("t", 0.0) or 0.0) for event in events), default=0.0)
+
+    def close_interval(key: tuple[str, str], end_event: dict[str, Any]) -> None:
+        start_event = active.pop(key, None)
+        if start_event is None:
+            return
+        start_t = float(start_event.get("t", 0.0) or 0.0)
+        end_t = float(end_event.get("t", 0.0) or 0.0)
+        if end_t <= start_t:
+            return
+        intervals.append(
+            {
+                "lane": str(start_event.get("entity_id", "")),
+                "entity_group": "Machine",
+                "status": "RUNNING",
+                "start": start_t,
+                "end": end_t,
+                "duration": end_t - start_t,
+                "interval_type": "MACHINE_PROCESSING",
+                "start_event": start_event,
+                "end_event": end_event,
+            }
+        )
+
+    for event in events:
+        event_type = str(event.get("type", ""))
+        key = _cycle_key(event)
+        if event_type in {"MACHINE_START", "MACHINE_RESUME"}:
+            # A repeated start for the same cycle should not silently erase an
+            # earlier segment. Close it at the replacement timestamp first.
+            if key in active:
+                close_interval(key, event)
+            active[key] = event
+        elif event_type in {"MACHINE_END", "MACHINE_ABORTED"}:
+            close_interval(key, event)
+
+    for key, start_event in list(active.items()):
+        close_interval(
+            key,
+            {
+                "t": sim_end,
+                "day": 0,
+                "type": "MACHINE_PROCESSING_HORIZON_END",
+                "entity_id": start_event.get("entity_id", ""),
+                "location": start_event.get("location", ""),
+                "details": {"cycle_id": key[1], "reason": "horizon_reached"},
+            },
+        )
+    return intervals
+
+
 def _state_context(state: dict[str, Any]) -> dict[str, str]:
     context = state.get("task_context")
     context = context if isinstance(context, dict) else {}
@@ -152,8 +207,11 @@ def _state_context(state: dict[str, Any]) -> dict[str, str]:
 def _state_signature(state: dict[str, Any]) -> tuple[str, ...]:
     # Gantt worker rows are intentionally availability-first.  Other axes and
     # task context remain in hover metadata, but they should not fragment the
-    # lane into primitive-sized slices.
-    return (str(state.get("availability") or ""),)
+    # lane into primitive-sized slices. Charging is the one power-axis state
+    # promoted to a segment because it is an operationally meaningful pause.
+    power = str(state.get("power") or "").strip().upper()
+    charging = "CHARGING" if power == "CHARGING" else ""
+    return (str(state.get("availability") or ""), charging)
 
 
 def _hover_line(label: str, value: Any) -> str:
@@ -213,6 +271,8 @@ def _build_worker_availability(events: list[dict[str, Any]]) -> list[dict[str, A
         availability = str(state.get("availability") or "AVAILABLE").strip().upper() or "AVAILABLE"
         if availability not in AVAILABILITY_STATES:
             availability = "UNKNOWN"
+        power = str(state.get("power") or "").strip().upper()
+        display_status = "CHARGING" if power == "CHARGING" else availability
         details = dict(_details(last_event.get(worker_id, {})))
         details["humanoid_state"] = state
         start_event = dict(last_event.get(worker_id, {}))
@@ -221,11 +281,11 @@ def _build_worker_availability(events: list[dict[str, Any]]) -> list[dict[str, A
             {
                 "lane": worker_id,
                 "entity_group": "Worker",
-                "status": availability,
+                "status": display_status,
                 "start": start_t,
                 "end": float(end_t),
                 "duration": duration,
-                "interval_type": availability,
+                "interval_type": display_status,
                 "start_event": start_event,
                 "end_event": end_event,
             }
@@ -445,15 +505,7 @@ def export_gantt(
 
     worker_availability = _build_worker_availability(events)
 
-    machine_running = _pair_intervals(
-        events,
-        "MACHINE_START",
-        {"MACHINE_END", "MACHINE_ABORTED"},
-        _cycle_key,
-        "RUNNING",
-        lambda _s, _e: "MACHINE_PROCESSING",
-        "Machine",
-    )
+    machine_running = _build_machine_processing_intervals(events)
     machine_down_break = _pair_intervals(
         events,
         "MACHINE_BROKEN",
@@ -607,6 +659,7 @@ def export_gantt(
             lines.append(_hover_line("Task", row.get("task_code", "")))
             lines.append(_hover_line("Primitive", row.get("primitive_call_code", "")))
             lines.append(_hover_line("Mobility", row.get("mobility", "")))
+            lines.append(_hover_line("Power", row.get("power", "")))
             lines.append(_hover_line("Reason", row.get("reason", "")))
         elif row["entity_group"] == "Ship Surface":
             lines.append(_hover_line("Surface Tile", row.get("work_tile_id", row.get("section_id", ""))))
@@ -636,6 +689,7 @@ def export_gantt(
         "BLOCKED": "#e67e22",
         "OFFLINE": "#95a5a6",
         "DISABLED": "#e74c3c",
+        "CHARGING": "#16a085",
         "UNKNOWN": "#6c757d",
         "RUNNING": "#27ae60",
         "DOWN": "#e74c3c",

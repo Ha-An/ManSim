@@ -25,6 +25,7 @@ AUDIT_CSV = "audit_summary.csv"
 RUN_SUMMARY_CSV = "comparison_summary.csv"
 MODE_SUMMARY_CSV = "mode_summary.csv"
 MODE_WORKER_SUMMARY_CSV = "mode_worker_summary.csv"
+PAIRED_COMPARISON_CSV = "paired_comparison.csv"
 SUMMARY_JSON = "comparison_summary.json"
 DASHBOARD_HTML = "comparison_dashboard.html"
 
@@ -37,21 +38,31 @@ DEFAULT_MODES = [
     "rolling_horizon_throughput_optimizer",
 ]
 
+SCENARIO_DEFAULT_OBJECTIVE = "scenario_default"
+MFG_FLOW_SHOP_OBJECTIVES = {
+    "maximize_throughput",
+    "minimize_makespan",
+}
+
 
 @dataclass(frozen=True)
 class ExperimentConfig:
     scenario: str
     horizon_days: int
+    makespan_max_sim_days: int
     minutes_per_day: float
+    objective_modes: list[str]
     seeds: list[int]
     worker_counts: list[int]
     modes: list[str]
     common_overrides: list[str]
     metrics: dict[str, list[str]]
+    adp_checkpoint_path: str = ""
 
 
 @dataclass(frozen=True)
 class RunSpec:
+    objective_mode: str
     mode: str
     seed: int
     worker_count: int
@@ -59,17 +70,28 @@ class RunSpec:
     horizon_days: int
     scenario: str
     minutes_per_day: float
+    makespan_max_sim_days: int
+    adp_checkpoint_path: str = ""
 
     @property
     def run_id(self) -> str:
-        return f"{self.mode}__workers_{self.worker_count}__seed_{self.seed}"
+        base = f"{self.mode}__workers_{self.worker_count}__seed_{self.seed}"
+        if self.objective_mode == SCENARIO_DEFAULT_OBJECTIVE:
+            return base
+        return f"{self.objective_mode}__{base}"
 
 
 def load_experiment_config(path: Path = DEFAULT_CONFIG_PATH) -> ExperimentConfig:
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     scenario = str(data.get("scenario", "factory_mfg_basic")).strip() or "factory_mfg_basic"
     horizon_days = int(data.get("horizon_days", 5) or 5)
+    makespan_max_sim_days = int(data.get("makespan_max_sim_days", 30) or 30)
     minutes_per_day = float(data.get("minutes_per_day", 240) or 240)
+    objective_modes = [
+        str(mode).strip()
+        for mode in data.get("objective_modes", [SCENARIO_DEFAULT_OBJECTIVE])
+        if str(mode).strip()
+    ]
     seeds = [int(seed) for seed in data.get("seeds", [2026, 2027, 2028, 2029, 2030])]
     worker_counts = [int(count) for count in data.get("worker_counts", [3, 4, 5, 6, 7, 8])]
     modes = [str(mode).strip() for mode in data.get("modes", DEFAULT_MODES) if str(mode).strip()]
@@ -80,15 +102,19 @@ def load_experiment_config(path: Path = DEFAULT_CONFIG_PATH) -> ExperimentConfig
         for group, values in metrics.items()
         if isinstance(values, list)
     }
+    adp_checkpoint_path = str(data.get("adp_checkpoint_path", "") or "").strip()
     return ExperimentConfig(
         scenario=scenario,
         horizon_days=horizon_days,
+        makespan_max_sim_days=makespan_max_sim_days,
         minutes_per_day=minutes_per_day,
+        objective_modes=objective_modes,
         seeds=seeds,
         worker_counts=worker_counts,
         modes=modes,
         common_overrides=common_overrides,
         metrics=normalized_metrics,
+        adp_checkpoint_path=adp_checkpoint_path,
     )
 
 
@@ -107,31 +133,52 @@ def build_run_specs(
     output_root: Path,
     *,
     modes: Iterable[str] | None = None,
+    objective_modes: Iterable[str] | None = None,
     seeds: Iterable[int] | None = None,
     worker_counts: Iterable[int] | None = None,
     days: int | None = None,
+    makespan_max_days: int | None = None,
     limit: int | None = None,
 ) -> list[RunSpec]:
     selected_modes = [str(mode).strip() for mode in (modes if modes is not None else cfg.modes) if str(mode).strip()]
+    selected_objectives = [
+        str(mode).strip()
+        for mode in (objective_modes if objective_modes is not None else cfg.objective_modes)
+        if str(mode).strip()
+    ]
     selected_seeds = [int(seed) for seed in (seeds if seeds is not None else cfg.seeds)]
     selected_worker_counts = [int(count) for count in (worker_counts if worker_counts is not None else cfg.worker_counts)]
     horizon_days = int(days if days is not None else cfg.horizon_days)
+    max_sim_days = int(makespan_max_days if makespan_max_days is not None else cfg.makespan_max_sim_days)
     specs: list[RunSpec] = []
-    for mode in selected_modes:
-        for worker_count in selected_worker_counts:
-            for seed in selected_seeds:
-                run_dir = output_root / "runs" / mode / f"workers_{worker_count}" / f"seed_{seed}"
-                specs.append(
-                    RunSpec(
-                        mode=mode,
-                        seed=seed,
-                        worker_count=worker_count,
-                        run_dir=run_dir,
-                        horizon_days=horizon_days,
-                        scenario=cfg.scenario,
-                        minutes_per_day=cfg.minutes_per_day,
+    for objective_mode in selected_objectives:
+        if objective_mode != SCENARIO_DEFAULT_OBJECTIVE and objective_mode not in MFG_FLOW_SHOP_OBJECTIVES:
+            raise ValueError(f"unsupported experiment objective_mode: {objective_mode}")
+        if objective_mode != SCENARIO_DEFAULT_OBJECTIVE and cfg.scenario != "mfg_flow_shop":
+            raise ValueError(
+                f"objective_mode={objective_mode} is only supported for scenario=mfg_flow_shop"
+            )
+        for mode in selected_modes:
+            for worker_count in selected_worker_counts:
+                for seed in selected_seeds:
+                    relative_run_dir = Path(mode) / f"workers_{worker_count}" / f"seed_{seed}"
+                    if objective_mode != SCENARIO_DEFAULT_OBJECTIVE:
+                        relative_run_dir = Path(objective_mode) / relative_run_dir
+                    run_dir = output_root / "runs" / relative_run_dir
+                    specs.append(
+                        RunSpec(
+                            objective_mode=objective_mode,
+                            mode=mode,
+                            seed=seed,
+                            worker_count=worker_count,
+                            run_dir=run_dir,
+                            horizon_days=horizon_days,
+                            scenario=cfg.scenario,
+                            minutes_per_day=cfg.minutes_per_day,
+                            makespan_max_sim_days=max_sim_days,
+                            adp_checkpoint_path=cfg.adp_checkpoint_path,
+                        )
                     )
-                )
     if limit is not None and limit >= 0:
         specs = specs[:limit]
     return specs
@@ -182,7 +229,12 @@ def dedicated_role_overrides(worker_count: int) -> list[str]:
     return overrides
 
 
-def build_run_command(spec: RunSpec, common_overrides: Iterable[str] = ()) -> list[str]:
+def build_run_command(
+    spec: RunSpec,
+    common_overrides: Iterable[str] = (),
+    *,
+    rolling_window_min: float | None = None,
+) -> list[str]:
     run_dir = spec.run_dir.resolve().as_posix()
     command = [
         sys.executable,
@@ -196,11 +248,48 @@ def build_run_command(spec: RunSpec, common_overrides: Iterable[str] = ()) -> li
         "runtime.ui.auto_open_results=false",
         f"hydra.run.dir={run_dir}",
     ]
-    if spec.mode == "rolling_horizon_dedicated_roles":
+    if spec.objective_mode != SCENARIO_DEFAULT_OBJECTIVE:
+        command.extend(
+            [
+                f"scenario.objective.mode={spec.objective_mode}",
+                f"scenario.objective.makespan.max_sim_days={spec.makespan_max_sim_days}",
+            ]
+        )
+    if spec.scenario == "factory_mfg_basic" and spec.mode == "rolling_horizon_dedicated_roles":
         command.extend(dedicated_role_overrides(spec.worker_count))
+    if spec.mode == "simulation_based_adp":
+        if not str(spec.adp_checkpoint_path).strip():
+            raise ValueError(
+                "simulation_based_adp experiment requires adp_checkpoint_path in the experiment config "
+                "or --adp-checkpoint on run_experiment.py."
+            )
+        checkpoint_path = Path(spec.adp_checkpoint_path).expanduser().resolve().as_posix()
+        command.append(f"decision.adp.checkpoint_path={checkpoint_path}")
+    window_override_prefix = "decision.rolling_horizon.window_min="
+    replay_override_prefix = "runtime.ui.export_replay_artifacts="
+    event_override_prefix = "runtime.artifacts.export_events="
+    is_rolling_mode = spec.mode.startswith("rolling_horizon_")
+    replay_override_seen = False
+    event_override_seen = False
     for override in common_overrides:
+        normalized_override = str(override).lstrip("+")
+        if normalized_override.startswith(replay_override_prefix):
+            replay_override_seen = True
+        if normalized_override.startswith(event_override_prefix):
+            event_override_seen = True
+        if normalized_override.startswith(window_override_prefix):
+            if rolling_window_min is not None or not is_rolling_mode:
+                continue
         if override and override not in command:
             command.append(str(override))
+    if not replay_override_seen:
+        command.append("runtime.ui.export_replay_artifacts=false")
+    if not event_override_seen:
+        command.append("runtime.artifacts.export_events=false")
+    if is_rolling_mode and rolling_window_min is not None:
+        if float(rolling_window_min) <= 0.0:
+            raise ValueError("rolling_window_min must be greater than zero")
+        command.append(f"decision.rolling_horizon.window_min={float(rolling_window_min):g}")
     return command
 
 
@@ -354,9 +443,13 @@ def discover_run_dirs(results_root: Path) -> list[Path]:
     runs_root = results_root / "runs"
     if not runs_root.exists():
         return []
-    nested = sorted(path for path in runs_root.glob("*/workers_*/*") if path.is_dir())
-    legacy = sorted(path for path in runs_root.glob("*/*") if path.is_dir() and not path.name.startswith("workers_"))
-    return nested + legacy
+    candidates = {
+        artifact.parent.resolve()
+        for artifact_name in ("run_meta.json", "kpi.json")
+        for artifact in runs_root.rglob(artifact_name)
+        if artifact.is_file()
+    }
+    return sorted(candidates)
 
 
 def worker_count_from_run_dir(run_dir: Path) -> int:
@@ -380,9 +473,31 @@ def load_run_identity(run_dir: Path) -> dict[str, Any]:
     return {
         "run_dir": str(run_dir.resolve()),
         "mode": str(run_meta.get("decision_mode") or kpi.get("run_meta", {}).get("decision_mode") or "").strip(),
+        "objective_mode": str(
+            run_meta.get("objective_mode")
+            or kpi.get("objective_mode")
+            or SCENARIO_DEFAULT_OBJECTIVE
+        ).strip(),
         "seed": int(run_meta.get("seed") or kpi.get("run_meta", {}).get("seed") or 0),
         "worker_count": worker_count_from_run_dir(run_dir),
         "scenario": str(run_meta.get("scenario_type") or kpi.get("scenario_type") or "").strip(),
         "total_days": int(run_meta.get("total_days") or kpi.get("run_meta", {}).get("total_days") or 0),
         "minutes_per_day": float(run_meta.get("minutes_per_day") or kpi.get("run_meta", {}).get("minutes_per_day") or 0.0),
+        "configured_throughput_days": int(
+            run_meta.get("configured_throughput_days")
+            or kpi.get("configured_throughput_days")
+            or 0
+        ),
+        "configured_max_sim_days": int(
+            run_meta.get("configured_max_sim_days")
+            or kpi.get("configured_max_sim_days")
+            or 0
+        ),
+        "objective_status": str(kpi.get("objective_status") or run_meta.get("objective_status") or ""),
+        "termination_reason": str(kpi.get("termination_reason") or run_meta.get("termination_reason") or ""),
+        "timing_profile_fingerprint": str(
+            (run_meta.get("task_primitive_timing", {}) if isinstance(run_meta.get("task_primitive_timing", {}), dict) else {}).get(
+                "profile_fingerprint", ""
+            )
+        ),
     }

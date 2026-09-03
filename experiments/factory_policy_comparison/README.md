@@ -1,21 +1,21 @@
-# Factory Policy Comparison Experiment Suite
+# Manufacturing Policy Comparison Experiment Suite
 
-This folder runs a fair factory-scenario comparison across six ManSim decision modes:
+This folder runs the default `mfg_flow_shop` policy comparison across two objectives, four fleet sizes, and four decision modes.
 
-- `fixed_priority`
-- `adaptive_priority`
-- `rolling_horizon_aging_priority`
-- `rolling_horizon_dedicated_roles`
-- `bottleneck_aware_dispatch`
-- `rolling_horizon_throughput_optimizer`
+- Objectives: `maximize_throughput`, `minimize_makespan`
+- Modes: `immediate_shared`, `immediate_dedicated_roles`, `rolling_horizon_shared`, `rolling_horizon_dedicated_roles`
+- Worker counts: `3, 4, 5, 6`
+- Seed: `2026`
+- Throughput horizon: 5 days
+- Shift length: 8 hours (`480` simulation minutes per day)
+- Makespan safety limit: 30 days
+- Total: `2 x 4 x 4 x 1 = 32` runs
 
-The default experiment uses `factory_mfg_basic`, worker counts `3..8`, five seeds, and a five-day horizon.
+The single-seed result is a deterministic descriptive comparison. It does not estimate statistical uncertainty.
 
-This suite is part of ManSim v0.5. It compares policy outcomes; the Pre-Run Diagnostics values are intentionally policy-independent within the same worker-count group.
+## Installation
 
-## Quick Start
-
-Run these commands from the ManSim repository root after cloning ManSim and HumanoidSim as sibling folders. The complete fresh-install procedure is in the [root README](../../README.md#installation) and [Installation Guide](../../docs/installation.md). LLM, OpenClaw, Knowledge Graph, Streamlit, and Node.js packages are not required.
+Run from the ManSim repository root after cloning ManSim and HumanoidSim as sibling folders. LLM, OpenClaw, Knowledge Graph, Streamlit, and Node.js packages are not required.
 
 ```powershell
 cd C:\Github\ManSim
@@ -24,39 +24,82 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pip install -e ..\HumanoidSim
 .\.venv\Scripts\python.exe -m humanoidsim validate-catalog
-.\.venv\Scripts\python.exe -c "from ortools.sat.python import cp_model; print('OR-Tools OK')"
 .\.venv\Scripts\python.exe -m pip check
 ```
 
-Dry-run the 180 commands without creating outputs:
+The complete setup procedure is in the [root README](../../README.md#installation) and [Installation Guide](../../docs/installation.md).
+
+## Run The Experiment
+
+Inspect all 32 commands without creating results:
 
 ```powershell
 .\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --dry-run
 ```
 
-Run a small smoke test:
+Run an 8-run smoke comparison using three workers:
 
 ```powershell
-.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --worker-counts 3 --seeds 2026 --days 1
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --worker-counts 3
 ```
 
-The smoke command runs all six policies once and verifies audit, aggregation, and automatic dashboard opening before the 180-run experiment.
-
-Run the full comparison:
+Run all 32 combinations:
 
 ```powershell
 .\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py
 ```
 
-실험이 끝나면 run audit와 KPI audit, 결과 집계가 수행되고 `comparison_dashboard.html`이 기본 브라우저에서 자동으로 열립니다. Headless 환경에서는 다음처럼 자동 열기만 끌 수 있습니다.
+Run only one objective or override its limit:
 
 ```powershell
-.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --no-open-dashboard
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --objectives maximize_throughput --days 5
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --objectives minimize_makespan --makespan-max-days 30
 ```
 
-Artifact audit에는 worker 이동 path와 tile segment의 인접성, map 경계, wall/blocking footprint 침범, Replay `entity_moved` 경로 검사, item pickup/carry/drop과 destination state 연결 검사가 포함됩니다. 공정성, artifact 또는 KPI audit가 실패하면 dashboard는 조사용으로 생성되지만 runner는 non-zero exit code로 종료됩니다.
+After all runs finish, the runner audits and summarizes the results, creates `comparison_dashboard.html`, and opens it in the default browser. Use `--no-open-dashboard` in a headless environment.
 
-The full 180-run experiment exports each run's Hub, KPI, Gantt, logs, and replay payloads and can require well over 100 GB. Check free disk space before starting, or use `--worker-counts`, `--seeds`, and `--limit` for a smaller experiment.
+## Worker-3 ADP Held-Out Comparison
+
+The four rule-based modes remain available without PyTorch. The ADP research profile compares a
+worker-3 checkpoint against a random feasible baseline and the four rule-based modes on five held-out
+seeds. Training, screening, final checkpoint selection, and held-out test seeds are disjoint.
+
+| Mode | Dispatch contract | Comparison role |
+| --- | --- | --- |
+| `random_feasible_dispatch` | Uniform choice among WAIT and conflict-free feasible tasks | Untrained stochastic baseline |
+| `immediate_shared` | Fixed-priority choice whenever a worker becomes idle | Primary reactive rule baseline |
+| `immediate_dedicated_roles` | Immediate choice constrained by exclusive task-rule ownership | Reactive specialization baseline |
+| `rolling_horizon_shared` | Strict-periodic global reallocation with shared roles | Periodic planning baseline |
+| `rolling_horizon_dedicated_roles` | Strict-periodic reallocation under fixed LPT roles | Periodic specialization baseline |
+| `simulation_based_adp` | Attention post-decision value and beam-search joint matching | Learned policy |
+
+All six modes use the same scenario, worker count, timing profile, finite buffers, stochastic seed, and
+five-day horizon. The primary test is the paired completed-product difference between ADP and Immediate
+Shared. A positive mean alone is not reported as superiority; the paired bootstrap 95% interval must
+also have a lower bound above zero. Results therefore describe this experiment contract rather than a
+universal ordering of dispatch policies.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-adp.txt
+.\.venv\Scripts\python.exe -m manufacturing_sim.adp.train `
+  --config configs/adp/mfg_flow_shop_throughput_10x100.yaml
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py `
+  --config experiments/factory_policy_comparison/config_mfg_flow_shop_worker3_adp.yaml `
+  --adp-checkpoint outputs/adp_training/<timestamp>/best.pt
+```
+
+This profile runs 30 simulations: six modes, five seeds, worker count 3, and the same 5-day
+`maximize_throughput` objective. An absent checkpoint, held-out seed overlap, or a scenario,
+objective, timing, feature-schema, review-interval, or worker-range
+mismatch stops the ADP run; it never falls back to a rule-based policy. Tiny smoke checkpoints only
+validate the execution contract and are not meaningful performance baselines.
+
+The generated `paired_comparison.csv` and dashboard report seed-paired differences, deterministic
+10,000-resample bootstrap 95% intervals, win/tie/loss counts, relative improvement, and the primary
+`simulation_based_adp - immediate_shared` superiority verdict. Superiority is reported only when the
+mean product difference is positive and the paired interval lower bound is above zero.
+
+## Result Layout
 
 Results are written to:
 
@@ -64,43 +107,58 @@ Results are written to:
 experiments/factory_policy_comparison/results/<timestamp>/
 ```
 
-Each run is stored as:
+Each objective-aware run is stored as:
 
 ```text
-runs/<decision_mode>/workers_<worker_count>/seed_<seed>/
+runs/<objective>/<decision_mode>/workers_<worker_count>/seed_2026/
 ```
 
-## Outputs
+Key outputs:
 
-- `run_status.csv`: command, status, elapsed time, and failure reason per run
-- `fairness_report.csv`: seed/config/pre-run-diagnostics consistency checks
-- `audit_summary.csv`: existing artifact/KPI audit results per run
-- `comparison_summary.csv`: run-level KPI table
-- `mode_worker_summary.csv`: mode × worker-count mean/std/min/max KPI table with marginal throughput gain
-- `mode_summary.csv`: mode-level mean/std/min/max KPI table
-- `comparison_summary.json`: machine-readable combined summary
-- `comparison_dashboard.html`: browser dashboard linking the original ManSim Hub/KPI/Gantt artifacts
+- `run_status.csv`: command status, failure reason, and elapsed time
+- `fairness_report.csv`: objective/config/seed/timing/stochastic consistency checks
+- `audit_summary.csv`: artifact and KPI audit results
+- `comparison_summary.csv`: run-level objective and KPI values
+- `mode_worker_summary.csv`: objective x mode x worker-count summary and marginal change
+- `mode_summary.csv`: objective x mode summary
+- `paired_comparison.csv`: seed-paired ADP differences, bootstrap intervals, and win/tie/loss
+- `comparison_summary.json`: machine-readable combined result
+- `theoretical_capacity.json`: worker-count-specific ideal upper bound, realistic expected production reference, and calculation components
+- `comparison_dashboard.html`: integrated Throughput and Makespan tabs with run links
 
-## Dedicated Roles Scaling
+The dashboard links each run's Hub, KPI dashboard, and Gantt. Policy experiments do not persist the large `events.jsonl` or heavy Replay JSON/HTML artifacts by default. KPI and Gantt artifacts are still generated from in-memory events, while fairness checks use the compact stochastic signature stored in `run_meta.json`. With one seed, the displayed mean equals the observed run value and standard deviation is zero.
 
-For `rolling_horizon_dedicated_roles`, the runner expands a fixed role template so all worker counts remain feasible:
+For `mfg_flow_shop`, the dashboard also reports a theoretical maximum production count and a theoretical minimum initial-batch makespan. This ideal deterministic bound uses triangular minimum times, all mandatory production tasks, shortest-path item movement with load multipliers, two parallel machines at each processing station, configured finite-buffer capacities, the single Inspection resource, pooled worker workload, charging duty cycle, startup lead time, and material availability. Failures, defects, incidents, dynamic traffic waits, and avoidable deadhead travel are relaxed, so the value is an optimistic capacity ceiling rather than an expected result.
 
-- `G1 Supply`: `REPLENISH_MATERIAL`
-- `G2 Machine`: `REPAIR_MACHINE`, `LOAD_MACHINE`, `SETUP_MACHINE`, `UNLOAD_MACHINE`
-- `G3 Flow/QA/Power`: `MANAGE_ROBOT_POWER`, `TRANSFER`, `INSPECT_PRODUCT`, `COLLECT_WASTE_OR_SCRAP`, `PREVENTIVE_MAINTENANCE`
+The dashboard also reports a policy-independent realistic expected production reference. It uses triangular expected times, four-machine availability and repair labor, direct-charge duty cycle, inspection yield, and first-order incident recovery burden. Its standard-work cadence conservatively serializes Station 2 release with downstream transport, inspection, and terminal delivery, so it is neither a hard upper bound nor a fitted policy result. Finite-buffer blocking, dynamic traffic, queue starvation, dispatch delay, role imbalance, and policy-specific overlap remain visible only in the observed experiment results. The report stores both expected process completions before quality loss and expected accepted products after the configured defect probability.
 
-`A1..A3` receive `G1..G3`; `A4+` repeat `G1`, `G2`, `G3`. Battery delivery providers are workers with the `G3` role, and receivers are the remaining workers. This is a fixed template baseline, not role-map tuning.
+Enable both event persistence and replay export only when per-run visual replay or event-level forensic auditing is required:
 
-## Fairness Checks
+```powershell
+runtime.artifacts.export_events=true runtime.ui.export_replay_artifacts=true
+```
 
-The suite checks that completed runs share:
+Event and Replay retention changes artifact generation and disk use, not simulation decisions or KPI values.
 
-- `scenario=factory_mfg_basic`
-- the expected worker count for each mode/worker-count/seed run
-- the same horizon and minutes per day
-- the expected seed for each mode/worker-count/seed run
-- matching policy-independent pre-run diagnostics fingerprints within each worker-count group
-- empty `artifact_status.errors`
-- no worker tile movement after battery is already depleted
+## Fairness And Failure Rules
 
-Pre-run diagnostics are intentionally scenario-level indicators. They should match across policy modes within the same worker-count group, while different worker counts are expected to have different environment fingerprints.
+Fairness is checked within each `objective x worker_count x seed` group. The suite requires:
+
+- identical scenario, seed, worker count, timing fingerprint, and policy-independent diagnostics
+- matching quality and machine-repair random-stream prefixes across policies
+- exactly 2400 simulation minutes and 480-minute daily restocking for Throughput
+- one initial fill, no later restocking, and terminal material lineage `30/30` for Makespan
+- empty artifact errors and passing artifact/KPI audits
+- no role violation, duplicate task ownership, invalid charging dock use, collision, or discontinuous worker movement
+
+An incomplete Makespan run or a missing combination causes the experiment command to return a non-zero exit code. A diagnostic dashboard is still generated when possible.
+
+## Legacy Six-Policy Factory Profile
+
+The previous 180-run `factory_mfg_basic` experiment remains available:
+
+```powershell
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --config experiments\factory_policy_comparison\config_factory_mfg_basic.yaml
+```
+
+Legacy outputs without an objective directory remain discoverable by the audit, summary, and dashboard tools.

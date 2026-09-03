@@ -17,6 +17,9 @@ from manufacturing_sim.simulation.scenarios.manufacturing.world import Manufactu
 def _load_cfg() -> dict:
     cfg_path = Path(__file__).resolve().parents[1] / "configs" / "scenario" / "factory_mfg_basic.yaml"
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    cfg["task_primitive_timing"] = yaml.safe_load(
+        (cfg_path.parents[1] / "task_primitive_timing" / "factory_mfg_basic.yaml").read_text(encoding="utf-8")
+    )
     cfg["horizon"]["num_days"] = 1
     cfg["humanoidsim"] = {"enabled": True, "validation_mode": "warn"}
     return cfg
@@ -169,6 +172,40 @@ class ZoneInventoryScrapTests(unittest.TestCase):
             finally:
                 logger.close()
 
+    def test_queue_pop_records_worker_only_after_carry_is_acquired(self) -> None:
+        cfg = _load_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(
+                    simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=4)
+                )
+                world._push_material_queue(1, "MAT-TEST-1")
+                popped = world._pop_material_queue(1, "MAT-TEST-1")
+                self.assertEqual("MAT-TEST-1", popped)
+                self.assertEqual(ItemState.IN_QUEUE, world.items[popped].state)
+                self.assertFalse(
+                    any(
+                        event["type"] == "ITEM_STATE_CHANGED"
+                        and event["details"].get("item_state") == "CARRIED_BY_WORKER"
+                        for event in logger.events
+                    )
+                )
+
+                self.assertTrue(world._set_agent_carrying(world.agents["A1"], "material", popped))
+                self.assertEqual(ItemState.CARRIED_BY_WORKER, world.items[popped].state)
+                self.assertEqual("A1", world.items[popped].metadata.get("state_ref"))
+                carried_events = [
+                    event
+                    for event in logger.events
+                    if event["type"] == "ITEM_STATE_CHANGED"
+                    and event["details"].get("item_state") == "CARRIED_BY_WORKER"
+                ]
+                self.assertEqual(1, len(carried_events))
+                self.assertEqual("A1", carried_events[0]["details"].get("ref"))
+            finally:
+                logger.close()
+
     def test_scrap_queue_batch_limit_and_state(self) -> None:
         cfg = _load_cfg()
         with tempfile.TemporaryDirectory() as tmp:
@@ -180,8 +217,16 @@ class ZoneInventoryScrapTests(unittest.TestCase):
                 batch = world._pop_inspection_scrap_batch(3)
                 self.assertEqual(["SCRAP-1", "SCRAP-2", "SCRAP-3"], batch)
                 self.assertEqual(1, len(world.inspection_scrap_queue))
+                world._set_worker_cargo_batch(
+                    world.agents["A1"],
+                    batch,
+                    "product",
+                    max_item_count=3,
+                    destination="scrap_disposal_bin",
+                )
                 for item_id in batch:
                     self.assertEqual(ItemState.CARRIED_BY_WORKER, world.items[item_id].state)
+                    self.assertEqual("A1", world.items[item_id].metadata.get("state_ref"))
                 self.assertEqual(ItemState.WAITING_SCRAP_DISPOSAL, world.items["SCRAP-4"].state)
             finally:
                 logger.close()

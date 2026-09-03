@@ -11,7 +11,9 @@ from humanoidsim import default_humanoid_state, expand_task_steps, transition_hu
 from manufacturing_sim.simulation.scenarios.manufacturing.entities import Task, Worker
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
 from manufacturing_sim.simulation.operational_complexity import build_operational_task_complexity_metrics
+from manufacturing_sim.simulation.rolling_horizon import strict_periodic_rolling_horizon_loop
 from manufacturing_sim.simulation.scenarios.shipyard.grid_map import ShipyardTileGridMap
+from manufacturing_sim.simulation.timing import PrimitiveTimingResolver
 
 
 SURFACE_TILE_STATES = {
@@ -38,6 +40,17 @@ TASK_ID_PREFIX = {
     "CLEAN_AREA": "CLN",
     "COLLECT_WASTE_OR_SCRAP": "SCRAP",
     "MANAGE_ROBOT_POWER": "BAT",
+}
+
+SHIPYARD_TIMED_TASK_CODES = {
+    "OPERATE_VEHICLE_TRANSPORT",
+    "TRANSFER",
+    "WELD_SEAM",
+    "PREPARE_SURFACE",
+    "PAINT_SURFACE",
+    "VERIFY_SHIP_SECTION",
+    "MANAGE_ROBOT_POWER",
+    "COLLECT_WASTE_OR_SCRAP",
 }
 
 _SUPPORTED_SCENARIO_KEYS = {
@@ -112,7 +125,15 @@ class ShipyardWorld:
         self.cfg = cfg
         self.logger = logger
         self.decision_module = decision_module
+        self.seed = int(cfg.get("seed", 2026))
+        self.timing = PrimitiveTimingResolver(
+            cfg.get("task_primitive_timing", {}),
+            scenario_type=_scenario_key(cfg),
+            seed=self.seed,
+            expected_task_codes=SHIPYARD_TIMED_TASK_CODES,
+        )
         self.map = ShipyardTileGridMap.from_world_config(cfg)
+        self.map.tile_time_min = self.timing.expected_tile_time
         self.minutes_per_day = float(cfg.get("horizon", {}).get("minutes_per_day", 240))
         self.num_days = int(cfg.get("horizon", {}).get("num_days", 1) or 1)
         factory_cfg = cfg.get("factory", {}) if isinstance(cfg.get("factory", {}), dict) else {}
@@ -122,9 +143,24 @@ class ShipyardWorld:
         rolling_cfg = decision_cfg.get("rolling_horizon", {}) if isinstance(decision_cfg.get("rolling_horizon", {}), dict) else {}
         self.rolling_horizon_enabled = self.decision_mode in {"rolling_horizon_aging_priority", "rolling_horizon_dedicated_roles"}
         self.rolling_horizon_window_min = max(0.1, float(rolling_cfg.get("window_min", 5.0) or 5.0))
-        self.rolling_horizon_window_index = -1
+        self.rolling_horizon_scheduler_mode = "strict_periodic"
+        self.rolling_horizon_candidate_collection_mode = "event_with_boundary_reconciliation"
+        configured_scheduler_mode = str(
+            rolling_cfg.get("scheduler_mode", self.rolling_horizon_scheduler_mode)
+            or self.rolling_horizon_scheduler_mode
+        ).strip().lower()
+        configured_collection_mode = str(
+            rolling_cfg.get("candidate_collection_mode", self.rolling_horizon_candidate_collection_mode)
+            or self.rolling_horizon_candidate_collection_mode
+        ).strip().lower()
+        # Legacy values remain parseable, while the effective runtime is fixed
+        # to strict periodic scheduling for every rolling mode.
+        self.rolling_horizon_configured_scheduler_mode = configured_scheduler_mode
+        self.rolling_horizon_configured_candidate_collection_mode = configured_collection_mode
+        self.rolling_horizon_window_index = 0
         self.rolling_horizon_window_start = 0.0
-        self.rolling_horizon_window_end = 0.0
+        self.rolling_horizon_window_end = self.rolling_horizon_window_min
+        self.rolling_horizon_logged_window_index = -1
         aging_cfg = rolling_cfg.get("aging", {}) if isinstance(rolling_cfg.get("aging", {}), dict) else {}
         self.rolling_horizon_rank_boost_per_window = max(0, int(aging_cfg.get("rank_boost_per_window", 1) or 1))
         self.rolling_horizon_pending: dict[str, dict[str, Any]] = {}
@@ -137,17 +173,27 @@ class ShipyardWorld:
             "stale_skipped_task_count": 0,
             "requeued_task_count": 0,
             "max_worker_queue_length": 0,
+            "immediate_dispatched_task_count": 0,
+            "strict_boundary_count": 0,
+            "late_boundary_count": 0,
         }
+        self.rolling_horizon_max_boundary_lag_min = 0.0
         immediate_cfg = (
             rolling_cfg.get("immediate_task_triggers", {})
             if isinstance(rolling_cfg.get("immediate_task_triggers", {}), dict)
             else {}
         )
         self.rolling_horizon_immediate_triggers_enabled = bool(immediate_cfg.get("enabled", False))
-        default_immediate_task_codes = {
-            "worker_low_battery": ["MANAGE_ROBOT_POWER"],
-            "machine_broken": ["REPAIR_MACHINE"],
-        }
+        self.rolling_horizon_immediate_queue_policy = (
+            str(immediate_cfg.get("queue_policy", "pool_only")).strip().lower() or "pool_only"
+        )
+        self.rolling_horizon_immediate_protect_from_window_requeue = bool(
+            immediate_cfg.get(
+                "protect_from_window_requeue",
+                self.rolling_horizon_immediate_queue_policy == "next_after_current",
+            )
+        )
+        default_immediate_task_codes = {"worker_low_battery": ["MANAGE_ROBOT_POWER"]}
         raw_immediate_task_codes = immediate_cfg.get("event_task_codes", default_immediate_task_codes)
         if not isinstance(raw_immediate_task_codes, dict):
             raw_immediate_task_codes = default_immediate_task_codes
@@ -162,8 +208,8 @@ class ShipyardWorld:
                 self.rolling_horizon_immediate_event_task_codes[str(event_name or "").strip().lower()] = codes
         battery_cfg = decision_cfg.get("battery", {}) if isinstance(decision_cfg.get("battery", {}), dict) else {}
         self.battery_period_min = float(worker_cfg.get("battery_swap_period_min", 240) or 240)
-        self.battery_pickup_time_min = float(worker_cfg.get("battery_pickup_time_min", 4.0) or 4.0)
-        self.battery_delivery_extra_min = float(worker_cfg.get("battery_delivery_extra_min", 3.0) or 3.0)
+        self.battery_pickup_time_min = self.timing.expected_task_duration("MANAGE_ROBOT_POWER")
+        self.battery_delivery_extra_min = self.battery_pickup_time_min
         battery_drain_cfg = worker_cfg.get("battery_drain", {}) if isinstance(worker_cfg.get("battery_drain", {}), dict) else {}
         self.battery_available_rate_multiplier = max(
             0.0,
@@ -192,6 +238,11 @@ class ShipyardWorld:
             worker.humanoid_state = default_humanoid_state(worker_id).to_dict()
             self.workers[worker_id] = worker
             self.rolling_horizon_dispatch_queues[worker_id] = []
+        self.rolling_horizon_dispatch_events: dict[str, simpy.Event] = {
+            worker_id: self.env.event() for worker_id in self.worker_ids
+        }
+        self.rolling_horizon_candidate_refresh_scheduled = False
+        self.rolling_horizon_candidate_refresh_triggers: set[str] = set()
         self.carts: dict[str, ShipyardCart] = {}
         for index in range(1, self.cart_count + 1):
             cart_id = f"CART-{index:02d}"
@@ -220,7 +271,7 @@ class ShipyardWorld:
         # not legacy named sections.
         self.sections = self.work_tiles
 
-        self.rng = random.Random(int(cfg.get("seed", 2026)))
+        self.rng = random.Random(self.seed)
         self.daily_summaries: list[dict[str, Any]] = []
         self.minute_snapshots: list[dict[str, Any]] = []
         self.worker_busy_min = {worker_id: 0.0 for worker_id in self.worker_ids}
@@ -240,6 +291,8 @@ class ShipyardWorld:
         return int(self.env.now // max(1.0, self.minutes_per_day)) + 1
 
     def start(self) -> None:
+        if self.rolling_horizon_enabled:
+            self.env.process(strict_periodic_rolling_horizon_loop(self.env, self))
         for worker in self.workers.values():
             self._emit_worker_state(worker, "WORKER_STATE_CHANGED")
             self.env.process(self._worker_loop(worker))
@@ -479,12 +532,16 @@ class ShipyardWorld:
                 "surface_tile_completion_ratio": round(completed / max(1, len(self.work_tiles)), 6),
             },
         )
+        self._rolling_horizon_request_candidate_refresh("ship_tile_state_changed")
 
     def _worker_loop(self, worker: Worker) -> Any:
         while not self.terminated:
             task = self.candidate_task(worker)
             if task is None:
-                yield self.env.timeout(1.0)
+                if self.rolling_horizon_enabled:
+                    yield self.rolling_horizon_dispatch_event(worker.worker_id)
+                else:
+                    yield self.env.timeout(1.0)
                 continue
             yield from self.execute_task(worker, task)
             if self._all_surface_tiles_complete():
@@ -494,23 +551,19 @@ class ShipyardWorld:
 
     def candidate_task(self, worker: Worker) -> Task | None:
         if self.rolling_horizon_enabled:
-            self._rolling_horizon_update()
             if self._worker_battery_remaining_min(worker.worker_id) <= 0.0 and worker.awaiting_battery_from:
                 return None
-            queued_battery = self._pop_queued_self_battery_task(worker)
-            if queued_battery is not None:
-                self._reserve_battery_task(worker, queued_battery)
-                return queued_battery
-            guard_battery = self._battery_guard_task(worker)
-            if guard_battery is not None:
-                self._reserve_battery_task(worker, guard_battery)
-                return guard_battery
             while self.rolling_horizon_dispatch_queues.get(worker.worker_id):
                 entry = self.rolling_horizon_dispatch_queues[worker.worker_id].pop(0)
                 task = entry["task"]
                 if not self._task_still_feasible(task):
                     self._rolling_horizon_log_skip(entry, "stale_or_infeasible_before_start")
                     continue
+                entry["status"] = "started"
+                entry["last_updated"] = float(self.env.now)
+                self._rolling_horizon_log_entry(
+                    "ROLLING_HORIZON_TASK_STARTED", entry, worker_id=worker.worker_id
+                )
                 self._reserve_battery_task(worker, task)
                 self._reserve_cart_task(worker, task)
                 work_tile_id = str(task.payload.get("work_tile_id", ""))
@@ -546,22 +599,103 @@ class ShipyardWorld:
         return task
 
     def _rolling_horizon_update(self) -> None:
-        now = float(self.env.now)
-        if self.rolling_horizon_window_index < 0:
-            self._rolling_horizon_start_window(now)
-            self._rolling_horizon_collect_candidates()
-            return
-        if now + 1e-9 < self.rolling_horizon_window_end:
-            return
-        self._rolling_horizon_requeue_unstarted()
-        self._rolling_horizon_dispatch_pending()
-        self._rolling_horizon_start_window(self.rolling_horizon_window_end)
-        self._rolling_horizon_collect_candidates()
+        """Compatibility refresh; periodic dispatch is coordinator-owned."""
+        if self.rolling_horizon_enabled:
+            self._rolling_horizon_collect_candidates(collection_trigger="event_refresh")
 
-    def _rolling_horizon_start_window(self, start_time: float) -> None:
+    def rolling_horizon_dispatch_event(self, worker_id: str) -> simpy.Event:
+        worker_id = str(worker_id)
+        event = self.rolling_horizon_dispatch_events.get(worker_id)
+        if event is None or event.triggered:
+            event = self.env.event()
+            self.rolling_horizon_dispatch_events[worker_id] = event
+        return event
+
+    def _rolling_horizon_notify_worker(self, worker_id: str) -> None:
+        worker_id = str(worker_id)
+        event = self.rolling_horizon_dispatch_events.get(worker_id)
+        if event is not None and not event.triggered:
+            event.succeed({"worker_id": worker_id, "time_min": float(self.env.now)})
+        self.rolling_horizon_dispatch_events[worker_id] = self.env.event()
+
+    def _rolling_horizon_notify_queued_workers(self) -> None:
+        for worker_id, queue in self.rolling_horizon_dispatch_queues.items():
+            if queue:
+                self._rolling_horizon_notify_worker(worker_id)
+
+    def _rolling_horizon_simulation_limit_min(self) -> float:
+        return float(self.num_days * self.minutes_per_day)
+
+    def _rolling_horizon_boundary_metadata(self) -> dict[str, Any]:
+        scheduled = float(
+            getattr(self, "rolling_horizon_current_scheduled_boundary_min", self.env.now)
+        )
+        actual = float(getattr(self, "rolling_horizon_current_actual_dispatch_min", self.env.now))
+        lag = max(0.0, actual - scheduled)
+        return {
+            "scheduled_boundary_min": round(scheduled, 6),
+            "actual_dispatch_min": round(actual, 6),
+            "boundary_lag_min": round(lag, 9),
+            "scheduler_mode": self.rolling_horizon_scheduler_mode,
+            "candidate_collection_mode": self.rolling_horizon_candidate_collection_mode,
+        }
+
+    def _rolling_horizon_initialize_strict_periodic(self) -> None:
+        self.rolling_horizon_window_index = 0
+        self.rolling_horizon_window_start = 0.0
+        self.rolling_horizon_window_end = float(self.rolling_horizon_window_min)
+        self.rolling_horizon_logged_window_index = -1
+        self.rolling_horizon_current_scheduled_boundary_min = 0.0
+        self.rolling_horizon_current_actual_dispatch_min = 0.0
+        self._rolling_horizon_start_window(0.0, collection_trigger="initial_scan")
+        self._rolling_horizon_collect_candidates(collection_trigger="initial_scan")
+
+    def _rolling_horizon_reconcile_candidates_at_boundary(self) -> None:
+        boundary_index = int(self.rolling_horizon_window_index)
+        for entry in self.rolling_horizon_pending.values():
+            entry["boundary_seen_index"] = -1
+        self._rolling_horizon_collect_candidates(collection_trigger="boundary_reconciliation")
+        stale_ids = [
+            opportunity_id
+            for opportunity_id, entry in self.rolling_horizon_pending.items()
+            if int(entry.get("boundary_seen_index", -1)) != boundary_index
+        ]
+        for opportunity_id in stale_ids:
+            entry = self.rolling_horizon_pending.pop(opportunity_id, None)
+            if isinstance(entry, dict):
+                self._rolling_horizon_log_skip(entry, "not_feasible_at_boundary")
+
+    def _rolling_horizon_process_strict_boundary(self, scheduled_boundary_min: float) -> None:
+        actual_dispatch_min = float(self.env.now)
+        scheduled_boundary_min = float(scheduled_boundary_min)
+        lag = max(0.0, actual_dispatch_min - scheduled_boundary_min)
+        self.rolling_horizon_current_scheduled_boundary_min = scheduled_boundary_min
+        self.rolling_horizon_current_actual_dispatch_min = actual_dispatch_min
+        self.rolling_horizon_metrics["strict_boundary_count"] += 1
+        self.rolling_horizon_max_boundary_lag_min = max(self.rolling_horizon_max_boundary_lag_min, lag)
+        if lag > 1e-9:
+            self.rolling_horizon_metrics["late_boundary_count"] += 1
+
+        self._rolling_horizon_requeue_unstarted()
+        self._rolling_horizon_reconcile_candidates_at_boundary()
+        self._rolling_horizon_dispatch_pending()
+        self._rolling_horizon_notify_queued_workers()
+
         self.rolling_horizon_window_index += 1
+        self.rolling_horizon_window_start = scheduled_boundary_min
+        self.rolling_horizon_window_end = scheduled_boundary_min + self.rolling_horizon_window_min
+        self._rolling_horizon_start_window(
+            scheduled_boundary_min, collection_trigger="boundary_reconciliation"
+        )
+
+    def _rolling_horizon_start_window(
+        self, start_time: float, *, collection_trigger: str = "event_refresh"
+    ) -> None:
         self.rolling_horizon_window_start = float(start_time)
         self.rolling_horizon_window_end = self.rolling_horizon_window_start + self.rolling_horizon_window_min
+        if self.rolling_horizon_logged_window_index == self.rolling_horizon_window_index:
+            return
+        self.rolling_horizon_logged_window_index = self.rolling_horizon_window_index
         self.rolling_horizon_metrics["started_window_count"] += 1
         self.logger.log(
             t=self.env.now,
@@ -576,8 +710,41 @@ class ShipyardWorld:
                 "window_min": round(self.rolling_horizon_window_min, 3),
                 "dispatch_policy": "dedicated_role_aging_priority" if self.decision_mode == "rolling_horizon_dedicated_roles" else "aging_priority",
                 "pending_candidate_count": len(self.rolling_horizon_pending),
+                "collection_trigger": collection_trigger,
+                **self._rolling_horizon_boundary_metadata(),
             },
         )
+
+    def _rolling_horizon_refresh_candidates_process(self):
+        yield self.env.timeout(0)
+        triggers = sorted(self.rolling_horizon_candidate_refresh_triggers)
+        self.rolling_horizon_candidate_refresh_triggers.clear()
+        self.rolling_horizon_candidate_refresh_scheduled = False
+        if not self.rolling_horizon_enabled or self.terminated:
+            return
+        self._rolling_horizon_collect_candidates(collection_trigger="event_refresh")
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_index(),
+            event_type="ROLLING_HORIZON_CANDIDATE_REFRESH",
+            entity_id=f"RHW-{self.rolling_horizon_window_index:04d}",
+            location="ShipDock",
+            details={
+                "window_index": int(self.rolling_horizon_window_index),
+                "collection_trigger": "event_refresh",
+                "source_triggers": triggers,
+                "scheduler_mode": self.rolling_horizon_scheduler_mode,
+            },
+        )
+
+    def _rolling_horizon_request_candidate_refresh(self, trigger: str) -> None:
+        if not self.rolling_horizon_enabled or self.terminated:
+            return
+        self.rolling_horizon_candidate_refresh_triggers.add(str(trigger or "state_change"))
+        if self.rolling_horizon_candidate_refresh_scheduled:
+            return
+        self.rolling_horizon_candidate_refresh_scheduled = True
+        self.env.process(self._rolling_horizon_refresh_candidates_process())
 
     def _rolling_horizon_immediate_task_codes_for_event(self, event_name: str) -> set[str]:
         if not self.rolling_horizon_enabled:
@@ -592,15 +759,16 @@ class ShipyardWorld:
         )
 
     def _rolling_horizon_collect_immediate_candidates(self, event_name: str) -> None:
+        event_name = str(event_name or "immediate").strip().lower() or "immediate"
         task_code_filter = self._rolling_horizon_immediate_task_codes_for_event(event_name)
         if not task_code_filter:
             return
-        if self.rolling_horizon_window_index < 0:
-            self._rolling_horizon_start_window(float(self.env.now))
         self._rolling_horizon_collect_candidates(
             task_code_filter=task_code_filter,
-            collection_trigger=str(event_name or "").strip().lower() or "immediate",
+            collection_trigger=event_name,
         )
+        if self.rolling_horizon_immediate_queue_policy == "next_after_current":
+            self._rolling_horizon_dispatch_immediate_candidates(event_name, task_code_filter)
 
     def _rolling_horizon_collect_candidates(
         self,
@@ -614,30 +782,55 @@ class ShipyardWorld:
             if str(code or "").strip()
         }
         collection_trigger = str(collection_trigger or "scheduled_scan").strip().lower() or "scheduled_scan"
-        existing_keys = {
-            str(entry.get("resource_key", ""))
+        immediate_trigger = (
+            collection_trigger in self.rolling_horizon_immediate_event_task_codes
+            and bool(normalized_task_code_filter)
+        )
+        pending_by_key = {
+            str(entry.get("resource_key", "")): entry
             for entry in self.rolling_horizon_pending.values()
             if str(entry.get("resource_key", ""))
         }
+        blocked_keys: set[str] = set()
         for queue in self.rolling_horizon_dispatch_queues.values():
             for entry in queue:
                 key = str(entry.get("resource_key", ""))
                 if key:
-                    existing_keys.add(key)
+                    blocked_keys.add(key)
         for work_tile in self.work_tiles.values():
             if work_tile.owner:
                 task_code, extra_payload = self._task_for_work_tile(work_tile)
                 if task_code:
-                    existing_keys.add(self._resource_key_for_payload(work_tile.work_tile_id, task_code, extra_payload))
+                    blocked_keys.add(
+                        self._resource_key_for_payload(work_tile.work_tile_id, task_code, extra_payload)
+                    )
+        scanned_keys: set[str] = set()
         for worker in self.workers.values():
             for task in self._candidate_tasks_for_worker(worker):
                 if normalized_task_code_filter and task.task_code not in normalized_task_code_filter:
                     continue
                 resource_key = self._resource_key(task)
-                if resource_key in existing_keys:
+                if resource_key in blocked_keys or resource_key in scanned_keys:
                     continue
                 allowed_workers = self._allowed_workers_for_task(task)
                 if not allowed_workers:
+                    continue
+                scanned_keys.add(resource_key)
+                existing_entry = pending_by_key.get(resource_key)
+                if existing_entry is not None:
+                    stable_task: Task = existing_entry["task"]
+                    task.task_id = stable_task.task_id
+                    task.instance_id = stable_task.instance_id
+                    existing_entry["task"] = task
+                    existing_entry["task_id"] = task.task_id
+                    existing_entry["task_code"] = task.task_code
+                    existing_entry["allowed_worker_ids"] = allowed_workers
+                    existing_entry["last_updated"] = float(self.env.now)
+                    if collection_trigger == "boundary_reconciliation":
+                        existing_entry["boundary_seen_index"] = int(self.rolling_horizon_window_index)
+                    if immediate_trigger:
+                        existing_entry["collection_trigger"] = collection_trigger
+                        existing_entry["immediate_trigger"] = True
                     continue
                 opportunity_id = self._next_rolling_horizon_opportunity_id()
                 entry = {
@@ -652,15 +845,64 @@ class ShipyardWorld:
                     "last_updated": float(self.env.now),
                     "status": "pool",
                     "collection_trigger": collection_trigger,
-                    "immediate_trigger": collection_trigger != "scheduled_scan",
+                    "immediate_trigger": immediate_trigger,
                 }
+                if collection_trigger == "boundary_reconciliation":
+                    entry["boundary_seen_index"] = int(self.rolling_horizon_window_index)
                 self.rolling_horizon_pending[opportunity_id] = entry
-                existing_keys.add(resource_key)
+                pending_by_key[resource_key] = entry
                 self.rolling_horizon_metrics["candidate_collected_count"] += 1
                 self._rolling_horizon_log_entry("ROLLING_HORIZON_CANDIDATE_COLLECTED", entry)
 
+    def _rolling_horizon_dispatch_immediate_candidates(
+        self, event_name: str, task_code_filter: set[str]
+    ) -> None:
+        normalized_codes = {str(code).strip().upper() for code in task_code_filter}
+        entries = sorted(
+            [
+                entry
+                for entry in self.rolling_horizon_pending.values()
+                if bool(entry.get("immediate_trigger", False))
+                and str(entry.get("collection_trigger", "")).strip().lower() == event_name
+                and str(entry.get("task_code", "")).strip().upper() in normalized_codes
+            ],
+            key=lambda entry: (
+                float(entry.get("first_seen", self.env.now)),
+                str(entry.get("resource_key", "")),
+            ),
+        )
+        for entry in entries:
+            opportunity_id = str(entry.get("opportunity_id", ""))
+            task: Task = entry["task"]
+            if not self._task_still_feasible(task):
+                self.rolling_horizon_pending.pop(opportunity_id, None)
+                self._rolling_horizon_log_skip(entry, "stale_immediate_candidate")
+                continue
+            worker_id = self._rolling_horizon_choose_worker(entry)
+            if not worker_id:
+                continue
+            entry["assigned_worker_id"] = worker_id
+            entry["status"] = "dispatched"
+            entry["last_updated"] = float(self.env.now)
+            entry["urgent_dispatch"] = True
+            entry["queue_policy"] = self.rolling_horizon_immediate_queue_policy
+            queue = self.rolling_horizon_dispatch_queues.setdefault(worker_id, [])
+            insert_at = 0
+            while insert_at < len(queue) and bool(queue[insert_at].get("urgent_dispatch", False)):
+                insert_at += 1
+            queue.insert(insert_at, entry)
+            self.rolling_horizon_pending.pop(opportunity_id, None)
+            self.rolling_horizon_metrics["dispatched_task_count"] += 1
+            self.rolling_horizon_metrics["immediate_dispatched_task_count"] += 1
+            self.rolling_horizon_metrics["max_worker_queue_length"] = max(
+                int(self.rolling_horizon_metrics.get("max_worker_queue_length", 0)), len(queue)
+            )
+            self._rolling_horizon_log_entry("ROLLING_HORIZON_DISPATCH", entry)
+            self._rolling_horizon_notify_worker(worker_id)
+
     def _rolling_horizon_dispatch_pending(self) -> None:
         reserved: set[str] = set()
+        dispatch_count = 0
         ordered_entries = sorted(
             list(self.rolling_horizon_pending.items()),
             key=lambda item: (
@@ -678,6 +920,8 @@ class ShipyardWorld:
         for opportunity_id, entry in ordered_entries:
             task = entry["task"]
             if not self._task_still_feasible(task):
+                if self._rolling_horizon_task_temporarily_unavailable(task):
+                    continue
                 self.rolling_horizon_pending.pop(opportunity_id, None)
                 self._rolling_horizon_log_skip(entry, "stale_or_infeasible_at_dispatch")
                 continue
@@ -695,19 +939,66 @@ class ShipyardWorld:
             self.rolling_horizon_pending.pop(opportunity_id, None)
             reserved.add(key)
             self.rolling_horizon_metrics["dispatched_task_count"] += 1
+            dispatch_count += 1
             queue_len = len(self.rolling_horizon_dispatch_queues[worker_id])
             self.rolling_horizon_metrics["max_worker_queue_length"] = max(
                 int(self.rolling_horizon_metrics.get("max_worker_queue_length", 0)),
                 queue_len,
             )
             self._rolling_horizon_log_entry("ROLLING_HORIZON_DISPATCH", entry)
+        if dispatch_count == 0:
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_index(),
+                event_type="ROLLING_HORIZON_DISPATCH",
+                entity_id=f"RHW-{self.rolling_horizon_window_index:04d}",
+                location="ShipDock",
+                details={
+                    "window_index": int(self.rolling_horizon_window_index),
+                    "candidate_count": len(self.rolling_horizon_pending),
+                    "dispatch_count": 0,
+                    "dispatch_policy": (
+                        "dedicated_role_aging_priority"
+                        if self.decision_mode == "rolling_horizon_dedicated_roles"
+                        else "aging_priority"
+                    ),
+                    **self._rolling_horizon_boundary_metadata(),
+                },
+            )
+
+    def _rolling_horizon_task_temporarily_unavailable(self, task: Task) -> bool:
+        if task.task_code == "TRANSFER" and task.payload.get("transfer_kind") == "cart_supply":
+            work_tile = self.work_tiles.get(str(task.payload.get("work_tile_id", "")))
+            item_type = str(task.payload.get("item_type", ""))
+            cart = self.carts.get(str(task.payload.get("source_cart_id", "")))
+            return bool(
+                work_tile is not None
+                and self._work_tile_needs_cart_supply(work_tile, item_type)
+                and cart is not None
+                and cart.status == "parked"
+                and bool(cart.parking_spot_id)
+                and cart.inventory_kind == item_type
+                and cart.inventory_count > 0
+                and cart.available_count <= 0
+            )
+        return False
 
     def _rolling_horizon_requeue_unstarted(self) -> None:
         for worker_id, queue in self.rolling_horizon_dispatch_queues.items():
             if not queue:
                 continue
+            retained_urgent: list[dict[str, Any]] = []
             self.rolling_horizon_dispatch_queues[worker_id] = []
             for entry in queue:
+                if (
+                    bool(entry.get("urgent_dispatch", False))
+                    and self.rolling_horizon_immediate_protect_from_window_requeue
+                ):
+                    if self._task_still_feasible(entry["task"]):
+                        retained_urgent.append(entry)
+                    else:
+                        self._rolling_horizon_log_skip(entry, "urgent_condition_no_longer_active")
+                    continue
                 self._release_cart_task(entry["task"])
                 entry.pop("assigned_worker_id", None)
                 entry["status"] = "pool"
@@ -715,6 +1006,7 @@ class ShipyardWorld:
                 self.rolling_horizon_pending[str(entry["opportunity_id"])] = entry
                 self.rolling_horizon_metrics["requeued_task_count"] += 1
                 self._rolling_horizon_log_entry("ROLLING_HORIZON_TASK_REQUEUED", entry, worker_id=worker_id)
+            self.rolling_horizon_dispatch_queues[worker_id].extend(retained_urgent)
 
     def _rolling_horizon_choose_worker(self, entry: dict[str, Any], *, excluded_workers: set[str] | None = None) -> str | None:
         task = entry["task"]
@@ -886,6 +1178,21 @@ class ShipyardWorld:
             "immediate_trigger": bool(entry.get("immediate_trigger", False)),
             "reason": entry.get("skip_reason", ""),
         }
+        if event_type == "ROLLING_HORIZON_DISPATCH":
+            if bool(entry.get("urgent_dispatch", False)):
+                details.update(
+                    {
+                        "scheduled_boundary_min": None,
+                        "actual_dispatch_min": round(float(self.env.now), 6),
+                        "boundary_lag_min": 0.0,
+                        "scheduler_mode": self.rolling_horizon_scheduler_mode,
+                        "candidate_collection_mode": self.rolling_horizon_candidate_collection_mode,
+                        "dispatch_kind": "immediate_exception",
+                    }
+                )
+            else:
+                details.update(self._rolling_horizon_boundary_metadata())
+                details["dispatch_kind"] = "strict_periodic"
         self.logger.log(
             t=self.env.now,
             day=self.day_index(),
@@ -1162,48 +1469,6 @@ class ShipyardWorld:
                 candidates.append(self._battery_task(worker.worker_id, action="battery_delivery", receiver_id=receiver_id))
         return candidates
 
-    def _pop_queued_self_battery_task(self, worker: Worker) -> Task | None:
-        if not self._battery_is_low(worker.worker_id) or worker.battery_service_owner or worker.awaiting_battery_from:
-            return None
-        queue = self.rolling_horizon_dispatch_queues.get(worker.worker_id, [])
-        for index, entry in enumerate(queue):
-            task = entry["task"]
-            if task.task_code != "MANAGE_ROBOT_POWER":
-                continue
-            if str(task.payload.get("power_action", "self_swap")) != "self_swap":
-                continue
-            queue.pop(index)
-            entry["status"] = "started"
-            entry["last_updated"] = float(self.env.now)
-            self._rolling_horizon_log_entry("ROLLING_HORIZON_TASK_STARTED", entry, worker_id=worker.worker_id)
-            return task
-        return None
-
-    def _battery_guard_task(self, worker: Worker) -> Task | None:
-        allowed = self._allowed_task_codes(worker.worker_id)
-        if allowed and "MANAGE_ROBOT_POWER" not in allowed:
-            return None
-        if not self._battery_is_low(worker.worker_id):
-            return None
-        if worker.battery_service_owner or worker.awaiting_battery_from:
-            return None
-        task = self._battery_task(worker.worker_id, action="self_swap")
-        entry = {
-            "opportunity_id": f"battery-guard:{task.task_id}",
-            "task": task,
-            "task_id": task.task_id,
-            "task_code": task.task_code,
-            "resource_key": self._resource_key(task),
-            "allowed_worker_ids": [worker.worker_id],
-            "assigned_worker_id": worker.worker_id,
-            "first_seen": float(self.env.now),
-            "first_window_index": self.rolling_horizon_window_index,
-            "last_updated": float(self.env.now),
-            "status": "dispatched",
-        }
-        self._rolling_horizon_log_entry("ROLLING_HORIZON_BATTERY_GUARD_DISPATCH", entry, worker_id=worker.worker_id)
-        return task
-
     def _reserve_battery_task(self, worker: Worker, task: Task) -> None:
         if task.task_code != "MANAGE_ROBOT_POWER":
             return
@@ -1337,6 +1602,100 @@ class ShipyardWorld:
         order = [str(code).upper() for code in raw_order if str(code).strip()]
         return order.index(task_code) + 1 if task_code in order else 999
 
+    def _primitive_rows(self, task: Task) -> list[dict[str, Any]]:
+        return [
+            row
+            for row in expand_task_steps(task.task_code, task.args)
+            if str(row.get("call_level", "")).strip().upper() == "PRIMITIVE_SKILL"
+        ]
+
+    def _execute_primitive_rows(
+        self,
+        worker: Worker,
+        task: Task,
+        rows: list[dict[str, Any]],
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        base_metadata = {"task_id": task.task_id, "source": "shipyard_world", **(metadata or {})}
+        for row in rows:
+            call_code = str(row["call_code"])
+            step_id = str(row["step_id"])
+            step_path = str(row["path"])
+            sampled_duration = self.timing.sample_step_duration(
+                task.task_code,
+                step_path,
+                sample_key=f"{task.task_id}:{step_path}",
+            )
+            entry = self.timing.step_entry(task.task_code, step_path)
+            distribution = entry.get("distribution")
+            timing_details = {
+                "timing_model": str(entry.get("timing_model", "duration")),
+                "sampled_duration_min": sampled_duration,
+                "distribution": distribution.to_dict() if distribution is not None else None,
+            }
+            worker.current_step_id = step_id
+            worker.current_primitive_call_code = call_code
+            self._transition(
+                worker,
+                {
+                    "event_type": "primitive_started",
+                    "task_code": task.task_code,
+                    "task_instance_id": task.instance_id,
+                    "step_id": step_id,
+                    "primitive_call_code": call_code,
+                    "metadata": {**base_metadata, "timing": timing_details},
+                },
+            )
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_index(),
+                event_type="HUMANOID_STEP_START",
+                entity_id=worker.worker_id,
+                location=worker.location,
+                details={
+                    "task_id": task.task_id,
+                    "task_code": task.task_code,
+                    "instance_id": task.instance_id,
+                    "step_id": step_id,
+                    "primitive_call_code": call_code,
+                    "task_path": step_path,
+                    "timing": timing_details,
+                    **base_metadata,
+                },
+            )
+            if sampled_duration > 0.0:
+                yield self.env.timeout(sampled_duration)
+            self._transition(
+                worker,
+                {
+                    "event_type": "primitive_finished",
+                    "task_code": task.task_code,
+                    "task_instance_id": task.instance_id,
+                    "step_id": step_id,
+                    "primitive_call_code": call_code,
+                    "metadata": {**base_metadata, "timing": timing_details},
+                },
+            )
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_index(),
+                event_type="HUMANOID_STEP_END",
+                entity_id=worker.worker_id,
+                location=worker.location,
+                details={
+                    "task_id": task.task_id,
+                    "task_code": task.task_code,
+                    "instance_id": task.instance_id,
+                    "step_id": step_id,
+                    "primitive_call_code": call_code,
+                    "task_path": step_path,
+                    "status": "completed",
+                    "timing": timing_details,
+                    **base_metadata,
+                },
+            )
+
     def execute_task(self, worker: Worker, task: Task) -> Any:
         if task.task_code == "MANAGE_ROBOT_POWER":
             yield from self._execute_battery_task(worker, task)
@@ -1406,37 +1765,7 @@ class ShipyardWorld:
         started = float(self.env.now)
         work_tile.started_at = work_tile.started_at if work_tile.started_at is not None else started
 
-        step_rows = [row for row in expand_task_steps(task_code, task.args) if str(row.get("call_level")) == "PRIMITIVE_SKILL"]
-        duration = self._operation_duration(task_code, work_tile_id)
-        step_duration = duration / max(1, len(step_rows))
-        for row in step_rows:
-            call_code = str(row["call_code"])
-            step_id = str(row["step_id"])
-            worker.current_step_id = step_id
-            worker.current_primitive_call_code = call_code
-            self._transition(
-                worker,
-                {
-                    "event_type": "primitive_started",
-                    "task_code": task_code,
-                    "task_instance_id": task.instance_id,
-                    "step_id": step_id,
-                    "primitive_call_code": call_code,
-                    "metadata": {"task_id": task.task_id, "source": "shipyard_world"},
-                },
-            )
-            yield self.env.timeout(step_duration)
-            self._transition(
-                worker,
-                {
-                    "event_type": "primitive_finished",
-                    "task_code": task_code,
-                    "task_instance_id": task.instance_id,
-                    "step_id": step_id,
-                    "primitive_call_code": call_code,
-                    "metadata": {"task_id": task.task_id, "source": "shipyard_world"},
-                },
-            )
+        yield from self._execute_primitive_rows(worker, task, self._primitive_rows(task))
 
         self._apply_task_result(work_tile, task_code, worker.worker_id, task.task_id)
         if task_code == "TRANSFER":
@@ -1477,6 +1806,7 @@ class ShipyardWorld:
         worker.current_task_payload = {}
         if work_tile.owner == worker.worker_id:
             work_tile.owner = None
+        self._rolling_horizon_request_candidate_refresh("task_finished")
 
     def _execute_cart_transport_task(self, worker: Worker, task: Task) -> Any:
         cart_id = str(task.payload.get("vehicle_id", ""))
@@ -1553,7 +1883,21 @@ class ShipyardWorld:
         batch_count = min(self.cart_capacity, max(1, int(task.payload.get("batch_count", self.cart_capacity) or self.cart_capacity)))
         cart.status = "loading"
         self._emit_cart_state(cart)
-        yield self.env.timeout(max(0.1, self._operation_duration(task_code, "") * 0.25))
+        step_rows = self._primitive_rows(task)
+        split_index = next(
+            (
+                index
+                for index, row in enumerate(step_rows)
+                if str(row.get("path", "")).endswith("s06_navigate_to_2")
+            ),
+            len(step_rows),
+        )
+        yield from self._execute_primitive_rows(
+            worker,
+            task,
+            step_rows[:split_index],
+            metadata={"vehicle_id": cart_id, "phase": "load"},
+        )
         cart.inventory_kind = item_type
         cart.inventory_count = batch_count
         cart.reserved_count = 0
@@ -1594,37 +1938,12 @@ class ShipyardWorld:
             ),
         )
 
-        step_rows = [row for row in expand_task_steps(task_code, task.args) if str(row.get("call_level")) == "PRIMITIVE_SKILL"]
-        duration = max(0.1, self._operation_duration(task_code, "") * 0.75)
-        step_duration = duration / max(1, len(step_rows))
-        for row in step_rows:
-            call_code = str(row["call_code"])
-            step_id = str(row["step_id"])
-            worker.current_step_id = step_id
-            worker.current_primitive_call_code = call_code
-            self._transition(
-                worker,
-                {
-                    "event_type": "primitive_started",
-                    "task_code": task_code,
-                    "task_instance_id": task.instance_id,
-                    "step_id": step_id,
-                    "primitive_call_code": call_code,
-                    "metadata": {"task_id": task.task_id, "source": "shipyard_world", "vehicle_id": cart_id},
-                },
-            )
-            yield self.env.timeout(step_duration)
-            self._transition(
-                worker,
-                {
-                    "event_type": "primitive_finished",
-                    "task_code": task_code,
-                    "task_instance_id": task.instance_id,
-                    "step_id": step_id,
-                    "primitive_call_code": call_code,
-                    "metadata": {"task_id": task.task_id, "source": "shipyard_world", "vehicle_id": cart_id},
-                },
-            )
+        yield from self._execute_primitive_rows(
+            worker,
+            task,
+            step_rows[split_index:],
+            metadata={"vehicle_id": cart_id, "phase": "park"},
+        )
 
         cart.status = "parked"
         cart.parking_spot_id = parking_id
@@ -1692,6 +2011,7 @@ class ShipyardWorld:
         worker.current_step_id = None
         worker.current_primitive_call_code = None
         worker.current_task_payload = {}
+        self._rolling_horizon_request_candidate_refresh("cart_task_finished")
 
     def _execute_battery_task(self, worker: Worker, task: Task) -> Any:
         task_code = task.task_code
@@ -1786,37 +2106,12 @@ class ShipyardWorld:
                 )
                 yield self.env.timeout(self.map.tile_time_min)
 
-        step_rows = [row for row in expand_task_steps(task_code, task.args) if str(row.get("call_level")) == "PRIMITIVE_SKILL"]
-        duration = self.battery_delivery_extra_min if action == "battery_delivery" else self.battery_pickup_time_min
-        step_duration = duration / max(1, len(step_rows))
-        for row in step_rows:
-            call_code = str(row["call_code"])
-            step_id = str(row["step_id"])
-            worker.current_step_id = step_id
-            worker.current_primitive_call_code = call_code
-            self._transition(
-                worker,
-                {
-                    "event_type": "primitive_started",
-                    "task_code": task_code,
-                    "task_instance_id": task.instance_id,
-                    "step_id": step_id,
-                    "primitive_call_code": call_code,
-                    "metadata": {"task_id": task.task_id, "source": "shipyard_world", "power_action": action},
-                },
-            )
-            yield self.env.timeout(step_duration)
-            self._transition(
-                worker,
-                {
-                    "event_type": "primitive_finished",
-                    "task_code": task_code,
-                    "task_instance_id": task.instance_id,
-                    "step_id": step_id,
-                    "primitive_call_code": call_code,
-                    "metadata": {"task_id": task.task_id, "source": "shipyard_world", "power_action": action},
-                },
-            )
+        yield from self._execute_primitive_rows(
+            worker,
+            task,
+            self._primitive_rows(task),
+            metadata={"power_action": action},
+        )
 
         serviced_worker_id = receiver_id if action == "battery_delivery" and receiver_id in self.workers else worker.worker_id
         if serviced_worker_id in self.workers:
@@ -1825,6 +2120,8 @@ class ShipyardWorld:
             serviced_worker.battery_service_owner = None
             serviced_worker.awaiting_battery_from = None
             self._emit_worker_state(serviced_worker)
+            if self.rolling_horizon_enabled:
+                self._rolling_horizon_notify_worker(serviced_worker_id)
         worker.battery_service_owner = None
 
         self.logger.log(
@@ -1876,6 +2173,7 @@ class ShipyardWorld:
         worker.current_step_id = None
         worker.current_primitive_call_code = None
         worker.current_task_payload = {}
+        self._rolling_horizon_request_candidate_refresh("battery_task_finished")
 
     def _move_worker(
         self,
@@ -1889,10 +2187,60 @@ class ShipyardWorld:
     ) -> Any:
         start = worker.tile or self.map.initial_worker_tile(worker.worker_id)
         path = path_override if path_override is not None else self.map.find_path(start, destination)
-        duration = max(0.0, (len(path) - 1) * self.map.tile_time_min)
+        if start == destination:
+            return
+        if cart is not None and len(path) < 2:
+            unobstructed = self.map.find_cart_route_path(
+                start,
+                destination,
+                footprint_tiles=self.cart_footprint_tiles,
+            )
+            if len(unobstructed) < 2:
+                raise RuntimeError(
+                    f"No cart-route connection for {cart.cart_id} from {start} to {destination} "
+                    f"while executing {task.task_id}."
+                )
+            wait_duration = max(0.001, float(self.map.tile_time_min))
+            while len(path) < 2:
+                self.cart_collision_wait_count += 1
+                self.cart_wait_time_min += wait_duration
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_index(),
+                    event_type="CART_TRAFFIC_WAIT",
+                    entity_id=cart.cart_id,
+                    location=cart.parking_spot_id or "cart_route",
+                    details={
+                        "cart_id": cart.cart_id,
+                        "worker_id": worker.worker_id,
+                        "task_id": task.task_id,
+                        "from_tile": self.map.tile_payload(start),
+                        "to_tile": self.map.tile_payload(destination),
+                        "duration": wait_duration,
+                        "reason": "route_temporarily_blocked",
+                    },
+                )
+                yield self.env.timeout(wait_duration)
+                start = worker.tile or cart.tile
+                path = self.map.find_cart_route_path(
+                    start,
+                    destination,
+                    blocked_tiles=self._other_cart_tiles(cart),
+                    footprint_tiles=self.cart_footprint_tiles,
+                )
+        if len(path) < 2:
+            raise RuntimeError(
+                f"No physical path for {worker.worker_id} from {start} to {destination} "
+                f"while executing {task.task_id}."
+            )
+        move_id = f"{worker.worker_id}-{task.task_id}-{int(self.env.now * 1000)}"
+        multiplier_key = "cart" if cart is not None else str(task.payload.get("item_type", "")).strip().lower()
+        move_multiplier = self.timing.multiplier(multiplier_key, 1.0) if multiplier_key else 1.0
+        timing_sample_key = f"{task.task_id}:{move_id}:{target_location or task.payload.get('target', 'ShipDock')}"
+        sampled_tile_time_min = self.timing.sample_tile_time(sample_key=timing_sample_key, multiplier=move_multiplier)
+        duration = max(0.0, (len(path) - 1) * sampled_tile_time_min)
         if duration <= 0.0:
             return
-        move_id = f"{worker.worker_id}-{task.task_id}-{int(self.env.now * 1000)}"
         target_location = str(target_location or task.payload.get("target", "ShipDock"))
         worker.movement_path = list(path)
         worker.movement_target_tile = destination
@@ -1925,6 +2273,10 @@ class ShipyardWorld:
                 "to_tile": self.map.tile_payload(destination),
                 "path_tiles": self.map.path_payload(path),
                 "duration": duration,
+                "sampled_tile_time_min": sampled_tile_time_min,
+                "base_tile_time_distribution": self.timing.movement_distribution.to_dict(),
+                "effective_time_multiplier": move_multiplier,
+                "timing_sample_key": timing_sample_key,
                 "move_id": move_id,
             },
         )
@@ -1947,11 +2299,15 @@ class ShipyardWorld:
                     "footprint_tiles": self.map.path_payload(self._cart_footprint_tiles(cart)),
                     "path_tiles": self.map.path_payload(path),
                     "duration": duration,
+                    "sampled_tile_time_min": sampled_tile_time_min,
+                    "base_tile_time_distribution": self.timing.movement_distribution.to_dict(),
+                    "effective_time_multiplier": move_multiplier,
+                    "timing_sample_key": timing_sample_key,
                     "move_id": move_id,
                 },
             )
             self._emit_cart_state(cart)
-        segment_duration = max(0.0, self.map.tile_time_min)
+        segment_duration = max(0.0, sampled_tile_time_min)
         segment_count = max(0, len(path) - 1)
         for segment_index, (from_tile, to_tile) in enumerate(zip(path, path[1:]), start=1):
             yield from self._wait_for_battery_delivery_if_depleted(worker, task, move_id)
@@ -2243,6 +2599,11 @@ class ShipyardWorld:
                     cart.inventory_kind = ""
                     cart.reserved_count = 0
                 self._emit_cart_state(cart)
+        worker.carrying_item_id = item_id
+        worker.carrying_item_type = item_type
+        worker.carrying_item_ids = [item_id]
+        worker.carrying_item_count = 1
+        worker.carrying_item_max_count = 1
         self.logger.log(
             t=self.env.now,
             day=self.day_index(),
@@ -2258,6 +2619,21 @@ class ShipyardWorld:
                 "transfer_kind": task.payload.get("transfer_kind", ""),
             },
         )
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_index(),
+            event_type="ITEM_STATE_CHANGED",
+            entity_id=item_id,
+            location=source,
+            details={
+                "item_id": item_id,
+                "item_type": item_type,
+                "item_state": "CARRIED_BY_WORKER",
+                "ref": worker.worker_id,
+                "tile": self.map.tile_payload(worker.tile),
+            },
+        )
+        self._emit_worker_cargo(worker)
 
     def _log_resource_dropoff(self, worker: Worker, task: Task, work_tile: ShipWorkTile) -> None:
         item_type = self._resource_item_type(task)
@@ -2277,13 +2653,45 @@ class ShipyardWorld:
                 "transfer_kind": task.payload.get("transfer_kind", ""),
             },
         )
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_index(),
+            event_type="ITEM_STATE_CHANGED",
+            entity_id=item_id,
+            location=work_tile.entity_id,
+            details={
+                "item_id": item_id,
+                "item_type": item_type,
+                "item_state": "COMPLETED",
+                "ref": work_tile.entity_id,
+            },
+        )
+        worker.carrying_item_id = None
+        worker.carrying_item_type = None
+        worker.carrying_item_ids = []
+        worker.carrying_item_count = 0
+        worker.carrying_item_max_count = 1
+        self._emit_worker_cargo(worker)
 
-    def _operation_duration(self, task_code: str, work_tile_id: str) -> float:
-        shipyard_cfg = self.cfg.get("shipyard", {}) if isinstance(self.cfg.get("shipyard", {}), dict) else {}
-        ops = shipyard_cfg.get("operations", {}) if isinstance(shipyard_cfg.get("operations", {}), dict) else {}
-        task_cfg = ops.get(task_code, {}) if isinstance(ops.get(task_code, {}), dict) else {}
-        tile_min = task_cfg.get("tile_min", {}) if isinstance(task_cfg.get("tile_min", {}), dict) else {}
-        return float(tile_min.get(work_tile_id, task_cfg.get("default_min", 1.0)) or 1.0)
+    def _emit_worker_cargo(self, worker: Worker) -> None:
+        item_ids = [str(item_id) for item_id in worker.carrying_item_ids if str(item_id)]
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_index(),
+            event_type="WORKER_CARGO_CHANGED",
+            entity_id=worker.worker_id,
+            location=worker.location,
+            details={
+                "cargo": {
+                    "item_id": worker.carrying_item_id,
+                    "item_type": worker.carrying_item_type,
+                    "item_ids": item_ids,
+                    "item_count": int(worker.carrying_item_count or len(item_ids)),
+                    "max_item_count": int(worker.carrying_item_max_count or 1),
+                },
+                "humanoid_state": worker.humanoid_state,
+            },
+        )
 
     def _apply_task_result(self, work_tile: ShipWorkTile, task_code: str, worker_id: str, task_id: str) -> None:
         payload: dict[str, Any] = {}
@@ -2418,7 +2826,7 @@ class ShipyardWorld:
         cart_util = round(cart_busy_total / max(1e-9, sim_time * max(1, len(self.carts))), 6) if self.carts else 0.0
         completed_task_counts: dict[str, int] = {}
         for event in self.logger.events:
-            if str(event.get("event_type", "")) != "AGENT_TASK_END":
+            if str(event.get("type", "")) != "AGENT_TASK_END":
                 continue
             details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
             if str(details.get("status", "")).strip().lower() != "completed":
@@ -2438,6 +2846,7 @@ class ShipyardWorld:
         )
         kpi = {
             "scenario_type": "shipyard_basic",
+            "task_primitive_timing": self.timing.summary(),
             "makespan_min": round(makespan, 3) if makespan is not None else None,
             "makespan_status": "complete" if all_tiles_complete else "pending",
             "surface_tile_count": len(self.work_tiles),
@@ -2494,17 +2903,42 @@ class ShipyardWorld:
             "rolling_horizon_requeued_task_count": int(self.rolling_horizon_metrics.get("requeued_task_count", 0)),
             "rolling_horizon_max_worker_queue_length": int(self.rolling_horizon_metrics.get("max_worker_queue_length", 0)),
             "rolling_horizon_stale_skipped_task_count": int(self.rolling_horizon_metrics.get("stale_skipped_task_count", 0)),
+            "rolling_horizon_immediate_dispatched_task_count": int(
+                self.rolling_horizon_metrics.get("immediate_dispatched_task_count", 0)
+            ),
+            "rolling_horizon_scheduler_mode": self.rolling_horizon_scheduler_mode,
+            "rolling_horizon_strict_boundary_count": int(
+                self.rolling_horizon_metrics.get("strict_boundary_count", 0)
+            ),
+            "rolling_horizon_late_boundary_count": int(
+                self.rolling_horizon_metrics.get("late_boundary_count", 0)
+            ),
+            "rolling_horizon_max_boundary_lag_min": round(
+                float(self.rolling_horizon_max_boundary_lag_min), 9
+            ),
             "rolling_horizon": {
                 "enabled": bool(self.rolling_horizon_enabled),
                 "dedicated_roles": self.decision_mode == "rolling_horizon_dedicated_roles",
                 "window_min": round(float(self.rolling_horizon_window_min), 3),
+                "scheduler_mode": self.rolling_horizon_scheduler_mode,
+                "candidate_collection_mode": self.rolling_horizon_candidate_collection_mode,
                 "window_count": int(self.rolling_horizon_metrics.get("started_window_count", 0)),
                 "candidate_collected_count": int(self.rolling_horizon_metrics.get("candidate_collected_count", 0)),
                 "dispatched_task_count": int(self.rolling_horizon_metrics.get("dispatched_task_count", 0)),
+                "immediate_dispatched_task_count": int(
+                    self.rolling_horizon_metrics.get("immediate_dispatched_task_count", 0)
+                ),
                 "stale_skipped_task_count": int(self.rolling_horizon_metrics.get("stale_skipped_task_count", 0)),
                 "requeued_task_count": int(self.rolling_horizon_metrics.get("requeued_task_count", 0)),
                 "pending_candidate_count": int(len(self.rolling_horizon_pending)),
                 "queued_dispatch_count": int(sum(len(queue) for queue in self.rolling_horizon_dispatch_queues.values())),
+                "strict_boundary_count": int(
+                    self.rolling_horizon_metrics.get("strict_boundary_count", 0)
+                ),
+                "late_boundary_count": int(
+                    self.rolling_horizon_metrics.get("late_boundary_count", 0)
+                ),
+                "max_boundary_lag_min": round(float(self.rolling_horizon_max_boundary_lag_min), 9),
             },
             **operational_complexity_metrics,
             "terminated": self.terminated,

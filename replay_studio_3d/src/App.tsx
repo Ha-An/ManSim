@@ -169,7 +169,12 @@ export default function App() {
   const machineEntities = useMemo(
     () =>
       Object.values(currentFrame?.domainState.entities ?? {})
-        .filter((entity) => entity.entity_type === "machine" || entity.entity_type === "workstation")
+        .filter(
+          (entity) =>
+            entity.entity_type === "machine" ||
+            entity.entity_type === "workstation" ||
+            entity.entity_type === "inspection_table",
+        )
         .sort((left, right) => left.label.localeCompare(right.label)),
     [currentFrame?.domainState.entities],
   );

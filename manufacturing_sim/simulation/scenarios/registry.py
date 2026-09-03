@@ -9,6 +9,7 @@ ScenarioRun = Callable[..., dict[str, Any]]
 
 _SUPPORTED_SCENARIOS = {
     "factory_mfg_basic": "factory_mfg_basic",
+    "mfg_flow_shop": "mfg_flow_shop",
     "shipyard_basic": "shipyard_basic",
 }
 
@@ -24,7 +25,7 @@ def scenario_type(experiment_cfg: dict[str, Any]) -> str:
 
 
 def _runner(kind: str) -> ScenarioRun:
-    if kind == "factory_mfg_basic":
+    if kind in {"factory_mfg_basic", "mfg_flow_shop"}:
         from manufacturing_sim.simulation.scenarios.manufacturing.run import run
 
         return run

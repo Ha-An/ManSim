@@ -21,6 +21,9 @@ export type EntityType =
   | "scrap_queue"
   | "scrap_bin"
   | "inspection_table"
+  | "ship_work_tile"
+  | "ship_hull"
+  | "ship_hull_segment"
   | "buffer";
 
 export type EntityStatus =

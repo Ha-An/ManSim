@@ -21,12 +21,26 @@ FACTORY_TASK_CODES = [
     "SETUP_MACHINE",
     "UNLOAD_MACHINE",
     "TRANSFER",
+    "LOAD_UNLOAD_TRANSFER_INTERFACE",
     "INSPECT_PRODUCT",
     "REPAIR_MACHINE",
     "PREVENTIVE_MAINTENANCE",
     "COLLECT_WASTE_OR_SCRAP",
     "MANAGE_ROBOT_POWER",
     "HANDOVER_ITEM",
+]
+
+MFG_FLOW_SHOP_TASK_CODES = [
+    "REPLENISH_MATERIAL",
+    "TRANSFER",
+    "LOAD_MACHINE",
+    "SETUP_MACHINE",
+    "UNLOAD_MACHINE",
+    "LOAD_UNLOAD_TRANSFER_INTERFACE",
+    "INSPECT_PRODUCT",
+    "REPAIR_MACHINE",
+    "MANAGE_ROBOT_POWER",
+    "COLLECT_WASTE_OR_SCRAP",
 ]
 
 
@@ -38,12 +52,12 @@ def build_factory_pre_run_diagnostics(*, world: Any, cfg: dict[str, Any]) -> dic
     outcomes. They are scenario-level indicators used before comparing modes.
     """
     scenario_type = _scenario_type(cfg)
-    if scenario_type != "factory_mfg_basic":
+    if scenario_type not in {"factory_mfg_basic", "mfg_flow_shop"}:
         return {
             "schema_version": "1.0",
             "scenario_type": scenario_type,
             "supported": False,
-            "reason": "Pre-run diagnostics are currently defined for factory_mfg_basic only.",
+            "reason": "Pre-run diagnostics are defined for manufacturing scenarios only.",
             "metrics": {},
         }
 
@@ -51,15 +65,33 @@ def build_factory_pre_run_diagnostics(*, world: Any, cfg: dict[str, Any]) -> dic
     machine_ids = _machine_ids(world)
     station_machine_ids = _station_machine_ids(world, machine_ids)
     horizon = _horizon_inputs(cfg, world)
-    task_complexity = _task_complexity_by_code()
+    configured_task_codes = (
+        cfg.get("factory", {}).get("enabled_task_codes", [])
+        if isinstance(cfg.get("factory", {}), dict)
+        else []
+    )
+    task_codes = [
+        str(code).strip().upper()
+        for code in configured_task_codes
+        if str(code).strip()
+    ]
+    if not task_codes:
+        task_codes = list(MFG_FLOW_SHOP_TASK_CODES if scenario_type == "mfg_flow_shop" else FACTORY_TASK_CODES)
+    task_complexity = _task_complexity_by_code(task_codes)
     estimated_counts = _estimate_factory_task_counts(
         cfg=cfg,
         horizon_days=horizon["num_days"],
         minutes_per_day=horizon["minutes_per_day"],
         machine_count=len(machine_ids),
         worker_count=len(worker_ids),
+        task_codes=task_codes,
     )
-    role_allowlists = _worker_task_allowlists(cfg, worker_ids)
+    role_allowlists = _worker_task_allowlists(
+        cfg,
+        worker_ids,
+        scenario_type=scenario_type,
+        task_codes=task_codes,
+    )
     task_loads_by_worker = _estimate_worker_complexity_loads(
         worker_ids=worker_ids,
         role_allowlists=role_allowlists,
@@ -70,10 +102,28 @@ def build_factory_pre_run_diagnostics(*, world: Any, cfg: dict[str, Any]) -> dic
         task_counts=estimated_counts,
         machine_ids=machine_ids,
         station_machine_ids=station_machine_ids,
+        scenario_type=scenario_type,
+        worker_ids=worker_ids,
+        inspection_workstation_id=str(getattr(world, "inspection_workstation_id", "inspection_table")),
     )
     topology = _map_topology_inputs(getattr(world, "grid_map", None))
     service_targets = _service_tile_inputs(getattr(world, "grid_map", None), machine_ids=machine_ids)
     battery_inputs = _battery_inputs(cfg, world)
+    mfg_flow_policy = getattr(world, "mfg_flow_task_policy", None)
+    mfg_flow_policy_summary = mfg_flow_policy.summary() if mfg_flow_policy is not None else None
+    rolling_scheduler = {
+        "enabled": bool(getattr(world, "rolling_horizon_enabled", False)),
+        "scheduler_mode": str(getattr(world, "rolling_horizon_scheduler_mode", "not_applicable")),
+        "candidate_collection_mode": str(
+            getattr(world, "rolling_horizon_candidate_collection_mode", "not_applicable")
+        ),
+        "window_min": float(getattr(world, "rolling_horizon_window_min", 0.0) or 0.0),
+        "first_dispatch_min": (
+            float(getattr(world, "rolling_horizon_window_min", 0.0) or 0.0)
+            if bool(getattr(world, "rolling_horizon_enabled", False))
+            else None
+        ),
+    }
 
     metrics = {
         "worker_otc_imbalance": _metric_worker_otc_imbalance(task_loads_by_worker),
@@ -85,6 +135,13 @@ def build_factory_pre_run_diagnostics(*, world: Any, cfg: dict[str, Any]) -> dic
             task_complexity=task_complexity,
             total_complexity=sum(float(estimated_counts.get(code, 0)) * _complexity_value(task_complexity, code) for code in estimated_counts),
             decision_cfg=cfg.get("decision", {}) if isinstance(cfg.get("decision", {}), dict) else {},
+            repair_collaboration_enabled=int(
+                (cfg.get("machine_failure", {}) if isinstance(cfg.get("machine_failure", {}), dict) else {}).get(
+                    "max_repair_agents", 1
+                )
+                or 1
+            )
+            > 1,
         ),
         "power_coordination_risk": _metric_power_coordination_risk(
             task_loads_by_worker=task_loads_by_worker,
@@ -117,6 +174,14 @@ def build_factory_pre_run_diagnostics(*, world: Any, cfg: dict[str, Any]) -> dic
             "map_topology": topology,
             "service_tile_targets": service_targets,
             "battery": battery_inputs,
+            "task_primitive_timing": {
+                "scenario_type": str(getattr(getattr(world, "timing", None), "scenario_type", "")),
+                "profile_fingerprint": str(getattr(getattr(world, "timing", None), "profile_fingerprint", "")),
+            },
+            "mfg_flow_shop_task_policy": mfg_flow_policy_summary,
+        },
+        "policy_runtime": {
+            "rolling_horizon_scheduler": rolling_scheduler,
         },
         "metrics": metrics,
     }
@@ -167,13 +232,16 @@ def _horizon_inputs(cfg: dict[str, Any], world: Any) -> dict[str, float]:
     }
 
 
-def _task_complexity_by_code() -> dict[str, dict[str, Any]]:
+def _task_complexity_by_code(task_codes: list[str] | None = None) -> dict[str, dict[str, Any]]:
     try:
         from humanoidsim import task_complexity_index
 
         return task_complexity_index()
     except Exception:
-        return {code: {"complexity": 1.0, "primitive_count": 0} for code in FACTORY_TASK_CODES}
+        return {
+            code: {"complexity": 1.0, "primitive_count": 0}
+            for code in (task_codes or FACTORY_TASK_CODES)
+        }
 
 
 def _complexity_value(task_complexity: dict[str, dict[str, Any]], task_code: str) -> float:
@@ -193,27 +261,80 @@ def _estimate_factory_task_counts(
     minutes_per_day: float,
     machine_count: int,
     worker_count: int,
+    task_codes: list[str] | None = None,
 ) -> dict[str, int]:
     factory = cfg.get("factory", {}) if isinstance(cfg.get("factory", {}), dict) else {}
-    processing = factory.get("processing_time_min", {}) if isinstance(factory.get("processing_time_min", {}), dict) else {}
+    processing = factory.get("processing_time", {}) if isinstance(factory.get("processing_time", {}), dict) else {}
+    if not processing:
+        processing = factory.get("processing_time_min", {}) if isinstance(factory.get("processing_time_min", {}), dict) else {}
     movement = cfg.get("movement", {}) if isinstance(cfg.get("movement", {}), dict) else {}
-    setup_min = max(0.1, float(movement.get("setup_min", 3.0) or 3.0))
-    unload_min = max(0.1, float(movement.get("unload_min", 2.0) or 2.0))
-    process_times = [float(value or 0.0) for key, value in processing.items() if str(key).startswith("station")]
+    timing = cfg.get("task_primitive_timing", {}) if isinstance(cfg.get("task_primitive_timing", {}), dict) else {}
+    timing_tasks = timing.get("tasks", {}) if isinstance(timing.get("tasks", {}), dict) else {}
+
+    def _expected_distribution(value: Any, fallback: float) -> float:
+        if not isinstance(value, dict):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return fallback
+        try:
+            return (float(value["min"]) + float(value["mode"]) + float(value["max"])) / 3.0
+        except (KeyError, TypeError, ValueError):
+            return fallback
+
+    def _step_expected(task_code: str, step_path: str, fallback: float) -> float:
+        task_cfg = timing_tasks.get(task_code, {}) if isinstance(timing_tasks.get(task_code, {}), dict) else {}
+        steps = task_cfg.get("steps", {}) if isinstance(task_cfg.get("steps", {}), dict) else {}
+        step = steps.get(step_path, {}) if isinstance(steps.get(step_path, {}), dict) else {}
+        return _expected_distribution(step.get("distribution"), fallback)
+
+    setup_min = max(
+        0.1,
+        _step_expected(
+            "SETUP_MACHINE",
+            "SETUP_MACHINE/s04_execute_machine_action",
+            float(movement.get("setup_min", 3.0) or 3.0),
+        ),
+    )
+    unload_min = max(
+        0.1,
+        _step_expected(
+            "UNLOAD_MACHINE",
+            "UNLOAD_MACHINE/s04_execute_machine_action",
+            float(movement.get("unload_min", 2.0) or 2.0),
+        ),
+    )
+    process_times = [
+        _expected_distribution(value, 0.0)
+        for key, value in processing.items()
+        if str(key).startswith("station")
+    ]
     avg_process_min = mean(process_times) if process_times else 25.0
     avg_cycle_min = max(1.0, avg_process_min + setup_min + unload_min)
     total_minutes = float(horizon_days) * float(minutes_per_day)
     estimated_machine_cycles = max(1, int((total_minutes / avg_cycle_min) * max(1, machine_count) * 0.75))
     inspection_cycles = max(1, int(estimated_machine_cycles * 0.45))
     repair_count = max(1, int(ceil(max(1, machine_count) * float(horizon_days) * 0.6)))
-    pm_count = max(0, int(ceil(max(1, machine_count) * float(horizon_days) * 0.2)))
+    enabled_codes = set(task_codes or FACTORY_TASK_CODES)
+    preventive_cfg = (
+        cfg.get("machine_failure", {}).get("preventive_maintenance", {})
+        if isinstance(cfg.get("machine_failure", {}), dict)
+        else {}
+    )
+    pm_enabled = (
+        bool(preventive_cfg.get("enabled", True))
+        if isinstance(preventive_cfg, dict)
+        else True
+    ) and "PREVENTIVE_MAINTENANCE" in enabled_codes
+    pm_count = max(0, int(ceil(max(1, machine_count) * float(horizon_days) * 0.2))) if pm_enabled else 0
     battery_count = max(1, int(ceil(max(1, worker_count) * float(horizon_days) * 0.6)))
-    return {
+    estimates = {
         "REPLENISH_MATERIAL": max(1, int(ceil(estimated_machine_cycles * 1.15))),
         "LOAD_MACHINE": estimated_machine_cycles,
         "SETUP_MACHINE": estimated_machine_cycles,
         "UNLOAD_MACHINE": estimated_machine_cycles,
         "TRANSFER": max(1, int(ceil(inspection_cycles * 1.25))),
+        "LOAD_UNLOAD_TRANSFER_INTERFACE": inspection_cycles * 2,
         "INSPECT_PRODUCT": inspection_cycles,
         "REPAIR_MACHINE": repair_count,
         "PREVENTIVE_MAINTENANCE": pm_count,
@@ -221,17 +342,24 @@ def _estimate_factory_task_counts(
         "MANAGE_ROBOT_POWER": battery_count,
         "HANDOVER_ITEM": 0,
     }
+    return {code: int(estimates.get(code, 0) or 0) for code in task_codes or FACTORY_TASK_CODES}
 
 
-def _worker_task_allowlists(cfg: dict[str, Any], worker_ids: list[str]) -> dict[str, list[str]]:
+def _worker_task_allowlists(
+    cfg: dict[str, Any],
+    worker_ids: list[str],
+    *,
+    scenario_type: str,
+    task_codes: list[str],
+) -> dict[str, list[str]]:
     decision = cfg.get("decision", {}) if isinstance(cfg.get("decision", {}), dict) else {}
     rolling = decision.get("rolling_horizon", {}) if isinstance(decision.get("rolling_horizon", {}), dict) else {}
     scenario_map = rolling.get("scenario_worker_task_priority", {}) if isinstance(rolling.get("scenario_worker_task_priority", {}), dict) else {}
-    raw = scenario_map.get("factory_mfg_basic")
+    raw = scenario_map.get(scenario_type)
     if not isinstance(raw, dict) or not raw:
         raw = rolling.get("worker_task_priority", {}) if isinstance(rolling.get("worker_task_priority", {}), dict) else {}
     if not isinstance(raw, dict) or not raw:
-        return {worker_id: list(FACTORY_TASK_CODES) for worker_id in worker_ids}
+        return {worker_id: list(task_codes) for worker_id in worker_ids}
     allowlists: dict[str, list[str]] = {}
     for worker_id in worker_ids:
         values = raw.get(worker_id, [])
@@ -270,6 +398,9 @@ def _factory_resource_templates(
     task_counts: dict[str, int],
     machine_ids: list[str],
     station_machine_ids: dict[str, list[str]],
+    scenario_type: str,
+    worker_ids: list[str],
+    inspection_workstation_id: str,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
 
@@ -301,9 +432,31 @@ def _factory_resource_templates(
             add(task_code, per_machine, [f"machine:{machine_id}"], machine_id)
 
     add("TRANSFER", int(task_counts.get("TRANSFER", 0) or 0), ["station_output_queue", "inspection_input_queue", "wip_item"], "station output -> inspection")
-    add("INSPECT_PRODUCT", int(task_counts.get("INSPECT_PRODUCT", 0) or 0), ["inspection_table", "inspection_input_queue"], "inspection")
+    add(
+        "LOAD_UNLOAD_TRANSFER_INTERFACE",
+        int(task_counts.get("LOAD_UNLOAD_TRANSFER_INTERFACE", 0) or 0),
+        [inspection_workstation_id, "inspection_input_queue", "inspection_output_queue", "inspection_scrap_queue"],
+        "inspection queue <-> workstation",
+    )
+    add(
+        "INSPECT_PRODUCT",
+        int(task_counts.get("INSPECT_PRODUCT", 0) or 0),
+        [inspection_workstation_id],
+        "inspection",
+    )
     add("COLLECT_WASTE_OR_SCRAP", int(task_counts.get("COLLECT_WASTE_OR_SCRAP", 0) or 0), ["inspection_scrap_queue", "scrap_disposal"], "scrap disposal")
-    add("MANAGE_ROBOT_POWER", int(task_counts.get("MANAGE_ROBOT_POWER", 0) or 0), ["battery_station", "fresh_battery_rack"], "battery service")
+    if scenario_type == "mfg_flow_shop":
+        battery_resources = [f"charging_dock_{worker_id}" for worker_id in worker_ids]
+        battery_target = "assigned charging docks"
+    else:
+        battery_resources = ["battery_station", "fresh_battery_rack"]
+        battery_target = "battery service"
+    add(
+        "MANAGE_ROBOT_POWER",
+        int(task_counts.get("MANAGE_ROBOT_POWER", 0) or 0),
+        battery_resources,
+        battery_target,
+    )
     return rows
 
 
@@ -356,6 +509,12 @@ def _service_tile_inputs(grid_map: Any, *, machine_ids: list[str]) -> dict[str, 
         "scrap_disposal_bin",
     ):
         targets.add(name)
+    objects = getattr(grid_map, "objects", {})
+    if isinstance(objects, dict):
+        for object_id, obj in objects.items():
+            object_type = str(getattr(obj, "object_type", "")).strip().lower()
+            if object_type in {"charging_dock", "inspection_desk"}:
+                targets.add(str(object_id))
     counts: dict[str, int] = {}
     for target in sorted(targets):
         try:
@@ -376,15 +535,39 @@ def _battery_inputs(cfg: dict[str, Any], world: Any) -> dict[str, Any]:
     agent_cfg = cfg.get("agent", {}) if isinstance(cfg.get("agent", {}), dict) else {}
     combined = {**agent_cfg, **worker}
     drain = combined.get("battery_drain", {}) if isinstance(combined.get("battery_drain", {}), dict) else {}
+    service = combined.get("battery_service", {}) if isinstance(combined.get("battery_service", {}), dict) else {}
     decision = cfg.get("decision", {}) if isinstance(cfg.get("decision", {}), dict) else {}
     battery_decision = decision.get("battery", {}) if isinstance(decision.get("battery", {}), dict) else {}
     return {
-        "battery_swap_period_min": round(float(combined.get("battery_swap_period_min", getattr(world, "battery_swap_period_min", 200.0)) or 200.0), 3),
+        "battery_swap_period_min": round(
+            float(
+                combined.get(
+                    "battery_capacity_min",
+                    combined.get("battery_swap_period_min", getattr(world, "battery_swap_period_min", 200.0)),
+                )
+                or 200.0
+            ),
+            3,
+        ),
+        "service_mode": str(service.get("mode", getattr(world, "battery_service_mode", "battery_swap"))).strip().lower(),
         "available_rate_multiplier": round(float(drain.get("available_rate_multiplier", getattr(world, "battery_available_rate_multiplier", 1.0)) or 1.0), 3),
         "non_available_rate_multiplier": round(float(drain.get("non_available_rate_multiplier", getattr(world, "battery_non_available_rate_multiplier", 2.0)) or 2.0), 3),
-        "low_threshold_ratio": round(float(battery_decision.get("low_threshold_ratio", 0.3) or 0.3), 3),
-        "delivery_provider_agent_ids": list(battery_decision.get("delivery_provider_agent_ids", [])) if isinstance(battery_decision.get("delivery_provider_agent_ids", []), list) else [],
-        "delivery_receiver_agent_ids": list(battery_decision.get("delivery_receiver_agent_ids", [])) if isinstance(battery_decision.get("delivery_receiver_agent_ids", []), list) else [],
+        "low_threshold_ratio": round(
+            float(service.get("low_threshold_ratio", battery_decision.get("low_threshold_ratio", 0.3)) or 0.3),
+            3,
+        ),
+        "delivery_provider_agent_ids": (
+            list(battery_decision.get("delivery_provider_agent_ids", []))
+            if bool(service.get("allow_battery_delivery", True))
+            and isinstance(battery_decision.get("delivery_provider_agent_ids", []), list)
+            else []
+        ),
+        "delivery_receiver_agent_ids": (
+            list(battery_decision.get("delivery_receiver_agent_ids", []))
+            if bool(service.get("allow_battery_delivery", True))
+            and isinstance(battery_decision.get("delivery_receiver_agent_ids", []), list)
+            else []
+        ),
     }
 
 
@@ -561,6 +744,7 @@ def _metric_robot_interaction_load(
     task_complexity: dict[str, dict[str, Any]],
     total_complexity: float,
     decision_cfg: dict[str, Any],
+    repair_collaboration_enabled: bool = False,
 ) -> dict[str, Any]:
     battery_cfg = decision_cfg.get("battery", {}) if isinstance(decision_cfg.get("battery", {}), dict) else {}
     providers = battery_cfg.get("delivery_provider_agent_ids", []) if isinstance(battery_cfg.get("delivery_provider_agent_ids", []), list) else []
@@ -568,6 +752,8 @@ def _metric_robot_interaction_load(
     interaction_task_codes = ["HANDOVER_ITEM"]
     if providers and receivers:
         interaction_task_codes.append("MANAGE_ROBOT_POWER")
+    if repair_collaboration_enabled:
+        interaction_task_codes.append("REPAIR_MACHINE")
     interaction_complexity = 0.0
     by_task: dict[str, float] = {}
     for task_code in interaction_task_codes:

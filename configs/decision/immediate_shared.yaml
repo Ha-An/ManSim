@@ -1,0 +1,168 @@
+# Policy axes for mfg_flow_shop:
+#   dispatch timing: immediate (no 5-minute pooling)
+#   role ownership:  shared (all workers may perform every production rule)
+# A worker requests work as soon as it becomes idle and selects the highest
+# configured-priority feasible task. Running tasks are never preempted.
+mode: immediate_shared
+
+mfg_flow_shop_policy:
+  # These 18 rules are the common task taxonomy used by all four policies.
+  # In this shared mode, `kind: exclusive` and `owner: auto` classify rules
+  # for a fair comparison but DO NOT create an exclusive worker owner.
+  validation: error
+  task_rules:
+    - role_number: 1
+      id: replenish_s1_material
+      display_name: REPLENISH_MATERIAL (to Station 1)
+      task_code: REPLENISH_MATERIAL
+      kind: exclusive
+      owner: auto
+      match: {transfer_kind: material_supply, station: 1}
+    - role_number: 2
+      id: replenish_s2_material
+      display_name: REPLENISH_MATERIAL (to Station 2)
+      task_code: REPLENISH_MATERIAL
+      kind: exclusive
+      owner: auto
+      match: {transfer_kind: material_supply, station: 2}
+    - role_number: 3
+      id: transfer_s1_to_s2
+      display_name: TRANSFER (Station 1 to Station 2)
+      task_code: TRANSFER
+      kind: exclusive
+      owner: auto
+      match: {transfer_kind: inter_station, from_station: 1}
+    - role_number: 4
+      id: transfer_s2_to_inspection
+      display_name: TRANSFER (Station 2 to Inspection)
+      task_code: TRANSFER
+      kind: exclusive
+      owner: auto
+      match: {transfer_kind: inter_station, from_station: 2}
+    - role_number: 5
+      id: transfer_inspection_to_completed
+      display_name: TRANSFER (Inspection to CompletedProducts)
+      task_code: TRANSFER
+      kind: exclusive
+      owner: auto
+      match: {transfer_kind: inter_station, from_station: 4}
+    - role_number: 6
+      id: dispose_inspection_scrap
+      display_name: COLLECT_WASTE_OR_SCRAP
+      task_code: COLLECT_WASTE_OR_SCRAP
+      kind: exclusive
+      owner: auto
+      match: {priority_key: scrap_disposal}
+    - role_number: 7
+      id: load_s1_material
+      display_name: LOAD_MACHINE (Station 1, material)
+      task_code: LOAD_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 1, load_slot: material}
+    - role_number: 8
+      id: load_s2_material
+      display_name: LOAD_MACHINE (Station 2, material)
+      task_code: LOAD_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 2, load_slot: material}
+    - role_number: 9
+      id: load_s2_intermediate
+      display_name: LOAD_MACHINE (Station 2, intermediate)
+      task_code: LOAD_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 2, load_slot: intermediate}
+    - role_number: 10
+      id: setup_s1
+      display_name: SETUP_MACHINE (Station 1)
+      task_code: SETUP_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 1}
+    - role_number: 11
+      id: setup_s2
+      display_name: SETUP_MACHINE (Station 2)
+      task_code: SETUP_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 2}
+    - role_number: 12
+      id: unload_s1
+      display_name: UNLOAD_MACHINE (Station 1)
+      task_code: UNLOAD_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 1}
+    - role_number: 13
+      id: unload_s2
+      display_name: UNLOAD_MACHINE (Station 2)
+      task_code: UNLOAD_MACHINE
+      kind: exclusive
+      owner: auto
+      match: {station: 2}
+    - role_number: 14
+      id: load_inspection_desk
+      display_name: LOAD_UNLOAD_TRANSFER_INTERFACE (load inspection desk)
+      task_code: LOAD_UNLOAD_TRANSFER_INTERFACE
+      kind: exclusive
+      owner: auto
+      match: {interface_action: load}
+    - role_number: 15
+      id: inspect_product
+      display_name: INSPECT_PRODUCT
+      task_code: INSPECT_PRODUCT
+      kind: exclusive
+      owner: auto
+      match: {}
+    - role_number: 16
+      id: unload_inspection_desk
+      display_name: LOAD_UNLOAD_TRANSFER_INTERFACE (unload inspection desk)
+      task_code: LOAD_UNLOAD_TRANSFER_INTERFACE
+      kind: exclusive
+      owner: auto
+      match: {interface_action: unload}
+    - role_number: 17
+      id: battery_charge
+      display_name: MANAGE_ROBOT_POWER
+      task_code: MANAGE_ROBOT_POWER
+      kind: self_service
+      owner: auto
+      match: {priority_key: battery_charge}
+    - role_number: 18
+      id: repair_machine
+      display_name: REPAIR_MACHINE
+      task_code: REPAIR_MACHINE
+      kind: collaborative
+      owner: auto
+      match: {priority_key: repair_machine}
+
+  # Lower position means higher dispatch priority. Keeping this order identical
+  # across all four policies isolates the effects of pooling and role ownership.
+  priority_order:
+    - battery_charge
+    - repair_machine
+    - dispose_inspection_scrap
+    - unload_inspection_desk
+    - unload_s2
+    - unload_s1
+    - transfer_inspection_to_completed
+    - inspect_product
+    - load_inspection_desk
+    - transfer_s2_to_inspection
+    - load_s2_intermediate
+    - load_s2_material
+    - setup_s2
+    - transfer_s1_to_s2
+    - load_s1_material
+    - setup_s1
+    - replenish_s2_material
+    - replenish_s1_material
+
+  # There is intentionally no `dedicated_roles` section. Shared eligibility is
+  # selected by `mode: immediate_shared`, not by the task rule `kind` labels.
+
+battery:
+  # Role 17 is always self-service: a worker can only execute its own charge.
+  low_threshold_ratio: 0.30

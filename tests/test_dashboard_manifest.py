@@ -5,11 +5,69 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from dashboards.dashboard import _finite_buffer_table
 from dashboards.manifest import build_dashboard_manifest
 from dashboards.results import export_results_dashboard
 
 
 class DashboardManifestTests(unittest.TestCase):
+    def test_finite_buffer_dashboard_uses_committed_and_reserved_capacity_metrics(self) -> None:
+        table = _finite_buffer_table(
+            {
+                "buffer_capacities": {"output_buffer_station_1": 2},
+                "buffer_max_occupancy": {"output_buffer_station_1": 1},
+                "buffer_max_reserved_slots": {"output_buffer_station_1": 1},
+                "buffer_max_committed_plus_reserved": {"output_buffer_station_1": 2},
+            }
+        )
+        self.assertIn("output_buffer_station_1", table)
+        self.assertIn("Max Inbound Reserved", table)
+        self.assertIn("<td>OK</td>", table)
+
+    def test_flow_shop_makespan_hub_uses_objective_specific_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_meta = {
+                "scenario_type": "mfg_flow_shop",
+                "decision_mode": "rolling_horizon_dedicated_roles",
+                "objective_mode": "minimize_makespan",
+                "objective_status": "complete",
+                "total_days": 30,
+                "minutes_per_day": 240,
+                "sim_total_min": 7200,
+                "sim_elapsed_min": 321.5,
+            }
+            export_results_dashboard(
+                output_dir=root,
+                kpi={
+                    "scenario_type": "mfg_flow_shop",
+                    "objective_mode": "minimize_makespan",
+                    "objective_status": "complete",
+                    "makespan_min": 321.5,
+                    "initial_batch_progress_ratio": 1.0,
+                    "initial_batch_yield_ratio": 0.8,
+                    "initial_batch_material_count": 30,
+                    "initial_batch_accepted_product_count": 12,
+                    "initial_batch_disposed_scrap_count": 3,
+                    "sim_elapsed_min": 321.5,
+                    "termination_reason": "initial_material_batch_terminal_complete",
+                    "terminated": True,
+                    "buffer_overflow_attempt_count": 0,
+                    "buffer_reservation_failure_count": 0,
+                    "buffer_reservation_leak_count": 0,
+                    "machine_blocked_after_service_min": 12.5,
+                },
+                run_meta=run_meta,
+            )
+            hub_html = (root / "results_dashboard.html").read_text(encoding="utf-8")
+            self.assertIn("Batch Makespan", hub_html)
+            self.assertIn("Batch Progress", hub_html)
+            self.assertIn("Batch Disposed Scrap", hub_html)
+            self.assertIn("Makespan Safety Limit", hub_html)
+            self.assertIn("Day 2 / 321.5m", hub_html)
+            self.assertIn("Finite Buffer Safety", hub_html)
+            self.assertIn("Blocked After Service", hub_html)
+
     def test_optional_artifacts_are_blank_when_files_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

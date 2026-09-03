@@ -37,10 +37,13 @@ class ItemState(str, Enum):
     PROCESSING = "PROCESSING"
     WAITING_MACHINE_UNLOAD = "WAITING_MACHINE_UNLOAD"
     WAITING_INSPECTION = "WAITING_INSPECTION"
+    STAGED_FOR_INSPECTION = "STAGED_FOR_INSPECTION"
     INSPECTING = "INSPECTING"
+    INSPECTED_WAITING_UNLOAD = "INSPECTED_WAITING_UNLOAD"
     WAITING_INSPECTION_OUTPUT = "WAITING_INSPECTION_OUTPUT"
     WAITING_SCRAP_DISPOSAL = "WAITING_SCRAP_DISPOSAL"
     DROPPED = "DROPPED"
+    TRANSFORMED = "TRANSFORMED"
     COMPLETED = "COMPLETED"
     SCRAPPED = "SCRAPPED"
 
@@ -75,6 +78,10 @@ class Machine:
     total_pm_min: float = 0.0
     failures: int = 0
     pm_count: int = 0
+    active_cycle_id: Optional[str] = None
+    cycle_sampled_process_min: float = 0.0
+    cycle_remaining_process_min: float = 0.0
+    repair_sampled_work_min: float = 0.0
 
 
 @dataclass
@@ -89,6 +96,7 @@ class Worker:
     current_move_segment_index: int = 0
     current_move_segment_from_tile: tuple[int, int] | None = None
     current_move_segment_to_tile: tuple[int, int] | None = None
+    current_move_segment_event_started: bool = False
     current_move_logical_destination: Optional[str] = None
     current_move_started_at: Optional[float] = None
     discharged: bool = False
@@ -98,6 +106,7 @@ class Worker:
     current_task_code: Optional[str] = None
     current_task_instance_id: Optional[str] = None
     current_task_payload: dict[str, Any] = field(default_factory=dict)
+    current_task_selection_meta: dict[str, Any] = field(default_factory=dict)
     current_child_task_code: Optional[str] = None
     current_child_task_name: Optional[str] = None
     current_child_task_instance_id: Optional[str] = None
@@ -115,6 +124,11 @@ class Worker:
     battery_remaining_budget_min: Optional[float] = None
     battery_last_accounted_at: float = 0.0
     battery_accounting_swap_at: float = 0.0
+    charging_started_at: Optional[float] = None
+    charging_start_budget_min: Optional[float] = None
+    charging_target_budget_min: Optional[float] = None
+    charging_duration_min: float = 0.0
+    charging_dock_id: Optional[str] = None
     suspended_task: Any = None
     battery_service_owner: Optional[str] = None
     awaiting_battery_from: Optional[str] = None

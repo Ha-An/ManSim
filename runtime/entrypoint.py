@@ -300,6 +300,26 @@ def _export_replay_studio_assets(output_dir: Path) -> tuple[Path, Path]:
     return output_log, output_layout
 
 
+def _export_replay_studio_layout(output_dir: Path) -> Path:
+    script_path = Path(__file__).resolve().parents[1] / "replay_studio" / "examples" / "export_mansim_run.py"
+    output_dir = Path(output_dir).resolve()
+    output_layout = (output_dir / "replay_studio_layout.json").resolve()
+    subprocess.run(
+        [
+            sys.executable,
+            str(script_path),
+            "--run-dir",
+            str(output_dir),
+            "--output-layout",
+            str(output_layout),
+            "--layout-only",
+        ],
+        check=True,
+        cwd=str(script_path.parent),
+    )
+    return output_layout
+
+
 def _export_run_dashboards(
     *,
     output_dir: Path,
@@ -314,8 +334,10 @@ def _export_run_dashboards(
     kpi = result.get("kpi", {}) if isinstance(result.get("kpi", {}), dict) else {}
     if not kpi:
         kpi = _load_json(output_dir / "kpi.json") or {}
-    events_path = Path(str(result.get("events_path", output_dir / "events.jsonl")))
-    events = _load_events(events_path)
+    events_path_raw = str(result.get("events_path", "") or "").strip()
+    events_path = Path(events_path_raw) if events_path_raw else output_dir / "events.jsonl"
+    events_available = events_path.is_file()
+    events = _load_events(events_path) if events_available else []
     daily_payload = _load_json(output_dir / "daily_summary.json") or {}
     daily_rows = daily_payload.get("days", []) if isinstance(daily_payload.get("days", []), list) else []
     run_meta = _load_json(output_dir / "run_meta.json") or {}
@@ -331,13 +353,14 @@ def _export_run_dashboards(
         manifest_path=manifest_path,
         current_run_id=current_run_id,
     )
-    export_gantt(
-        events,
-        output_dir,
-        manifest=manifest,
-        manifest_path=manifest_path,
-        current_run_id=current_run_id,
-    )
+    if events_available:
+        export_gantt(
+            events,
+            output_dir,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            current_run_id=current_run_id,
+        )
     pre_run_diagnostics_dashboard_path: Path | None = None
     if isinstance(pre_run_diagnostics, dict):
         pre_run_diagnostics_dashboard_path = export_pre_run_diagnostics_dashboard(
@@ -347,11 +370,22 @@ def _export_run_dashboards(
             manifest_path=manifest_path,
             current_run_id=current_run_id,
         )
-    replay_path = export_replay_dashboard(output_dir=output_dir, events=events)
-    operations_replay_path = export_operations_replay(output_dir=output_dir, events=events)
-    manager_replay_path = export_manager_replay(output_dir=output_dir)
-    manager_replay_json_path = output_dir / "manager_replay.json"
-    replay_studio_log_path, replay_studio_layout_path = _export_replay_studio_assets(output_dir)
+    replay_artifacts_enabled = bool(
+        _runtime_ui_cfg(cfg).get("export_replay_artifacts", True)
+    ) and events_available
+    replay_path: Path | None = None
+    operations_replay_path: Path | None = None
+    manager_replay_path: Path | None = None
+    manager_replay_json_path: Path | None = None
+    replay_studio_log_path: Path | None = None
+    if replay_artifacts_enabled:
+        replay_path = export_replay_dashboard(output_dir=output_dir, events=events)
+        operations_replay_path = export_operations_replay(output_dir=output_dir, events=events)
+        manager_replay_path = export_manager_replay(output_dir=output_dir)
+        manager_replay_json_path = output_dir / "manager_replay.json"
+        replay_studio_log_path, replay_studio_layout_path = _export_replay_studio_assets(output_dir)
+    else:
+        replay_studio_layout_path = _export_replay_studio_layout(output_dir)
     llm_wiki_dashboard_raw = str(run_meta.get("llm_wiki_dashboard_path", "")).strip()
     llm_wiki_dashboard_path = Path(llm_wiki_dashboard_raw) if llm_wiki_dashboard_raw else output_dir / "llm_wiki_dashboard.html"
     if not llm_wiki_dashboard_path.exists():
@@ -400,13 +434,13 @@ def _export_run_dashboards(
     )
     return {
         "results_dashboard_path": str(results_path.resolve()),
-        "replay_dashboard_path": str(replay_path.resolve()),
-        "operations_replay_dashboard_path": str(operations_replay_path.resolve()),
+        "replay_dashboard_path": str(replay_path.resolve()) if replay_path is not None else "",
+        "operations_replay_dashboard_path": str(operations_replay_path.resolve()) if operations_replay_path is not None else "",
         "pre_run_diagnostics_path": str(pre_run_diagnostics_json_path.resolve()) if pre_run_diagnostics_json_path.exists() else "",
         "pre_run_diagnostics_dashboard_path": str(pre_run_diagnostics_dashboard_path.resolve()) if pre_run_diagnostics_dashboard_path is not None and pre_run_diagnostics_dashboard_path.exists() else "",
         "manager_replay_dashboard_path": str(manager_replay_path.resolve()) if manager_replay_path is not None else "",
-        "manager_replay_json_path": str(manager_replay_json_path.resolve()) if manager_replay_json_path.exists() else "",
-        "replay_studio_log_path": str(replay_studio_log_path.resolve()),
+        "manager_replay_json_path": str(manager_replay_json_path.resolve()) if manager_replay_json_path is not None and manager_replay_json_path.exists() else "",
+        "replay_studio_log_path": str(replay_studio_log_path.resolve()) if replay_studio_log_path is not None else "",
         "replay_studio_layout_path": str(replay_studio_layout_path.resolve()),
         "knowledge_dashboard_path": str(knowledge_path.resolve()),
         "llm_wiki_dashboard_path": str(llm_wiki_dashboard_path.resolve()) if llm_wiki_dashboard_path.exists() else "",
@@ -668,7 +702,7 @@ def main(cfg: DictConfig) -> None:
             "kpi_path": str((child_output_dir / "kpi.json").resolve()),
             "run_meta_path": str((child_output_dir / "run_meta.json").resolve()),
             "daily_summary_path": str((child_output_dir / "daily_summary.json").resolve()),
-            "events_path": str((child_output_dir / "events.jsonl").resolve()),
+            "events_path": str(result.get("events_path", "") or ""),
             "knowledge_in_path": str(result.get("knowledge_in_path", "")),
             "knowledge_out_path": str(knowledge_store.markdown_path.resolve()),
             "llm_knowledge_base_root": str(result.get("llm_knowledge_base_root", "")),

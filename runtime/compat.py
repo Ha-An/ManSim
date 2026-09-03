@@ -30,7 +30,9 @@ def build_legacy_experiment_cfg(cfg: DictConfig) -> dict[str, Any]:
     decision_cfg = _to_dict(cfg.get("decision", {}))
     heuristic_cfg = _to_dict(cfg.get("heuristic_rules", {}))
     humanoidsim_cfg = _to_dict(cfg.get("humanoidsim", {}))
+    task_primitive_timing_cfg = _to_dict(cfg.get("task_primitive_timing", {}))
     worker_cfg = _to_dict(cfg.get("worker", {}))
+    runtime_cfg = _to_dict(cfg.get("runtime", {}))
 
     experiment_cfg = dict(scenario_cfg)
     scenario_worker_cfg = _to_dict(scenario_cfg.get("worker", {}))
@@ -56,5 +58,7 @@ def build_legacy_experiment_cfg(cfg: DictConfig) -> dict[str, Any]:
     experiment_cfg["decision"] = decision_cfg
     experiment_cfg["heuristic_rules"] = heuristic_cfg
     experiment_cfg["humanoidsim"] = humanoidsim_cfg
+    experiment_cfg["task_primitive_timing"] = task_primitive_timing_cfg
     experiment_cfg["worker"] = merged_worker_cfg
+    experiment_cfg["runtime"] = runtime_cfg
     return experiment_cfg

@@ -462,7 +462,9 @@ function itemStageGroup(entity: BaseEntityState): "queue" | "carried" | "loaded"
       "PROCESSING",
       "WAITING_MACHINE_UNLOAD",
       "WAITING_INSPECTION",
+      "STAGED_FOR_INSPECTION",
       "INSPECTING",
+      "INSPECTED_WAITING_UNLOAD",
       "WAITING_INSPECTION_OUTPUT",
     ].includes(state)
   ) {

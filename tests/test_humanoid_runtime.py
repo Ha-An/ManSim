@@ -53,9 +53,17 @@ SELECTED_TASK_ARGS = {
         "item": {"entity_type": "machine_output", "entity_id": "S1M1"},
         "destination": "output_buffer_station_1",
     },
+    "LOAD_UNLOAD_TRANSFER_INTERFACE": {
+        "item": {"entity_type": "product", "entity_id": "PRODUCT-1"},
+        "interface": "inspection_desk",
+        "action": "load",
+        "source": "intermediate_queue_4",
+        "destination": "inspection_desk",
+    },
     "INSPECT_PRODUCT": {
-        "target": "inspection_input_queue",
+        "target": "PRODUCT-1",
         "inspection_plan": {"station": 2, "defect_prob": 0.05},
+        "workstation": "inspection_desk",
     },
     "REPAIR_MACHINE": {
         "machine": "S1M1",

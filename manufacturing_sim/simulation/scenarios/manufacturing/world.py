@@ -31,8 +31,15 @@ from manufacturing_sim.simulation.scenarios.manufacturing.entities import (
     default_humanoid_state_payload,
 )
 from manufacturing_sim.simulation.scenarios.manufacturing.grid_map import Tile, TileGridMap
-from manufacturing_sim.simulation.scenarios.manufacturing.humanoid_runtime import HumanoidTaskRuntime
+from manufacturing_sim.simulation.scenarios.manufacturing.humanoid_runtime import (
+    TASK_CODE_BY_PRIORITY_KEY,
+    HumanoidTaskRuntime,
+)
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
+from manufacturing_sim.simulation.scenarios.manufacturing.task_rules import (
+    MFG_FLOW_SHOP_POLICY_MODES,
+    MfgFlowShopTaskPolicy,
+)
 from manufacturing_sim.simulation.scenarios.manufacturing.traffic import (
     TrafficConflict,
     TrafficMonitor,
@@ -46,6 +53,8 @@ from manufacturing_sim.simulation.scenarios.manufacturing.throughput_policy impo
     score_task_for_throughput,
 )
 from manufacturing_sim.simulation.operational_complexity import build_operational_task_complexity_metrics
+from manufacturing_sim.simulation.rolling_horizon import strict_periodic_rolling_horizon_loop
+from manufacturing_sim.simulation.timing import PrimitiveTimingResolver, TriangularDistribution, sample_triangular
 
 
 TASK_ID_PREFIX_BY_TASK_CODE: dict[str, str] = {
@@ -56,6 +65,7 @@ TASK_ID_PREFIX_BY_TASK_CODE: dict[str, str] = {
     "SETUP_MACHINE": "SET",
     "UNLOAD_MACHINE": "UL",
     "INSPECT_PRODUCT": "INS",
+    "LOAD_UNLOAD_TRANSFER_INTERFACE": "IFT",
     "REPAIR_MACHINE": "RM",
     "PREVENTIVE_MAINTENANCE": "PM",
     "HANDOVER_ITEM": "HND",
@@ -64,13 +74,93 @@ TASK_ID_PREFIX_BY_TASK_CODE: dict[str, str] = {
 
 _SUPPORTED_SCENARIO_KEYS = {
     "factory_mfg_basic": "factory_mfg_basic",
+    "mfg_flow_shop": "mfg_flow_shop",
     "shipyard_basic": "shipyard_basic",
 }
+
+MFG_FLOW_SHOP_TASK_CODES = {
+    "REPLENISH_MATERIAL",
+    "TRANSFER",
+    "LOAD_MACHINE",
+    "SETUP_MACHINE",
+    "UNLOAD_MACHINE",
+    "INSPECT_PRODUCT",
+    "LOAD_UNLOAD_TRANSFER_INTERFACE",
+    "REPAIR_MACHINE",
+    "MANAGE_ROBOT_POWER",
+    "COLLECT_WASTE_OR_SCRAP",
+}
+
+MFG_FLOW_SHOP_OBJECTIVE_MODES = {"minimize_makespan", "maximize_throughput"}
+
+
+def _stable_random_stream(seed: int, namespace: str) -> random.Random:
+    digest = hashlib.sha256(f"{int(seed)}|{str(namespace)}".encode("utf-8")).digest()
+    return random.Random(int.from_bytes(digest[:16], byteorder="big", signed=False))
 
 
 def _normalized_scenario_key(cfg: dict[str, Any]) -> str:
     raw = str(cfg.get("scenario_type") or cfg.get("type") or cfg.get("name") or "factory_mfg_basic").strip().lower()
     return _SUPPORTED_SCENARIO_KEYS.get(raw, raw)
+
+
+def resolve_manufacturing_objective(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Resolve run-length and replenishment semantics without changing legacy scenarios."""
+
+    scenario_key = _normalized_scenario_key(cfg)
+    horizon_cfg = cfg.get("horizon", {}) if isinstance(cfg.get("horizon", {}), dict) else {}
+    configured_days = max(1, int(horizon_cfg.get("num_days", 1) or 1))
+    resolved: dict[str, Any] = {
+        "mode": "maximize_throughput",
+        "configured_throughput_days": configured_days,
+        "run_day_limit": configured_days,
+        "max_sim_days": configured_days,
+        "terminal_policy": "",
+        "restock_interval_days": 1,
+        "restock_target_fill": None,
+    }
+    if scenario_key != "mfg_flow_shop":
+        return resolved
+
+    objective_cfg = cfg.get("objective", {}) if isinstance(cfg.get("objective", {}), dict) else {}
+    mode = str(objective_cfg.get("mode", "maximize_throughput") or "maximize_throughput").strip().lower()
+    if mode not in MFG_FLOW_SHOP_OBJECTIVE_MODES:
+        raise ValueError(
+            "mfg_flow_shop objective.mode must be one of: "
+            + ", ".join(sorted(MFG_FLOW_SHOP_OBJECTIVE_MODES))
+        )
+
+    makespan_cfg = objective_cfg.get("makespan", {}) if isinstance(objective_cfg.get("makespan", {}), dict) else {}
+    throughput_cfg = objective_cfg.get("throughput", {}) if isinstance(objective_cfg.get("throughput", {}), dict) else {}
+    max_sim_days = int(makespan_cfg.get("max_sim_days", 30) or 30)
+    if max_sim_days <= 0:
+        raise ValueError("objective.makespan.max_sim_days must be greater than zero.")
+    terminal_policy = str(
+        makespan_cfg.get("terminal_policy", "product_or_disposed_scrap") or "product_or_disposed_scrap"
+    ).strip().lower()
+    if terminal_policy != "product_or_disposed_scrap":
+        raise ValueError(
+            "mfg_flow_shop objective.makespan.terminal_policy must be product_or_disposed_scrap."
+        )
+    restock_interval_days = int(throughput_cfg.get("restock_interval_days", 1) or 1)
+    if restock_interval_days <= 0:
+        raise ValueError("objective.throughput.restock_interval_days must be greater than zero.")
+    raw_target_fill = throughput_cfg.get("restock_target_fill")
+    restock_target_fill = int(raw_target_fill) if raw_target_fill is not None else None
+    if restock_target_fill is not None and restock_target_fill < 0:
+        raise ValueError("objective.throughput.restock_target_fill must be zero or greater.")
+
+    resolved.update(
+        {
+            "mode": mode,
+            "run_day_limit": max_sim_days if mode == "minimize_makespan" else configured_days,
+            "max_sim_days": max_sim_days,
+            "terminal_policy": terminal_policy,
+            "restock_interval_days": restock_interval_days,
+            "restock_target_fill": restock_target_fill,
+        }
+    )
+    return resolved
 
 
 def _scenario_entry(mapping: Any, scenario_key: str) -> Any:
@@ -95,15 +185,50 @@ class ManufacturingWorld:
         self.cfg = cfg
         self.logger = logger
         self.decision_module = decision_module
+        self.scenario_key = _normalized_scenario_key(cfg)
+        self.is_mfg_flow_shop = self.scenario_key == "mfg_flow_shop"
+        self.objective = resolve_manufacturing_objective(cfg)
+        self.objective_mode = str(self.objective["mode"])
         decision_cfg = cfg.get("decision", {}) if isinstance(cfg.get("decision", {}), dict) else {}
         self.decision_mode = normalize_decision_mode(str(decision_cfg.get("mode", "adaptive_priority")))
+        self.mfg_flow_task_policy: MfgFlowShopTaskPolicy | None = None
 
         seed = int(cfg.get("seed", 7))
         self.seed = seed
+        # Stochastic mechanisms use independent streams. Dispatch order may
+        # change exposure, but it must not alter quality or failure samples.
         self.rng = random.Random(seed)
+        self.quality_rng = _stable_random_stream(seed, f"{self.scenario_key}:quality")
+        self.machine_failure_rngs: dict[str, random.Random] = {}
+        self.humanoid_incident_rngs: dict[tuple[str, str], random.Random] = {}
+        self.stochastic_streams = {
+            "scheme": "isolated_v1",
+            "base_seed": seed,
+            "quality": f"{self.scenario_key}:quality",
+            "machine_failure": f"{self.scenario_key}:machine_failure:<machine_id>",
+            "humanoid_incident": f"{self.scenario_key}:humanoid_incident:<worker_id>:<incident_code>",
+        }
+        configured_task_codes = cfg.get("factory", {}).get("enabled_task_codes", [])
+        self.enabled_task_codes = {
+            str(code).strip().upper() for code in configured_task_codes if str(code).strip()
+        }
+        if not self.enabled_task_codes:
+            self.enabled_task_codes = (
+                set(MFG_FLOW_SHOP_TASK_CODES)
+                if self.is_mfg_flow_shop
+                else set(TASK_CODE_BY_PRIORITY_KEY.values())
+            )
+        self.timing = PrimitiveTimingResolver(
+            cfg.get("task_primitive_timing", {}),
+            scenario_type=self.scenario_key,
+            seed=seed,
+            expected_task_codes=self.enabled_task_codes,
+        )
+        self.primitive_duration_cache: dict[tuple[str, str], float] = {}
 
         horizon_cfg = cfg["horizon"]
-        self.num_days = int(horizon_cfg["num_days"])
+        self.configured_throughput_days = int(self.objective["configured_throughput_days"])
+        self.num_days = int(self.objective["run_day_limit"])
         self.minutes_per_day = int(horizon_cfg["minutes_per_day"])
 
         factory_cfg = cfg["factory"]
@@ -112,8 +237,8 @@ class ManufacturingWorld:
         self.num_agents = self.num_workers
         self.machines_per_station = int(factory_cfg["machines_per_station"])
 
-        process_cfg = factory_cfg["processing_time_min"]
-        station_time_pairs: list[tuple[int, float]] = []
+        process_cfg = factory_cfg["processing_time"]
+        station_time_pairs: list[tuple[int, TriangularDistribution]] = []
         for key, value in process_cfg.items():
             key_str = str(key)
             if not key_str.startswith("station"):
@@ -121,16 +246,22 @@ class ManufacturingWorld:
             suffix = key_str.replace("station", "", 1)
             if not suffix.isdigit():
                 continue
-            station_time_pairs.append((int(suffix), float(value)))
+            station_time_pairs.append(
+                (
+                    int(suffix),
+                    TriangularDistribution.from_config(value, label=f"factory.processing_time.{key_str}"),
+                )
+            )
         if not station_time_pairs:
-            raise ValueError("factory.processing_time_min must define at least one stationN entry.")
+            raise ValueError("factory.processing_time must define at least one stationN entry.")
         station_time_pairs.sort(key=lambda x: x[0])
         self.stations = [station for station, _ in station_time_pairs]
         self.last_processing_station = max(self.stations)
         self.inspection_queue_station = 4
-        self.processing_time_min = {station: proc_time for station, proc_time in station_time_pairs}
-        self.inspection_base_time_min = float(factory_cfg["inspection_base_time_min"])
-        self.inspection_min_time_min = float(factory_cfg["inspection_min_time_min"])
+        self.processing_time_distribution = {station: distribution for station, distribution in station_time_pairs}
+        self.processing_time_min = {station: distribution.expected for station, distribution in station_time_pairs}
+        self.inspection_base_time_min = self.timing.expected_call_duration("INSPECT_PRODUCT", "EXECUTE_QUALITY_ACTION")
+        self.inspection_min_time_min = self.inspection_base_time_min
 
         self.movement_cfg = cfg["movement"]
         self.traffic_cfg = self.movement_cfg.get("traffic", {}) if isinstance(self.movement_cfg.get("traffic", {}), dict) else {}
@@ -146,15 +277,16 @@ class ManufacturingWorld:
         )
         self.traffic_conflicts: list[dict[str, Any]] = []
         self.traffic_move_counter = itertools.count(1)
+        self.timing_move_counter = itertools.count(1)
+        self.active_movement_timing_sessions: dict[str, dict[str, str]] = {}
         transport_cfg = self.movement_cfg.get("item_transport", {}) if isinstance(self.movement_cfg.get("item_transport", {}), dict) else {}
-        weight_cfg = transport_cfg.get("weight_time_multiplier", {}) if isinstance(transport_cfg.get("weight_time_multiplier", {}), dict) else {}
         self.item_transport_weight_multiplier = {
-            "material": float(weight_cfg.get("material", 1.0) or 1.0),
-            "intermediate": float(weight_cfg.get("intermediate", 1.5) or 1.5),
-            "product": float(weight_cfg.get("product", 2.0) or 2.0),
-            "battery": float(weight_cfg.get("battery", 1.0) or 1.0),
-            "battery_fresh": float(weight_cfg.get("battery_fresh", weight_cfg.get("battery", 1.0)) or 1.0),
-            "battery_spent": float(weight_cfg.get("battery_spent", weight_cfg.get("battery", 1.0)) or 1.0),
+            "material": self.timing.multiplier("material"),
+            "intermediate": self.timing.multiplier("intermediate"),
+            "product": self.timing.multiplier("product"),
+            "battery": self.timing.multiplier("battery"),
+            "battery_fresh": self.timing.multiplier("battery_fresh", self.timing.multiplier("battery")),
+            "battery_spent": self.timing.multiplier("battery_spent", self.timing.multiplier("battery")),
         }
         collaboration_cfg = (
             transport_cfg.get("product_collaboration", {})
@@ -185,19 +317,125 @@ class ManufacturingWorld:
                 int(material_shelf_cfg.get("initial_fill", self.material_shelf_capacity) or self.material_shelf_capacity),
             ),
         )
-        self.material_shelf_restock_policy = str(material_shelf_cfg.get("restock_policy", "day_boundary") or "day_boundary").strip().lower()
+        self.material_shelf_restock_policy = (
+            "objective"
+            if self.is_mfg_flow_shop
+            else str(material_shelf_cfg.get("restock_policy", "day_boundary") or "day_boundary").strip().lower()
+        )
+        configured_restock_target = self.objective.get("restock_target_fill")
+        self.throughput_restock_target_fill = (
+            self.material_shelf_capacity
+            if configured_restock_target is None
+            else int(configured_restock_target)
+        )
+        if self.throughput_restock_target_fill > self.material_shelf_capacity:
+            raise ValueError(
+                "objective.throughput.restock_target_fill cannot exceed warehouse.material_shelf.capacity."
+            )
+        self.throughput_restock_interval_days = int(self.objective.get("restock_interval_days", 1) or 1)
         self.machine_failure_cfg = cfg["machine_failure"]
+        self.machine_failure_cfg["repair_time_min"] = self.timing.expected_call_duration(
+            "REPAIR_MACHINE", "EXECUTE_MAINTENANCE_ACTION"
+        )
+        preventive_cfg = (
+            self.machine_failure_cfg.get("preventive_maintenance", {})
+            if isinstance(self.machine_failure_cfg.get("preventive_maintenance", {}), dict)
+            else {}
+        )
+        self.preventive_maintenance_enabled = bool(
+            preventive_cfg.get("enabled", "PREVENTIVE_MAINTENANCE" in self.enabled_task_codes)
+        )
+        if self.preventive_maintenance_enabled:
+            self.machine_failure_cfg["pm_time_min"] = self.timing.expected_call_duration(
+                "PREVENTIVE_MAINTENANCE", "INSPECT_OR_DIAGNOSE"
+            )
         legacy_agent_cfg = cfg.get("agent", {}) if isinstance(cfg.get("agent", {}), dict) else {}
         worker_cfg = cfg.get("worker", {}) if isinstance(cfg.get("worker", {}), dict) else {}
         # Keep legacy scenario keys readable while making `worker` the canonical config surface.
         self.agent_cfg = {
             "battery_swap_period_min": 200,
-            "battery_pickup_time_min": 5,
-            "battery_delivery_extra_min": 4,
+            "battery_pickup_time_min": self.timing.expected_task_duration("MANAGE_ROBOT_POWER"),
+            "battery_delivery_extra_min": self.timing.expected_task_duration("TRANSFER"),
             **legacy_agent_cfg,
             **worker_cfg,
         }
-        self.inventory_targets = cfg["inventory_targets"]
+        battery_service_cfg = (
+            self.agent_cfg.get("battery_service", {})
+            if isinstance(self.agent_cfg.get("battery_service", {}), dict)
+            else {}
+        )
+        self.battery_service_mode = str(battery_service_cfg.get("mode", "battery_swap")).strip().lower()
+        self.battery_direct_charge_enabled = self.battery_service_mode == "dock_charge"
+        self.battery_delivery_enabled = bool(
+            battery_service_cfg.get(
+                "delivery_enabled",
+                battery_service_cfg.get("allow_battery_delivery", not self.battery_direct_charge_enabled),
+            )
+        )
+        self.battery_swap_enabled = bool(
+            battery_service_cfg.get(
+                "swap_enabled",
+                battery_service_cfg.get("allow_battery_swap", not self.battery_direct_charge_enabled),
+            )
+        )
+        self.battery_charge_low_threshold_ratio = max(
+            0.0, min(1.0, float(battery_service_cfg.get("low_threshold_ratio", 0.30) or 0.30))
+        )
+        self.battery_charge_target_soc = max(
+            0.0, min(1.0, float(battery_service_cfg.get("target_soc", 1.0) or 1.0))
+        )
+        self.inspection_workstation_id = str(
+            factory_cfg.get("inspection", {}).get("workstation_id", "inspection_table")
+        ).strip() or "inspection_table"
+        self.inspection_capacity = max(
+            1,
+            int(factory_cfg.get("inspection", {}).get("capacity", 1) or 1),
+        )
+        self.buffer_capacities: dict[str, int] = {}
+        if self.is_mfg_flow_shop:
+            buffer_cfg = factory_cfg.get("buffers", {})
+            if not isinstance(buffer_cfg, dict):
+                raise ValueError("factory.buffers must be a mapping for mfg_flow_shop.")
+            for station in self.stations:
+                station_cfg = buffer_cfg.get(f"station{station}", {})
+                if not isinstance(station_cfg, dict):
+                    raise ValueError(f"factory.buffers.station{station} must be a mapping.")
+                capacity_fields = {
+                    f"material_queue_{station}": "material_input_capacity",
+                    f"output_buffer_station_{station}": "output_capacity",
+                }
+                if self._station_requires_intermediate(station):
+                    capacity_fields[f"intermediate_queue_{station}"] = "intermediate_input_capacity"
+                for buffer_id, field_name in capacity_fields.items():
+                    value = int(station_cfg.get(field_name, 0) or 0)
+                    if value <= 0:
+                        raise ValueError(
+                            f"factory.buffers.station{station}.{field_name} must be greater than zero."
+                        )
+                    self.buffer_capacities[buffer_id] = value
+            inspection_buffer_cfg = buffer_cfg.get("inspection", {})
+            if not isinstance(inspection_buffer_cfg, dict):
+                raise ValueError("factory.buffers.inspection must be a mapping.")
+            inspection_fields = {
+                f"intermediate_queue_{self.inspection_queue_station}": "input_capacity",
+                f"output_buffer_station_{self.inspection_queue_station}": "pass_output_capacity",
+                "inspection_scrap_queue": "scrap_output_capacity",
+            }
+            for buffer_id, field_name in inspection_fields.items():
+                value = int(inspection_buffer_cfg.get(field_name, 0) or 0)
+                if value <= 0:
+                    raise ValueError(
+                        f"factory.buffers.inspection.{field_name} must be greater than zero."
+                    )
+                self.buffer_capacities[buffer_id] = value
+        # ``factory_mfg_basic`` keeps its legacy target-level replenishment.
+        # ``mfg_flow_shop`` is demand-driven and intentionally has no station
+        # inventory target configuration.
+        self.inventory_targets = (
+            cfg.get("inventory_targets", {})
+            if isinstance(cfg.get("inventory_targets", {}), dict)
+            else {}
+        )
         self.dispatcher_cfg = cfg["dispatcher"]
         self.heuristic_rules = cfg.get("heuristic_rules", {}) if isinstance(cfg.get("heuristic_rules", {}), dict) else {}
         self.throughput_policy_cfg = (
@@ -217,11 +455,13 @@ class ManufacturingWorld:
         mean_ttf = float(self.machine_failure_cfg["mean_time_to_fail_min"])
         self.machine_failure_base_lambda = 1.0 / max(1.0, mean_ttf)
         self.max_repair_agents = max(1, int(self.machine_failure_cfg.get("max_repair_agents", 3) or 3))
-        self.pm_lambda_multiplier = float(self.machine_failure_cfg["pm_lambda_multiplier"])
-        self.pm_effect_duration_min = float(self.machine_failure_cfg["pm_effect_duration_min"])
-        self.pm_interval_target_min = float(self.machine_failure_cfg["pm_interval_target_min"])
+        self.pm_lambda_multiplier = float(self.machine_failure_cfg.get("pm_lambda_multiplier", 1.0))
+        self.pm_effect_duration_min = float(self.machine_failure_cfg.get("pm_effect_duration_min", 0.0))
+        self.pm_interval_target_min = float(self.machine_failure_cfg.get("pm_interval_target_min", math.inf))
 
-        self.battery_swap_period_min = float(self.agent_cfg["battery_swap_period_min"])
+        self.battery_swap_period_min = float(
+            self.agent_cfg.get("battery_capacity_min", self.agent_cfg["battery_swap_period_min"])
+        )
         battery_drain_cfg = self.agent_cfg.get("battery_drain", {}) if isinstance(self.agent_cfg.get("battery_drain", {}), dict) else {}
         self.battery_available_rate_multiplier = max(
             0.0,
@@ -299,6 +539,22 @@ class ManufacturingWorld:
         self.material_supply_owner: dict[int, str | None] = {station: None for station in self.stations}
         self.scrap_disposal_owner: str | None = None
         self.item_reservations: dict[str, dict[str, Any]] = {}
+        self.buffer_slot_reservations: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        self.buffer_metrics: dict[str, Any] = {
+            "overflow_attempt_count": 0,
+            "reservation_failure_count": 0,
+            "reservation_release_count": 0,
+            "reservation_commit_count": 0,
+            "blocked_after_service_count": 0,
+            "blocked_after_service_started_at": {},
+            "blocked_after_service_min_by_machine": defaultdict(float),
+            "max_occupancy_by_buffer": defaultdict(int),
+            "max_reserved_by_buffer": defaultdict(int),
+            "max_committed_plus_reserved_by_buffer": defaultdict(int),
+            "candidate_scan_count": 0,
+            "candidate_count_total": 0,
+            "candidate_count_max": 0,
+        }
 
         self.items: dict[str, Item] = {}
         self.dropped_items: dict[str, dict[str, Any]] = {}
@@ -324,6 +580,10 @@ class ManufacturingWorld:
             if self.map_enabled
             else None
         )
+        if self.grid_map is not None:
+            self.grid_map.tile_time_min = self.timing.expected_tile_time
+        self.movement_cfg["setup_min"] = self.timing.expected_call_duration("SETUP_MACHINE", "EXECUTE_MACHINE_ACTION")
+        self.movement_cfg["unload_min"] = self.timing.expected_call_duration("UNLOAD_MACHINE", "EXECUTE_MACHINE_ACTION")
 
         self.machines: dict[str, Machine] = {}
         self.machines_by_station: dict[int, list[str]] = {station: [] for station in self.stations}
@@ -333,13 +593,26 @@ class ManufacturingWorld:
         self._build_workers()
         # Deprecated alias retained for modules that still use "agent" as orchestration vocabulary.
         self.agents = self.workers
+        self._rolling_horizon_initialize_worker_events()
+        self._init_mfg_flow_task_policy(decision_cfg)
         self.humanoid_runtime = HumanoidTaskRuntime(self, cfg)
 
         self.product_count = 0
         self.scrap_count = 0
+        self.initial_batch_material_ids: set[str] = set()
+        self.initial_batch_material_station: dict[str, int] = {}
+        self.initial_batch_terminal_material_ids: set[str] = set()
+        self.initial_batch_accepted_output_ids: set[str] = set()
+        self.initial_batch_disposed_scrap_ids: set[str] = set()
+        self.initial_batch_terminal_outcomes: dict[str, dict[str, str]] = {}
+        self.makespan_min: float | None = None
+        self.objective_inventory_prepared_days: set[int] = set()
         self.station_throughput = defaultdict(int)
         self.inspection_active_agents = 0
         self.inspection_owner: str | None = None
+        self.inspection_desk_item_id: str | None = None
+        self.inspection_desk_result: str | None = None
+        self.inspection_desk_state = "EMPTY"
 
         self.minute_snapshots: list[dict[str, Any]] = []
         self.task_records: list[dict[str, Any]] = []
@@ -350,7 +623,20 @@ class ManufacturingWorld:
         self.terminated = False
         self.termination_reason = ""
         self.termination_event = self.env.event()
+        self.pending_termination_reason = ""
+        self.pending_termination_agent_id = ""
         self.active_battery_delivery_owner: str | None = None
+        self.adp_coordinator: Any | None = None
+        if self.decision_mode in {"simulation_based_adp", "random_feasible_dispatch"}:
+            if not self.is_mfg_flow_shop or self.objective_mode != "maximize_throughput":
+                raise ValueError(
+                    f"{self.decision_mode} supports only scenario=mfg_flow_shop with "
+                    "scenario.objective.mode=maximize_throughput."
+                )
+            from manufacturing_sim.adp import ADPDecisionCoordinator
+
+            adp_cfg = decision_cfg.get("adp", {}) if isinstance(decision_cfg.get("adp", {}), dict) else {}
+            self.adp_coordinator = ADPDecisionCoordinator(self, adp_cfg)
 
     def _init_rolling_horizon(self, decision_cfg: dict[str, Any]) -> None:
         rolling_cfg = decision_cfg.get("rolling_horizon", {}) if isinstance(decision_cfg.get("rolling_horizon", {}), dict) else {}
@@ -358,14 +644,38 @@ class ManufacturingWorld:
         scenario_key = _normalized_scenario_key(self.cfg)
         self.rolling_horizon_enabled = self.decision_mode in {
             "rolling_horizon_aging_priority",
+            "rolling_horizon_shared",
             "rolling_horizon_dedicated_roles",
             "rolling_horizon_throughput_optimizer",
         }
         self.rolling_horizon_dedicated_roles_enabled = self.decision_mode == "rolling_horizon_dedicated_roles"
         self.rolling_horizon_throughput_optimizer_enabled = self.decision_mode == "rolling_horizon_throughput_optimizer"
         self.rolling_horizon_window_min = max(0.1, float(rolling_cfg.get("window_min", 5.0) or 5.0))
+        self.rolling_horizon_scheduler_mode = "strict_periodic"
+        self.rolling_horizon_candidate_collection_mode = "event_with_boundary_reconciliation"
+        configured_scheduler_mode = str(
+            rolling_cfg.get("scheduler_mode", self.rolling_horizon_scheduler_mode) or self.rolling_horizon_scheduler_mode
+        ).strip().lower()
+        configured_collection_mode = str(
+            rolling_cfg.get(
+                "candidate_collection_mode",
+                self.rolling_horizon_candidate_collection_mode,
+            )
+            or self.rolling_horizon_candidate_collection_mode
+        ).strip().lower()
+        # Legacy values remain parseable, but rolling execution is always the
+        # strict-periodic runtime above. Keep both for auditability.
+        self.rolling_horizon_configured_scheduler_mode = configured_scheduler_mode
+        self.rolling_horizon_configured_candidate_collection_mode = configured_collection_mode
+        scenario_dispatch_policy = _scenario_entry(
+            rolling_cfg.get("scenario_dispatch_policy", {}), scenario_key
+        )
         self.rolling_horizon_dispatch_policy = (
-            str(rolling_cfg.get("dispatch_policy", "aging_priority")).strip().lower()
+            str(
+                scenario_dispatch_policy
+                if scenario_dispatch_policy is not None
+                else rolling_cfg.get("dispatch_policy", "aging_priority")
+            ).strip().lower()
             or "aging_priority"
         )
         optimizer_cfg = rolling_cfg.get("optimizer", {}) if isinstance(rolling_cfg.get("optimizer", {}), dict) else {}
@@ -388,6 +698,9 @@ class ManufacturingWorld:
             for value in battery_cfg.get("delivery_receiver_agent_ids", ["A2", "A3"])
             if str(value).strip()
         ]
+        if not self.battery_delivery_enabled:
+            self.rolling_horizon_battery_delivery_provider_agent_ids = []
+            self.rolling_horizon_battery_delivery_receiver_agent_ids = []
 
         default_priority_order = [
             "MANAGE_ROBOT_POWER",
@@ -399,13 +712,14 @@ class ManufacturingWorld:
             "SETUP_MACHINE",
             "TRANSFER",
             "REPLENISH_MATERIAL",
+            "LOAD_UNLOAD_TRANSFER_INTERFACE",
             "INSPECT_PRODUCT",
             "PREVENTIVE_MAINTENANCE",
         ]
         default_worker_task_priority = {
             "A1": ["MANAGE_ROBOT_POWER", "REPLENISH_MATERIAL"],
             "A2": ["REPAIR_MACHINE", "LOAD_MACHINE", "SETUP_MACHINE", "UNLOAD_MACHINE"],
-            "A3": ["TRANSFER", "INSPECT_PRODUCT", "COLLECT_WASTE_OR_SCRAP", "PREVENTIVE_MAINTENANCE"],
+            "A3": ["TRANSFER", "LOAD_UNLOAD_TRANSFER_INTERFACE", "INSPECT_PRODUCT", "COLLECT_WASTE_OR_SCRAP", "PREVENTIVE_MAINTENANCE"],
         }
         scenario_worker_priority = _scenario_entry(rolling_cfg.get("scenario_worker_task_priority", {}), scenario_key)
         raw_worker_priority = (
@@ -430,6 +744,30 @@ class ManufacturingWorld:
                     seen_worker_codes.add(code)
             if normalized_codes:
                 self.rolling_horizon_worker_task_priority[str(worker_id).strip()] = normalized_codes
+        has_granular_policy = isinstance(decision_cfg.get("mfg_flow_shop_policy", {}), dict) and bool(
+            decision_cfg.get("mfg_flow_shop_policy", {})
+        )
+        if self.is_mfg_flow_shop and self.rolling_horizon_dedicated_roles_enabled and not has_granular_policy:
+            role_templates = [
+                ["MANAGE_ROBOT_POWER", "REPAIR_MACHINE", "REPLENISH_MATERIAL"],
+                ["MANAGE_ROBOT_POWER", "REPAIR_MACHINE", "LOAD_MACHINE", "SETUP_MACHINE", "UNLOAD_MACHINE"],
+                [
+                    "MANAGE_ROBOT_POWER",
+                    "REPAIR_MACHINE",
+                    "TRANSFER",
+                    "LOAD_UNLOAD_TRANSFER_INTERFACE",
+                    "INSPECT_PRODUCT",
+                    "COLLECT_WASTE_OR_SCRAP",
+                ],
+            ]
+            for index in range(1, self.num_workers + 1):
+                worker_id = f"A{index}"
+                configured = self.rolling_horizon_worker_task_priority.get(worker_id)
+                template = configured or role_templates[(index - 1) % len(role_templates)]
+                ordered = ["MANAGE_ROBOT_POWER", "REPAIR_MACHINE", *template]
+                self.rolling_horizon_worker_task_priority[worker_id] = list(
+                    dict.fromkeys(code for code in ordered if code in self.enabled_task_codes)
+                )
         self.rolling_horizon_worker_task_rank: dict[str, dict[str, int]] = {
             worker_id: {code: index + 1 for index, code in enumerate(codes)}
             for worker_id, codes in self.rolling_horizon_worker_task_priority.items()
@@ -454,25 +792,42 @@ class ManufacturingWorld:
         seen_codes: set[str] = set()
         for value in raw_order:
             code = str(value or "").strip().upper()
-            if code and code not in seen_codes:
+            if (
+                code
+                and code not in seen_codes
+                and (not self.is_mfg_flow_shop or code in self.enabled_task_codes)
+            ):
                 priority_order.append(code)
                 seen_codes.add(code)
         fallback_priority_order = [] if self.rolling_horizon_dedicated_roles_enabled and dedicated_order else default_priority_order
         for code in fallback_priority_order:
-            if code not in seen_codes:
+            if code not in seen_codes and (not self.is_mfg_flow_shop or code in self.enabled_task_codes):
                 priority_order.append(code)
                 seen_codes.add(code)
         self.rolling_horizon_task_code_priority_order = priority_order
         self.rolling_horizon_task_code_rank: dict[str, int] = {
             code: index + 1 for index, code in enumerate(priority_order)
         }
-        aging_cfg = rolling_cfg.get("aging", {}) if isinstance(rolling_cfg.get("aging", {}), dict) else {}
+        scenario_aging_cfg = _scenario_entry(rolling_cfg.get("scenario_aging", {}), scenario_key)
+        aging_cfg = (
+            scenario_aging_cfg
+            if isinstance(scenario_aging_cfg, dict)
+            else rolling_cfg.get("aging", {})
+            if isinstance(rolling_cfg.get("aging", {}), dict)
+            else {}
+        )
+        configured_rank_boost = aging_cfg.get("rank_boost_per_window", 1)
         self.rolling_horizon_rank_boost_per_window = max(
             0,
-            int(aging_cfg.get("rank_boost_per_window", 1) or 1),
+            int(1 if configured_rank_boost is None else configured_rank_boost),
+        )
+        scenario_immediate_cfg = _scenario_entry(
+            rolling_cfg.get("scenario_immediate_task_triggers", {}), scenario_key
         )
         immediate_cfg = (
-            rolling_cfg.get("immediate_task_triggers", {})
+            scenario_immediate_cfg
+            if isinstance(scenario_immediate_cfg, dict)
+            else rolling_cfg.get("immediate_task_triggers", {})
             if isinstance(rolling_cfg.get("immediate_task_triggers", {}), dict)
             else {}
         )
@@ -483,10 +838,7 @@ class ManufacturingWorld:
         self.rolling_horizon_immediate_protect_from_window_requeue = bool(
             immediate_cfg.get("protect_from_window_requeue", self.rolling_horizon_immediate_queue_policy == "next_after_current")
         )
-        default_immediate_task_codes = {
-            "worker_low_battery": ["MANAGE_ROBOT_POWER"],
-            "machine_broken": ["REPAIR_MACHINE"],
-        }
+        default_immediate_task_codes = {"worker_low_battery": ["MANAGE_ROBOT_POWER"]}
         raw_immediate_task_codes = immediate_cfg.get("event_task_codes", default_immediate_task_codes)
         if not isinstance(raw_immediate_task_codes, dict):
             raw_immediate_task_codes = default_immediate_task_codes
@@ -507,6 +859,11 @@ class ManufacturingWorld:
         self.rolling_horizon_pending: dict[str, dict[str, Any]] = {}
         self.rolling_horizon_pending_resource_index: dict[str, str] = {}
         self.rolling_horizon_dispatch_queues: dict[str, deque[dict[str, Any]]] = defaultdict(deque)
+        # Workers are constructed after decision configuration is parsed. The
+        # per-worker wake-up events are created once worker IDs are available.
+        self.rolling_horizon_dispatch_events: dict[str, simpy.Event] = {}
+        self.rolling_horizon_candidate_refresh_scheduled = False
+        self.rolling_horizon_candidate_refresh_triggers: set[str] = set()
         self.rolling_horizon_metrics: dict[str, int] = {
             "started_window_count": 0,
             "window_count": 0,
@@ -520,7 +877,10 @@ class ManufacturingWorld:
             "throughput_optimizer_window_count": 0,
             "throughput_optimizer_solved_count": 0,
             "throughput_optimizer_failed_count": 0,
+            "strict_boundary_count": 0,
+            "late_boundary_count": 0,
         }
+        self.rolling_horizon_max_boundary_lag_min = 0.0
         self.throughput_optimizer_objective_values: list[float] = []
         self.throughput_score_values: list[float] = []
         self.rolling_horizon_max_queue_length_by_worker: dict[str, int] = defaultdict(int)
@@ -533,6 +893,38 @@ class ManufacturingWorld:
             "skipped_by_worker": defaultdict(int),
         }
 
+    def _init_mfg_flow_task_policy(self, decision_cfg: dict[str, Any]) -> None:
+        if not self.is_mfg_flow_shop:
+            return
+        if self.decision_mode not in MFG_FLOW_SHOP_POLICY_MODES:
+            supported = ", ".join(sorted(MFG_FLOW_SHOP_POLICY_MODES))
+            raise ValueError(
+                f"mfg_flow_shop supports only its four representative decision modes: {supported}. "
+                f"Received: {self.decision_mode}."
+            )
+        policy_cfg = (
+            decision_cfg.get("mfg_flow_shop_policy", {})
+            if isinstance(decision_cfg.get("mfg_flow_shop_policy", {}), dict)
+            else {}
+        )
+        self.mfg_flow_task_policy = MfgFlowShopTaskPolicy(
+            world=self,
+            decision_mode=self.decision_mode,
+            cfg=policy_cfg,
+            worker_ids=self.workers,
+        )
+        summary = self.mfg_flow_task_policy.summary()
+        if self.mfg_flow_task_policy.dedicated:
+            self.rolling_horizon_worker_task_priority = {
+                worker_id: list(payload.get("task_codes", []))
+                for worker_id, payload in summary.get("workers", {}).items()
+                if isinstance(payload, dict)
+            }
+            self.rolling_horizon_worker_task_rank = {
+                worker_id: {code: index + 1 for index, code in enumerate(codes)}
+                for worker_id, codes in self.rolling_horizon_worker_task_priority.items()
+            }
+
     def _rule(self, dotted_path: str, default: Any) -> Any:
         node: Any = self.heuristic_rules
         for key in dotted_path.split("."):
@@ -540,6 +932,38 @@ class ManufacturingWorld:
                 return default
             node = node[key]
         return node
+
+    def resolve_primitive_duration(self, task: Task, step: dict[str, Any]) -> float:
+        task_code = str(task.task_code or task.task_type).strip().upper()
+        step_path = str(step.get("path", "")).strip()
+        cache_key = (str(task.task_id), step_path)
+        if cache_key in self.primitive_duration_cache:
+            return self.primitive_duration_cache[cache_key]
+        if task_code == "REPAIR_MACHINE" and str(step.get("call_code", "")).strip().upper() == "EXECUTE_MAINTENANCE_ACTION":
+            machine = self.machines.get(str(task.payload.get("machine_id", "")))
+            if machine is not None and machine.repair_sampled_work_min > 0.0:
+                duration = float(machine.repair_sampled_work_min)
+            else:
+                duration = self.timing.sample_step_duration(
+                    task_code,
+                    step_path,
+                    sample_key=f"{task.task_id}:{step_path}",
+                )
+        else:
+            duration = self.timing.sample_step_duration(
+                task_code,
+                step_path,
+                sample_key=f"{task.task_id}:{step_path}",
+            )
+        self.primitive_duration_cache[cache_key] = duration
+        return duration
+
+    @staticmethod
+    def active_primitive_duration(task: Task, fallback: float = 0.0) -> float:
+        timing = task.payload.get("_active_primitive_timing", {}) if isinstance(task.payload, dict) else {}
+        if not isinstance(timing, dict):
+            return max(0.0, float(fallback))
+        return max(0.0, float(timing.get("sampled_duration_min", fallback) or fallback))
 
     def _station_requires_intermediate(self, station: int) -> bool:
         # First stage is material-only; later stages require material + intermediate.
@@ -565,13 +989,130 @@ class ManufacturingWorld:
             worker.humanoid_state = default_humanoid_state_payload(worker_id)
             if self.grid_map is not None:
                 worker.tile = self.grid_map.register_worker(worker_id, self.grid_map.initial_worker_tile(worker_id))
+                initial_zone = self.grid_map.zone_for_tile(worker.tile)
+                if initial_zone:
+                    worker.location = initial_zone
             self.workers[worker_id] = worker
+
+    @property
+    def minimize_makespan_enabled(self) -> bool:
+        return self.is_mfg_flow_shop and self.objective_mode == "minimize_makespan"
+
+    @property
+    def maximize_throughput_enabled(self) -> bool:
+        return self.is_mfg_flow_shop and self.objective_mode == "maximize_throughput"
+
+    def objective_metadata(self) -> dict[str, Any]:
+        return {
+            "objective_mode": self.objective_mode,
+            "configured_max_sim_days": int(self.objective.get("max_sim_days", self.num_days) or self.num_days),
+            "configured_throughput_days": int(self.configured_throughput_days),
+            "objective_run_day_limit": int(self.num_days),
+            "objective_terminal_policy": str(self.objective.get("terminal_policy", "")),
+            "throughput_restock_interval_days": int(self.throughput_restock_interval_days),
+            "throughput_restock_target_fill": int(self.throughput_restock_target_fill),
+        }
+
+    def _objective_reporting_days(self) -> float:
+        if self.minimize_makespan_enabled:
+            return max(1e-9, float(self.env.now) / max(1.0, float(self.minutes_per_day)))
+        return float(max(1, self.configured_throughput_days if self.is_mfg_flow_shop else self.num_days))
+
+    def _validate_initial_makespan_batch(self) -> None:
+        if not self.minimize_makespan_enabled:
+            return
+        initial_inventory_cfg = self.cfg.get("initial_inventory", {})
+        initial_material_cfg = initial_inventory_cfg.get("material", {}) if isinstance(initial_inventory_cfg, dict) else {}
+        nonzero_station_inventory = {
+            f"station{station}": int(initial_material_cfg.get(f"station{station}", 0) or 0)
+            for station in self.stations
+            if int(initial_material_cfg.get(f"station{station}", 0) or 0) != 0
+        }
+        if nonzero_station_inventory:
+            raise ValueError(
+                "minimize_makespan requires initial_inventory.material at every station to be zero; "
+                f"found {nonzero_station_inventory}."
+            )
+        if self.material_shelf_initial_fill <= 0:
+            raise ValueError("minimize_makespan requires warehouse.material_shelf.initial_fill to be greater than zero.")
+        material_units_per_output = max(1, len(self.stations))
+        if self.material_shelf_initial_fill % material_units_per_output != 0:
+            raise ValueError(
+                "warehouse.material_shelf.initial_fill must be divisible by the number of material-consuming "
+                f"stages ({material_units_per_output}) for minimize_makespan."
+            )
+
+    def _register_initial_material_batch(self) -> None:
+        if not self.minimize_makespan_enabled:
+            return
+        self.initial_batch_material_ids = {
+            str(slot.get("material_item_id"))
+            for slot in self.warehouse_material_shelf_slots.values()
+            if str(slot.get("material_item_id") or "").strip()
+        }
+        sorted_material_ids = sorted(self.initial_batch_material_ids)
+        sorted_stations = sorted(self.stations)
+        self.initial_batch_material_station = {
+            item_id: sorted_stations[index % len(sorted_stations)]
+            for index, item_id in enumerate(sorted_material_ids)
+        }
+        station_material_ids = {
+            station: [
+                item_id
+                for item_id in sorted_material_ids
+                if self.initial_batch_material_station.get(item_id) == station
+            ]
+            for station in sorted_stations
+        }
+        for item_id in self.initial_batch_material_ids:
+            item = self.items.get(item_id)
+            if item is not None:
+                item.metadata["initial_makespan_batch"] = True
+                item.metadata["initial_batch_target_station"] = self.initial_batch_material_station[item_id]
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="INITIAL_MATERIAL_BATCH_REGISTERED",
+            entity_id="warehouse_material_shelf",
+            location="Warehouse",
+            details={
+                "material_ids": sorted(self.initial_batch_material_ids),
+                "material_count": len(self.initial_batch_material_ids),
+                "expected_output_count": self.initial_batch_expected_output_count(),
+                "terminal_policy": str(self.objective.get("terminal_policy", "")),
+                "station_material_ids": station_material_ids,
+                "station_material_quota": {
+                    str(station): len(material_ids)
+                    for station, material_ids in station_material_ids.items()
+                },
+            },
+        )
+
+    def initial_batch_expected_output_count(self) -> int:
+        return len(self.initial_batch_material_ids) // max(1, len(self.stations))
+
+    def prepare_objective_day(self, day: int) -> None:
+        normalized_day = max(1, int(day))
+        if not self.is_mfg_flow_shop or normalized_day in self.objective_inventory_prepared_days:
+            return
+        self.objective_inventory_prepared_days.add(normalized_day)
+        if (
+            self.maximize_throughput_enabled
+            and normalized_day > 1
+            and (normalized_day - 1) % self.throughput_restock_interval_days == 0
+        ):
+            self._restock_material_shelf(
+                reason="throughput_day_boundary",
+                target_fill=self.throughput_restock_target_fill,
+            )
 
     def bootstrap(self) -> None:
         from manufacturing_sim.simulation.scenarios.manufacturing import processes
 
+        self._validate_initial_makespan_batch()
         self._ensure_material_shelf_slots()
         self._restock_material_shelf(reason="initial_fill", target_fill=self.material_shelf_initial_fill)
+        self._register_initial_material_batch()
 
         initial_inventory_cfg = self.cfg.get("initial_inventory", {})
         initial_material_cfg = initial_inventory_cfg.get("material", {}) if isinstance(initial_inventory_cfg, dict) else {}
@@ -583,6 +1124,11 @@ class ManufacturingWorld:
         for machine_id in self.machines:
             self.env.process(processes.machine_lifecycle(self.env, self, machine_id))
             self.env.process(processes.machine_failure_monitor(self.env, self, machine_id))
+
+        if self._rolling_horizon_active():
+            self.env.process(strict_periodic_rolling_horizon_loop(self.env, self))
+        if self._adp_active():
+            self.adp_coordinator.start()
 
         for agent_id in self.agents:
             self.env.process(processes.agent_work_loop(self.env, self, agent_id))
@@ -597,7 +1143,8 @@ class ManufacturingWorld:
     def start_day(self, day: int, strategy: StrategyState, job_plan: JobPlan) -> None:
         self.current_day = day
         self.current_strategy = strategy
-        if self.material_shelf_restock_policy == "day_boundary":
+        self.prepare_objective_day(day)
+        if not self.is_mfg_flow_shop and self.material_shelf_restock_policy == "day_boundary":
             self._restock_material_shelf(reason="day_boundary")
         job_plan.ensure_runtime_context(tuple(sorted(self.agents.keys())))
         self.current_job_plan = job_plan
@@ -634,11 +1181,15 @@ class ManufacturingWorld:
             entity_id="system",
             location="CoordinationReview",
             details={
-                "task_priority_weights": job_plan.task_priority_weights,
-                "shared_task_priority_weights": job_plan.task_priority_weights,
-                "agent_priority_multipliers": job_plan.agent_priority_multipliers,
+                "task_priority_weights": self._current_shared_task_priority_weights(),
+                "shared_task_priority_weights": self._current_shared_task_priority_weights(),
+                "agent_priority_multipliers": {
+                    agent_id: self.current_agent_priority_multipliers(agent_id)
+                    for agent_id in sorted(self.agents.keys())
+                },
                 "agent_effective_task_priority_weights": {
-                    agent_id: job_plan.effective_task_priority_weights(agent_id) for agent_id in sorted(self.agents.keys())
+                    agent_id: self.current_effective_task_priority_weights(agent_id)
+                    for agent_id in sorted(self.agents.keys())
                 },
                 "agent_task_allowlists": dict(job_plan.agent_task_allowlists),
                 "quotas": job_plan.quotas,
@@ -655,11 +1206,42 @@ class ManufacturingWorld:
 
     def current_agent_priority_multipliers(self, agent_id: str) -> dict[str, float]:
         self.current_job_plan.ensure_agent_priority_multipliers(tuple(sorted(self.agents.keys())))
-        return dict(self.current_job_plan.agent_priority_multipliers.get(str(agent_id), {}))
+        values = dict(self.current_job_plan.agent_priority_multipliers.get(str(agent_id), {}))
+        return {key: float(values.get(key, 1.0)) for key in self._scenario_priority_keys()}
 
     def current_effective_task_priority_weights(self, agent_id: str) -> dict[str, float]:
         self.current_job_plan.ensure_agent_priority_multipliers(tuple(sorted(self.agents.keys())))
-        return self.current_job_plan.effective_task_priority_weights(str(agent_id))
+        values = self.current_job_plan.effective_task_priority_weights(str(agent_id))
+        multipliers = self.current_job_plan.agent_priority_multipliers.get(str(agent_id), {})
+        return {
+            key: float(
+                values.get(
+                    key,
+                    float(self.current_job_plan.task_priority_weights.get(key, 1.0))
+                    * float(multipliers.get(key, 1.0)),
+                )
+            )
+            for key in self._scenario_priority_keys()
+        }
+
+    def _scenario_priority_keys(self) -> list[str]:
+        if not self.is_mfg_flow_shop:
+            return sorted(set(default_task_priority_weights().keys()) | {"battery_charge"})
+        return [
+            "battery_charge",
+            "inspect_product",
+            "inter_station_transfer",
+            "load_machine",
+            "material_supply",
+            "repair_machine",
+            "scrap_disposal",
+            "setup_machine",
+            "unload_machine",
+        ]
+
+    def _current_shared_task_priority_weights(self) -> dict[str, float]:
+        values = self.current_job_plan.task_priority_weights or {}
+        return {key: float(values.get(key, 1.0)) for key in self._scenario_priority_keys()}
 
     def _agent_priority_profile_summary(
         self,
@@ -1309,7 +1891,7 @@ class ManufacturingWorld:
             if "*" not in triggers and primitive not in triggers:
                 continue
             probability = self._random_incident_probability(code)
-            if probability <= 0.0 or self.rng.random() >= probability:
+            if probability <= 0.0 or self._humanoid_incident_random(agent.agent_id, code) >= probability:
                 continue
             self._emit_humanoid_incident(
                 agent,
@@ -1335,7 +1917,7 @@ class ManufacturingWorld:
         if isinstance(recovery_context, dict) and bool(recovery_context.get("active", False)):
             return False
         probability = self._random_incident_probability("ITEM_DROPPED", per_tile=True)
-        if probability <= 0.0 or self.rng.random() >= probability:
+        if probability <= 0.0 or self._humanoid_incident_random(agent.agent_id, "ITEM_DROPPED") >= probability:
             return False
         self._drop_agent_cargo_due_to_incident(agent, logical_destination=logical_destination, destination=destination, move_id=move_id)
         return True
@@ -1749,6 +2331,8 @@ class ManufacturingWorld:
     def _task_priority_key(self, task: Task) -> str:
         if task.task_type == "BATTERY_SWAP":
             return "battery_swap"
+        if task.task_type == "BATTERY_CHARGE":
+            return "battery_charge"
         if task.task_type == "REPAIR_MACHINE":
             return "repair_machine"
         if task.task_type == "UNLOAD_MACHINE":
@@ -1761,6 +2345,9 @@ class ManufacturingWorld:
             return "preventive_maintenance"
         if task.task_type == "INSPECT_PRODUCT":
             return "inspect_product"
+        if task.task_type == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+            action = str(task.payload.get("interface_action") or task.payload.get("action") or "").strip().lower()
+            return "load_inspection_desk" if action == "load" else "unload_inspection_desk"
         if task.task_type == "HANDOVER_ITEM":
             return "handover_item"
         if task.task_type == "TRANSFER":
@@ -1879,19 +2466,20 @@ class ManufacturingWorld:
         ended_at: float,
         logical_destination: str,
     ) -> bool:
-        if self.traffic_monitor is None or not self.traffic_enabled:
-            return False
-        segment = TrafficSegment(
-            move_id=move_id,
-            worker_id=agent.agent_id,
-            segment_index=segment_index,
-            from_tile=from_tile,
-            to_tile=to_tile,
-            started_at=float(started_at),
-            ended_at=float(ended_at),
-        )
-        conflicts = self.traffic_monitor.begin_segment(segment)
-        recovery_requested = self._log_traffic_conflicts(agent, conflicts)
+        agent.current_move_segment_event_started = False
+        recovery_requested = False
+        if self.traffic_monitor is not None and self.traffic_enabled:
+            segment = TrafficSegment(
+                move_id=move_id,
+                worker_id=agent.agent_id,
+                segment_index=segment_index,
+                from_tile=from_tile,
+                to_tile=to_tile,
+                started_at=float(started_at),
+                ended_at=float(ended_at),
+            )
+            conflicts = self.traffic_monitor.begin_segment(segment)
+            recovery_requested = self._log_traffic_conflicts(agent, conflicts)
         if self.traffic_emit_tile_step_events and not recovery_requested:
             self._update_battery_accounting(agent, started_at)
             self.logger.log(
@@ -1912,6 +2500,7 @@ class ManufacturingWorld:
                     "battery_remaining_min": round(float(self.battery_remaining(agent)), 3),
                 },
             )
+            agent.current_move_segment_event_started = True
         return recovery_requested
 
     def _traffic_end_segment(
@@ -1927,7 +2516,7 @@ class ManufacturingWorld:
     ) -> None:
         if self.traffic_monitor is not None:
             self.traffic_monitor.end_segment(agent.agent_id, move_id, segment_index, ended_at=float(ended_at))
-        if self.traffic_emit_tile_step_events:
+        if self.traffic_emit_tile_step_events and bool(getattr(agent, "current_move_segment_event_started", False)):
             self._update_battery_accounting(agent, ended_at)
             self.logger.log(
                 t=ended_at,
@@ -1946,6 +2535,7 @@ class ManufacturingWorld:
                     "battery_remaining_min": round(float(self.battery_remaining(agent)), 3),
                 },
             )
+        agent.current_move_segment_event_started = False
 
     def _object_service_tile_payload(self, agent: Worker, object_id: str) -> dict[str, Any] | None:
         grid = self.grid_map
@@ -2003,8 +2593,49 @@ class ManufacturingWorld:
         )
         return valid
 
+    def _refresh_blocked_after_service_metrics(self) -> None:
+        starts = self.buffer_metrics["blocked_after_service_started_at"]
+        durations = self.buffer_metrics["blocked_after_service_min_by_machine"]
+        for machine in self.machines.values():
+            buffer_id = f"output_buffer_station_{machine.station}"
+            blocked = bool(
+                machine.output_intermediate is not None
+                and self._buffer_capacity(buffer_id) is not None
+                and self._buffer_available_slots(buffer_id) <= 0
+            )
+            started_at = starts.get(machine.machine_id)
+            if blocked and started_at is None:
+                starts[machine.machine_id] = float(self.env.now)
+                self.buffer_metrics["blocked_after_service_count"] += 1
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="MACHINE_BLOCKED_AFTER_SERVICE",
+                    entity_id=machine.machine_id,
+                    location=f"Station{machine.station}",
+                    details={
+                        "buffer_id": buffer_id,
+                        "capacity": self._buffer_capacity(buffer_id),
+                        "occupancy": len(self.output_buffers[machine.station]),
+                        "reserved": self._buffer_reserved_count(buffer_id),
+                    },
+                )
+            elif not blocked and started_at is not None:
+                duration = max(0.0, float(self.env.now) - float(started_at))
+                durations[machine.machine_id] += duration
+                starts.pop(machine.machine_id, None)
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="MACHINE_BLOCKED_AFTER_SERVICE_CLEARED",
+                    entity_id=machine.machine_id,
+                    location=f"Station{machine.station}",
+                    details={"buffer_id": buffer_id, "duration_min": round(duration, 6)},
+                )
+
     def capture_snapshot(self) -> None:
         t = self.env.now
+        self._refresh_blocked_after_service_metrics()
         self.minute_snapshots.append(
             {
                 "t": round(t, 3),
@@ -2027,6 +2658,15 @@ class ManufacturingWorld:
                     for worker_id, worker in self.workers.items()
                 },
                 "inspection_active_agents": self.inspection_active_agents,
+                "inspection_desk_state": self.inspection_desk_state,
+                "inspection_desk_item_id": self.inspection_desk_item_id,
+                "inspection_desk_result": self.inspection_desk_result,
+                "inspection_owner": self.inspection_owner,
+                "buffer_capacities": dict(self.buffer_capacities),
+                "buffer_reserved_counts": {
+                    buffer_id: self._buffer_reserved_count(buffer_id)
+                    for buffer_id in sorted(self.buffer_capacities)
+                },
                 "incident_count": len(self.incident_events),
                 "commitment_count": sum(len(rows) for rows in self.current_commitments().values()),
             }
@@ -2044,6 +2684,7 @@ class ManufacturingWorld:
         step: dict[str, Any] | None = None,
         status: str = "",
         metadata: dict[str, Any] | None = None,
+        reconcile_power: bool = True,
     ) -> None:
         self._update_battery_accounting(worker)
         runtime = getattr(self, "humanoid_runtime", None)
@@ -2060,6 +2701,8 @@ class ManufacturingWorld:
                 metadata=metadata,
             )
         if (
+            reconcile_power
+            and
             event_type not in {"power_normal", "power_low", "power_critical", "disabled"}
             and hasattr(self, "heuristic_rules")
             and hasattr(self, "battery_swap_period_min")
@@ -2268,9 +2911,7 @@ class ManufacturingWorld:
     def _dock_agent_at_target(self, agent: Agent, task: Task | None = None, *, reason: str = "align_target"):
         """Represent precise local alignment after path travel and before work."""
         self._set_humanoid_primitive_hint(agent, "ALIGN", reason=reason)
-        duration = max(0.0, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.0) or 0.0))
-        if duration > 1e-9:
-            yield self.env.timeout(duration)
+        yield self.env.timeout(0.0)
         finished_call_code = self._catalog_primitive_for_active_task(agent, "ALIGN")
         self._transition_humanoid_state(
             agent,
@@ -2312,6 +2953,7 @@ class ManufacturingWorld:
             instance_id=task_instance_id,
             assigned_robot_id=worker.worker_id,
             task_spec_name=task_code.replace("_", " ").title() if task_code else "",
+            selection_meta=copy.deepcopy(getattr(worker, "current_task_selection_meta", {}) or {}),
         )
 
     def _current_child_task_stub(self, worker: Worker) -> Task | None:
@@ -2968,6 +3610,14 @@ class ManufacturingWorld:
         worker.carrying_item_count = len(normalized_ids)
         worker.carrying_item_max_count = max(1, int(max_item_count or 1))
         self._sync_humanoid_cargo_state(worker, destination=destination)
+        for item_id in normalized_ids:
+            self._set_item_state(
+                item_id,
+                ItemState.CARRIED_BY_WORKER,
+                location=self.worker_display_location(worker),
+                ref=worker.worker_id,
+                item_type=normalized_type,
+            )
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -2982,6 +3632,7 @@ class ManufacturingWorld:
 
     def _set_machine_state(self, machine: Machine, state: MachineState | str, reason: str = "") -> None:
         next_state = state if isinstance(state, MachineState) else MachineState(str(state))
+        state_changed = machine.state != next_state
         if machine.state == next_state and not reason:
             return
         machine.state = next_state
@@ -3005,6 +3656,8 @@ class ManufacturingWorld:
                 "repair_remaining_min": round(float(machine.repair_work_remaining_min), 3),
             },
         )
+        if state_changed:
+            self._rolling_horizon_request_candidate_refresh("machine_state_changed")
 
     def _set_item_state(
         self,
@@ -3048,12 +3701,20 @@ class ManufacturingWorld:
             "item_state": item.state.value,
             "ref": ref,
         }
-        for key in ("source_item_ids", "source_material_ids", "source_intermediate_ids", "transformed_from_item_ids"):
+        for key in (
+            "source_item_ids",
+            "source_material_ids",
+            "source_intermediate_ids",
+            "transformed_from_item_ids",
+            "transformed_to_item_id",
+        ):
             value = item.metadata.get(key)
             if isinstance(value, list):
                 details[key] = [str(candidate) for candidate in value if str(candidate).strip()]
             elif isinstance(value, str) and value.strip():
-                details[key] = [value.strip()]
+                details[key] = value.strip() if key == "transformed_to_item_id" else [value.strip()]
+        if str(item.metadata.get("inspection_result") or "").strip():
+            details["inspection_result"] = str(item.metadata.get("inspection_result")).strip().upper()
         if tile is not None:
             details["tile"] = self._tile_payload(tile)
         self.logger.log(
@@ -3064,6 +3725,67 @@ class ManufacturingWorld:
             location=location,
             details=details,
         )
+
+    def _record_initial_batch_terminal_output(
+        self,
+        item_id: str,
+        *,
+        outcome: str,
+        completed_by_agent_id: str = "",
+    ) -> None:
+        if not self.minimize_makespan_enabled or not self.initial_batch_material_ids:
+            return
+        item = self.items.get(str(item_id))
+        if item is None:
+            return
+        source_material_ids = {
+            str(source_id)
+            for source_id in item.metadata.get("source_material_ids", [])
+            if str(source_id).strip()
+        }
+        covered_material_ids = source_material_ids & self.initial_batch_material_ids
+        if not covered_material_ids:
+            return
+
+        normalized_outcome = str(outcome).strip().lower()
+        if normalized_outcome == "accepted_product":
+            self.initial_batch_accepted_output_ids.add(str(item_id))
+        elif normalized_outcome == "disposed_scrap":
+            self.initial_batch_disposed_scrap_ids.add(str(item_id))
+        else:
+            raise ValueError(f"Unsupported initial batch terminal outcome: {outcome}")
+
+        newly_terminal = covered_material_ids - self.initial_batch_terminal_material_ids
+        self.initial_batch_terminal_material_ids.update(covered_material_ids)
+        for material_id in newly_terminal:
+            self.initial_batch_terminal_outcomes[material_id] = {
+                "outcome": normalized_outcome,
+                "output_item_id": str(item_id),
+            }
+        terminal_count = len(self.initial_batch_terminal_material_ids)
+        initial_count = len(self.initial_batch_material_ids)
+        progress_ratio = terminal_count / max(1, initial_count)
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="INITIAL_MATERIAL_BATCH_PROGRESS",
+            entity_id=str(item_id),
+            location="CompletedProducts" if normalized_outcome == "accepted_product" else "ScrapDisposal",
+            details={
+                "outcome": normalized_outcome,
+                "covered_material_ids": sorted(covered_material_ids),
+                "newly_terminal_material_ids": sorted(newly_terminal),
+                "terminal_material_count": terminal_count,
+                "initial_material_count": initial_count,
+                "progress_ratio": round(progress_ratio, 6),
+            },
+        )
+        if terminal_count == initial_count and self.makespan_min is None:
+            self.makespan_min = float(self.env.now)
+            self._request_simulation_termination(
+                "initial_material_batch_terminal_complete",
+                after_agent_id=completed_by_agent_id,
+            )
 
     def _register_dropped_item(
         self,
@@ -3168,7 +3890,7 @@ class ManufacturingWorld:
             return False
         if self._humanoid_incident_enabled("GRIP_FAILED"):
             probability = self._random_incident_probability("GRIP_FAILED")
-            if probability > 0.0 and self.rng.random() < probability:
+            if probability > 0.0 and self._humanoid_incident_random(agent.agent_id, "GRIP_FAILED") < probability:
                 self._emit_humanoid_incident(
                     agent,
                     "GRIP_FAILED",
@@ -3382,11 +4104,23 @@ class ManufacturingWorld:
                 ref=station,
                 item_type=item_type,
             )
+        elif task_type == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+            action = str(payload.get("interface_action") or payload.get("action") or "").strip().lower()
+            _add(
+                payload.get("inspection_product_id") or payload.get("item_id"),
+                source=(
+                    f"intermediate_queue_{self.inspection_queue_station}"
+                    if action == "load"
+                    else "inspection_desk"
+                ),
+                ref=(self.inspection_queue_station if action == "load" else self.inspection_workstation_id),
+                item_type="product",
+            )
         elif task_type == "INSPECT_PRODUCT":
             _add(
                 payload.get("inspection_product_id"),
-                source=f"intermediate_queue_{self.inspection_queue_station}",
-                ref=self.inspection_queue_station,
+                source="inspection_desk",
+                ref=self.inspection_workstation_id,
                 item_type="product",
             )
         elif task_type == "COLLECT_WASTE_OR_SCRAP":
@@ -3398,6 +4132,30 @@ class ManufacturingWorld:
 
     def _task_item_dependencies_available(self, task: Task, agent: Agent) -> bool:
         payload = task.payload if isinstance(task.payload, dict) else {}
+        task_type = str(task.task_type or "").strip().upper()
+        machine_task_types = {
+            "LOAD_MACHINE",
+            "SETUP_MACHINE",
+            "UNLOAD_MACHINE",
+            "REPAIR_MACHINE",
+            "PREVENTIVE_MAINTENANCE",
+        }
+        if task_type in machine_task_types:
+            machine = self.machines.get(str(payload.get("machine_id", "") or ""))
+            if machine is None:
+                return False
+            if task_type == "REPAIR_MACHINE":
+                if not machine.broken:
+                    return False
+            elif machine.broken:
+                return False
+        destination_buffer_id = self._task_destination_buffer_id(task)
+        if (
+            self._buffer_capacity(destination_buffer_id) is not None
+            and str(task.task_id or "") not in self.buffer_slot_reservations.get(destination_buffer_id, {})
+            and self._buffer_available_slots(destination_buffer_id) <= 0
+        ):
+            return False
         for ref in self._task_item_reservation_refs(task):
             item_id = str(ref.get("item_id", "")).strip()
             if not item_id or self._item_reserved_by_other(item_id, agent.agent_id, task.task_id):
@@ -3428,6 +4186,9 @@ class ManufacturingWorld:
                 except (TypeError, ValueError):
                     return False
                 if item_id not in self.output_buffers.get(station, deque()):
+                    return False
+            elif source == "inspection_desk":
+                if item_id != self.inspection_desk_item_id:
                     return False
             elif source == "inspection_scrap_queue":
                 if item_id not in self.inspection_scrap_queue:
@@ -3486,12 +4247,13 @@ class ManufacturingWorld:
                     station = int(payload.get("station", 0) or 0)
                 except (TypeError, ValueError):
                     return False
-                owner = self.material_supply_owner.get(station)
-                if owner is not None and owner != agent.agent_id:
-                    return False
-                self.material_supply_owner[station] = agent.agent_id
-                owner_kind = "material_supply"
-                owner_ref = str(station)
+                if not self.is_mfg_flow_shop:
+                    owner = self.material_supply_owner.get(station)
+                    if owner is not None and owner != agent.agent_id:
+                        return False
+                    self.material_supply_owner[station] = agent.agent_id
+                    owner_kind = "material_supply"
+                    owner_ref = str(station)
             elif transfer_kind == "battery_delivery":
                 target_id = str(payload.get("target_agent_id", ""))
                 target = self.agents.get(target_id)
@@ -3525,11 +4287,11 @@ class ManufacturingWorld:
                 machine.pm_owner = agent.agent_id
                 owner_kind = "machine_pm"
             owner_ref = machine.machine_id
-        elif task_type == "INSPECT_PRODUCT":
+        elif task_type in {"INSPECT_PRODUCT", "LOAD_UNLOAD_TRANSFER_INTERFACE"}:
             if self.inspection_owner is not None and self.inspection_owner != agent.agent_id:
                 return False
             self.inspection_owner = agent.agent_id
-            owner_kind = "inspection"
+            owner_kind = "inspection_workstation"
             owner_ref = "inspection"
         elif task_type == "COLLECT_WASTE_OR_SCRAP":
             if self.scrap_disposal_owner is not None and self.scrap_disposal_owner != agent.agent_id:
@@ -3576,12 +4338,112 @@ class ManufacturingWorld:
             machine = self.machines.get(ref)
             if machine is not None and machine.pm_owner == owner_agent:
                 machine.pm_owner = None
-        elif kind == "inspection":
-            if self.inspection_owner == owner_agent:
-                self.inspection_owner = None
+        elif kind in {"inspection", "inspection_workstation"}:
+            self._release_inspection_desk(
+                owner_agent,
+                task_id=str(getattr(task, "task_id", "") or ""),
+                product_id=str(payload.get("inspection_product_id") or payload.get("item_id") or ""),
+                reason=reason,
+            )
         elif kind == "scrap_disposal":
             if self.scrap_disposal_owner == owner_agent:
                 self.scrap_disposal_owner = None
+
+    def _release_inspection_desk(
+        self,
+        agent_id: str,
+        *,
+        task_id: str = "",
+        product_id: str = "",
+        reason: str = "",
+    ) -> bool:
+        if self.inspection_owner != agent_id:
+            return False
+        self.inspection_owner = None
+        if self.inspection_desk_state == "INSPECTING" and self.inspection_desk_item_id:
+            item = self.items.get(self.inspection_desk_item_id)
+            result_recorded = bool(
+                item is not None and item.metadata.get("inspection_result_recorded", False)
+            )
+            next_state = "INSPECTED_WAITING_UNLOAD" if result_recorded else "STAGED_FOR_INSPECTION"
+            self._set_inspection_desk_state(
+                next_state,
+                result=(str(item.metadata.get("inspection_result") or "") if result_recorded else None)
+                if item is not None
+                else None,
+                reason=reason or "inspection_released",
+            )
+        if self.inspection_active_agents <= 0:
+            self._rolling_horizon_request_candidate_refresh("inspection_workstation_released")
+            return True
+        self.inspection_active_agents = max(0, self.inspection_active_agents - 1)
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="INSPECTION_DESK_RELEASED",
+            entity_id=self.inspection_workstation_id,
+            location="Inspection",
+            details={
+                "worker_id": agent_id,
+                "task_id": task_id,
+                "product_id": product_id,
+                "active_worker_ids": [],
+                "reason": str(reason or "inspection_complete"),
+                "desk_state": self.inspection_desk_state,
+                "inspection_result": self.inspection_desk_result or "",
+            },
+        )
+        self._rolling_horizon_request_candidate_refresh("inspection_workstation_released")
+        return True
+
+    def _set_inspection_desk_state(
+        self,
+        state: str,
+        *,
+        item_id: str | None = None,
+        result: str | None = None,
+        reason: str = "",
+    ) -> None:
+        normalized_state = str(state or "EMPTY").strip().upper()
+        if normalized_state not in {
+            "EMPTY",
+            "STAGED_FOR_INSPECTION",
+            "INSPECTING",
+            "INSPECTED_WAITING_UNLOAD",
+        }:
+            raise ValueError(f"Unsupported inspection desk state: {state}")
+        normalized_item_id = str(item_id).strip() if item_id else None
+        if normalized_state != "EMPTY" and normalized_item_id is None and self.inspection_desk_item_id is None:
+            raise ValueError(f"Inspection desk state {normalized_state} requires an item id.")
+        normalized_result = str(result or "").strip().upper()
+        if normalized_state == "INSPECTED_WAITING_UNLOAD":
+            effective_result = normalized_result or str(self.inspection_desk_result or "").strip().upper()
+            if effective_result not in {"PASS", "FAIL"}:
+                raise ValueError("INSPECTED_WAITING_UNLOAD requires a PASS or FAIL result.")
+        previous_state = self.inspection_desk_state
+        previous_item_id = self.inspection_desk_item_id
+        if item_id is not None or normalized_state == "EMPTY":
+            self.inspection_desk_item_id = normalized_item_id
+        if result is not None or normalized_state in {"EMPTY", "STAGED_FOR_INSPECTION"}:
+            self.inspection_desk_result = normalized_result if normalized_result in {"PASS", "FAIL"} else None
+        self.inspection_desk_state = normalized_state
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="INSPECTION_DESK_STATE_CHANGED",
+            entity_id=self.inspection_workstation_id,
+            location="Inspection",
+            details={
+                "previous_state": previous_state,
+                "desk_state": self.inspection_desk_state,
+                "previous_item_id": previous_item_id or "",
+                "product_id": self.inspection_desk_item_id or "",
+                "inspection_result": self.inspection_desk_result or "",
+                "owner_worker_id": self.inspection_owner or "",
+                "reason": str(reason or ""),
+            },
+        )
+        self._rolling_horizon_request_candidate_refresh("inspection_desk_state_changed")
 
     def _first_unreserved_queue_item(
         self,
@@ -3631,15 +4493,300 @@ class ManufacturingWorld:
         except ValueError:
             return False
 
-    @staticmethod
-    def _appendleft_if_absent(queue: deque[str], item_id: str | None) -> None:
+    def _buffer_queue(self, buffer_id: str) -> deque[str] | None:
+        normalized = str(buffer_id or "").strip()
+        if normalized.startswith("material_queue_"):
+            try:
+                return self.material_queues.get(int(normalized.rsplit("_", 1)[1]))
+            except (TypeError, ValueError):
+                return None
+        if normalized.startswith("intermediate_queue_"):
+            try:
+                return self.intermediate_queues.get(int(normalized.rsplit("_", 1)[1]))
+            except (TypeError, ValueError):
+                return None
+        if normalized.startswith("output_buffer_station_"):
+            try:
+                return self.output_buffers.get(int(normalized.rsplit("_", 1)[1]))
+            except (TypeError, ValueError):
+                return None
+        if normalized == "inspection_output_queue":
+            return self.output_buffers.get(self.inspection_queue_station)
+        if normalized == "inspection_scrap_queue":
+            return self.inspection_scrap_queue
+        return None
+
+    def _buffer_id_for_queue(self, queue: deque[str]) -> str:
+        for station, candidate in self.material_queues.items():
+            if candidate is queue:
+                return f"material_queue_{station}"
+        for station, candidate in self.intermediate_queues.items():
+            if candidate is queue:
+                return f"intermediate_queue_{station}"
+        for station, candidate in self.output_buffers.items():
+            if candidate is queue:
+                return f"output_buffer_station_{station}"
+        if self.inspection_scrap_queue is queue:
+            return "inspection_scrap_queue"
+        return ""
+
+    def _buffer_capacity(self, buffer_id: str) -> int | None:
+        value = self.buffer_capacities.get(str(buffer_id or "").strip())
+        return int(value) if value is not None else None
+
+    def _rolling_horizon_queued_resource_keys(self) -> set[str]:
+        excluded_keys = set(
+            getattr(self, "_rolling_horizon_candidate_slot_exclusions", set()) or set()
+        )
+        keys: set[str] = set()
+        for queue in getattr(self, "rolling_horizon_dispatch_queues", {}).values():
+            for entry in queue:
+                if not isinstance(entry, dict):
+                    continue
+                for key in entry.get("exclusive_resource_keys", []):
+                    value = str(key or "")
+                    if value in excluded_keys:
+                        continue
+                    if value:
+                        keys.add(value)
+        return keys
+
+    def _queued_buffer_slot_tokens(self, buffer_id: str) -> set[int]:
+        prefix = f"buffer_slot:{str(buffer_id or '').strip()}:"
+        tokens: set[int] = set()
+        for value in self._rolling_horizon_queued_resource_keys():
+            if not value.startswith(prefix):
+                continue
+            try:
+                tokens.add(int(value.rsplit(":", 1)[1]))
+            except (TypeError, ValueError):
+                continue
+        return tokens
+
+    def _buffer_reserved_count(self, buffer_id: str, *, exclude_task_id: str = "") -> int:
+        rows = self.buffer_slot_reservations.get(str(buffer_id or "").strip(), {})
+        excluded = str(exclude_task_id or "").strip()
+        active = sum(1 for task_id in rows if not excluded or str(task_id) != excluded)
+        return active + len(self._queued_buffer_slot_tokens(buffer_id))
+
+    def _buffer_available_slots(self, buffer_id: str, *, exclude_task_id: str = "") -> int:
+        capacity = self._buffer_capacity(buffer_id)
+        if capacity is None:
+            return 1_000_000_000
+        queue = self._buffer_queue(buffer_id)
+        occupancy = len(queue) if queue is not None else 0
+        reserved = self._buffer_reserved_count(buffer_id, exclude_task_id=exclude_task_id)
+        return max(0, int(capacity) - int(occupancy) - int(reserved))
+
+    def _buffer_available_slot_tokens(self, buffer_id: str, *, limit: int | None = None) -> list[int]:
+        capacity = self._buffer_capacity(buffer_id)
+        if capacity is None:
+            count = max(1, int(limit or 1))
+            return list(range(count))
+        available = self._buffer_available_slots(buffer_id)
+        if limit is not None:
+            available = min(available, max(0, int(limit)))
+        used_tokens = {
+            int(row.get("slot_token", -1))
+            for row in self.buffer_slot_reservations.get(buffer_id, {}).values()
+            if int(row.get("slot_token", -1)) >= 0
+        }
+        used_tokens.update(self._queued_buffer_slot_tokens(buffer_id))
+        tokens = [token for token in range(capacity) if token not in used_tokens]
+        return tokens[:available]
+
+    def _task_destination_buffer_id(self, task: Task) -> str:
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        explicit = str(payload.get("destination_buffer_id", "") or "").strip()
+        if explicit:
+            return explicit
+        task_type = str(task.task_type or "").strip().upper()
+        if task_type == "UNLOAD_MACHINE":
+            machine = self.machines.get(str(payload.get("machine_id", "") or ""))
+            return f"output_buffer_station_{machine.station}" if machine is not None else ""
+        if task_type == "TRANSFER":
+            transfer_kind = str(payload.get("transfer_kind", "") or "").strip().lower()
+            if transfer_kind == "material_supply":
+                return f"material_queue_{int(payload.get('station', 0) or 0)}"
+            if transfer_kind == "inter_station":
+                from_station = int(payload.get("from_station", 0) or 0)
+                if from_station == self.inspection_queue_station:
+                    return ""
+                target_station = from_station + 1
+                if target_station > self.last_processing_station:
+                    target_station = self.inspection_queue_station
+                return f"intermediate_queue_{target_station}"
+        if task_type == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+            action = str(payload.get("interface_action") or payload.get("action") or "").strip().lower()
+            if action == "unload":
+                result = str(payload.get("inspection_result", "") or "").strip().upper()
+                return (
+                    f"output_buffer_station_{self.inspection_queue_station}"
+                    if result == "PASS"
+                    else "inspection_scrap_queue"
+                )
+        return ""
+
+    def _reserve_task_buffer_slot(self, agent: Agent, task: Task) -> bool:
+        buffer_id = self._task_destination_buffer_id(task)
+        capacity = self._buffer_capacity(buffer_id)
+        if not buffer_id or capacity is None:
+            return True
+        task_id = str(task.task_id or "").strip()
+        existing = self.buffer_slot_reservations[buffer_id].get(task_id)
+        if isinstance(existing, dict):
+            return True
+        preferred = task.payload.get("destination_slot_token")
+        available_tokens = self._buffer_available_slot_tokens(buffer_id)
+        try:
+            preferred_token = int(preferred) if preferred is not None else None
+        except (TypeError, ValueError):
+            preferred_token = None
+        if preferred_token in available_tokens:
+            slot_token = int(preferred_token)
+        elif available_tokens:
+            slot_token = int(available_tokens[0])
+        else:
+            self.buffer_metrics["reservation_failure_count"] += 1
+            task.payload["failure_reason"] = "destination_buffer_full"
+            return False
+        row = {
+            "task_id": task_id,
+            "agent_id": agent.agent_id,
+            "buffer_id": buffer_id,
+            "slot_token": slot_token,
+            "reserved_at": float(self.env.now),
+        }
+        self.buffer_slot_reservations[buffer_id][task_id] = row
+        task.payload["destination_buffer_id"] = buffer_id
+        task.payload["destination_slot_token"] = slot_token
+        task.payload["_reserved_buffer_slot"] = dict(row)
+        self.buffer_metrics["max_reserved_by_buffer"][buffer_id] = max(
+            int(self.buffer_metrics["max_reserved_by_buffer"].get(buffer_id, 0)),
+            len(self.buffer_slot_reservations[buffer_id]),
+        )
+        self._record_buffer_occupancy(buffer_id)
+        return True
+
+    def _release_task_buffer_slot(self, task: Task, *, reason: str = "") -> None:
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        row = payload.pop("_reserved_buffer_slot", None)
+        buffer_id = str(
+            (row.get("buffer_id") if isinstance(row, dict) else None)
+            or payload.get("destination_buffer_id")
+            or ""
+        ).strip()
+        task_id = str(task.task_id or "").strip()
+        if buffer_id and task_id and self.buffer_slot_reservations.get(buffer_id, {}).pop(task_id, None) is not None:
+            self.buffer_metrics["reservation_release_count"] += 1
+        if buffer_id and not self.buffer_slot_reservations.get(buffer_id):
+            self.buffer_slot_reservations.pop(buffer_id, None)
+
+    def _commit_task_buffer_slot(self, task: Task, buffer_id: str) -> bool:
+        normalized = str(buffer_id or "").strip()
+        task_id = str(task.task_id or "").strip()
+        row = self.buffer_slot_reservations.get(normalized, {}).pop(task_id, None)
+        if row is None and self._buffer_capacity(normalized) is not None:
+            return False
+        if normalized and not self.buffer_slot_reservations.get(normalized):
+            self.buffer_slot_reservations.pop(normalized, None)
+        if isinstance(task.payload, dict):
+            task.payload.pop("_reserved_buffer_slot", None)
+        if row is not None:
+            self.buffer_metrics["reservation_commit_count"] += 1
+        return True
+
+    def _task_has_buffer_reservation(self, task: Task | None, buffer_id: str) -> bool:
+        return bool(
+            task is not None
+            and str(task.task_id or "") in self.buffer_slot_reservations.get(buffer_id, {})
+        )
+
+    def _record_buffer_occupancy(self, buffer_id: str) -> None:
+        queue = self._buffer_queue(buffer_id)
+        if queue is None:
+            return
+        self.buffer_metrics["max_occupancy_by_buffer"][buffer_id] = max(
+            int(self.buffer_metrics["max_occupancy_by_buffer"].get(buffer_id, 0)),
+            len(queue),
+        )
+        committed_plus_reserved = len(queue) + self._buffer_reserved_count(buffer_id)
+        self.buffer_metrics["max_committed_plus_reserved_by_buffer"][buffer_id] = max(
+            int(self.buffer_metrics["max_committed_plus_reserved_by_buffer"].get(buffer_id, 0)),
+            committed_plus_reserved,
+        )
+        capacity = self._buffer_capacity(buffer_id)
+        if capacity is not None and committed_plus_reserved > capacity:
+            raise RuntimeError(
+                f"Finite buffer invariant violated for {buffer_id}: "
+                f"occupancy+reservations={committed_plus_reserved} capacity={capacity}."
+            )
+
+    def _buffer_push_allowed(self, buffer_id: str, *, task: Task | None = None) -> bool:
+        capacity = self._buffer_capacity(buffer_id)
+        if capacity is None:
+            return True
+        queue = self._buffer_queue(buffer_id)
+        occupancy = len(queue) if queue is not None else 0
+        own_reservation = bool(
+            task is not None
+            and str(task.task_id or "") in self.buffer_slot_reservations.get(buffer_id, {})
+        )
+        if own_reservation:
+            return occupancy < capacity
+        return occupancy + self._buffer_reserved_count(buffer_id) < capacity
+
+    def _log_buffer_overflow_attempt(self, buffer_id: str, item_id: str, task: Task | None = None) -> None:
+        self.buffer_metrics["overflow_attempt_count"] += 1
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="BUFFER_OVERFLOW_PREVENTED",
+            entity_id=buffer_id,
+            location=self._grid_logical_destination(buffer_id),
+            details={
+                "item_id": str(item_id or ""),
+                "task_id": str(getattr(task, "task_id", "") or ""),
+                "capacity": self._buffer_capacity(buffer_id),
+                "occupancy": len(self._buffer_queue(buffer_id) or ()),
+                "reserved": self._buffer_reserved_count(buffer_id),
+            },
+        )
+
+    def _appendleft_if_absent(self, queue: deque[str], item_id: str | None) -> None:
         value = str(item_id or "").strip()
         if value and value not in queue:
+            buffer_id = self._buffer_id_for_queue(queue)
+            if buffer_id and not self._buffer_push_allowed(buffer_id):
+                self._log_buffer_overflow_attempt(buffer_id, value)
+                raise RuntimeError(f"Cannot roll back {value}: finite buffer {buffer_id} is full.")
             queue.appendleft(value)
+            if buffer_id:
+                self._record_buffer_occupancy(buffer_id)
 
     def _finalize_selected_task(self, agent: Agent, task: Task | None) -> Task | None:
         if task is None:
             return None
+        if self._mfg_flow_policy_active():
+            rule = self._mfg_flow_task_rule(task)
+            allowed_worker_ids = self._mfg_flow_allowed_worker_ids_for_task(task)
+            if self._mfg_flow_dedicated_policy_active() and agent.agent_id not in allowed_worker_ids:
+                self.rolling_horizon_dedicated_role_metrics["role_violation_count"] += 1
+                task.payload["failure_reason"] = "ROLE_VIOLATION"
+                return None
+            task.selection_meta["task_rule_id"] = str(rule.rule_id)
+            task.selection_meta["role_number"] = int(rule.role_number)
+            task.selection_meta["role_task_code"] = str(rule.task_code)
+            task.selection_meta["role_display_name"] = str(rule.display_name)
+            task.selection_meta["role_policy"] = (
+                "workload_balanced_dedicated" if self._mfg_flow_dedicated_policy_active() else "shared"
+            )
+            task.selection_meta["allowed_worker_ids"] = list(allowed_worker_ids)
+            task.selection_meta["role_owner_agent_id"] = (
+                agent.agent_id
+                if rule.kind == "self_service"
+                else self.mfg_flow_task_policy.exclusive_owner_by_rule.get(rule.rule_id, "")
+            )
         if agent.suspended_task is task and isinstance(task.payload.get("_reserved_item_ids"), list):
             return task
         if not self._reserve_task_domain_owner(agent, task):
@@ -3649,10 +4796,22 @@ class ManufacturingWorld:
             self._release_task_domain_owner(agent, task, reason="item_reservation_failed")
             task.payload["failure_reason"] = "RESOURCE_PREEMPTED"
             return None
+        if not self._reserve_task_buffer_slot(agent, task):
+            self._release_task_item_reservations(task, reason="buffer_reservation_failed")
+            self._release_task_domain_owner(agent, task, reason="buffer_reservation_failed")
+            return None
         return task
 
-    def _push_material_queue(self, station: int, item_id: str) -> None:
+    def _push_material_queue(self, station: int, item_id: str, *, task: Task | None = None) -> bool:
+        buffer_id = f"material_queue_{station}"
+        if not self._buffer_push_allowed(buffer_id, task=task):
+            self._log_buffer_overflow_attempt(buffer_id, item_id, task)
+            return False
+        if self._task_has_buffer_reservation(task, buffer_id) and not self._commit_task_buffer_slot(task, buffer_id):
+            self._log_buffer_overflow_attempt(buffer_id, item_id, task)
+            return False
         self.material_queues[station].append(item_id)
+        self._record_buffer_occupancy(buffer_id)
         self._set_item_state(item_id, ItemState.IN_QUEUE, location=f"Station{station}", ref=f"material_queue_{station}", item_type="material")
         self.logger.log(
             t=self.env.now,
@@ -3662,6 +4821,9 @@ class ManufacturingWorld:
             location=f"Station{station}",
             details={"item_id": item_id, "queue": "material"},
         )
+
+        self._rolling_horizon_request_candidate_refresh("material_queue_push")
+        return True
 
     def _pop_material_queue(self, station: int, item_id: str | None = None) -> str | None:
         if not self.material_queues[station]:
@@ -3673,7 +4835,6 @@ class ManufacturingWorld:
         item_id = str(item_id).strip()
         if not self._remove_item_from_deque(self.material_queues[station], item_id):
             return None
-        self._set_item_state(item_id, ItemState.CARRIED_BY_WORKER, location=f"Station{station}", ref=f"material_queue_{station}", item_type="material")
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -3682,12 +4843,23 @@ class ManufacturingWorld:
             location=f"Station{station}",
             details={"item_id": item_id, "queue": "material"},
         )
+        self._rolling_horizon_request_candidate_refresh("material_queue_pop")
         return item_id
 
-    def _push_inspection_scrap_queue(self, item_id: str) -> None:
+    def _push_inspection_scrap_queue(self, item_id: str, *, task: Task | None = None) -> bool:
         if not item_id:
-            return
+            return False
+        if item_id in self.inspection_scrap_queue:
+            return True
+        buffer_id = "inspection_scrap_queue"
+        if not self._buffer_push_allowed(buffer_id, task=task):
+            self._log_buffer_overflow_attempt(buffer_id, item_id, task)
+            return False
+        if self._task_has_buffer_reservation(task, buffer_id) and not self._commit_task_buffer_slot(task, buffer_id):
+            self._log_buffer_overflow_attempt(buffer_id, item_id, task)
+            return False
         self.inspection_scrap_queue.append(item_id)
+        self._record_buffer_occupancy(buffer_id)
         self._set_item_state(
             item_id,
             ItemState.WAITING_SCRAP_DISPOSAL,
@@ -3706,6 +4878,8 @@ class ManufacturingWorld:
                 "queue_length": len(self.inspection_scrap_queue),
             },
         )
+        self._rolling_horizon_request_candidate_refresh("inspection_scrap_queue_push")
+        return True
 
     def _pop_inspection_scrap_batch(self, max_count: int, item_ids: list[str] | None = None) -> list[str]:
         count = max(1, int(max_count or 1))
@@ -3720,19 +4894,22 @@ class ManufacturingWorld:
             if not self._remove_item_from_deque(self.inspection_scrap_queue, item_id):
                 continue
             popped.append(item_id)
-            self._set_item_state(
-                item_id,
-                ItemState.CARRIED_BY_WORKER,
-                location="Inspection",
-                ref="inspection_scrap_queue",
-                item_type="product",
-            )
+        if popped:
+            self._rolling_horizon_request_candidate_refresh("inspection_scrap_queue_pop")
         return popped
 
-    def _push_intermediate_queue(self, station: int, item_id: str) -> None:
+    def _push_intermediate_queue(self, station: int, item_id: str, *, task: Task | None = None) -> bool:
         if station not in self.intermediate_queues:
             raise ValueError(f"intermediate queue for station {station} is not defined")
+        buffer_id = f"intermediate_queue_{station}"
+        if not self._buffer_push_allowed(buffer_id, task=task):
+            self._log_buffer_overflow_attempt(buffer_id, item_id, task)
+            return False
+        if self._task_has_buffer_reservation(task, buffer_id) and not self._commit_task_buffer_slot(task, buffer_id):
+            self._log_buffer_overflow_attempt(buffer_id, item_id, task)
+            return False
         self.intermediate_queues[station].append(item_id)
+        self._record_buffer_occupancy(buffer_id)
         location = "Inspection" if station == self.inspection_queue_station else f"Station{station}"
         queue_name = "product" if station == self.inspection_queue_station else "intermediate"
         item_state = ItemState.WAITING_INSPECTION if station == self.inspection_queue_station else ItemState.IN_QUEUE
@@ -3745,6 +4922,8 @@ class ManufacturingWorld:
             location=location,
             details={"item_id": item_id, "queue": queue_name},
         )
+        self._rolling_horizon_request_candidate_refresh("intermediate_queue_push")
+        return True
 
     def _pop_intermediate_queue(self, station: int, item_id: str | None = None) -> str | None:
         if station not in self.intermediate_queues:
@@ -3760,8 +4939,6 @@ class ManufacturingWorld:
             return None
         location = "Inspection" if station == self.inspection_queue_station else f"Station{station}"
         queue_name = "product" if station == self.inspection_queue_station else "intermediate"
-        item_state = ItemState.INSPECTING if station == self.inspection_queue_station else ItemState.CARRIED_BY_WORKER
-        self._set_item_state(item_id, item_state, location=location, ref=f"intermediate_queue_{station}", item_type=queue_name)
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -3770,6 +4947,7 @@ class ManufacturingWorld:
             location=location,
             details={"item_id": item_id, "queue": queue_name},
         )
+        self._rolling_horizon_request_candidate_refresh("intermediate_queue_pop")
         return item_id
 
     def _pop_output_buffer_item(self, station: int, item_id: str | None = None) -> str | None:
@@ -3783,15 +4961,7 @@ class ManufacturingWorld:
         item_id = str(item_id).strip()
         if not self._remove_item_from_deque(buffer, item_id):
             return None
-        item_type = "product" if station >= self.last_processing_station else "intermediate"
         location = "Inspection" if station == self.inspection_queue_station else f"Station{station}"
-        self._set_item_state(
-            item_id,
-            ItemState.CARRIED_BY_WORKER,
-            location=location,
-            ref=f"output_buffer_station_{station}",
-            item_type=item_type,
-        )
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -3800,7 +4970,25 @@ class ManufacturingWorld:
             location=location,
             details={"item_id": item_id, "queue": "output"},
         )
+        self._rolling_horizon_request_candidate_refresh("output_buffer_pop")
         return item_id
+
+    def _push_output_buffer_item(self, station: int, item_id: str, *, task: Task | None = None) -> bool:
+        buffer = self.output_buffers.get(station)
+        if buffer is None:
+            raise ValueError(f"output buffer for station {station} is not defined")
+        buffer_id = f"output_buffer_station_{station}"
+        if not self._buffer_push_allowed(buffer_id, task=task):
+            self._log_buffer_overflow_attempt(buffer_id, item_id, task)
+            return False
+        if self._task_has_buffer_reservation(task, buffer_id) and not self._commit_task_buffer_slot(task, buffer_id):
+            self._log_buffer_overflow_attempt(buffer_id, item_id, task)
+            return False
+        if item_id not in buffer:
+            buffer.append(item_id)
+        self._record_buffer_occupancy(buffer_id)
+        self._rolling_horizon_request_candidate_refresh("output_buffer_push")
+        return True
 
     def _agent_discharged_intervals(self) -> list[tuple[str, float, float]]:
         active: dict[str, float] = {}
@@ -4131,7 +5319,7 @@ class ManufacturingWorld:
         catalog = getattr(getattr(self, "humanoid_runtime", None), "catalog", None)
         return build_operational_task_complexity_metrics(
             dict(completed_task_counts),
-            num_days=float(self.num_days or 1),
+            num_days=self._objective_reporting_days(),
             catalog=catalog,
         )
 
@@ -4246,6 +5434,169 @@ class ManufacturingWorld:
             "item_transport_time_by_type": {
                 key: round(value, 3) for key, value in sorted(item_transport_time_by_type.items())
             },
+        }
+
+    @staticmethod
+    def _battery_charge_sessions_from_events(
+        events: list[dict[str, Any]],
+        sim_end: float,
+    ) -> list[dict[str, Any]]:
+        active: dict[tuple[str, str], dict[str, Any]] = {}
+        sessions: list[dict[str, Any]] = []
+
+        def _close(
+            key: tuple[str, str],
+            end_t: float,
+            *,
+            completed: bool,
+            status: str,
+            details: dict[str, Any] | None = None,
+        ) -> None:
+            row = active.pop(key, None)
+            event_details = details if isinstance(details, dict) else {}
+            if row is None:
+                if not completed:
+                    return
+                recorded_duration = max(
+                    0.0,
+                    float(
+                        event_details.get("actual_charge_duration_min")
+                        or event_details.get("charge_duration_min")
+                        or 0.0
+                    ),
+                )
+                row = {
+                    "worker_id": key[0],
+                    "task_id": key[1],
+                    "started_at": max(0.0, float(end_t) - recorded_duration),
+                }
+            raw_started_at = row.get("started_at")
+            started_at = float(end_t) if raw_started_at is None else float(raw_started_at)
+            sessions.append(
+                {
+                    **row,
+                    "ended_at": float(end_t),
+                    "duration_min": max(0.0, float(end_t) - started_at),
+                    "completed": bool(completed),
+                    "status": str(status),
+                }
+            )
+
+        ordered_events = sorted(
+            enumerate(events),
+            key=lambda pair: (float(pair[1].get("t", 0.0) or 0.0), pair[0]),
+        )
+        for _index, event in ordered_events:
+            event_type = str(event.get("type", "")).strip().upper()
+            if event_type not in {
+                "BATTERY_CHARGE_STARTED",
+                "BATTERY_CHARGE_COMPLETED",
+                "BATTERY_CHARGE_INTERRUPTED",
+                "AGENT_TASK_END",
+            }:
+                continue
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            payload = details.get("payload", {}) if isinstance(details.get("payload", {}), dict) else {}
+            worker_id = str(event.get("entity_id", "")).strip()
+            task_id = str(details.get("task_id", "")).strip()
+            key = (worker_id, task_id)
+            event_t = float(event.get("t", 0.0) or 0.0)
+
+            if event_type == "BATTERY_CHARGE_STARTED":
+                active[key] = {
+                    "worker_id": worker_id,
+                    "task_id": task_id,
+                    "started_at": event_t,
+                    "charging_dock_id": str(details.get("charging_dock_id", "")),
+                }
+            elif event_type == "BATTERY_CHARGE_COMPLETED":
+                _close(key, event_t, completed=True, status="completed", details=details)
+            elif event_type == "BATTERY_CHARGE_INTERRUPTED":
+                _close(key, event_t, completed=False, status="interrupted", details=details)
+            elif str(payload.get("action", "")).strip().lower() == "dock_charge":
+                _close(
+                    key,
+                    event_t,
+                    completed=False,
+                    status=str(details.get("status", "interrupted") or "interrupted"),
+                    details=details,
+                )
+
+        effective_end = max(0.0, float(sim_end))
+        for key in list(active):
+            _close(key, effective_end, completed=False, status="open_at_simulation_end")
+        return sessions
+
+    def _battery_charge_sessions(self) -> list[dict[str, Any]]:
+        return self._battery_charge_sessions_from_events(
+            self.logger.events,
+            float(getattr(getattr(self, "env", None), "now", 0.0) or 0.0),
+        )
+
+    @staticmethod
+    def _battery_charge_time_in_interval(
+        sessions: list[dict[str, Any]],
+        start_t: float,
+        end_t: float,
+    ) -> float:
+        interval_start = float(start_t)
+        interval_end = max(interval_start, float(end_t))
+        total = 0.0
+        for session in sessions:
+            raw_started_at = session.get("started_at")
+            raw_ended_at = session.get("ended_at")
+            session_start = interval_start if raw_started_at is None else float(raw_started_at)
+            session_end = interval_end if raw_ended_at is None else float(raw_ended_at)
+            total += max(
+                0.0,
+                min(interval_end, session_end) - max(interval_start, session_start),
+            )
+        return total
+
+    def _battery_service_metrics(self) -> dict[str, Any]:
+        charge_started = 0
+        swap_count = 0
+        delivery_count = 0
+        preventive_maintenance_task_count = 0
+
+        for event in self.logger.events:
+            event_type = str(event.get("type", "")).strip().upper()
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            if event_type == "BATTERY_CHARGE_STARTED":
+                charge_started += 1
+            elif event_type == "BATTERY_SWAP":
+                swap_count += 1
+            elif event_type == "BATTERY_DELIVERED":
+                delivery_count += 1
+            elif event_type == "AGENT_TASK_START":
+                if str(details.get("task_type", "")).strip().upper() == "PREVENTIVE_MAINTENANCE":
+                    preventive_maintenance_task_count += 1
+
+        sessions = self._battery_charge_sessions()
+        completed_sessions = [session for session in sessions if bool(session.get("completed"))]
+        charge_time_min = sum(float(session.get("duration_min", 0.0) or 0.0) for session in sessions)
+        charge_count_by_worker: dict[str, int] = defaultdict(int)
+        charge_time_by_worker: dict[str, float] = defaultdict(float)
+        for session in sessions:
+            worker_id = str(session.get("worker_id", "")).strip()
+            if not worker_id:
+                continue
+            if bool(session.get("completed")):
+                charge_count_by_worker[worker_id] += 1
+            charge_time_by_worker[worker_id] += float(session.get("duration_min", 0.0) or 0.0)
+
+        return {
+            "battery_service_mode": self.battery_service_mode,
+            "battery_charge_started_count": int(charge_started),
+            "battery_charge_count": int(len(completed_sessions)),
+            "battery_charge_time_min": round(charge_time_min, 3),
+            "battery_charge_count_by_worker": dict(sorted(charge_count_by_worker.items())),
+            "battery_charge_time_min_by_worker": {
+                key: round(value, 3) for key, value in sorted(charge_time_by_worker.items())
+            },
+            "battery_swap_count": int(swap_count),
+            "battery_delivery_count": int(delivery_count),
+            "preventive_maintenance_task_count": int(preventive_maintenance_task_count),
         }
 
     def _repair_collaboration_metrics(self) -> dict[str, Any]:
@@ -4636,7 +5987,7 @@ class ManufacturingWorld:
             if machine_id not in self.machines:
                 continue
             t = float(event.get("t", 0.0) or 0.0)
-            if event_type == "MACHINE_START":
+            if event_type in {"MACHINE_START", "MACHINE_RESUME"}:
                 active_processing[machine_id] = t
             elif event_type in {"MACHINE_END", "MACHINE_ABORTED"}:
                 start = active_processing.pop(machine_id, None)
@@ -4922,7 +6273,9 @@ class ManufacturingWorld:
     def _warehouse_push_material(self, station: int) -> str:
         item_id = self._next_item_id(f"MAT-S{station}")
         self.items[item_id] = Item(item_id=item_id, item_type="material", created_at=self.env.now, current_station=station)
-        self._push_material_queue(station, item_id)
+        if not self._push_material_queue(station, item_id):
+            self.items.pop(item_id, None)
+            raise ValueError(f"Initial inventory exceeds material_queue_{station} capacity.")
         return item_id
 
     def _ensure_material_shelf_slots(self) -> None:
@@ -4950,6 +6303,20 @@ class ManufacturingWorld:
     def _material_shelf_count(self) -> int:
         self._ensure_material_shelf_slots()
         return sum(1 for slot in self.warehouse_material_shelf_slots.values() if slot.get("material_item_id"))
+
+    def _material_matches_supply_station(self, item_id: str, station: int | None) -> bool:
+        if station is None or not self.minimize_makespan_enabled:
+            return True
+        return self.initial_batch_material_station.get(str(item_id)) == int(station)
+
+    def _material_shelf_count_for_station(self, station: int) -> int:
+        self._ensure_material_shelf_slots()
+        return sum(
+            1
+            for slot in self.warehouse_material_shelf_slots.values()
+            if slot.get("material_item_id")
+            and self._material_matches_supply_station(str(slot["material_item_id"]), station)
+        )
 
     def _restock_material_shelf(self, *, reason: str, target_fill: int | None = None) -> int:
         self._ensure_material_shelf_slots()
@@ -4996,6 +6363,7 @@ class ManufacturingWorld:
                     "slots": restocked_slots,
                 },
             )
+            self._rolling_horizon_request_candidate_refresh("warehouse_material_restock")
         return len(restocked_slots)
 
     def _first_available_material_shelf_slot(
@@ -5004,6 +6372,7 @@ class ManufacturingWorld:
         task_id: str = "",
         exclude_item_ids: set[str] | None = None,
         exclude_slot_ids: set[str] | None = None,
+        station: int | None = None,
     ) -> dict[str, Any] | None:
         self._ensure_material_shelf_slots()
         excluded_items = exclude_item_ids or set()
@@ -5014,6 +6383,8 @@ class ManufacturingWorld:
                 continue
             item_id = str(slot.get("material_item_id") or "").strip()
             if item_id in excluded_items:
+                continue
+            if item_id and not self._material_matches_supply_station(item_id, station):
                 continue
             if item_id and not self._item_reserved_by_other(item_id, agent_id, task_id):
                 return slot
@@ -5031,6 +6402,7 @@ class ManufacturingWorld:
         self._release_task_item_reservations(task, reason="material_rebind")
         excluded_slots = exclude_slot_ids or set()
         preferred_slot_id = str(preferred_slot_id or "").strip()
+        supply_station = int(task.payload["station"]) if task.payload.get("station") is not None else None
         candidates: list[dict[str, Any]] = []
         if preferred_slot_id and preferred_slot_id not in excluded_slots:
             preferred = self.warehouse_material_shelf_slots.get(preferred_slot_id)
@@ -5041,6 +6413,7 @@ class ManufacturingWorld:
             agent.agent_id,
             task.task_id,
             exclude_slot_ids=excluded_slots | ({preferred_slot_id} if preferred_slot_id else set()),
+            station=supply_station,
         )
         if first_slot is not None:
             candidates.append(first_slot)
@@ -5049,6 +6422,8 @@ class ManufacturingWorld:
             slot_id = str(slot.get("slot_id") or "").strip()
             item_id = str(slot.get("material_item_id") or "").strip()
             if not slot_id or not item_id or slot_id in excluded_slots:
+                continue
+            if not self._material_matches_supply_station(item_id, supply_station):
                 continue
             if self._reserve_item_for_task(
                 agent,
@@ -5122,13 +6497,38 @@ class ManufacturingWorld:
                 "shelf_capacity": self.material_shelf_capacity,
             },
         )
+        self._rolling_horizon_request_candidate_refresh("warehouse_material_picked")
         return str(slot.get("slot_id", "")), stored_item_id
 
     def machine_failure_lambda(self, machine: Machine) -> float:
         multiplier = self.pm_lambda_multiplier if self.env.now < machine.pm_until else 1.0
         return self.machine_failure_base_lambda * multiplier
 
-    def _repair_total_work_min(self) -> float:
+    def sample_machine_failure_delay(self, machine: Machine, failure_rate: float) -> float:
+        machine_id = str(machine.machine_id)
+        rng = self.machine_failure_rngs.get(machine_id)
+        if rng is None:
+            rng = _stable_random_stream(
+                self.seed,
+                f"{self.scenario_key}:machine_failure:{machine_id}",
+            )
+            self.machine_failure_rngs[machine_id] = rng
+        return max(1.0, float(rng.expovariate(float(failure_rate))))
+
+    def _humanoid_incident_random(self, worker_id: str, incident_code: str) -> float:
+        key = (str(worker_id).strip(), str(incident_code).strip().upper())
+        rng = self.humanoid_incident_rngs.get(key)
+        if rng is None:
+            rng = _stable_random_stream(
+                self.seed,
+                f"{self.scenario_key}:humanoid_incident:{key[0]}:{key[1]}",
+            )
+            self.humanoid_incident_rngs[key] = rng
+        return float(rng.random())
+
+    def _repair_total_work_min(self, machine: Machine | None = None) -> float:
+        if machine is not None and float(machine.repair_sampled_work_min or 0.0) > 0.0:
+            return float(machine.repair_sampled_work_min)
         return float(self.machine_failure_cfg["repair_time_min"])
 
     def _repair_team_size(self, machine: Machine) -> int:
@@ -5195,7 +6595,7 @@ class ManufacturingWorld:
             "repair_team": list(machine.repair_team),
             "repair_team_size": self._repair_team_size(machine),
             "repair_remaining_min": round(float(machine.repair_work_remaining_min), 3),
-            "repair_total_min": round(self._repair_total_work_min(), 3),
+            "repair_total_min": round(self._repair_total_work_min(machine), 3),
         }
         if reason:
             details["reason"] = reason
@@ -5231,7 +6631,7 @@ class ManufacturingWorld:
         if self._repair_team_size(machine) >= self.max_repair_agents:
             return False
         if machine.repair_work_remaining_min <= 0.0:
-            machine.repair_work_remaining_min = self._repair_total_work_min()
+            machine.repair_work_remaining_min = self._repair_total_work_min(machine)
         self._refresh_repair_progress(machine)
         machine.repair_team.append(agent_id)
         self._sync_repair_owner(machine)
@@ -5286,7 +6686,7 @@ class ManufacturingWorld:
                 "by": team_snapshot[0] if team_snapshot else "",
                 "repair_team": team_snapshot,
                 "repair_team_size": len(team_snapshot),
-                "repair_total_min": round(self._repair_total_work_min(), 3),
+                "repair_total_min": round(self._repair_total_work_min(machine), 3),
             },
         )
         done_event = self._ensure_repair_done_event(machine)
@@ -5330,12 +6730,17 @@ class ManufacturingWorld:
             return
         was_processing = machine.state == MachineState.PROCESSING
         machine.broken = True
-        machine.setup_ready = False
         machine.failures += 1
         machine.failed_since = self.env.now
         machine.repair_team = []
         machine.repair_owner = None
-        machine.repair_work_remaining_min = self._repair_total_work_min()
+        machine.repair_sampled_work_min = self.timing.sample_step_duration(
+            "REPAIR_MACHINE",
+            "REPAIR_MACHINE/s03_execute_maintenance_action",
+            sample_key=f"{machine.machine_id}:failure:{machine.failures}",
+        )
+        machine.repair_work_remaining_min = machine.repair_sampled_work_min
+        machine.setup_ready = bool(was_processing and machine.active_cycle_id)
         machine.repair_last_progress_at = None
         machine.repair_done_event = None
         machine.repair_monitor_process = None
@@ -5347,8 +6752,15 @@ class ManufacturingWorld:
             event_type="MACHINE_BROKEN",
             entity_id=machine.machine_id,
             location=f"Station{machine.station}",
-            details={"reason": reason},
+            details={
+                "reason": reason,
+                "sampled_repair_time_min": round(float(machine.repair_sampled_work_min), 6),
+                "repair_time_distribution": self.timing.distribution_for_step(
+                    "REPAIR_MACHINE", "REPAIR_MACHINE/s03_execute_maintenance_action"
+                ).to_dict(),
+            },
         )
+        self._rolling_horizon_invalidate_machine_work(machine.machine_id)
         self.emit_incident(
             "machine_broken",
             affected_entities=[machine.machine_id, f"Station{machine.station}"],
@@ -5356,7 +6768,7 @@ class ManufacturingWorld:
             details={"reason": reason, "station": machine.station},
             notify_workers=[agent_id for agent_id, agent in self.agents.items() if self.agent_display_location(agent) == f"Station{machine.station}"],
         )
-        self._rolling_horizon_collect_immediate_candidates("machine_broken")
+        self._rolling_horizon_request_candidate_refresh("machine_broken")
         if was_processing and machine.active_process is not None and machine.active_process.is_alive:
             machine.active_process.interrupt("machine_breakdown")
 
@@ -5368,6 +6780,8 @@ class ManufacturingWorld:
         if at_t is None or float(at_t) <= now:
             return max(0.0, self._update_battery_accounting(agent, now))
         current = self._update_battery_accounting(agent, now)
+        if agent.charging_started_at is not None:
+            return current
         future_delta = max(0.0, float(at_t) - now)
         return max(0.0, current - future_delta * self._battery_drain_rate_multiplier(agent))
 
@@ -5403,7 +6817,14 @@ class ManufacturingWorld:
             elapsed = max(0.0, now - last)
             remaining_raw = getattr(agent, "battery_remaining_budget_min", period)
             remaining = float(remaining_raw if remaining_raw is not None else period)
-            agent.battery_remaining_budget_min = max(0.0, remaining - elapsed * self._battery_drain_rate_multiplier(agent))
+            if agent.charging_started_at is not None:
+                target = float(agent.charging_target_budget_min or period)
+                duration = max(1e-9, float(agent.charging_duration_min or 0.0))
+                start_budget = float(agent.charging_start_budget_min or 0.0)
+                progress = min(1.0, max(0.0, (now - float(agent.charging_started_at)) / duration))
+                agent.battery_remaining_budget_min = min(target, start_budget + (target - start_budget) * progress)
+            else:
+                agent.battery_remaining_budget_min = max(0.0, remaining - elapsed * self._battery_drain_rate_multiplier(agent))
             agent.battery_last_accounted_at = now
         budget_raw = getattr(agent, "battery_remaining_budget_min", period)
         return float(budget_raw if budget_raw is not None else period)
@@ -5414,16 +6835,38 @@ class ManufacturingWorld:
         agent.battery_remaining_budget_min = float(self.battery_swap_period_min)
         agent.battery_last_accounted_at = now
         agent.battery_accounting_swap_at = now
+        agent.charging_started_at = None
+        agent.charging_start_budget_min = None
+        agent.charging_target_budget_min = None
+        agent.charging_duration_min = 0.0
+        agent.charging_dock_id = None
+
+    def _assigned_charging_dock(self, agent: Agent) -> str:
+        return f"charging_dock_{agent.agent_id}"
+
+    def _worker_at_assigned_charging_dock(self, agent: Agent) -> bool:
+        if self.grid_map is None or agent.tile is None:
+            return self.agent_display_location(agent) == "BatteryStation"
+        return agent.tile in self.grid_map.service_tiles.get(self._assigned_charging_dock(agent), [])
+
+    def _battery_service_target(self, agent: Agent) -> str:
+        return self._assigned_charging_dock(agent) if self.battery_direct_charge_enabled else "battery_rack"
 
     def _battery_service_margin_min(self) -> float:
         return max(3.0, float(self.movement_cfg.get("setup_min", 3.0)) + 1.0)
 
     def _battery_swap_service_min(self, agent: Agent) -> float:
         origin = self.agent_display_location(agent)
-        return float(self.travel_time(origin, "battery_rack")) + float(self.agent_cfg["battery_pickup_time_min"])
+        target = self._battery_service_target(agent)
+        return float(self.travel_time(origin, target)) + float(self.agent_cfg["battery_pickup_time_min"])
 
     def _battery_mandatory_threshold(self, agent: Agent) -> float:
         configured = float(self._rule("world.battery.mandatory_swap_threshold_min", 15.0))
+        if self.battery_direct_charge_enabled:
+            configured = max(
+                configured,
+                float(self.battery_swap_period_min) * float(self.battery_charge_low_threshold_ratio),
+            )
         if getattr(self, "rolling_horizon_enabled", False):
             configured = max(configured, float(self.battery_swap_period_min) * float(self.rolling_horizon_battery_low_ratio))
         physical = self._battery_swap_service_min(agent) + self._battery_service_margin_min()
@@ -5455,7 +6898,50 @@ class ManufacturingWorld:
             return "power_low"
         return "power_normal"
 
+    def _close_interrupted_direct_charge(
+        self,
+        agent: Agent,
+        *,
+        task_id: str,
+        reason: str,
+    ) -> float:
+        if agent.charging_started_at is None:
+            return 0.0
+        charge_started_at = float(agent.charging_started_at)
+        dock_id = str(agent.charging_dock_id or self._assigned_charging_dock(agent))
+        planned_duration = max(0.0, float(agent.charging_duration_min or 0.0))
+        self._update_battery_accounting(agent)
+        actual_duration = max(0.0, float(self.env.now) - charge_started_at)
+        current_budget = max(0.0, float(agent.battery_remaining_budget_min or 0.0))
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="BATTERY_CHARGE_INTERRUPTED",
+            entity_id=agent.agent_id,
+            location=dock_id,
+            details={
+                "task_id": str(task_id),
+                "charging_dock_id": dock_id,
+                "actual_charge_duration_min": round(actual_duration, 6),
+                "planned_charge_duration_min": round(planned_duration, 6),
+                "final_soc": round(
+                    current_budget / max(1e-9, float(self.battery_swap_period_min)),
+                    6,
+                ),
+                "reason": str(reason or "task_interrupted"),
+            },
+        )
+        agent.charging_started_at = None
+        agent.charging_start_budget_min = None
+        agent.charging_target_budget_min = None
+        agent.charging_duration_min = 0.0
+        agent.charging_dock_id = None
+        self._sync_humanoid_power_state(agent)
+        return actual_duration
+
     def _sync_humanoid_power_state(self, agent: Agent) -> None:
+        if agent.charging_started_at is not None:
+            return
         event_type = self._humanoid_power_event_for_battery(agent)
         target_power = {
             "power_normal": "POWER_NORMAL",
@@ -5483,44 +6969,57 @@ class ManufacturingWorld:
         )
 
     def _battery_monitor_sleep_min(self, agent: Agent, eps: float = 1e-6) -> float:
+        if agent.charging_started_at is not None:
+            elapsed = max(0.0, float(self.env.now) - float(agent.charging_started_at))
+            return max(eps, min(1.0, max(0.0, float(agent.charging_duration_min) - elapsed)))
         remaining = max(0.0, float(self.battery_remaining(agent)))
         critical = max(0.0, float(self._battery_mandatory_threshold(agent)))
         low = max(critical, float(self._battery_low_alert_threshold(agent)))
         if remaining > low + eps:
-            return max(eps, remaining - low)
+            wait = max(eps, remaining - low)
+            return min(1.0, wait) if self.battery_direct_charge_enabled else wait
         if remaining > critical + eps:
-            return max(eps, remaining - critical)
-        return max(eps, remaining)
+            wait = max(eps, remaining - critical)
+            return min(1.0, wait) if self.battery_direct_charge_enabled else wait
+        wait = max(eps, remaining)
+        return min(1.0, wait) if self.battery_direct_charge_enabled else wait
 
     def _task_estimated_duration(self, agent: Agent, task: Task) -> float:
-        task_type = str(task.task_type).strip().upper()
-        if task_type == "BATTERY_SWAP":
-            return self._battery_swap_service_min(agent)
-        if task_type == "REPAIR_MACHINE":
+        priority_key = str(task.priority_key or task.task_type).strip().lower()
+        task_code = str(task.task_code or TASK_CODE_BY_PRIORITY_KEY.get(priority_key, "")).strip().upper()
+        service_expected = self.timing.expected_task_duration(task_code) if task_code in self.timing.task_steps else 0.0
+
+        if priority_key in {"battery_swap", "battery_charge"}:
+            return float(self.travel_time(self.agent_display_location(agent), self._battery_service_target(agent))) + service_expected
+        if priority_key == "repair_machine":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
             active_helpers = self._repair_team_size(machine)
             future_team_size = min(self.max_repair_agents, active_helpers + (0 if agent.agent_id in machine.repair_team else 1))
             future_team_size = max(1, future_team_size)
-            remaining = float(machine.repair_work_remaining_min) if machine.repair_work_remaining_min > 0.0 else self._repair_total_work_min()
-            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + (remaining / future_team_size)
-        if task_type == "PREVENTIVE_MAINTENANCE":
+            action_expected = self.timing.expected_call_duration("REPAIR_MACHINE", "EXECUTE_MAINTENANCE_ACTION")
+            return (
+                float(self.travel_time(self.agent_display_location(agent), machine.machine_id))
+                + max(0.0, service_expected - action_expected)
+                + (action_expected / future_team_size)
+            )
+        if priority_key == "preventive_maintenance":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
-            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + float(self.machine_failure_cfg["pm_time_min"])
-        if task_type == "UNLOAD_MACHINE":
+            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + service_expected
+        if priority_key == "unload_machine":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
             output_buffer_id = f"output_buffer_station_{machine.station}"
             return (
                 float(self.travel_time(self.agent_display_location(agent), machine.machine_id))
-                + float(self.movement_cfg["unload_min"])
+                + service_expected
                 + float(self.travel_time(machine.machine_id, output_buffer_id))
             )
-        if task_type == "LOAD_MACHINE":
+        if priority_key == "load_machine":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
@@ -5531,21 +7030,27 @@ class ManufacturingWorld:
             return (
                 float(self.travel_time(self.agent_display_location(agent), source))
                 + float(self.travel_time(source, machine.machine_id))
-                + max(0.1, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.1) or 0.1))
+                + service_expected
             )
-        if task_type == "SETUP_MACHINE":
+        if priority_key == "setup_machine":
             machine = self.machines.get(str(task.payload.get("machine_id", "")))
             if machine is None:
                 return 0.0
-            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + float(self.movement_cfg["setup_min"])
-        if task_type == "INSPECT_PRODUCT":
+            return float(self.travel_time(self.agent_display_location(agent), machine.machine_id)) + service_expected
+        if priority_key == "inspect_product":
             return (
-                float(self.travel_time(self.agent_display_location(agent), "intermediate_queue_4"))
-                + float(self.travel_time("intermediate_queue_4", "inspection_table"))
-                + float(self.inspection_base_time_min)
-                + float(self.travel_time("inspection_table", "inspection_output_queue"))
+                float(self.travel_time(self.agent_display_location(agent), self.inspection_workstation_id))
+                + service_expected
             )
-        if task_type == "HANDOVER_ITEM":
+        if priority_key in {"load_inspection_desk", "unload_inspection_desk"}:
+            source = str(task.payload.get("source") or "")
+            destination = str(task.payload.get("destination") or "")
+            return (
+                float(self.travel_time(self.agent_display_location(agent), source))
+                + float(self.travel_time(source, destination))
+                + service_expected
+            )
+        if priority_key == "handover_item":
             source_agent = self.agents.get(str(task.payload.get("source_agent_id", "")))
             session = self.product_transport_sessions.get(str(task.payload.get("transport_session_id", "")))
             if source_agent is None or not isinstance(session, dict):
@@ -5554,12 +7059,16 @@ class ManufacturingWorld:
             if not math.isfinite(travel):
                 return 0.0
             remaining = self._product_session_remaining_travel_min(session, future_extra_carriers=1)
-            return travel + remaining
-        if task_type == "TRANSFER":
+            return travel + remaining + service_expected
+        if priority_key == "material_supply":
+            station = int(task.payload.get("station", 1) or 1)
+            return (
+                float(self.travel_time(self.agent_display_location(agent), "Warehouse"))
+                + float(self.travel_time("Warehouse", f"material_queue_{station}"))
+                + service_expected
+            )
+        if priority_key in {"inter_station_transfer", "battery_delivery_low_battery", "battery_delivery_discharged"}:
             transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
-            if transfer_kind == "material_supply":
-                station = int(task.payload.get("station", 1) or 1)
-                return float(self.travel_time(self.agent_display_location(agent), "Warehouse")) + float(self.travel_time("Warehouse", f"material_queue_{station}"))
             if transfer_kind == "inter_station":
                 from_station = int(task.payload.get("from_station", 1) or 1)
                 from_location = "Inspection" if from_station == self.inspection_queue_station else f"Station{from_station}"
@@ -5572,18 +7081,22 @@ class ManufacturingWorld:
                 to_target = "warehouse_buffer" if from_station == self.inspection_queue_station else (
                     f"intermediate_queue_{from_station + 1}" if (from_station + 1) <= self.last_processing_station else "intermediate_queue_4"
                 )
-                return float(self.travel_time(self.agent_display_location(agent), from_target)) + float(self.travel_time(from_location, to_target))
+                return (
+                    float(self.travel_time(self.agent_display_location(agent), from_target))
+                    + float(self.travel_time(from_location, to_target))
+                    + service_expected
+                )
             if transfer_kind == "battery_delivery":
                 target_agent = self.agents.get(str(task.payload.get("target_agent_id", "")))
                 if target_agent is None:
-                    return self._battery_swap_service_min(agent)
+                    return service_expected
                 return (
                     float(self.travel_time(self.agent_display_location(agent), "battery_rack"))
-                    + float(self.agent_cfg["battery_pickup_time_min"])
                     + float(self.travel_time("battery_rack", self.agent_display_location(target_agent)))
-                    + float(self.agent_cfg["battery_delivery_extra_min"])
+                    + service_expected
                 )
-        return 0.0
+        target = str(task.location or task.payload.get("target") or "")
+        return (float(self.travel_time(self.agent_display_location(agent), target)) if target else 0.0) + service_expected
 
     def _emit_low_battery_alert_if_needed(self, agent: Agent) -> None:
         if agent.discharged:
@@ -5618,22 +7131,42 @@ class ManufacturingWorld:
             return False
         return agent.discharged or self.battery_remaining(agent) <= eps
 
+    def _terminate_simulation(self, reason: str) -> None:
+        if self.terminated:
+            return
+        self.pending_termination_reason = ""
+        self.pending_termination_agent_id = ""
+        self.terminated = True
+        self.termination_reason = str(reason)
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="SIM_TERMINATED",
+            entity_id="system",
+            location="Factory",
+            details={"reason": self.termination_reason, "objective_mode": self.objective_mode},
+        )
+        if not self.termination_event.triggered:
+            self.termination_event.succeed(self.termination_reason)
+
+    def _request_simulation_termination(self, reason: str, *, after_agent_id: str = "") -> None:
+        agent_id = str(after_agent_id or "").strip()
+        agent = self.agents.get(agent_id) if agent_id else None
+        if agent is not None and agent.current_task_id:
+            self.pending_termination_reason = str(reason)
+            self.pending_termination_agent_id = agent_id
+            return
+        self._terminate_simulation(reason)
+
+    def terminate_at_objective_limit(self) -> None:
+        if self.minimize_makespan_enabled and not self.terminated:
+            self._terminate_simulation("makespan_max_days_reached")
+
     def check_all_agents_discharged(self) -> None:
         if self.terminated:
             return
         if self.agents and all(a.discharged for a in self.agents.values()):
-            self.terminated = True
-            self.termination_reason = "all_agents_discharged"
-            self.logger.log(
-                t=self.env.now,
-                day=self.day_for_time(self.env.now),
-                event_type="SIM_TERMINATED",
-                entity_id="system",
-                location="Factory",
-                details={"reason": self.termination_reason},
-            )
-            if not self.termination_event.triggered:
-                self.termination_event.succeed(self.termination_reason)
+            self._terminate_simulation("all_agents_discharged")
 
     def _clear_in_transit(self, agent: Agent) -> None:
         agent.in_transit_from = None
@@ -5649,10 +7182,17 @@ class ManufacturingWorld:
         agent.current_move_segment_index = 0
         agent.current_move_segment_from_tile = None
         agent.current_move_segment_to_tile = None
+        agent.current_move_segment_event_started = False
         agent.current_move_logical_destination = None
         agent.current_move_started_at = None
 
-    def _close_current_move_segment(self, agent: Agent, *, logical_destination: str | None = None) -> None:
+    def _close_current_move_segment(
+        self,
+        agent: Agent,
+        *,
+        logical_destination: str | None = None,
+        reason: str = "segment_cancelled",
+    ) -> None:
         """Cancel an in-flight tile segment without claiming arrival.
 
         This path is used before the segment timeout completes (incident,
@@ -5667,9 +7207,28 @@ class ManufacturingWorld:
             return
         if self.traffic_monitor is not None:
             self.traffic_monitor.cancel_segment(agent.agent_id, move_id, segment_index)
+        if bool(getattr(agent, "current_move_segment_event_started", False)):
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="AGENT_MOVE_TILE_CANCELLED",
+                entity_id=agent.agent_id,
+                location=self.agent_display_location(agent),
+                details={
+                    "move_id": move_id,
+                    "segment_index": segment_index,
+                    "from_tile": self._tile_payload(from_tile),
+                    "to_tile": self._tile_payload(to_tile),
+                    "committed_tile": self._tile_payload(agent.tile),
+                    "logical_destination": str(logical_destination or agent.current_move_logical_destination or ""),
+                    "status": "interrupted",
+                    "reason": str(reason or "segment_cancelled"),
+                },
+            )
         agent.current_move_segment_index = 0
         agent.current_move_segment_from_tile = None
         agent.current_move_segment_to_tile = None
+        agent.current_move_segment_event_started = False
 
     def _log_interrupted_move(self, agent: Agent, *, reason: str, logical_destination: str | None = None) -> None:
         move_id = str(agent.current_move_id or "")
@@ -5970,11 +7529,25 @@ class ManufacturingWorld:
         self.check_all_agents_discharged()
 
     def start_agent_task(self, agent: Agent, task: Task, start_t: float) -> None:
+        depleted_dock_charge = bool(
+            agent.discharged
+            and task.task_type == "BATTERY_CHARGE"
+            and self.battery_direct_charge_enabled
+            and self._worker_at_assigned_charging_dock(agent)
+        )
+        if agent.discharged and not depleted_dock_charge:
+            raise RuntimeError(
+                f"Discharged worker {agent.agent_id} cannot start task {task.task_type}; "
+                "only charging at its assigned dock is allowed."
+            )
         agent.current_task_id = task.task_id
         agent.current_task_type = task.task_type
         agent.current_task_code = task.task_code or ""
         agent.current_task_instance_id = task.instance_id or ""
         agent.current_task_payload = copy.deepcopy(task.payload) if isinstance(task.payload, dict) else {}
+        agent.current_task_selection_meta = (
+            copy.deepcopy(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
+        )
         agent.current_child_task_code = None
         agent.current_child_task_name = None
         agent.current_child_task_instance_id = None
@@ -5983,11 +7556,15 @@ class ManufacturingWorld:
         agent.current_task_started_at = start_t
         self._transition_humanoid_state(
             agent,
-            "task_assigned",
-            reason="task_selected",
+            # HumanoidSim deliberately disallows DISABLED -> ASSIGNED. A fully
+            # depleted worker already at its own dock starts the recovery action
+            # directly; the regular assignment lifecycle remains unchanged.
+            "task_started" if depleted_dock_charge else "task_assigned",
+            reason="depleted_dock_charge_started" if depleted_dock_charge else "task_selected",
             source="mansim.task_selection",
             task=task,
-            status="pending",
+            status="running" if depleted_dock_charge else "pending",
+            reconcile_power=not depleted_dock_charge,
         )
         selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
         details: dict[str, Any] = {
@@ -6008,6 +7585,15 @@ class ManufacturingWorld:
             "agent_role": self.current_agent_role(agent.agent_id),
             "commitment_id": agent.current_commitment_id,
         }
+        for key in (
+            "task_rule_id",
+            "role_number",
+            "role_task_code",
+            "role_owner_agent_id",
+            "role_display_name",
+        ):
+            if key in selection:
+                details[key] = copy.deepcopy(selection.get(key))
         if selection:
             if "decision_source" in selection:
                 details["decision_source"] = selection.get("decision_source")
@@ -6072,11 +7658,24 @@ class ManufacturingWorld:
     def finish_agent_task(self, agent: Agent, task: Task, start_t: float, status: str, reason: str = "") -> None:
         end_t = self.env.now
         duration = max(0.0, end_t - start_t)
+        selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
+        role_event_details = {
+            key: copy.deepcopy(selection.get(key))
+            for key in (
+                "task_rule_id",
+                "role_number",
+                "role_task_code",
+                "role_owner_agent_id",
+                "role_display_name",
+            )
+            if key in selection
+        }
         preserve_carrying = status == "interrupted" and reason in {"battery_depleted", "battery_swap_wait", "horizon_reached"}
         preserve_reservations = preserve_carrying and agent.suspended_task is task
         if not preserve_reservations:
             self._release_task_domain_owner(agent, task, reason=f"{status}:{reason}")
             self._release_task_item_reservations(task, reason=f"{status}:{reason}")
+            self._release_task_buffer_slot(task, reason=f"{status}:{reason}")
         if (not preserve_carrying) and (agent.carrying_item_id is not None or agent.carrying_item_type is not None):
             self._clear_agent_carrying(agent, destination=agent.location, emit_event=True)
         recovered_before_incomplete_end = status != "completed" and self._task_recovered_before_incomplete_end(agent, task)
@@ -6109,6 +7708,8 @@ class ManufacturingWorld:
                 "args": task.args,
                 "humanoid": task.humanoid,
                 "humanoid_state": self._humanoid_state_payload(agent),
+                "selection": selection,
+                **role_event_details,
             },
         )
         if agent.discharged:
@@ -6158,7 +7759,6 @@ class ManufacturingWorld:
             else:
                 agent.last_recovery_completed_task_id = None
                 agent.last_recovery_completed_at = None
-        selection = dict(task.selection_meta) if isinstance(task.selection_meta, dict) else {}
         self.task_records.append(
             {
                 "day": self.day_for_time(end_t),
@@ -6177,6 +7777,7 @@ class ManufacturingWorld:
                 "decision_rule": str(selection.get("decision_rule", "")),
                 "decision_trace_id": str(selection.get("decision_trace_id", "")),
                 "expected_task_signature": selection.get("expected_task_signature", {}),
+                **role_event_details,
             }
         )
         if status == "completed":
@@ -6208,6 +7809,7 @@ class ManufacturingWorld:
         agent.current_task_code = None
         agent.current_task_instance_id = None
         agent.current_task_payload = {}
+        agent.current_task_selection_meta = {}
         agent.current_child_task_code = None
         agent.current_child_task_name = None
         agent.current_child_task_instance_id = None
@@ -6220,9 +7822,41 @@ class ManufacturingWorld:
         agent.current_primitive_call_code = None
         agent.current_task_started_at = None
         agent.current_commitment_id = None
+        self._rolling_horizon_request_candidate_refresh("task_finished")
+        pending_reason = str(getattr(self, "pending_termination_reason", "") or "")
+        pending_agent_id = str(getattr(self, "pending_termination_agent_id", "") or "")
+        if pending_reason and pending_agent_id == agent.agent_id:
+            reason_to_emit = pending_reason
+            self.pending_termination_reason = ""
+            self.pending_termination_agent_id = ""
+            self._terminate_simulation(reason_to_emit)
 
     def handle_task_interruption(self, agent: Agent, task: Task, reason: str) -> None:
         if reason in {"battery_depleted", "battery_swap_wait"}:
+            if (
+                reason == "battery_depleted"
+                and task.task_type == "BATTERY_CHARGE"
+                and self.battery_direct_charge_enabled
+                and not self._worker_at_assigned_charging_dock(agent)
+            ):
+                if agent.battery_service_owner == agent.agent_id:
+                    agent.battery_service_owner = None
+                agent.suspended_task = None
+                task.payload["failure_reason"] = "battery_depleted_before_charging_dock"
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="BATTERY_CHARGE_ABORTED",
+                    entity_id=agent.agent_id,
+                    location=self.agent_display_location(agent),
+                    details={
+                        "task_type": task.task_type,
+                        "task_id": task.task_id,
+                        "charging_dock_id": self._assigned_charging_dock(agent),
+                        "reason": "battery_depleted_before_charging_dock",
+                    },
+                )
+                return
             if task.task_type == "REPAIR_MACHINE":
                 machine = self.machines.get(task.payload.get("machine_id"))
                 if machine is not None:
@@ -6245,7 +7879,7 @@ class ManufacturingWorld:
                     notify_workers=[agent.agent_id],
                 )
                 return
-            if task.task_type == "BATTERY_SWAP" and agent.battery_service_owner == agent.agent_id:
+            if task.task_type in {"BATTERY_SWAP", "BATTERY_CHARGE"} and agent.battery_service_owner == agent.agent_id:
                 # If an agent gets discharged while trying to self-swap,
                 # allow others to deliver a battery for rescue.
                 agent.battery_service_owner = None
@@ -6270,7 +7904,7 @@ class ManufacturingWorld:
             )
             return
 
-        if task.task_type == "BATTERY_SWAP":
+        if task.task_type in {"BATTERY_SWAP", "BATTERY_CHARGE"}:
             if agent.battery_service_owner == agent.agent_id:
                 agent.battery_service_owner = None
 
@@ -6287,7 +7921,7 @@ class ManufacturingWorld:
                 moved_id = task.payload.pop("transfer_item_id", None)
                 if moved_id is None:
                     moved_id = task.payload.pop("transfer_intermediate_id", None)
-                if moved_id is not None:
+                if moved_id is not None and str(moved_id) not in self.dropped_items:
                     self._appendleft_if_absent(self.output_buffers[from_station], str(moved_id))
             elif transfer_kind == "material_supply":
                 station = int(task.payload.get("station", 1))
@@ -6313,7 +7947,9 @@ class ManufacturingWorld:
             task.payload.pop("item_id", None)
             task.payload.pop("material_id", None)
             task.payload.pop("intermediate_id", None)
-            if item_id is not None:
+            if item_id and item_id in self.dropped_items:
+                pass
+            elif item_id is not None:
                 if loaded_on_machine:
                     pass
                 elif load_slot == "intermediate" and station in self.intermediate_queues:
@@ -6340,11 +7976,43 @@ class ManufacturingWorld:
                 machine.unload_owner = None
 
         elif task.task_type == "INSPECT_PRODUCT":
-            if self.inspection_owner == agent.agent_id:
-                self.inspection_owner = None
-            product_id = task.payload.pop("inspection_product_id", None)
-            if product_id is not None:
-                self._appendleft_if_absent(self.intermediate_queues[self.inspection_queue_station], str(product_id))
+            # Keep the workstation owner until worker_work_loop has moved the
+            # interrupted worker off the desk service tile. finish_agent_task()
+            # releases the owner after physical egress.
+            pass
+
+        elif task.task_type == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+            product_id = str(task.payload.get("inspection_product_id") or task.payload.get("item_id") or "").strip()
+            action = str(task.payload.get("interface_action") or task.payload.get("action") or "").strip().lower()
+            placed = bool(task.payload.get("_inspection_interface_placed"))
+            if product_id and not placed and product_id not in self.dropped_items:
+                if action == "load" and self.inspection_desk_item_id != product_id:
+                    self._appendleft_if_absent(self.intermediate_queues[self.inspection_queue_station], product_id)
+                    self._set_item_state(
+                        product_id,
+                        ItemState.WAITING_INSPECTION,
+                        location="Inspection",
+                        ref=f"intermediate_queue_{self.inspection_queue_station}",
+                        item_type="product",
+                    )
+                elif action == "unload" and self.inspection_desk_item_id in {None, product_id}:
+                    result = str(task.payload.get("inspection_result") or "").strip().upper()
+                    self._set_inspection_desk_state(
+                        "INSPECTED_WAITING_UNLOAD",
+                        item_id=product_id,
+                        result=result,
+                        reason=reason,
+                    )
+                    self._set_item_state(
+                        product_id,
+                        ItemState.INSPECTED_WAITING_UNLOAD,
+                        location="Inspection",
+                        ref=self.inspection_workstation_id,
+                        item_type="product",
+                    )
+            # Owner release is deliberately deferred to finish_agent_task().
+            # Releasing it here exposes the next inspection stage while this
+            # interrupted worker still physically blocks the sole desk tile.
 
         elif task.task_type == "REPAIR_MACHINE":
             machine = self.machines.get(task.payload.get("machine_id"))
@@ -6391,7 +8059,11 @@ class ManufacturingWorld:
         self._clear_agent_carrying(agent, emit_event=False)
 
     def mandatory_task_for_agent(self, agent: Agent) -> Task | None:
-        if agent.discharged:
+        if agent.discharged and not (
+            self.battery_direct_charge_enabled
+            and self.grid_map is not None
+            and agent.tile in self.grid_map.service_tiles.get(self._assigned_charging_dock(agent), [])
+        ):
             return None
         battery_remaining = self.battery_remaining(agent)
         threshold = self._battery_mandatory_threshold(agent)
@@ -6407,11 +8079,17 @@ class ManufacturingWorld:
         ):
             return Task(
                 task_id=self._next_task_id("BAT"),
-                task_type="BATTERY_SWAP",
-                priority_key="battery_swap",
+                task_type="BATTERY_CHARGE" if self.battery_direct_charge_enabled else "BATTERY_SWAP",
+                priority_key="battery_charge" if self.battery_direct_charge_enabled else "battery_swap",
                 priority=mandatory_priority,
                 location="BatteryStation",
-                payload={"target_agent_id": agent.agent_id, "battery_remaining_min": round(battery_remaining, 3)},
+                payload={
+                    "target_agent_id": agent.agent_id,
+                    "battery_remaining_min": round(battery_remaining, 3),
+                    "action": "dock_charge" if self.battery_direct_charge_enabled else "swap_battery",
+                    "charging_dock_id": self._assigned_charging_dock(agent) if self.battery_direct_charge_enabled else "",
+                    "target_soc": self.battery_charge_target_soc,
+                },
             )
         return None
 
@@ -6427,14 +8105,17 @@ class ManufacturingWorld:
         proactive_priority = float(self._rule("world.task_priority.battery_swap", 150.0))
         return Task(
             task_id=self._next_task_id("BAT"),
-            task_type="BATTERY_SWAP",
-            priority_key="battery_swap",
+            task_type="BATTERY_CHARGE" if self.battery_direct_charge_enabled else "BATTERY_SWAP",
+            priority_key="battery_charge" if self.battery_direct_charge_enabled else "battery_swap",
             priority=proactive_priority,
             location="BatteryStation",
             payload={
                 "target_agent_id": agent.agent_id,
                 "battery_remaining_min": round(float(battery_remaining), 3),
                 "battery_safety_guard": True,
+                "action": "dock_charge" if self.battery_direct_charge_enabled else "swap_battery",
+                "charging_dock_id": self._assigned_charging_dock(agent) if self.battery_direct_charge_enabled else "",
+                "target_soc": self.battery_charge_target_soc,
             },
         )
 
@@ -6567,6 +8248,61 @@ class ManufacturingWorld:
     def _fixed_task_assignment_active(self) -> bool:
         return self.decision_mode == "fixed_task_assignment"
 
+    def _mfg_flow_policy_active(self) -> bool:
+        return bool(self.is_mfg_flow_shop and self.mfg_flow_task_policy is not None)
+
+    def _adp_active(self) -> bool:
+        return bool(
+            getattr(self, "decision_mode", None) in {"simulation_based_adp", "random_feasible_dispatch"}
+            and getattr(self, "adp_coordinator", None) is not None
+        )
+
+    def adp_dispatch_event(self, worker_id: str) -> simpy.Event:
+        if not self._adp_active():
+            return self.env.event()
+        return self.adp_coordinator.dispatch_event(str(worker_id))
+
+    def _select_adp_task(self, agent: Agent) -> Task | None:
+        if not self._adp_active():
+            return None
+        task = self.adp_coordinator.pop_task(agent.agent_id)
+        if task is None:
+            self.adp_coordinator.request("worker_idle")
+        return task
+
+    def _mfg_flow_dedicated_policy_active(self) -> bool:
+        return bool(self._mfg_flow_policy_active() and self.mfg_flow_task_policy.dedicated)
+
+    def _mfg_flow_task_rule(self, task: Task) -> Any:
+        if not self._mfg_flow_policy_active():
+            return None
+        task_code = str(
+            task.task_code
+            or TASK_CODE_BY_PRIORITY_KEY.get(self._task_priority_key(task), "")
+            or task.task_type
+        ).strip().upper()
+        return self.mfg_flow_task_policy.rule_for_task(task, task_code)
+
+    def _mfg_flow_allowed_worker_ids_for_task(self, task: Task) -> list[str]:
+        if not self._mfg_flow_policy_active():
+            return sorted(self.agents)
+        task_code = str(
+            task.task_code
+            or TASK_CODE_BY_PRIORITY_KEY.get(self._task_priority_key(task), "")
+            or task.task_type
+        ).strip().upper()
+        return self.mfg_flow_task_policy.allowed_worker_ids(task, task_code)
+
+    def _mfg_flow_task_rank(self, task: Task) -> int:
+        if not self._mfg_flow_policy_active():
+            return 9999
+        task_code = str(
+            task.task_code
+            or TASK_CODE_BY_PRIORITY_KEY.get(self._task_priority_key(task), "")
+            or task.task_type
+        ).strip().upper()
+        return int(self.mfg_flow_task_policy.rank_for_task(task, task_code))
+
     def _filter_candidates_for_agent(self, agent: Agent, candidates: list[Task]) -> list[Task]:
         filtered = list(candidates)
         battery_reserve = self._battery_swap_service_min(agent) + self._battery_service_margin_min()
@@ -6576,6 +8312,11 @@ class ManufacturingWorld:
             # latency in the reserve calculation so a feasible production task
             # cannot strand the worker just short of the charger/helper.
             battery_reserve += max(0.0, float(getattr(self, "rolling_horizon_window_min", 0.0) or 0.0))
+        elif self._adp_active():
+            battery_reserve += max(
+                0.0,
+                float(getattr(self.adp_coordinator, "max_review_interval_min", 0.0) or 0.0),
+            )
         delivery_receiver = (
             self._rolling_horizon_dedicated_roles_active()
             and agent.agent_id in set(getattr(self, "rolling_horizon_battery_delivery_receiver_agent_ids", []))
@@ -6590,7 +8331,7 @@ class ManufacturingWorld:
         battery_safe: list[Task] = []
         for task in filtered:
             family = self._task_priority_key(task)
-            if family in {"battery_swap", "battery_delivery_low_battery", "battery_delivery_discharged"}:
+            if family in {"battery_swap", "battery_charge", "battery_delivery_low_battery", "battery_delivery_discharged"}:
                 battery_safe.append(task)
                 continue
             if delivery_receiver:
@@ -6603,6 +8344,12 @@ class ManufacturingWorld:
             if self.battery_remaining(agent) >= self._task_estimated_duration(agent, task) + battery_reserve:
                 battery_safe.append(task)
         filtered = battery_safe
+        if self._mfg_flow_dedicated_policy_active():
+            filtered = [
+                task
+                for task in filtered
+                if agent.agent_id in set(self._mfg_flow_allowed_worker_ids_for_task(task))
+            ]
         if not self._fixed_task_assignment_active():
             return filtered
         allowlist = set(self.current_agent_task_allowlist(agent.agent_id))
@@ -6636,14 +8383,14 @@ class ManufacturingWorld:
             return None
         battery_candidates = [
             task for task in candidates
-            if self._task_priority_key(task) in {"battery_swap", "battery_delivery_discharged", "battery_delivery_low_battery"}
+            if self._task_priority_key(task) in {"battery_swap", "battery_charge", "battery_delivery_discharged", "battery_delivery_low_battery"}
         ]
         if not battery_candidates:
             return None
 
         def _battery_rank(task: Task) -> tuple[int, tuple[float, float, float, str, str]]:
             family = self._task_priority_key(task)
-            order = {"battery_swap": 0, "battery_delivery_discharged": 1, "battery_delivery_low_battery": 2}
+            order = {"battery_swap": 0, "battery_charge": 0, "battery_delivery_discharged": 1, "battery_delivery_low_battery": 2}
             return order.get(family, 9), self._task_sort_key(task, agent)
 
         chosen = sorted(battery_candidates, key=_battery_rank)[0]
@@ -6677,7 +8424,7 @@ class ManufacturingWorld:
                 machine_id = str(task.payload.get("machine_id", ""))
                 machine = self.machines.get(machine_id)
                 return int(machine.station) if machine is not None else None
-        if task.task_type == "INSPECT_PRODUCT":
+        if task.task_type in {"INSPECT_PRODUCT", "LOAD_UNLOAD_TRANSFER_INTERFACE"}:
             return self.inspection_queue_station
         if task.task_type == "HANDOVER_ITEM":
             return None
@@ -6719,12 +8466,70 @@ class ManufacturingWorld:
                 active.append(str(suspended.task_id or ""))
         return sorted({task_id for task_id in active if task_id})
 
+    @staticmethod
+    def _task_is_material_load_for_machine(task: Task | None, machine_id: str) -> bool:
+        if task is None or str(task.task_type).strip().upper() != "LOAD_MACHINE":
+            return False
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        return (
+            str(payload.get("machine_id", "")).strip() == str(machine_id).strip()
+            and str(payload.get("load_slot", "")).strip().lower() == "material"
+        )
+
+    def _machine_material_load_in_progress(self, machine_id: str) -> bool:
+        for agent in self.agents.values():
+            current = Task(
+                task_id=str(agent.current_task_id or ""),
+                task_type=str(agent.current_task_type or ""),
+                priority_key="",
+                priority=0.0,
+                location=str(agent.location),
+                payload=copy.deepcopy(getattr(agent, "current_task_payload", {}) or {}),
+            )
+            if current.task_id and self._task_is_material_load_for_machine(current, machine_id):
+                return True
+            suspended = agent.suspended_task if isinstance(agent.suspended_task, Task) else None
+            if self._task_is_material_load_for_machine(suspended, machine_id):
+                return True
+        return False
+
+    def _station_material_replenishment_required(self, station: int) -> bool:
+        if not self.is_mfg_flow_shop:
+            material_cfg = self.inventory_targets.get("material", {})
+            target = int(material_cfg[f"station{station}"])
+            return len(self.material_queues[station]) < target
+
+        return self._station_material_replenishment_count(station) > 0
+
+    def _station_material_replenishment_count(self, station: int) -> int:
+        if not self.is_mfg_flow_shop:
+            return 1 if self._station_material_replenishment_required(station) else 0
+
+        # Flow-shop replenishment is driven only by currently unmet machine
+        # demand. Queue contents and already-reserved inbound slots are supply;
+        # there is deliberately no line-side target stock.
+        demand = 0
+        for machine_id in self.machines_by_station.get(station, []):
+            machine = self.machines[machine_id]
+            if (
+                not machine.broken
+                and machine.state == MachineState.WAIT_INPUT
+                and machine.output_intermediate is None
+                and machine.input_material is None
+                and not self._machine_material_load_in_progress(machine_id)
+            ):
+                demand += 1
+        buffer_id = f"material_queue_{station}"
+        available_supply = len(self.material_queues[station]) + self._buffer_reserved_count(buffer_id)
+        unmet = max(0, demand - available_supply)
+        return min(unmet, self._buffer_available_slots(buffer_id))
+
     def _task_target_id(self, task: Task) -> str:
-        if task.task_type == "BATTERY_SWAP":
+        if task.task_type in {"BATTERY_SWAP", "BATTERY_CHARGE"}:
             return str(task.payload.get("target_agent_id", ""))
         if task.task_type in {"LOAD_MACHINE", "SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
             return str(task.payload.get("machine_id", ""))
-        if task.task_type == "INSPECT_PRODUCT":
+        if task.task_type in {"INSPECT_PRODUCT", "LOAD_UNLOAD_TRANSFER_INTERFACE"}:
             return "inspection"
         if task.task_type == "HANDOVER_ITEM":
             return str(task.payload.get("source_agent_id", ""))
@@ -6744,12 +8549,12 @@ class ManufacturingWorld:
         return ""
 
     def _task_target_type(self, task: Task) -> str:
-        if task.task_type == "BATTERY_SWAP":
+        if task.task_type in {"BATTERY_SWAP", "BATTERY_CHARGE"}:
             return "agent"
         if task.task_type in {"LOAD_MACHINE", "SETUP_MACHINE", "UNLOAD_MACHINE", "REPAIR_MACHINE", "PREVENTIVE_MAINTENANCE"}:
             return "machine"
-        if task.task_type == "INSPECT_PRODUCT":
-            return "station"
+        if task.task_type in {"INSPECT_PRODUCT", "LOAD_UNLOAD_TRANSFER_INTERFACE"}:
+            return "inspection_workstation"
         if task.task_type == "HANDOVER_ITEM":
             return "agent"
         if task.task_type == "TRANSFER":
@@ -6761,14 +8566,25 @@ class ManufacturingWorld:
         return "none"
 
     def _task_shareable(self, task: Task) -> bool:
-        if self._rolling_horizon_dedicated_roles_active() and str(task.task_type).strip().upper() == "REPAIR_MACHINE":
+        if (
+            self._rolling_horizon_dedicated_roles_active()
+            and not self.is_mfg_flow_shop
+            and str(task.task_type).strip().upper() == "REPAIR_MACHINE"
+        ):
             return False
         return str(task.task_type).strip().upper() == "REPAIR_MACHINE"
 
     def _task_capacity(self, task: Task) -> int:
-        if self._rolling_horizon_dedicated_roles_active() and str(task.task_type).strip().upper() == "REPAIR_MACHINE":
+        if (
+            self._rolling_horizon_dedicated_roles_active()
+            and not self.is_mfg_flow_shop
+            and str(task.task_type).strip().upper() == "REPAIR_MACHINE"
+        ):
             return 1
         if str(task.task_type).strip().upper() == "REPAIR_MACHINE":
+            machine = self.machines.get(str(task.payload.get("machine_id", "") or ""))
+            if machine is not None:
+                return max(1, self._repair_slots_remaining(machine))
             return self.max_repair_agents
         return 1
 
@@ -6786,8 +8602,15 @@ class ManufacturingWorld:
         if task.task_type == "PREVENTIVE_MAINTENANCE":
             return "A machine is idle and due for preventive maintenance."
         if task.task_type == "INSPECT_PRODUCT":
-            return "Inspection input is available for acceptance processing."
-        if task.task_type == "BATTERY_SWAP":
+            return "A staged product is waiting on the inspection workstation for quality evaluation."
+        if task.task_type == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+            action = str(task.payload.get("interface_action") or task.payload.get("action") or "").strip().lower()
+            if action == "load":
+                return "A product in the inspection input queue can be staged on the empty inspection workstation."
+            return "A classified product can be unloaded from the inspection workstation to its result queue."
+        if task.task_type in {"BATTERY_SWAP", "BATTERY_CHARGE"}:
+            if task.task_type == "BATTERY_CHARGE":
+                return "The worker is below the battery threshold and can charge at its assigned dock after the current task."
             return "The worker is below the mandatory battery threshold and can self-swap now."
         if task.task_type == "TRANSFER":
             transfer_kind = str(task.payload.get("transfer_kind", "")).strip().lower()
@@ -6810,7 +8633,15 @@ class ManufacturingWorld:
         extra = ""
         if task.task_type == "TRANSFER":
             extra = str(payload.get("transfer_kind", "")).strip().lower()
-        elif task.task_type == "BATTERY_SWAP":
+        elif task.task_type == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+            extra = ":".join(
+                [
+                    str(payload.get("interface_action") or payload.get("action") or "").strip().lower(),
+                    str(payload.get("inspection_product_id") or payload.get("item_id") or "").strip(),
+                    str(payload.get("interface") or self.inspection_workstation_id).strip(),
+                ]
+            )
+        elif task.task_type in {"BATTERY_SWAP", "BATTERY_CHARGE"}:
             extra = str(payload.get("target_agent_id", "")).strip().upper()
         raw = "|".join(
             [
@@ -6998,6 +8829,41 @@ class ManufacturingWorld:
             str(task.location),
         )
 
+    def _select_mfg_flow_immediate_task(self, candidates: list[Task], agent: Agent) -> Task | None:
+        if not candidates:
+            return None
+        task = min(
+            candidates,
+            key=lambda candidate: (
+                self._mfg_flow_task_rank(candidate),
+                float(self.travel_time(agent.location, candidate.location)),
+                float(self._task_estimated_duration(agent, candidate)),
+                str(candidate.task_id),
+            ),
+        )
+        rule = self._mfg_flow_task_rule(task)
+        selected = self._annotate_task_selection(
+            task,
+            decision_source=self.decision_mode,
+            decision_rule="fixed_granular_priority",
+            rationale="Selected the first feasible mfg_flow_shop task by configured granular priority.",
+            candidate_count=len(candidates),
+            score_hint=-float(self._mfg_flow_task_rank(task)),
+            decision_focus=[str(rule.rule_id)],
+            fallback_reason="mfg_flow_shop_policy",
+        )
+        selected.selection_meta["task_rule_id"] = str(rule.rule_id)
+        selected.selection_meta["role_number"] = int(rule.role_number)
+        selected.selection_meta["role_task_code"] = str(rule.task_code)
+        selected.selection_meta["role_display_name"] = str(rule.display_name)
+        selected.selection_meta["role_owner_agent_id"] = (
+            agent.agent_id if rule.kind == "self_service" else self.mfg_flow_task_policy.exclusive_owner_by_rule.get(rule.rule_id, "")
+        )
+        selected.selection_meta["role_policy"] = (
+            "workload_balanced_dedicated" if self._mfg_flow_dedicated_policy_active() else "shared"
+        )
+        return selected
+
     def _rolling_horizon_active(self) -> bool:
         return bool(getattr(self, "rolling_horizon_enabled", False))
 
@@ -7059,7 +8925,7 @@ class ManufacturingWorld:
         return self._rolling_horizon_transfer_kind(task) == "battery_delivery"
 
     def _rolling_horizon_is_self_battery_swap(self, task: Task, agent: Agent) -> bool:
-        if self._task_priority_key(task) != "battery_swap":
+        if self._task_priority_key(task) not in {"battery_swap", "battery_charge"}:
             return False
         payload = task.payload if isinstance(task.payload, dict) else {}
         return str(payload.get("target_agent_id", "")).strip() == str(agent.agent_id)
@@ -7084,6 +8950,8 @@ class ManufacturingWorld:
         return self._rolling_horizon_task_code(task)
 
     def _rolling_horizon_allowed_worker_ids_for_task(self, task: Task) -> list[str]:
+        if self._mfg_flow_policy_active():
+            return self._mfg_flow_allowed_worker_ids_for_task(task)
         if not self._rolling_horizon_dedicated_roles_active():
             return []
         task_code = self._rolling_horizon_task_code(task)
@@ -7104,6 +8972,8 @@ class ManufacturingWorld:
         return sorted(allowed)
 
     def _rolling_horizon_task_allowed_for_worker(self, worker_id: str, task: Task) -> bool:
+        if self._mfg_flow_policy_active():
+            return str(worker_id) in set(self._mfg_flow_allowed_worker_ids_for_task(task))
         if not self._rolling_horizon_dedicated_roles_active():
             return True
         return str(worker_id) in set(self._rolling_horizon_allowed_worker_ids_for_task(task))
@@ -7113,6 +8983,8 @@ class ManufacturingWorld:
         return allowed[0] if len(allowed) == 1 else ""
 
     def _rolling_horizon_base_rank_for_worker_task(self, worker_id: str, task: Task) -> int:
+        if self._mfg_flow_policy_active():
+            return self._mfg_flow_task_rank(task)
         if self._rolling_horizon_dedicated_roles_active():
             rank_code = self._rolling_horizon_role_rank_code(task)
             worker_ranks = getattr(self, "rolling_horizon_worker_task_rank", {}).get(str(worker_id), {})
@@ -7126,6 +8998,8 @@ class ManufacturingWorld:
         return int(getattr(self, "rolling_horizon_task_code_rank", {}).get(code, fallback_rank))
 
     def _rolling_horizon_priority(self, task: Task) -> float:
+        if self._mfg_flow_policy_active():
+            return float(self._mfg_flow_task_rank(task))
         task_code = self._rolling_horizon_task_code(task)
         return float(self._rolling_horizon_base_rank_for_code(task_code))
 
@@ -7158,6 +9032,8 @@ class ManufacturingWorld:
             "target_station": self._task_target_station(task),
             "location": signature_location,
             "transfer_kind": transfer_kind,
+            "interface_action": str(payload.get("interface_action") or payload.get("action") or "").strip().lower(),
+            "interface": str(payload.get("interface") or ""),
             "transfer_item_id": str(
                 payload.get("transfer_item_id")
                 or payload.get("material_item_id")
@@ -7166,6 +9042,8 @@ class ManufacturingWorld:
                 or ""
             ),
             "source_slot_id": str(payload.get("source_slot_id") or ""),
+            "destination_buffer_id": str(payload.get("destination_buffer_id") or ""),
+            "destination_slot_token": str(payload.get("destination_slot_token") if payload.get("destination_slot_token") is not None else ""),
             "load_slot": str(payload.get("load_slot") or ""),
             "machine_id": str(payload.get("machine_id") or ""),
             "target_agent_id": str(payload.get("target_agent_id") or ""),
@@ -7190,23 +9068,29 @@ class ManufacturingWorld:
         payload = task.payload if isinstance(task.payload, dict) else {}
         keys: set[str] = set()
         transfer_kind = str(payload.get("transfer_kind", "")).strip().lower()
+        if str(task.task_type).strip().upper() in {"INSPECT_PRODUCT", "LOAD_UNLOAD_TRANSFER_INTERFACE"}:
+            keys.add(f"inspection_workstation:{self.inspection_workstation_id}")
         if str(task.task_type).strip().upper() == "TRANSFER" and transfer_kind == "material_supply":
             station = self._task_target_station(task)
-            if station is not None:
+            if station is not None and not self.is_mfg_flow_shop:
                 # Material replenishment is station-scoped: while one station
                 # supply opportunity is unresolved, a later window must not
                 # create another station supply opportunity with a different
                 # shelf item. The active task path also uses material_supply_owner
                 # as a station-level lock.
                 keys.add(f"material_supply_station:{station}")
+        destination_buffer_id = str(payload.get("destination_buffer_id") or "").strip()
+        destination_slot_token = payload.get("destination_slot_token")
+        if destination_buffer_id and destination_slot_token is not None:
+            keys.add(f"buffer_slot:{destination_buffer_id}:{int(destination_slot_token)}")
         if str(task.task_type).strip().upper() == "TRANSFER" and transfer_kind == "battery_delivery":
             target_agent_id = str(payload.get("target_agent_id") or "").strip()
             if target_agent_id:
                 keys.add(f"battery_delivery_target:{target_agent_id}")
-        if self._task_priority_key(task) == "battery_swap":
+        if self._task_priority_key(task) in {"battery_swap", "battery_charge"}:
             target_agent_id = str(payload.get("target_agent_id") or task.assigned_robot_id or "").strip()
             if target_agent_id:
-                keys.add(f"battery_swap_agent:{target_agent_id}")
+                keys.add(f"battery_service_agent:{target_agent_id}")
         source_slot_id = str(payload.get("source_slot_id") or "").strip()
         if source_slot_id:
             keys.add(f"material_slot:{source_slot_id}")
@@ -7289,6 +9173,87 @@ class ManufacturingWorld:
                 if value:
                     self.rolling_horizon_pending_resource_index.setdefault(value, opportunity_id)
 
+    @staticmethod
+    def _rolling_horizon_entry_targets_machine(entry: dict[str, Any], machine_id: str) -> bool:
+        signature = entry.get("rolling_task_signature", {})
+        signature = signature if isinstance(signature, dict) else {}
+        target_type = str(entry.get("target_type") or signature.get("target_type") or "").strip().lower()
+        target_id = str(
+            entry.get("target_id")
+            or signature.get("target_id")
+            or signature.get("machine_id")
+            or ""
+        ).strip()
+        return target_type == "machine" and target_id == str(machine_id)
+
+    def _rolling_horizon_invalidate_machine_work(self, machine_id: str) -> None:
+        """Drop unstarted non-repair work that became infeasible after a breakdown."""
+        if not self._rolling_horizon_active():
+            return
+        machine_id = str(machine_id or "").strip()
+        if not machine_id:
+            return
+
+        window_index = int(self.rolling_horizon_window_index)
+        pending_to_remove: list[str] = []
+        for opportunity_id, entry in list(self.rolling_horizon_pending.items()):
+            if not isinstance(entry, dict):
+                continue
+            task_code = str(entry.get("task_code", "") or "").strip().upper()
+            if task_code == "REPAIR_MACHINE" or not self._rolling_horizon_entry_targets_machine(entry, machine_id):
+                continue
+            resource_keys = [
+                str(key or "").strip()
+                for key in entry.get("exclusive_resource_keys", [])
+                if str(key or "").strip()
+            ]
+            self._rolling_horizon_log_pending_skip(
+                entry,
+                window_index=window_index,
+                resource_keys=resource_keys,
+                reason="machine_broken_invalidated",
+            )
+            pending_to_remove.append(str(opportunity_id))
+
+        for opportunity_id in pending_to_remove:
+            self.rolling_horizon_pending.pop(opportunity_id, None)
+
+        queue_changed = False
+        for worker_id, queue in self.rolling_horizon_dispatch_queues.items():
+            if not queue:
+                continue
+            retained: deque[dict[str, Any]] = deque()
+            agent = self.agents.get(str(worker_id))
+            while queue:
+                entry = queue.popleft()
+                if not isinstance(entry, dict):
+                    continue
+                task_code = str(entry.get("task_code", "") or "").strip().upper()
+                if task_code == "REPAIR_MACHINE" or not self._rolling_horizon_entry_targets_machine(entry, machine_id):
+                    retained.append(entry)
+                    continue
+                queue_changed = True
+                if agent is not None:
+                    self._rolling_horizon_log_task_skip(agent, entry, "machine_broken_invalidated")
+            queue.extend(retained)
+
+        if pending_to_remove or queue_changed:
+            self._rolling_horizon_rebuild_pending_resource_index()
+            self._rolling_horizon_refresh_queue_metrics()
+
+    @staticmethod
+    def _rolling_horizon_immediate_repair_ignores_resource(
+        *,
+        collection_trigger: str,
+        task_code: str,
+        target_id: str,
+        resource_key: str,
+    ) -> bool:
+        return (
+            str(task_code or "").strip().upper() == "REPAIR_MACHINE"
+            and str(resource_key or "").strip() == f"machine:{str(target_id or '').strip()}"
+        )
+
     def _rolling_horizon_worker_available(self, agent: Agent) -> bool:
         if agent.discharged or agent.awaiting_battery_from is not None:
             return False
@@ -7316,6 +9281,26 @@ class ManufacturingWorld:
         )
         self.rolling_horizon_metrics["queued_dispatch_count"] = total
 
+    def _rolling_horizon_urgent_queue_entry_still_feasible(
+        self,
+        worker_id: str,
+        queue_entry: dict[str, Any],
+    ) -> bool:
+        agent = self.agents.get(str(worker_id))
+        if agent is None:
+            return False
+        opportunity_id = str(queue_entry.get("opportunity_id", "") or "").strip()
+        candidates = self._bind_humanoid_candidates_for_agent(
+            agent,
+            self._filter_candidates_for_agent(agent, self._candidate_tasks(agent)),
+        )
+        return any(
+            self._rolling_horizon_opportunity_id(task) == opportunity_id
+            and self._rolling_horizon_task_allowed_for_worker(agent.agent_id, task)
+            and self._task_item_dependencies_available(task, agent)
+            for task in candidates
+        )
+
     def _rolling_horizon_requeue_unstarted_dispatches(self, window_index: int) -> int:
         """Return queued-but-not-started rolling tasks to the pending pool.
 
@@ -7338,7 +9323,16 @@ class ManufacturingWorld:
                     bool(queue_entry.get("urgent_dispatch", False))
                     and bool(getattr(self, "rolling_horizon_immediate_protect_from_window_requeue", False))
                 ):
-                    retained_urgent_entries.append(queue_entry)
+                    if self._rolling_horizon_urgent_queue_entry_still_feasible(worker_id, queue_entry):
+                        retained_urgent_entries.append(queue_entry)
+                    else:
+                        agent = self.agents.get(str(worker_id))
+                        if agent is not None:
+                            self._rolling_horizon_log_task_skip(
+                                agent,
+                                queue_entry,
+                                "urgent_condition_no_longer_active",
+                            )
                     continue
                 opportunity_id = str(queue_entry.get("opportunity_id", "") or "").strip()
                 if not opportunity_id:
@@ -7348,8 +9342,14 @@ class ManufacturingWorld:
                 if entry is None:
                     entry = {
                         "opportunity_id": opportunity_id,
-                        "first_window_index": int(queue_entry.get("first_window_index", window_index) or window_index),
-                        "first_seen_min": float(queue_entry.get("first_seen_min", now) or now),
+                        "first_window_index": int(
+                            window_index
+                            if queue_entry.get("first_window_index") is None
+                            else queue_entry.get("first_window_index")
+                        ),
+                        "first_seen_min": float(
+                            now if queue_entry.get("first_seen_min") is None else queue_entry.get("first_seen_min")
+                        ),
                         "last_seen_min": now,
                         "task_id": str(queue_entry.get("task_id", "") or ""),
                         "task_code": str(queue_entry.get("task_code", "")),
@@ -7367,6 +9367,10 @@ class ManufacturingWorld:
                         "capacity": int(queue_entry.get("capacity", 1) or 1),
                         "exclusive_resource_keys": list(queue_entry.get("exclusive_resource_keys", [])),
                         "role_policy": str(queue_entry.get("role_policy", "")),
+                        "task_rule_id": str(queue_entry.get("task_rule_id", "")),
+                        "role_number": int(queue_entry.get("role_number", 0) or 0),
+                        "role_task_code": str(queue_entry.get("role_task_code", "")),
+                        "role_display_name": str(queue_entry.get("role_display_name", "")),
                         "role_owner_agent_id": str(queue_entry.get("role_owner_agent_id", "")),
                         "allowed_worker_ids": list(queue_entry.get("allowed_worker_ids", [])),
                         "workers": set(),
@@ -7408,7 +9412,116 @@ class ManufacturingWorld:
             self._rolling_horizon_refresh_queue_metrics()
         return requeued_count
 
-    def _rolling_horizon_log_window_start(self) -> None:
+    def _rolling_horizon_initialize_worker_events(self) -> None:
+        if not hasattr(self, "rolling_horizon_dispatch_events"):
+            return
+        self.rolling_horizon_dispatch_events = {
+            agent_id: self.env.event() for agent_id in sorted(self.agents.keys())
+        }
+
+    def rolling_horizon_dispatch_event(self, agent_id: str) -> simpy.Event:
+        agent_id = str(agent_id)
+        event = self.rolling_horizon_dispatch_events.get(agent_id)
+        if event is None or event.triggered:
+            event = self.env.event()
+            self.rolling_horizon_dispatch_events[agent_id] = event
+        return event
+
+    def _rolling_horizon_notify_worker(self, agent_id: str) -> None:
+        agent_id = str(agent_id)
+        event = self.rolling_horizon_dispatch_events.get(agent_id)
+        if event is not None and not event.triggered:
+            event.succeed({"worker_id": agent_id, "time_min": float(self.env.now)})
+        self.rolling_horizon_dispatch_events[agent_id] = self.env.event()
+
+    def _rolling_horizon_notify_queued_workers(self) -> None:
+        for agent_id, queue in self.rolling_horizon_dispatch_queues.items():
+            if queue:
+                self._rolling_horizon_notify_worker(agent_id)
+
+    def _rolling_horizon_simulation_limit_min(self) -> float:
+        return float(self.num_days * self.minutes_per_day)
+
+    def _rolling_horizon_boundary_metadata(self) -> dict[str, Any]:
+        scheduled = float(
+            getattr(self, "rolling_horizon_current_scheduled_boundary_min", self.env.now)
+        )
+        actual = float(getattr(self, "rolling_horizon_current_actual_dispatch_min", self.env.now))
+        lag = max(0.0, actual - scheduled)
+        return {
+            "scheduled_boundary_min": round(scheduled, 6),
+            "actual_dispatch_min": round(actual, 6),
+            "boundary_lag_min": round(lag, 9),
+            "scheduler_mode": self.rolling_horizon_scheduler_mode,
+            "candidate_collection_mode": self.rolling_horizon_candidate_collection_mode,
+        }
+
+    def _rolling_horizon_initialize_strict_periodic(self) -> None:
+        self.rolling_horizon_window_index = 0
+        self.rolling_horizon_window_start_min = 0.0
+        self.rolling_horizon_window_end_min = float(self.rolling_horizon_window_min)
+        self.rolling_horizon_logged_window_index = -1
+        self.rolling_horizon_current_scheduled_boundary_min = 0.0
+        self.rolling_horizon_current_actual_dispatch_min = 0.0
+        self._rolling_horizon_log_window_start(collection_trigger="initial_scan")
+        self._rolling_horizon_collect_candidates(collection_trigger="initial_scan")
+
+    def _rolling_horizon_reconcile_candidates_at_boundary(self) -> None:
+        boundary_index = int(self.rolling_horizon_window_index)
+        for entry in self.rolling_horizon_pending.values():
+            entry["workers"] = set()
+            entry["tasks_by_worker"] = {}
+            entry["boundary_seen_index"] = -1
+        # Rebuild after clearing the resource index so an obsolete pending row
+        # cannot hide the currently feasible opportunity for the same resource.
+        self.rolling_horizon_pending_resource_index = {}
+        self._rolling_horizon_collect_candidates(collection_trigger="boundary_reconciliation")
+
+        stale_ids: list[str] = []
+        for opportunity_id, entry in self.rolling_horizon_pending.items():
+            tasks_by_worker = entry.get("tasks_by_worker", {})
+            seen_index = entry.get("boundary_seen_index", -1)
+            if (
+                int(-1 if seen_index is None else seen_index) != boundary_index
+                or not isinstance(tasks_by_worker, dict)
+                or not tasks_by_worker
+            ):
+                stale_ids.append(str(opportunity_id))
+        for opportunity_id in stale_ids:
+            entry = self.rolling_horizon_pending.pop(opportunity_id, None)
+            if isinstance(entry, dict):
+                self._rolling_horizon_log_pending_skip(
+                    entry,
+                    window_index=boundary_index,
+                    resource_keys=list(entry.get("exclusive_resource_keys", [])),
+                    reason="not_feasible_at_boundary",
+                )
+        self._rolling_horizon_rebuild_pending_resource_index()
+
+    def _rolling_horizon_process_strict_boundary(self, scheduled_boundary_min: float) -> None:
+        actual_dispatch_min = float(self.env.now)
+        scheduled_boundary_min = float(scheduled_boundary_min)
+        lag = max(0.0, actual_dispatch_min - scheduled_boundary_min)
+        self.rolling_horizon_current_scheduled_boundary_min = scheduled_boundary_min
+        self.rolling_horizon_current_actual_dispatch_min = actual_dispatch_min
+        self.rolling_horizon_metrics["strict_boundary_count"] += 1
+        self.rolling_horizon_max_boundary_lag_min = max(
+            float(self.rolling_horizon_max_boundary_lag_min), lag
+        )
+        if lag > 1e-9:
+            self.rolling_horizon_metrics["late_boundary_count"] += 1
+
+        self._rolling_horizon_requeue_unstarted_dispatches(int(self.rolling_horizon_window_index))
+        self._rolling_horizon_reconcile_candidates_at_boundary()
+        self._rolling_horizon_dispatch_window()
+        self._rolling_horizon_notify_queued_workers()
+
+        self.rolling_horizon_window_index += 1
+        self.rolling_horizon_window_start_min = scheduled_boundary_min
+        self.rolling_horizon_window_end_min = scheduled_boundary_min + self.rolling_horizon_window_min
+        self._rolling_horizon_log_window_start(collection_trigger="boundary_reconciliation")
+
+    def _rolling_horizon_log_window_start(self, *, collection_trigger: str = "event_refresh") -> None:
         if self.rolling_horizon_logged_window_index == self.rolling_horizon_window_index:
             return
         self.rolling_horizon_logged_window_index = self.rolling_horizon_window_index
@@ -7425,25 +9538,49 @@ class ManufacturingWorld:
                 "window_end_min": round(float(self.rolling_horizon_window_end_min), 3),
                 "window_min": round(float(self.rolling_horizon_window_min), 3),
                 "dispatch_policy": self.rolling_horizon_dispatch_policy,
+                "collection_trigger": str(collection_trigger),
+                **self._rolling_horizon_boundary_metadata(),
             },
         )
 
     def _rolling_horizon_update(self) -> None:
+        """Compatibility refresh; periodic dispatch is coordinator-owned."""
         if not self._rolling_horizon_active():
             return
-        now = float(self.env.now)
-        self._rolling_horizon_log_window_start()
-        self._rolling_horizon_collect_candidates()
-        while now + 1e-9 >= self.rolling_horizon_window_end_min:
-            self._rolling_horizon_requeue_unstarted_dispatches(int(self.rolling_horizon_window_index))
-            self._rolling_horizon_collect_candidates()
-            self._rolling_horizon_dispatch_window()
-            self.rolling_horizon_window_index += 1
-            self.rolling_horizon_window_start_min = self.rolling_horizon_window_end_min
-            self.rolling_horizon_window_end_min = (
-                self.rolling_horizon_window_start_min + self.rolling_horizon_window_min
-            )
-            self._rolling_horizon_log_window_start()
+        self._rolling_horizon_collect_candidates(collection_trigger="event_refresh")
+
+    def _rolling_horizon_refresh_candidates_process(self):
+        yield self.env.timeout(0)
+        triggers = sorted(self.rolling_horizon_candidate_refresh_triggers)
+        self.rolling_horizon_candidate_refresh_triggers.clear()
+        self.rolling_horizon_candidate_refresh_scheduled = False
+        if not self._rolling_horizon_active() or self.terminated:
+            return
+        self._rolling_horizon_collect_candidates(collection_trigger="event_refresh")
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="ROLLING_HORIZON_CANDIDATE_REFRESH",
+            entity_id=f"RH-{self.rolling_horizon_window_index:05d}",
+            location="CoordinationReview",
+            details={
+                "window_index": int(self.rolling_horizon_window_index),
+                "collection_trigger": "event_refresh",
+                "source_triggers": triggers,
+                "scheduler_mode": self.rolling_horizon_scheduler_mode,
+            },
+        )
+
+    def _rolling_horizon_request_candidate_refresh(self, trigger: str) -> None:
+        if self._adp_active():
+            self.adp_coordinator.request(trigger)
+        if not self._rolling_horizon_active() or self.terminated:
+            return
+        self.rolling_horizon_candidate_refresh_triggers.add(str(trigger or "state_change"))
+        if self.rolling_horizon_candidate_refresh_scheduled:
+            return
+        self.rolling_horizon_candidate_refresh_scheduled = True
+        self.env.process(self._rolling_horizon_refresh_candidates_process())
 
     def _rolling_horizon_immediate_task_codes_for_event(self, event_name: str) -> set[str]:
         if not self._rolling_horizon_active():
@@ -7461,10 +9598,13 @@ class ManufacturingWorld:
         task_code_filter = self._rolling_horizon_immediate_task_codes_for_event(event_name)
         if not task_code_filter:
             return
+        event_name = str(event_name or "").strip().lower() or "immediate"
+        if event_name == "worker_low_battery" and self.battery_delivery_enabled:
+            task_code_filter = set(task_code_filter) | {"TRANSFER"}
         self._rolling_horizon_log_window_start()
         self._rolling_horizon_collect_candidates(
             task_code_filter=task_code_filter,
-            collection_trigger=str(event_name or "").strip().lower() or "immediate",
+            collection_trigger=event_name,
         )
         if str(getattr(self, "rolling_horizon_immediate_queue_policy", "")).strip().lower() == "next_after_current":
             self._rolling_horizon_dispatch_immediate_candidates(
@@ -7485,6 +9625,10 @@ class ManufacturingWorld:
             if str(code or "").strip()
         }
         collection_trigger = str(collection_trigger or "scheduled_scan").strip().lower() or "scheduled_scan"
+        immediate_trigger = (
+            collection_trigger in self.rolling_horizon_immediate_event_task_codes
+            and bool(normalized_task_code_filter)
+        )
         queued_resource_index = self._rolling_horizon_queued_resource_index()
         queued_resource_index.update(self._rolling_horizon_active_resource_index())
         for agent_id in sorted(self.agents.keys()):
@@ -7504,11 +9648,11 @@ class ManufacturingWorld:
                 if normalized_task_code_filter and task_code not in normalized_task_code_filter:
                     continue
                 if (
-                    priority_key == "battery_swap"
+                    priority_key in {"battery_swap", "battery_charge"}
                     and self._rolling_horizon_is_self_battery_swap(task, agent)
                     and (
                         str(agent.current_task_code or "").strip().upper() == "MANAGE_ROBOT_POWER"
-                        or str(agent.current_task_type or "").strip().upper() == "BATTERY_SWAP"
+                        or str(agent.current_task_type or "").strip().upper() in {"BATTERY_SWAP", "BATTERY_CHARGE"}
                     )
                 ):
                     # The worker is already executing its own battery service.
@@ -7518,9 +9662,20 @@ class ManufacturingWorld:
                 opportunity_id = self._rolling_horizon_opportunity_id(task)
                 rolling_signature = self._rolling_horizon_task_signature(task)
                 exclusive_resource_keys = self._rolling_horizon_exclusive_resource_keys(task)
+                blocking_resource_keys = [
+                    key
+                    for key in exclusive_resource_keys
+                    if not self._rolling_horizon_immediate_repair_ignores_resource(
+                        collection_trigger=collection_trigger,
+                        task_code=task_code,
+                        target_id=self._task_target_id(task),
+                        resource_key=key,
+                    )
+                ]
                 allowed_worker_ids = self._rolling_horizon_allowed_worker_ids_for_task(task)
                 role_owner_agent_id = self._rolling_horizon_role_owner_for_task(task)
-                if any(key in queued_resource_index for key in exclusive_resource_keys):
+                task_rule = self._mfg_flow_task_rule(task) if self._mfg_flow_policy_active() else None
+                if any(key in queued_resource_index for key in blocking_resource_keys):
                     # A previous window already committed this concrete item,
                     # slot, or machine to a worker dispatch queue. Treat it as
                     # unavailable until that worker accepts or skips the task.
@@ -7528,7 +9683,7 @@ class ManufacturingWorld:
                 conflicting_opportunity_id = next(
                     (
                         self.rolling_horizon_pending_resource_index[key]
-                        for key in exclusive_resource_keys
+                        for key in blocking_resource_keys
                         if key in self.rolling_horizon_pending_resource_index
                         and self.rolling_horizon_pending_resource_index[key] != opportunity_id
                     ),
@@ -7563,7 +9718,17 @@ class ManufacturingWorld:
                         "shareable": self._task_shareable(task),
                         "capacity": self._task_capacity(task),
                         "exclusive_resource_keys": list(exclusive_resource_keys),
-                        "role_policy": "dedicated_roles" if self._rolling_horizon_dedicated_roles_active() else "shared_pool",
+                        "role_policy": (
+                            "workload_balanced_dedicated"
+                            if self._mfg_flow_dedicated_policy_active()
+                            else "dedicated_roles"
+                            if self._rolling_horizon_dedicated_roles_active()
+                            else "shared_pool"
+                        ),
+                        "task_rule_id": str(task_rule.rule_id) if task_rule is not None else "",
+                        "role_number": int(task_rule.role_number) if task_rule is not None else 0,
+                        "role_task_code": str(task_rule.task_code) if task_rule is not None else "",
+                        "role_display_name": str(task_rule.display_name) if task_rule is not None else "",
                         "role_owner_agent_id": role_owner_agent_id,
                         "allowed_worker_ids": list(allowed_worker_ids),
                         "workers": set(),
@@ -7573,11 +9738,25 @@ class ManufacturingWorld:
                     self.rolling_horizon_pending[opportunity_id] = entry
                     for key in exclusive_resource_keys:
                         self.rolling_horizon_pending_resource_index.setdefault(key, opportunity_id)
+                for key in exclusive_resource_keys:
+                    self.rolling_horizon_pending_resource_index.setdefault(key, opportunity_id)
                 if not str(entry.get("task_id", "") or "").strip():
                     entry["task_id"] = self._next_task_id_for_task_code(task_code)
                 entry["last_seen_min"] = now
                 entry["effective_priority_rank"] = self._rolling_horizon_effective_rank(entry)
-                if collection_trigger != "scheduled_scan":
+                if collection_trigger == "boundary_reconciliation":
+                    entry["boundary_seen_index"] = int(self.rolling_horizon_window_index)
+                task_immediate_trigger = immediate_trigger and (
+                    collection_trigger != "worker_low_battery"
+                    or priority_key
+                    in {
+                        "battery_swap",
+                        "battery_charge",
+                        "battery_delivery_low_battery",
+                        "battery_delivery_discharged",
+                    }
+                )
+                if task_immediate_trigger:
                     entry["immediate_trigger"] = True
                     entry["collection_trigger"] = collection_trigger
                     entry["last_immediate_seen_min"] = now
@@ -7616,8 +9795,12 @@ class ManufacturingWorld:
                         "task_signature": dict(entry["task_signature"]),
                         "rolling_task_signature": dict(entry["rolling_task_signature"]),
                         "collection_trigger": collection_trigger,
-                        "immediate_trigger": collection_trigger != "scheduled_scan",
+                        "immediate_trigger": task_immediate_trigger,
                         "role_policy": str(entry.get("role_policy", "")),
+                        "task_rule_id": str(entry.get("task_rule_id", "")),
+                        "role_number": int(entry.get("role_number", 0) or 0),
+                        "role_task_code": str(entry.get("role_task_code", "")),
+                        "role_display_name": str(entry.get("role_display_name", "")),
                         "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                         "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
                     },
@@ -7633,6 +9816,7 @@ class ManufacturingWorld:
         queue = self.rolling_horizon_dispatch_queues[worker_id]
         if not urgent:
             queue.append(queue_entry)
+            self._rolling_horizon_notify_worker(worker_id)
             return
         insert_at = 0
         for existing in queue:
@@ -7640,6 +9824,7 @@ class ManufacturingWorld:
                 break
             insert_at += 1
         queue.insert(insert_at, queue_entry)
+        self._rolling_horizon_notify_worker(worker_id)
 
     def _rolling_horizon_dispatch_immediate_candidates(
         self,
@@ -7680,7 +9865,17 @@ class ManufacturingWorld:
         for entry in opportunities:
             opportunity_id = str(entry.get("opportunity_id", "")).strip()
             resource_keys = [str(key or "").strip() for key in entry.get("exclusive_resource_keys", []) if str(key or "").strip()]
-            if any(key in committed_resource_keys for key in resource_keys):
+            blocking_resource_keys = [
+                key
+                for key in resource_keys
+                if not self._rolling_horizon_immediate_repair_ignores_resource(
+                    collection_trigger=event_name,
+                    task_code=str(entry.get("task_code", "")),
+                    target_id=str(entry.get("target_id", "")),
+                    resource_key=key,
+                )
+            ]
+            if any(key in committed_resource_keys for key in blocking_resource_keys):
                 # Another queued/running task already owns this urgent resource.
                 continue
             tasks_by_worker = entry.get("tasks_by_worker", {})
@@ -7736,6 +9931,10 @@ class ManufacturingWorld:
                         "rolling_task_signature": dict(entry.get("rolling_task_signature", {})),
                         "exclusive_resource_keys": list(resource_keys),
                         "role_policy": str(entry.get("role_policy", "")),
+                        "task_rule_id": str(entry.get("task_rule_id", "")),
+                        "role_number": int(entry.get("role_number", 0) or 0),
+                        "role_task_code": str(entry.get("role_task_code", "")),
+                        "role_display_name": str(entry.get("role_display_name", "")),
                         "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                         "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
                         "collection_trigger": event_name,
@@ -7755,8 +9954,12 @@ class ManufacturingWorld:
                 effective_rank = self._rolling_horizon_effective_rank(entry)
                 queue_entry = {
                     "window_index": window_index,
-                    "first_window_index": int(entry.get("first_window_index", window_index) or window_index),
-                    "first_seen_min": float(entry.get("first_seen_min", self.env.now) or self.env.now),
+                    "first_window_index": int(
+                        window_index if entry.get("first_window_index") is None else entry.get("first_window_index")
+                    ),
+                    "first_seen_min": float(
+                        self.env.now if entry.get("first_seen_min") is None else entry.get("first_seen_min")
+                    ),
                     "opportunity_id": str(entry.get("opportunity_id", "")),
                     "task_id": str(entry.get("task_id", "")),
                     "task_code": str(entry.get("task_code", "")),
@@ -7775,6 +9978,10 @@ class ManufacturingWorld:
                     "capacity": int(entry.get("capacity", 1) or 1),
                     "exclusive_resource_keys": list(entry.get("exclusive_resource_keys", [])),
                     "role_policy": str(entry.get("role_policy", "")),
+                    "task_rule_id": str(entry.get("task_rule_id", "")),
+                    "role_number": int(entry.get("role_number", 0) or 0),
+                    "role_task_code": str(entry.get("role_task_code", "")),
+                    "role_display_name": str(entry.get("role_display_name", "")),
                     "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                     "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
                     "assigned_worker_id": worker_id,
@@ -7783,6 +9990,12 @@ class ManufacturingWorld:
                     "urgent_dispatch": True,
                     "collection_trigger": event_name,
                     "queue_policy": str(getattr(self, "rolling_horizon_immediate_queue_policy", "")),
+                    "scheduler_mode": self.rolling_horizon_scheduler_mode,
+                    "candidate_collection_mode": self.rolling_horizon_candidate_collection_mode,
+                    "scheduled_boundary_min": None,
+                    "actual_dispatch_min": round(float(self.env.now), 6),
+                    "boundary_lag_min": 0.0,
+                    "dispatch_kind": "immediate_exception",
                 }
                 self._rolling_horizon_insert_dispatch_queue_entry(worker_id, queue_entry, urgent=True)
                 dispatched_opportunity_ids.add(str(entry.get("opportunity_id", "")))
@@ -7846,6 +10059,10 @@ class ManufacturingWorld:
                 "rolling_task_signature": dict(entry.get("rolling_task_signature", {})),
                 "exclusive_resource_keys": list(resource_keys),
                 "role_policy": str(entry.get("role_policy", "")),
+                "task_rule_id": str(entry.get("task_rule_id", "")),
+                "role_number": int(entry.get("role_number", 0) or 0),
+                "role_task_code": str(entry.get("role_task_code", "")),
+                "role_display_name": str(entry.get("role_display_name", "")),
                 "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                 "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
                 "reason": reason,
@@ -7904,7 +10121,17 @@ class ManufacturingWorld:
         for entry in opportunities:
             opportunity_id = str(entry.get("opportunity_id", "")).strip()
             resource_keys = [str(key or "").strip() for key in entry.get("exclusive_resource_keys", []) if str(key or "").strip()]
-            if any(key in committed_resource_keys for key in resource_keys):
+            blocking_resource_keys = [
+                key
+                for key in resource_keys
+                if not self._rolling_horizon_immediate_repair_ignores_resource(
+                    collection_trigger="boundary_reconciliation",
+                    task_code=str(entry.get("task_code", "")),
+                    target_id=str(entry.get("target_id", "")),
+                    resource_key=key,
+                )
+            ]
+            if any(key in committed_resource_keys for key in blocking_resource_keys):
                 stale_opportunity_ids.add(opportunity_id)
                 self._rolling_horizon_log_pending_skip(
                     entry,
@@ -7981,16 +10208,36 @@ class ManufacturingWorld:
                     "dispatch_count": 0,
                     "optimizer_status": "NOT_SOLVED",
                     "reason": "no_feasible_optimizer_rows",
+                    **self._rolling_horizon_boundary_metadata(),
                 },
             )
             return
 
         model = cp_model.CpModel()
         variables = [model.NewBoolVar(f"x_{idx}") for idx in range(len(assignment_rows))]
-        for row_indexes in rows_by_opportunity.values():
-            model.Add(sum(variables[idx] for idx in row_indexes) <= 1)
-        for row_indexes in rows_by_resource_key.values():
-            model.Add(sum(variables[idx] for idx in row_indexes) <= 1)
+        for opportunity_id, row_indexes in rows_by_opportunity.items():
+            entry = self.rolling_horizon_pending.get(opportunity_id, {})
+            capacity = max(1, int(entry.get("capacity", 1) or 1)) if isinstance(entry, dict) else 1
+            shareable = isinstance(entry, dict) and bool(entry.get("shareable", False))
+            if not shareable:
+                capacity = 1
+            model.Add(sum(variables[idx] for idx in row_indexes) <= capacity)
+        for resource_key, row_indexes in rows_by_resource_key.items():
+            repair_rows = [
+                idx
+                for idx in row_indexes
+                if str(assignment_rows[idx]["entry"].get("task_code", "")).strip().upper() == "REPAIR_MACHINE"
+                and resource_key
+                == f"machine:{str(assignment_rows[idx]['entry'].get('target_id', '')).strip()}"
+            ]
+            if len(repair_rows) == len(row_indexes) and repair_rows:
+                capacity = max(
+                    max(1, int(assignment_rows[idx]["entry"].get("capacity", 1) or 1))
+                    for idx in repair_rows
+                )
+                model.Add(sum(variables[idx] for idx in row_indexes) <= capacity)
+            else:
+                model.Add(sum(variables[idx] for idx in row_indexes) <= 1)
 
         worker_counts: dict[str, Any] = {}
         for worker_id in sorted(self.agents.keys()):
@@ -8046,6 +10293,7 @@ class ManufacturingWorld:
                     "time_limit_s": time_limit_s,
                     "num_search_workers": num_search_workers,
                     "random_seed": solver_seed,
+                    **self._rolling_horizon_boundary_metadata(),
                 },
             )
             raise ThroughputOptimizerFailed(
@@ -8076,14 +10324,28 @@ class ManufacturingWorld:
             entry = row["entry"]
             worker_id = str(row["worker_id"])
             resource_keys = list(row.get("resource_keys", []))
-            if any(key in committed_resource_keys for key in resource_keys):
+            blocking_resource_keys = [
+                key
+                for key in resource_keys
+                if not self._rolling_horizon_immediate_repair_ignores_resource(
+                    collection_trigger="boundary_reconciliation",
+                    task_code=str(entry.get("task_code", "")),
+                    target_id=str(entry.get("target_id", "")),
+                    resource_key=key,
+                )
+            ]
+            if any(key in committed_resource_keys for key in blocking_resource_keys):
                 continue
             sequence_by_worker[worker_id] += 1
             effective_rank = self._rolling_horizon_effective_rank(entry)
             queue_entry = {
                 "window_index": window_index,
-                "first_window_index": int(entry.get("first_window_index", window_index) or window_index),
-                "first_seen_min": float(entry.get("first_seen_min", self.env.now) or self.env.now),
+                "first_window_index": int(
+                    window_index if entry.get("first_window_index") is None else entry.get("first_window_index")
+                ),
+                "first_seen_min": float(
+                    self.env.now if entry.get("first_seen_min") is None else entry.get("first_seen_min")
+                ),
                 "opportunity_id": str(entry.get("opportunity_id", "")),
                 "task_id": str(entry.get("task_id", "")),
                 "task_code": str(entry.get("task_code", "")),
@@ -8102,6 +10364,10 @@ class ManufacturingWorld:
                 "capacity": int(entry.get("capacity", 1) or 1),
                 "exclusive_resource_keys": list(entry.get("exclusive_resource_keys", [])),
                 "role_policy": str(entry.get("role_policy", "")),
+                "task_rule_id": str(entry.get("task_rule_id", "")),
+                "role_number": int(entry.get("role_number", 0) or 0),
+                "role_task_code": str(entry.get("role_task_code", "")),
+                "role_display_name": str(entry.get("role_display_name", "")),
                 "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                 "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
                 "assigned_worker_id": worker_id,
@@ -8112,6 +10378,7 @@ class ManufacturingWorld:
                 "optimizer_score": round(float(row.get("score", 0.0) or 0.0), 3),
                 "score_components": dict(row.get("score_components", {})),
                 "sequence_position": int(row.get("queue_length", 0) or 0) + sequence_by_worker[worker_id],
+                **self._rolling_horizon_boundary_metadata(),
             }
             self.rolling_horizon_dispatch_queues[worker_id].append(queue_entry)
             dispatched_opportunity_ids.add(str(entry.get("opportunity_id", "")))
@@ -8154,6 +10421,7 @@ class ManufacturingWorld:
                     "optimizer_status": status_name,
                     "optimizer_objective": round(objective_value, 3),
                     "reason": "optimizer_selected_no_assignments",
+                    **self._rolling_horizon_boundary_metadata(),
                 },
             )
 
@@ -8173,6 +10441,7 @@ class ManufacturingWorld:
                     "dispatch_policy": self.rolling_horizon_dispatch_policy,
                     "candidate_count": 0,
                     "dispatch_count": 0,
+                    **self._rolling_horizon_boundary_metadata(),
                 },
             )
             return
@@ -8198,7 +10467,17 @@ class ManufacturingWorld:
         for entry in opportunities:
             opportunity_id = str(entry.get("opportunity_id", "")).strip()
             resource_keys = [str(key or "").strip() for key in entry.get("exclusive_resource_keys", []) if str(key or "").strip()]
-            if any(key in committed_resource_keys for key in resource_keys):
+            blocking_resource_keys = [
+                key
+                for key in resource_keys
+                if not self._rolling_horizon_immediate_repair_ignores_resource(
+                    collection_trigger="boundary_reconciliation",
+                    task_code=str(entry.get("task_code", "")),
+                    target_id=str(entry.get("target_id", "")),
+                    resource_key=key,
+                )
+            ]
+            if any(key in committed_resource_keys for key in blocking_resource_keys):
                 stale_opportunity_ids.add(opportunity_id)
                 self.logger.log(
                     t=self.env.now,
@@ -8220,6 +10499,10 @@ class ManufacturingWorld:
                         "rolling_task_signature": dict(entry.get("rolling_task_signature", {})),
                         "exclusive_resource_keys": list(resource_keys),
                         "role_policy": str(entry.get("role_policy", "")),
+                        "task_rule_id": str(entry.get("task_rule_id", "")),
+                        "role_number": int(entry.get("role_number", 0) or 0),
+                        "role_task_code": str(entry.get("role_task_code", "")),
+                        "role_display_name": str(entry.get("role_display_name", "")),
                         "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                         "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
                         "reason": "resource_already_committed",
@@ -8283,6 +10566,10 @@ class ManufacturingWorld:
                         "rolling_task_signature": dict(entry.get("rolling_task_signature", {})),
                         "exclusive_resource_keys": list(resource_keys),
                         "role_policy": str(entry.get("role_policy", "")),
+                        "task_rule_id": str(entry.get("task_rule_id", "")),
+                        "role_number": int(entry.get("role_number", 0) or 0),
+                        "role_task_code": str(entry.get("role_task_code", "")),
+                        "role_display_name": str(entry.get("role_display_name", "")),
                         "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                         "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
                         "reason": "stale_or_unavailable_resource",
@@ -8303,8 +10590,12 @@ class ManufacturingWorld:
                 effective_rank = self._rolling_horizon_effective_rank(entry)
                 queue_entry = {
                     "window_index": window_index,
-                    "first_window_index": int(entry.get("first_window_index", window_index) or window_index),
-                    "first_seen_min": float(entry.get("first_seen_min", self.env.now) or self.env.now),
+                    "first_window_index": int(
+                        window_index if entry.get("first_window_index") is None else entry.get("first_window_index")
+                    ),
+                    "first_seen_min": float(
+                        self.env.now if entry.get("first_seen_min") is None else entry.get("first_seen_min")
+                    ),
                     "opportunity_id": str(entry.get("opportunity_id", "")),
                     "task_id": str(entry.get("task_id", "")),
                     "task_code": str(entry.get("task_code", "")),
@@ -8323,11 +10614,16 @@ class ManufacturingWorld:
                     "capacity": int(entry.get("capacity", 1) or 1),
                     "exclusive_resource_keys": list(entry.get("exclusive_resource_keys", [])),
                     "role_policy": str(entry.get("role_policy", "")),
+                    "task_rule_id": str(entry.get("task_rule_id", "")),
+                    "role_number": int(entry.get("role_number", 0) or 0),
+                    "role_task_code": str(entry.get("role_task_code", "")),
+                    "role_display_name": str(entry.get("role_display_name", "")),
                     "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                     "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
                     "assigned_worker_id": worker_id,
                     "queue_length_before": int(_queue_length),
                     "assigned_at_min": round(float(self.env.now), 3),
+                    **self._rolling_horizon_boundary_metadata(),
                 }
                 self.rolling_horizon_dispatch_queues[worker_id].append(queue_entry)
                 dispatched_opportunity_ids.add(str(entry.get("opportunity_id", "")))
@@ -8374,6 +10670,7 @@ class ManufacturingWorld:
                     "candidate_count": len(self.rolling_horizon_pending),
                     "dispatch_count": 0,
                     "reason": "no_available_worker",
+                    **self._rolling_horizon_boundary_metadata(),
                 },
             )
 
@@ -8530,6 +10827,9 @@ class ManufacturingWorld:
             if self._rolling_horizon_throughput_optimizer_active():
                 rationale = "Rolling horizon throughput optimizer selected this queued task with OR-Tools CP-SAT."
                 focus = ["throughput_optimizer", self._task_priority_key(task)]
+            elif self._mfg_flow_policy_active():
+                rationale = "Rolling horizon dispatch selected the task by configured fixed granular priority."
+                focus = [str(queue_entry.get("task_rule_id", "")) or self._task_priority_key(task)]
             elif not self._rolling_horizon_dedicated_roles_active():
                 rationale = "Rolling horizon dispatch selected the task by aged HumanoidSim task-code rank."
                 focus = [self._task_priority_key(task)]
@@ -8548,6 +10848,26 @@ class ManufacturingWorld:
             )
             if isinstance(queue_entry.get("score_components", {}), dict):
                 selected.selection_meta["score_components"] = dict(queue_entry.get("score_components", {}))
+            for key in (
+                "task_rule_id",
+                "role_number",
+                "role_task_code",
+                "role_display_name",
+                "role_policy",
+                "role_owner_agent_id",
+                "allowed_worker_ids",
+                "urgent_dispatch",
+                "collection_trigger",
+                "queue_policy",
+                "scheduler_mode",
+                "candidate_collection_mode",
+                "scheduled_boundary_min",
+                "actual_dispatch_min",
+                "boundary_lag_min",
+                "dispatch_kind",
+            ):
+                if queue_entry.get(key) is not None:
+                    selected.selection_meta[key] = copy.deepcopy(queue_entry.get(key))
             if queue_entry.get("optimizer_status") is not None:
                 selected.selection_meta["optimizer_status"] = str(queue_entry.get("optimizer_status"))
             if queue_entry.get("sequence_position") is not None:
@@ -8596,7 +10916,7 @@ class ManufacturingWorld:
         incident_class = str(incident.get("incident_class", "")).strip().lower()
         if incident_class == "machine_broken" and task.task_type == "REPAIR_MACHINE":
             score += 4.0
-        if incident_class in {"worker_discharged", "worker_low_battery"} and task.task_type in {"BATTERY_SWAP", "TRANSFER"}:
+        if incident_class in {"worker_discharged", "worker_low_battery"} and task.task_type in {"BATTERY_SWAP", "BATTERY_CHARGE", "TRANSFER"}:
             score += 4.0
         if incident_class in {"buffer_blocked", "commitment_blocked"} and task.task_type in {"UNLOAD_MACHINE", "TRANSFER", "INSPECT_PRODUCT"}:
             score += 2.0
@@ -8809,6 +11129,9 @@ class ManufacturingWorld:
                 rationale="Resume the interrupted task before taking a new one.",
             )))
 
+        if self._adp_active():
+            return self._select_adp_task(agent)
+
         mandatory = None if self._rolling_horizon_active() else self.mandatory_task_for_agent(agent)
         if mandatory is not None:
             self._resolve_selection_blocker(agent.agent_id, reason="mandatory_task_selected")
@@ -8820,14 +11143,24 @@ class ManufacturingWorld:
                 score_hint=self._task_score(mandatory, agent),
             )))
 
-        if self._rolling_horizon_active():
-            self._rolling_horizon_update()
-
-        candidates = self._bind_humanoid_candidates_for_agent(
-            agent,
-            self._filter_candidates_for_agent(agent, self._candidate_tasks(agent)),
+        queue = self.rolling_horizon_dispatch_queues.get(agent.agent_id)
+        head_entry = queue[0] if self._rolling_horizon_active() and queue else {}
+        head_resource_keys = (
+            head_entry.get("exclusive_resource_keys", [])
+            if isinstance(head_entry, dict)
+            else []
         )
-        candidates = [task for task in candidates if self._task_item_dependencies_available(task, agent)]
+        self._rolling_horizon_candidate_slot_exclusions = {
+            str(key) for key in head_resource_keys if str(key)
+        }
+        try:
+            candidates = self._bind_humanoid_candidates_for_agent(
+                agent,
+                self._filter_candidates_for_agent(agent, self._candidate_tasks(agent)),
+            )
+            candidates = [task for task in candidates if self._task_item_dependencies_available(task, agent)]
+        finally:
+            self._rolling_horizon_candidate_slot_exclusions = set()
         if not candidates:
             if self._rolling_horizon_active():
                 rolling_task = self._select_rolling_horizon_task(agent, [])
@@ -8849,6 +11182,12 @@ class ManufacturingWorld:
         if battery_safety_task is not None:
             self._resolve_selection_blocker(agent.agent_id, reason="battery_safety_selected")
             return self._finalize_selected_task(agent, battery_safety_task)
+
+        if self._mfg_flow_policy_active():
+            task = self._select_mfg_flow_immediate_task(candidates, agent)
+            if task is not None:
+                self._resolve_selection_blocker(agent.agent_id, reason="mfg_flow_shop_policy_selected")
+                return self._finalize_selected_task(agent, task)
 
         local_response_task = self._select_local_response_task(candidates, agent)
         if local_response_task is not None:
@@ -9037,7 +11376,30 @@ class ManufacturingWorld:
 
     def _candidate_tasks(self, agent: Agent) -> list[Task]:
         tasks: list[Task] = []
-        local_candidate_item_ids: set[str] = set()
+        queued_resource_keys = (
+            self._rolling_horizon_queued_resource_keys()
+            if self._rolling_horizon_active()
+            else set()
+        )
+        local_candidate_item_ids: set[str] = {
+            key.split(":", 1)[1]
+            for key in queued_resource_keys
+            if key.startswith("item:") and ":" in key
+        }
+        queued_material_slot_ids: set[str] = {
+            key.split(":", 1)[1]
+            for key in queued_resource_keys
+            if key.startswith("material_slot:") and ":" in key
+        }
+        candidate_buffer_slots: dict[str, deque[int]] = {}
+
+        def _next_buffer_slot(buffer_id: str, *, limit: int | None = None) -> int | None:
+            if buffer_id not in candidate_buffer_slots:
+                candidate_buffer_slots[buffer_id] = deque(
+                    self._buffer_available_slot_tokens(buffer_id, limit=limit)
+                )
+            slots = candidate_buffer_slots[buffer_id]
+            return int(slots.popleft()) if slots else None
         deliver_priority_discharged = float(self._rule("world.task_priority.battery_delivery_discharged", 149.0))
         deliver_priority_low_battery = float(self._rule("world.task_priority.battery_delivery_low_battery", 140.0))
         priority_repair_machine = float(self._rule("world.task_priority.repair_machine", 115.0))
@@ -9048,15 +11410,18 @@ class ManufacturingWorld:
         priority_inter_station_transfer = float(self._rule("world.task_priority.inter_station_transfer", 85.0))
         priority_material_supply = float(self._rule("world.task_priority.material_supply", 85.0))
         priority_inspect_product = float(self._rule("world.task_priority.inspect_product", 72.0))
+        priority_load_inspection_desk = float(self._rule("world.task_priority.load_inspection_desk", 74.0))
+        priority_unload_inspection_desk = float(self._rule("world.task_priority.unload_inspection_desk", 112.0))
         priority_handover_item = float(self._rule("world.task_priority.handover_item", 100.0))
 
         proactive_swap = self._proactive_battery_swap_task(agent)
         if proactive_swap is not None:
             tasks.append(proactive_swap)
 
-        tasks.extend(self._handover_item_candidates(agent, priority_handover_item))
+        if "HANDOVER_ITEM_TO_ROBOT" in self.enabled_task_codes:
+            tasks.extend(self._handover_item_candidates(agent, priority_handover_item))
 
-        for other in self.agents.values():
+        for other in (self.agents.values() if self.battery_delivery_enabled else []):
             if other.agent_id == agent.agent_id:
                 continue
             deliver_threshold = self._battery_delivery_trigger_threshold(other)
@@ -9095,16 +11460,24 @@ class ManufacturingWorld:
                     )
                 )
             elif machine.output_intermediate is not None and machine.unload_owner is None:
-                tasks.append(
-                    Task(
-                        task_id=self._next_task_id("UL"),
-                        task_type="UNLOAD_MACHINE",
-                        priority_key="unload_machine",
-                        priority=priority_unload_machine,
-                        location=f"Station{machine.station}",
-                        payload={"machine_id": machine.machine_id, "station": machine.station},
+                destination_buffer_id = f"output_buffer_station_{machine.station}"
+                destination_slot_token = _next_buffer_slot(destination_buffer_id)
+                if destination_slot_token is not None:
+                    tasks.append(
+                        Task(
+                            task_id=self._next_task_id("UL"),
+                            task_type="UNLOAD_MACHINE",
+                            priority_key="unload_machine",
+                            priority=priority_unload_machine,
+                            location=f"Station{machine.station}",
+                            payload={
+                                "machine_id": machine.machine_id,
+                                "station": machine.station,
+                                "destination_buffer_id": destination_buffer_id,
+                                "destination_slot_token": destination_slot_token,
+                            },
+                        )
                     )
-                )
             elif (
                 not machine.broken
                 and machine.state == MachineState.WAIT_INPUT
@@ -9184,6 +11557,8 @@ class ManufacturingWorld:
 
             pm_due = self.env.now - machine.last_pm_at >= self.pm_interval_target_min
             if (
+                self.preventive_maintenance_enabled
+                and
                 pm_due
                 and not machine.broken
                 and machine.state != MachineState.PROCESSING
@@ -9203,14 +11578,12 @@ class ManufacturingWorld:
 
         for station, buffer in self.output_buffers.items():
             if buffer:
-                transfer_item_id = self._first_unreserved_queue_item(
+                transfer_item_ids = self._unreserved_queue_items(
                     buffer,
+                    len(buffer),
                     agent.agent_id,
                     exclude_item_ids=local_candidate_item_ids,
                 )
-                if not transfer_item_id:
-                    continue
-                local_candidate_item_ids.add(transfer_item_id)
                 task_location = "Inspection" if station == self.inspection_queue_station else f"Station{station}"
                 transfer_priority = priority_inter_station_transfer
                 if station == self.inspection_queue_station:
@@ -9218,30 +11591,43 @@ class ManufacturingWorld:
                         transfer_priority,
                         float(self._rule("world.task_priority.completed_product_delivery", 125.0)),
                     )
-                tasks.append(
-                    Task(
-                        task_id=self._next_task_id("TR"),
-                        task_type="TRANSFER",
-                        priority_key="inter_station_transfer",
-                        priority=transfer_priority,
-                        location=task_location,
-                        payload={
-                            "transfer_kind": "inter_station",
-                            "from_station": station,
-                            "transfer_item_id": transfer_item_id,
-                        },
+                for transfer_item_id in transfer_item_ids:
+                    payload = {
+                        "transfer_kind": "inter_station",
+                        "from_station": station,
+                        "transfer_item_id": transfer_item_id,
+                    }
+                    destination_buffer_id = ""
+                    destination_slot_token: int | None = None
+                    if station != self.inspection_queue_station:
+                        target_station = station + 1
+                        if target_station > self.last_processing_station:
+                            target_station = self.inspection_queue_station
+                        destination_buffer_id = f"intermediate_queue_{target_station}"
+                        destination_slot_token = _next_buffer_slot(destination_buffer_id)
+                        if destination_slot_token is None:
+                            break
+                        payload["destination_buffer_id"] = destination_buffer_id
+                        payload["destination_slot_token"] = destination_slot_token
+                    local_candidate_item_ids.add(transfer_item_id)
+                    tasks.append(
+                        Task(
+                            task_id=self._next_task_id("TR"),
+                            task_type="TRANSFER",
+                            priority_key="inter_station_transfer",
+                            priority=transfer_priority,
+                            location=task_location,
+                            payload=payload,
+                        )
                     )
-                )
 
         for station in self.stations:
-            material_target = int(self.inventory_targets["material"][f"station{station}"])
             active_supply_task_ids = self._active_material_supply_task_ids_for_station(station)
-            if (
-                len(self.material_queues[station]) < material_target
-                and self.material_supply_owner.get(station) is None
-                and not active_supply_task_ids
-            ):
-                if self._material_shelf_count() > 0:
+            requested_count = self._station_material_replenishment_count(station)
+            if not self.is_mfg_flow_shop and (self.material_supply_owner.get(station) is not None or active_supply_task_ids):
+                requested_count = 0
+            if requested_count > 0 and self._material_shelf_count_for_station(station) > 0:
+                if not self.is_mfg_flow_shop:
                     tasks.append(
                         Task(
                             task_id=self._next_task_id("MAT"),
@@ -9254,19 +11640,73 @@ class ManufacturingWorld:
                                 "station": station,
                                 "source": "Warehouse",
                                 "destination": f"material_queue_{station}",
-                                "target_level": material_target,
                                 "item_request": {
                                     "entity_type": "material",
                                     "selection_policy": "available_material_from_source",
                                     "quantity": 1,
                                 },
+                                "target_level": int(
+                                    self.inventory_targets["material"][f"station{station}"]
+                                ),
                             },
                         )
                     )
-                else:
-                    self._log_material_shelf_empty_once()
+                    continue
+                excluded_shelf_items = set(local_candidate_item_ids)
+                for _ in range(requested_count):
+                    destination_buffer_id = f"material_queue_{station}"
+                    destination_slot_token = _next_buffer_slot(destination_buffer_id)
+                    source_slot = self._first_available_material_shelf_slot(
+                        agent.agent_id,
+                        exclude_item_ids=excluded_shelf_items,
+                        exclude_slot_ids=queued_material_slot_ids,
+                        station=station,
+                    )
+                    if destination_slot_token is None or source_slot is None:
+                        break
+                    source_slot_id = str(source_slot.get("slot_id") or "")
+                    material_item_id = str(source_slot.get("material_item_id") or "")
+                    if not source_slot_id or not material_item_id:
+                        break
+                    excluded_shelf_items.add(material_item_id)
+                    local_candidate_item_ids.add(material_item_id)
+                    payload = {
+                        "transfer_kind": "material_supply",
+                        "station": station,
+                        "source": "Warehouse",
+                        "destination": destination_buffer_id,
+                        "destination_buffer_id": destination_buffer_id,
+                        "destination_slot_token": destination_slot_token,
+                        "source_slot_id": source_slot_id,
+                        "transfer_item_id": material_item_id,
+                        "material_item_id": material_item_id,
+                        "item_request": {
+                            "entity_type": "material",
+                            "selection_policy": "available_material_from_source",
+                            "quantity": 1,
+                        },
+                    }
+                    payload["supply_policy"] = "machine_demand"
+                    tasks.append(
+                        Task(
+                            task_id=self._next_task_id("MAT"),
+                            task_type="TRANSFER",
+                            priority_key="material_supply",
+                            priority=priority_material_supply,
+                            location="Warehouse",
+                            payload=payload,
+                        )
+                    )
+            elif requested_count > 0 and self._material_shelf_count() <= 0:
+                self._log_material_shelf_empty_once()
 
-        if self.intermediate_queues[self.inspection_queue_station] and self.inspection_owner is None:
+        if (
+            "LOAD_UNLOAD_TRANSFER_INTERFACE" in self.enabled_task_codes
+            and self.inspection_desk_state == "EMPTY"
+            and self.inspection_desk_item_id is None
+            and self.intermediate_queues[self.inspection_queue_station]
+            and self.inspection_owner is None
+        ):
             product_id = self._first_unreserved_queue_item(
                 self.intermediate_queues[self.inspection_queue_station],
                 agent.agent_id,
@@ -9276,12 +11716,86 @@ class ManufacturingWorld:
                 local_candidate_item_ids.add(product_id)
                 tasks.append(
                     Task(
+                        task_id=self._next_task_id("IFT"),
+                        task_type="LOAD_UNLOAD_TRANSFER_INTERFACE",
+                        priority_key="load_inspection_desk",
+                        priority=priority_load_inspection_desk,
+                        location="Inspection",
+                        payload={
+                            "interface_action": "load",
+                            "action": "load",
+                            "inspection_product_id": product_id,
+                            "item_id": product_id,
+                            "item_type": "product",
+                            "interface": self.inspection_workstation_id,
+                            "source": f"intermediate_queue_{self.inspection_queue_station}",
+                            "destination": self.inspection_workstation_id,
+                        },
+                    )
+                )
+        elif (
+            self.inspection_desk_state == "STAGED_FOR_INSPECTION"
+            and self.inspection_desk_item_id
+            and self.inspection_desk_result is None
+            and self.inspection_owner is None
+        ):
+            product_id = str(self.inspection_desk_item_id)
+            if not self._item_reserved_by_other(product_id, agent.agent_id):
+                local_candidate_item_ids.add(product_id)
+                tasks.append(
+                    Task(
                         task_id=self._next_task_id("INS"),
                         task_type="INSPECT_PRODUCT",
                         priority_key="inspect_product",
                         priority=priority_inspect_product,
                         location="Inspection",
-                        payload={"inspection_product_id": product_id},
+                        payload={
+                            "inspection_product_id": product_id,
+                            "workstation": self.inspection_workstation_id,
+                        },
+                    )
+                )
+        elif (
+            "LOAD_UNLOAD_TRANSFER_INTERFACE" in self.enabled_task_codes
+            and self.inspection_desk_state == "INSPECTED_WAITING_UNLOAD"
+            and self.inspection_desk_item_id
+            and self.inspection_desk_result in {"PASS", "FAIL"}
+            and self.inspection_owner is None
+        ):
+            product_id = str(self.inspection_desk_item_id)
+            result = str(self.inspection_desk_result)
+            destination_buffer_id = (
+                f"output_buffer_station_{self.inspection_queue_station}"
+                if result == "PASS"
+                else "inspection_scrap_queue"
+            )
+            destination_slot_token = _next_buffer_slot(destination_buffer_id)
+            if (
+                destination_slot_token is not None
+                and not self._item_reserved_by_other(product_id, agent.agent_id)
+            ):
+                destination = "inspection_output_queue" if result == "PASS" else "inspection_scrap_queue"
+                local_candidate_item_ids.add(product_id)
+                tasks.append(
+                    Task(
+                        task_id=self._next_task_id("IFT"),
+                        task_type="LOAD_UNLOAD_TRANSFER_INTERFACE",
+                        priority_key="unload_inspection_desk",
+                        priority=priority_unload_inspection_desk,
+                        location="Inspection",
+                        payload={
+                            "interface_action": "unload",
+                            "action": "unload",
+                            "inspection_product_id": product_id,
+                            "item_id": product_id,
+                            "item_type": "product",
+                            "inspection_result": result,
+                            "interface": self.inspection_workstation_id,
+                            "source": self.inspection_workstation_id,
+                            "destination": destination,
+                            "destination_buffer_id": destination_buffer_id,
+                            "destination_slot_token": destination_slot_token,
+                        },
                     )
                 )
         if self.inspection_scrap_queue and self.scrap_disposal_owner is None:
@@ -9308,7 +11822,19 @@ class ManufacturingWorld:
                         },
                     )
                 )
-        return tasks
+        filtered_tasks = [
+            task
+            for task in tasks
+            if TASK_CODE_BY_PRIORITY_KEY.get(self._task_priority_key(task), str(task.task_code or "").upper())
+            in self.enabled_task_codes
+        ]
+        self.buffer_metrics["candidate_scan_count"] += 1
+        self.buffer_metrics["candidate_count_total"] += len(filtered_tasks)
+        self.buffer_metrics["candidate_count_max"] = max(
+            int(self.buffer_metrics.get("candidate_count_max", 0)),
+            len(filtered_tasks),
+        )
+        return filtered_tasks
 
     def travel_time(self, src: str, dst: str) -> float:
         if self.grid_map is not None:
@@ -9355,6 +11881,8 @@ class ManufacturingWorld:
         planned_path: list[Tile] = [start_tile]
         planned_duration = 0.0
         move_id = ""
+        sampled_tile_time_min = float(grid.tile_time_min)
+        move_time_multiplier = 1.0
         segment_index = 0
         path_wait_incident_emitted = False
         last_path_wait_motion_refresh_at: float | None = None
@@ -9470,8 +11998,30 @@ class ManufacturingWorld:
             if not movement_started:
                 movement_started = True
                 planned_path = path
-                planned_duration = max(0.0, float(len(path) - 1) * grid.tile_time_min * self._current_transport_time_multiplier(agent))
                 move_id = f"{agent.agent_id}-move-{next(self.traffic_move_counter):06d}"
+                move_time_multiplier = self._current_transport_time_multiplier(agent)
+                current_task_id = str(agent.current_task_id or "")
+                timing_session = self.active_movement_timing_sessions.get(agent.agent_id, {})
+                if (
+                    str(timing_session.get("task_id", "")) == current_task_id
+                    and str(timing_session.get("destination", "")) == logical_dst
+                ):
+                    timing_sample_key = str(timing_session["sample_key"])
+                else:
+                    timing_sample_key = (
+                        f"{current_task_id or agent.agent_id}:{logical_dst}:"
+                        f"move-{next(self.timing_move_counter):06d}"
+                    )
+                    self.active_movement_timing_sessions[agent.agent_id] = {
+                        "task_id": current_task_id,
+                        "destination": logical_dst,
+                        "sample_key": timing_sample_key,
+                    }
+                sampled_tile_time_min = self.timing.sample_tile_time(
+                    sample_key=timing_sample_key,
+                    multiplier=move_time_multiplier,
+                )
+                planned_duration = max(0.0, float(len(path) - 1) * sampled_tile_time_min)
                 agent.current_move_id = move_id
                 agent.current_move_started_at = float(self.env.now)
                 agent.current_move_logical_destination = logical_dst
@@ -9499,11 +12049,13 @@ class ManufacturingWorld:
                             "from_tile": self._tile_payload(current_tile),
                             "to_tile": self._tile_payload(path[-1]),
                             "path_tiles": [self._tile_payload(tile) for tile in path],
-                            "tile_time_min": round(float(grid.tile_time_min), 6),
+                            "sampled_tile_time_min": round(sampled_tile_time_min, 6),
+                            "base_tile_time_distribution": self.timing.movement_distribution.to_dict(),
+                            "timing_sample_key": timing_sample_key,
                             "carrying_item_type": agent.carrying_item_type,
                             "carrying_item_id": agent.carrying_item_id,
                             "item_time_multiplier": round(self._item_transport_multiplier(agent.carrying_item_type), 3),
-                            "effective_time_multiplier": round(self._current_transport_time_multiplier(agent), 3),
+                            "effective_time_multiplier": round(move_time_multiplier, 3),
                             "transport_session": self._worker_cargo_payload(agent).get("transport_session_id"),
                             "carrier_ids": self._worker_cargo_payload(agent).get("carrier_ids", []),
                             "move_id": move_id,
@@ -9574,7 +12126,7 @@ class ManufacturingWorld:
             agent.reserved_tile = next_tile
             segment_index += 1
             segment_started_at = float(self.env.now)
-            segment_duration = float(grid.tile_time_min) * self._current_transport_time_multiplier(agent)
+            segment_duration = sampled_tile_time_min
             segment_ended_at = segment_started_at + segment_duration
             agent.current_move_segment_index = segment_index
             agent.current_move_segment_from_tile = current_tile
@@ -9700,7 +12252,7 @@ class ManufacturingWorld:
                 dynamic_total = max(
                     segment_duration,
                     (float(self.env.now) - float(agent.current_move_started_at or self.env.now))
-                    + (remaining_edges * float(grid.tile_time_min) * self._current_transport_time_multiplier(agent)),
+                    + (remaining_edges * sampled_tile_time_min),
                 )
                 self._set_in_transit(agent, str(agent.location), logical_dst, progress, dynamic_total)
 
@@ -9752,6 +12304,7 @@ class ManufacturingWorld:
             if move_id:
                 self._traffic_complete_plan(move_id)
             self._clear_current_move(agent)
+            self.active_movement_timing_sessions.pop(agent.agent_id, None)
         if agent.current_task_type:
             task = Task(
                 task_id=str(agent.current_task_id or ""),
@@ -9909,6 +12462,39 @@ class ManufacturingWorld:
         result = yield from self._execute_task_domain_action(agent, task)
         return result
 
+    def vacate_completed_task_service_tile(self, agent: Agent, task: Task):
+        """Move a task-ending worker off the single-capacity desk approach."""
+
+        if self.grid_map is None or agent.discharged:
+            return
+        if str(task.task_type or "").strip().upper() not in {
+            "LOAD_UNLOAD_TRANSFER_INTERFACE",
+            "INSPECT_PRODUCT",
+        }:
+            return
+        desk_tiles = set(self.grid_map.service_tiles.get(self.inspection_workstation_id, []))
+        if agent.tile not in desk_tiles:
+            return
+        staging_tiles = self.grid_map.service_tiles.get("inspection_staging", [])
+        if not staging_tiles:
+            raise RuntimeError("Inspection workstation has no passable staging tile for worker egress.")
+        from_tile = agent.tile
+        yield from self.move_agent(agent, "inspection_staging", emit_move_events=True)
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="INSPECTION_WORKSTATION_VACATED",
+            entity_id=self.inspection_workstation_id,
+            location="Inspection",
+            details={
+                "worker_id": agent.agent_id,
+                "task_id": task.task_id,
+                "task_code": str(task.task_code or task.task_type or ""),
+                "from_tile": self._tile_payload(from_tile),
+                "to_tile": self._tile_payload(agent.tile),
+            },
+        )
+
     def _dropped_item_recovery_destination(
         self,
         parent_task: Task,
@@ -9916,6 +12502,7 @@ class ManufacturingWorld:
         incident_context: dict[str, Any],
         dropped_info: dict[str, Any],
     ) -> str:
+        payload = parent_task.payload if isinstance(parent_task.payload, dict) else {}
         destination = str(
             incident_context.get("destination")
             or dropped_info.get("destination")
@@ -9923,9 +12510,24 @@ class ManufacturingWorld:
             or dropped_info.get("logical_destination")
             or ""
         ).strip()
+        if parent_task.task_type == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+            action = str(payload.get("interface_action") or payload.get("action") or "").strip().lower()
+            if action == "load":
+                return str(payload.get("destination") or self.inspection_workstation_id)
+            if action == "unload":
+                result = str(payload.get("inspection_result") or self.inspection_desk_result or "").strip().upper()
+                return str(
+                    payload.get("destination")
+                    or ("inspection_output_queue" if result == "PASS" else "inspection_scrap_queue")
+                )
+        if parent_task.task_type == "INSPECT_PRODUCT":
+            normalized = self.grid_map.normalize_location(destination) if self.grid_map is not None else destination
+            if not normalized or normalized == self.inspection_workstation_id:
+                # INSPECT_PRODUCT no longer transports the item. This fallback
+                # only protects legacy traces that still report a dropped item.
+                return self.inspection_workstation_id
         if destination:
             return destination
-        payload = parent_task.payload if isinstance(parent_task.payload, dict) else {}
         if parent_task.task_type == "TRANSFER":
             transfer_kind = str(payload.get("transfer_kind", "")).strip().lower()
             if transfer_kind == "material_supply":
@@ -9940,9 +12542,47 @@ class ManufacturingWorld:
                 return str(payload.get("target_agent_id", "") or "")
         if parent_task.task_type in {"LOAD_MACHINE", "SETUP_MACHINE"}:
             return str(payload.get("machine_id", "") or "")
-        if parent_task.task_type == "INSPECT_PRODUCT":
-            return "inspection_table"
         return str(dropped_info.get("logical_destination") or "")
+
+    def _log_recovered_inspection_unload(
+        self,
+        agent: Agent,
+        task: Task,
+        item_id: str,
+        result: str,
+        destination: str,
+    ) -> None:
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="INSPECTION_DESK_ITEM_UNLOADED",
+            entity_id=item_id,
+            location="Inspection",
+            details={
+                "worker_id": agent.agent_id,
+                "task_id": task.task_id,
+                "product_id": item_id,
+                "action": "unload",
+                "source": self.inspection_workstation_id,
+                "destination": destination,
+                "workstation": self.inspection_workstation_id,
+                "inspection_result": result,
+                "source_event": "dropped_item_recovery",
+            },
+        )
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="ITEM_MOVED",
+            entity_id=item_id,
+            location="Inspection",
+            details={
+                "from": self.inspection_workstation_id,
+                "to": destination,
+                "item_type": "product",
+                "source_event": "dropped_item_recovery",
+            },
+        )
 
     def _place_recovered_dropped_item(
         self,
@@ -9954,19 +12594,90 @@ class ManufacturingWorld:
     ) -> str:
         normalized = self.grid_map.normalize_location(destination) if self.grid_map is not None else str(destination)
         item_type_norm = str(item_type or "unknown").strip().lower()
+        payload = parent_task.payload if isinstance(parent_task.payload, dict) else {}
+        interface_action = str(payload.get("interface_action") or payload.get("action") or "").strip().lower()
+
+        if normalized == self.inspection_workstation_id:
+            if (
+                bool(payload.get("_inspection_interface_placed"))
+                and self.inspection_desk_item_id == item_id
+                and self.inspection_desk_state == "STAGED_FOR_INSPECTION"
+            ):
+                return "Inspection"
+            if self.inspection_desk_item_id not in {None, item_id}:
+                raise RuntimeError(
+                    f"Cannot recover {item_id} to occupied inspection desk {self.inspection_desk_item_id}."
+                )
+            self._set_inspection_desk_state(
+                "STAGED_FOR_INSPECTION",
+                item_id=item_id,
+                reason="dropped_interface_load_recovered",
+            )
+            self._set_item_state(
+                item_id,
+                ItemState.STAGED_FOR_INSPECTION,
+                location="Inspection",
+                ref=self.inspection_workstation_id,
+                item_type="product",
+            )
+            payload["_inspection_interface_placed"] = True
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="INSPECTION_DESK_ITEM_LOADED",
+                entity_id=item_id,
+                location="Inspection",
+                details={
+                    "worker_id": agent.agent_id,
+                    "task_id": parent_task.task_id,
+                    "product_id": item_id,
+                    "action": "load",
+                    "source": str(payload.get("source") or ""),
+                    "destination": self.inspection_workstation_id,
+                    "workstation": self.inspection_workstation_id,
+                    "source_event": "dropped_item_recovery",
+                },
+            )
+            return "Inspection"
 
         if normalized.startswith("material_queue_"):
             station = int(normalized.rsplit("_", 1)[-1])
-            self._push_material_queue(station, item_id)
+            if not self._push_material_queue(station, item_id, task=parent_task):
+                raise RuntimeError(f"Cannot recover {item_id}: material_queue_{station} is full.")
             return f"Station{station}"
 
         if normalized.startswith("intermediate_queue_"):
             station = int(normalized.rsplit("_", 1)[-1])
-            self._push_intermediate_queue(station, item_id)
+            if not self._push_intermediate_queue(station, item_id, task=parent_task):
+                raise RuntimeError(f"Cannot recover {item_id}: intermediate_queue_{station} is full.")
             return "Inspection" if station == self.inspection_queue_station else f"Station{station}"
 
+        if normalized.startswith("station_") and normalized.endswith("_output_queue"):
+            station_text = normalized.removeprefix("station_").removesuffix("_output_queue")
+            try:
+                station = int(station_text)
+            except ValueError:
+                station = 0
+            if station in self.output_buffers:
+                if not self._push_output_buffer_item(station, item_id, task=parent_task):
+                    raise RuntimeError(f"Cannot recover {item_id}: output_buffer_station_{station} is full.")
+                output_item_type = "product" if station >= self.last_processing_station else "intermediate"
+                self._set_item_state(
+                    item_id,
+                    ItemState.IN_OUTPUT_BUFFER,
+                    location=f"Station{station}",
+                    ref=f"output_buffer_station_{station}",
+                    item_type=output_item_type,
+                )
+                return f"Station{station}"
+
         if normalized == "inspection_output_queue":
-            self.output_buffers[self.inspection_queue_station].append(item_id)
+            if not self._push_output_buffer_item(
+                self.inspection_queue_station,
+                item_id,
+                task=parent_task,
+            ):
+                raise RuntimeError(f"Cannot recover {item_id}: inspection output buffer is full.")
             self._set_item_state(
                 item_id,
                 ItemState.WAITING_INSPECTION_OUTPUT,
@@ -9974,10 +12685,19 @@ class ManufacturingWorld:
                 ref="inspection_output_queue",
                 item_type="product",
             )
+            if interface_action == "unload" and not bool(payload.get("_inspection_interface_placed")):
+                payload["_inspection_interface_placed"] = True
+                self._set_inspection_desk_state("EMPTY", reason="dropped_interface_unload_recovered")
+                self._log_recovered_inspection_unload(agent, parent_task, item_id, "PASS", normalized)
             return "Inspection"
 
         if normalized == "inspection_scrap_queue":
-            self._push_inspection_scrap_queue(item_id)
+            if not self._push_inspection_scrap_queue(item_id, task=parent_task):
+                raise RuntimeError(f"Cannot recover {item_id}: inspection scrap queue is full.")
+            if interface_action == "unload" and not bool(payload.get("_inspection_interface_placed")):
+                payload["_inspection_interface_placed"] = True
+                self._set_inspection_desk_state("EMPTY", reason="dropped_interface_unload_recovered")
+                self._log_recovered_inspection_unload(agent, parent_task, item_id, "FAIL", normalized)
             return "Inspection"
 
         if normalized == "completed_product_buffer":
@@ -9997,11 +12717,36 @@ class ManufacturingWorld:
                 location="CompletedProducts",
                 details={"target": "completed_product_buffer", "source": "dropped_item_recovery"},
             )
+            self._record_initial_batch_terminal_output(
+                item_id,
+                outcome="accepted_product",
+                completed_by_agent_id=agent.agent_id,
+            )
             return "CompletedProducts"
 
         if normalized == "scrap_disposal_bin":
             self.disposed_scrap_count += 1
             self._set_item_state(item_id, ItemState.SCRAPPED, location="ScrapDisposal", ref="scrap_disposal_bin", item_type=item_type_norm)
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="SCRAP_DISPOSED",
+                entity_id="scrap_disposal_bin",
+                location="ScrapDisposal",
+                details={
+                    "item_ids": [item_id],
+                    "item_count": 1,
+                    "disposed_scrap_count": int(self.disposed_scrap_count),
+                    "scrap_transport_batches": int(self.scrap_transport_batches),
+                    "source": "dropped_item_recovery",
+                    "humanoid_state": self._humanoid_state_payload(agent),
+                },
+            )
+            self._record_initial_batch_terminal_output(
+                item_id,
+                outcome="disposed_scrap",
+                completed_by_agent_id=agent.agent_id,
+            )
             return "ScrapDisposal"
 
         machine = self.machines.get(normalized)
@@ -10049,9 +12794,7 @@ class ManufacturingWorld:
                 recovery_task.payload["failure_reason"] = "dropped_item_unreachable"
                 return False
             self._set_humanoid_primitive_hint(agent, "LOCALIZE_OBJECT", reason="dropped_item_recovery_localize")
-            yield self.env.timeout(max(0.0, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.0) or 0.0)))
             self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM", reason="dropped_item_recovery_identify")
-            yield self.env.timeout(max(0.0, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.0) or 0.0)))
             self._set_humanoid_primitive_hint(agent, "GRASP", reason="dropped_item_recovery_pickup")
             if not self._set_agent_carrying(agent, item_type, item_id):
                 recovery_task.payload["failure_reason"] = "dropped_item_pickup_failed"
@@ -10074,7 +12817,6 @@ class ManufacturingWorld:
             "transfer_intermediate_id",
             "material_id",
             "intermediate_id",
-            "inspection_product_id",
             "scrap_item_id",
         ):
             if str(parent_task.payload.get(key, "")) == item_id:
@@ -10098,6 +12840,353 @@ class ManufacturingWorld:
         )
         return True
 
+    def _execute_inspection_task_primitive(self, agent: Agent, task: Task, step: dict[str, Any]):
+        """Apply inspection interface and quality state changes at primitive boundaries."""
+
+        task_code = str(task.task_code or task.task_type or "").strip().upper()
+        call_code = str(step.get("call_code", "") or "").strip().upper()
+        step_id = str(step.get("step_id", "") or "").strip().lower()
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        product_id = str(payload.get("inspection_product_id") or payload.get("item_id") or "").strip()
+
+        if task_code == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+            action = str(payload.get("interface_action") or payload.get("action") or "").strip().lower()
+            if action not in {"load", "unload"} or not product_id:
+                payload["failure_reason"] = "invalid_inspection_interface_args"
+                return False
+
+            if call_code == "NAVIGATE_TO":
+                target = str(payload.get("source") if step_id == "s01_navigate_to" else payload.get("destination") or "")
+                if not target:
+                    payload["failure_reason"] = "missing_interface_location"
+                    return False
+                yield from self.move_agent(agent, target, emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, target, task, f"inspection_interface_{action}"):
+                    return False
+                yield from self._dock_agent_at_target(agent, task, reason=f"inspection_interface_{action}_alignment")
+                return True
+
+            if call_code in {"LOCALIZE_OBJECT", "PRIMITIVE_IDENTIFY_ITEM"}:
+                if self._maybe_random_humanoid_step_incident(agent, task, step, call_code):
+                    return False
+                if action == "load":
+                    return product_id in self.intermediate_queues[self.inspection_queue_station]
+                return (
+                    self.inspection_desk_item_id == product_id
+                    and self.inspection_desk_state == "INSPECTED_WAITING_UNLOAD"
+                    and self.inspection_desk_result in {"PASS", "FAIL"}
+                )
+
+            if call_code == "GRASP":
+                if action == "load":
+                    if self.inspection_desk_item_id is not None or self.inspection_desk_state != "EMPTY":
+                        payload["failure_reason"] = "inspection_desk_not_empty"
+                        return False
+                    popped = self._pop_intermediate_queue(self.inspection_queue_station, product_id)
+                    if popped != product_id:
+                        payload["failure_reason"] = "RESOURCE_PREEMPTED"
+                        return False
+                else:
+                    if (
+                        self.inspection_desk_item_id != product_id
+                        or self.inspection_desk_state != "INSPECTED_WAITING_UNLOAD"
+                        or self.inspection_desk_result not in {"PASS", "FAIL"}
+                    ):
+                        payload["failure_reason"] = "inspection_result_not_ready"
+                        return False
+                    payload["inspection_result"] = str(self.inspection_desk_result)
+                if not self._set_agent_carrying(agent, "product", product_id):
+                    if action == "load":
+                        self._appendleft_if_absent(self.intermediate_queues[self.inspection_queue_station], product_id)
+                        self._set_item_state(
+                            product_id,
+                            ItemState.WAITING_INSPECTION,
+                            location="Inspection",
+                            ref=f"intermediate_queue_{self.inspection_queue_station}",
+                            item_type="product",
+                        )
+                    return False
+                if action == "unload":
+                    self._set_item_state(
+                        product_id,
+                        ItemState.CARRIED_BY_WORKER,
+                        location="Inspection",
+                        ref=agent.agent_id,
+                        item_type="product",
+                    )
+                return True
+
+            if call_code == "PLACE":
+                if agent.carrying_item_id != product_id:
+                    payload["failure_reason"] = "inspection_interface_item_not_carried"
+                    return False
+                if action == "load":
+                    self._set_inspection_desk_state(
+                        "STAGED_FOR_INSPECTION",
+                        item_id=product_id,
+                        reason="inspection_item_loaded",
+                    )
+                    self._set_item_state(
+                        product_id,
+                        ItemState.STAGED_FOR_INSPECTION,
+                        location="Inspection",
+                        ref=self.inspection_workstation_id,
+                        item_type="product",
+                    )
+                    event_type = "INSPECTION_DESK_ITEM_LOADED"
+                else:
+                    result = str(payload.get("inspection_result") or "").strip().upper()
+                    destination = "inspection_output_queue" if result == "PASS" else "inspection_scrap_queue"
+                    if result == "PASS":
+                        if not self._push_output_buffer_item(
+                            self.inspection_queue_station,
+                            product_id,
+                            task=task,
+                        ):
+                            payload["failure_reason"] = "inspection_output_buffer_full"
+                            return False
+                        self._set_item_state(
+                            product_id,
+                            ItemState.WAITING_INSPECTION_OUTPUT,
+                            location="Inspection",
+                            ref="inspection_output_queue",
+                            item_type="product",
+                        )
+                    elif result == "FAIL":
+                        if not self._push_inspection_scrap_queue(product_id, task=task):
+                            payload["failure_reason"] = "inspection_scrap_buffer_full"
+                            return False
+                    else:
+                        payload["failure_reason"] = "missing_inspection_result"
+                        return False
+                    payload["destination"] = destination
+                    self._set_inspection_desk_state("EMPTY", reason="inspection_item_unloaded")
+                    event_type = "INSPECTION_DESK_ITEM_UNLOADED"
+                payload["_inspection_interface_placed"] = True
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type=event_type,
+                    entity_id=product_id,
+                    location="Inspection",
+                    details={
+                        "worker_id": agent.agent_id,
+                        "task_id": task.task_id,
+                        "product_id": product_id,
+                        "action": action,
+                        "source": str(payload.get("source") or ""),
+                        "destination": str(payload.get("destination") or ""),
+                        "workstation": self.inspection_workstation_id,
+                        "inspection_result": str(payload.get("inspection_result") or ""),
+                    },
+                )
+                return True
+
+            if call_code == "RELEASE":
+                if not payload.get("_inspection_interface_placed"):
+                    return False
+                destination = str(payload.get("destination") or "")
+                self._clear_agent_carrying(agent, destination=destination)
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="ITEM_MOVED",
+                    entity_id=product_id,
+                    location="Inspection",
+                    details={
+                        "from": str(payload.get("source") or ""),
+                        "to": destination,
+                        "item_type": "product",
+                        "worker_id": agent.agent_id,
+                        "task_id": task.task_id,
+                        "interface_action": action,
+                    },
+                )
+                return True
+
+            if call_code == "VERIFY_PLACEMENT":
+                if action == "load":
+                    return (
+                        self.inspection_desk_item_id == product_id
+                        and self.inspection_desk_state == "STAGED_FOR_INSPECTION"
+                    )
+                destination = str(payload.get("destination") or "")
+                if destination == "inspection_output_queue":
+                    return product_id in self.output_buffers[self.inspection_queue_station]
+                return product_id in self.inspection_scrap_queue
+            return True
+
+        if task_code != "INSPECT_PRODUCT" or not product_id:
+            return False
+
+        if call_code == "NAVIGATE_TO":
+            yield from self.move_agent(agent, self.inspection_workstation_id, emit_move_events=True)
+            if not self._confirm_object_service_tile(agent, self.inspection_workstation_id, task, "inspect_product_desk"):
+                return False
+            yield from self._dock_agent_at_target(agent, task, reason="inspection_desk_alignment")
+            return True
+
+        if call_code in {"PRIMITIVE_IDENTIFY_ITEM", "LOCALIZE_OBJECT"}:
+            if self._maybe_random_humanoid_step_incident(agent, task, step, call_code):
+                return False
+            return (
+                self.inspection_desk_item_id == product_id
+                and self.inspection_desk_state in {"STAGED_FOR_INSPECTION", "INSPECTING"}
+            )
+
+        if call_code == "EXECUTE_QUALITY_ACTION":
+            if self.inspection_desk_item_id != product_id or self.inspection_desk_state not in {
+                "STAGED_FOR_INSPECTION",
+                "INSPECTING",
+            }:
+                payload["failure_reason"] = "inspection_item_not_staged"
+                return False
+            if self.inspection_desk_state == "STAGED_FOR_INSPECTION":
+                self.inspection_active_agents += 1
+                self._set_inspection_desk_state("INSPECTING", item_id=product_id, reason="inspection_started")
+                self._set_item_state(
+                    product_id,
+                    ItemState.INSPECTING,
+                    location="Inspection",
+                    ref=self.inspection_workstation_id,
+                    item_type="product",
+                )
+                for event_type in ("INSPECTION_DESK_OCCUPIED", "INSPECTION_STARTED"):
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type=event_type,
+                        entity_id=self.inspection_workstation_id if event_type == "INSPECTION_DESK_OCCUPIED" else product_id,
+                        location="Inspection",
+                        details={
+                            "worker_id": agent.agent_id,
+                            "task_id": task.task_id,
+                            "product_id": product_id,
+                            "active_worker_ids": [agent.agent_id],
+                            "workstation": self.inspection_workstation_id,
+                        },
+                    )
+            return True
+
+        if call_code == "CLASSIFY_RESULT":
+            item = self.items.get(product_id)
+            if item is None or self.inspection_desk_state != "INSPECTING":
+                return False
+            stored_result = str(item.metadata.get("inspection_result") or "").strip().upper()
+            if stored_result not in {"PASS", "FAIL"}:
+                stored_result = "FAIL" if self.quality_rng.random() < float(self.quality_cfg["defect_prob"]) else "PASS"
+                item.metadata["inspection_result"] = stored_result
+                item.metadata["inspection_classified_at"] = round(float(self.env.now), 6)
+            self.inspection_desk_result = stored_result
+            payload["inspection_result"] = stored_result
+            return True
+
+        if call_code == "RECORD_RESULT":
+            item = self.items.get(product_id)
+            result = str(
+                self.inspection_desk_result
+                or (item.metadata.get("inspection_result") if item is not None else "")
+                or ""
+            ).strip().upper()
+            if item is None or result not in {"PASS", "FAIL"}:
+                return False
+            self._set_inspection_desk_state(
+                "INSPECTED_WAITING_UNLOAD",
+                item_id=product_id,
+                result=result,
+                reason="inspection_result_recorded",
+            )
+            self._set_item_state(
+                product_id,
+                ItemState.INSPECTED_WAITING_UNLOAD,
+                location="Inspection",
+                ref=self.inspection_workstation_id,
+                item_type="product",
+            )
+            if not bool(item.metadata.get("inspection_result_recorded", False)):
+                item.metadata["inspection_result_recorded"] = True
+                item.metadata["inspection_recorded_at"] = round(float(self.env.now), 6)
+                if result == "FAIL":
+                    self.scrap_count += 1
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="INSPECTION_RESULT_RECORDED",
+                    entity_id=product_id,
+                    location="Inspection",
+                    details={
+                        "worker_id": agent.agent_id,
+                        "task_id": task.task_id,
+                        "product_id": product_id,
+                        "inspection_result": result,
+                        "workstation": self.inspection_workstation_id,
+                    },
+                )
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="INSPECT_PASS" if result == "PASS" else "INSPECT_FAIL",
+                    entity_id=product_id,
+                    location=self.inspection_workstation_id,
+                    details={"inspector": agent.agent_id},
+                )
+                if result == "FAIL":
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type="SCRAP",
+                        entity_id=product_id,
+                        location=self.inspection_workstation_id,
+                        details={"queue_id": "inspection_scrap_queue", "status": "awaiting_unload"},
+                    )
+            return True
+        return True
+
+    def _execute_inspection_task_without_runtime(self, agent: Agent, task: Task):
+        """Execute the same primitive-boundary contract when HumanoidSim logging is disabled."""
+
+        task_code = str(task.task_code or task.task_type or "").strip().upper()
+        task.task_code = task_code
+        if task_code == "LOAD_UNLOAD_TRANSFER_INTERFACE":
+            primitive_steps = (
+                ("s01_navigate_to", "NAVIGATE_TO"),
+                ("s02_localize_object", "LOCALIZE_OBJECT"),
+                ("s03_reach_to", "REACH_TO"),
+                ("s04_grasp", "GRASP"),
+                ("s05_lift", "LIFT"),
+                ("s06_navigate_to_2", "NAVIGATE_TO"),
+                ("s07_place", "PLACE"),
+                ("s08_release", "RELEASE"),
+                ("s09_verify_placement", "VERIFY_PLACEMENT"),
+            )
+        elif task_code == "INSPECT_PRODUCT":
+            primitive_steps = (
+                ("s01_navigate_to_workstation", "NAVIGATE_TO"),
+                ("s02_primitive_identify_item", "PRIMITIVE_IDENTIFY_ITEM"),
+                ("s03_localize_object", "LOCALIZE_OBJECT"),
+                ("s04_execute_quality_action", "EXECUTE_QUALITY_ACTION"),
+                ("s05_classify_result", "CLASSIFY_RESULT"),
+                ("s06_record_result", "RECORD_RESULT"),
+            )
+        else:
+            return False
+
+        for step_id, call_code in primitive_steps:
+            step = {
+                "path": f"{task_code}/{step_id}",
+                "step_id": step_id,
+                "call_code": call_code,
+                "call_level": "PRIMITIVE_SKILL",
+            }
+            completed = bool((yield from self._execute_inspection_task_primitive(agent, task, step)))
+            if not completed:
+                return False
+            if call_code != "NAVIGATE_TO":
+                duration = float(self.resolve_primitive_duration(task, step) or 0.0)
+                if duration > 1e-9:
+                    yield self.env.timeout(duration)
+        return True
+
     def _execute_task_domain_action(self, agent: Agent, task: Task):
         task_type = task.task_type
 
@@ -10105,7 +13194,11 @@ class ManufacturingWorld:
             machine = self.machines[task.payload["machine_id"]]
             # Broken machines are strictly limited to REPAIR_MACHINE only.
             if machine.broken:
+                task.payload["failure_reason"] = "machine_broken"
                 return False
+
+        if task_type in {"LOAD_UNLOAD_TRANSFER_INTERFACE", "INSPECT_PRODUCT"}:
+            return (yield from self._execute_inspection_task_without_runtime(agent, task))
 
         if task_type == "HANDOVER_ITEM":
             if str(task.payload.get("handover_kind", "")) != "product_collaboration_join":
@@ -10136,9 +13229,7 @@ class ManufacturingWorld:
             if not self._product_session_has_remaining_path(session):
                 return False
             self._set_humanoid_primitive_hint(agent, "ANNOUNCE_INTENT")
-            yield self.env.timeout(max(0.0, float(getattr(self.humanoid_runtime, "default_primitive_min_duration", 0.0) or 0.0)))
             self._set_humanoid_primitive_hint(agent, "SYNC_WITH_ROBOT")
-            yield self.env.timeout(max(0.0, float(getattr(self.humanoid_runtime, "default_primitive_min_duration", 0.0) or 0.0)))
             self._set_humanoid_primitive_hint(agent, "EXECUTE_ROBOT_COLLABORATION_ACTION")
             if not self._join_product_transport_session(agent, session_id, task=task):
                 return False
@@ -10152,6 +13243,127 @@ class ManufacturingWorld:
             self._set_humanoid_primitive_hint(agent, "CONFIRM_OPERATOR_STATE")
             self._set_humanoid_primitive_hint(agent, "LOG_RESULT")
             return True
+
+        if task_type == "BATTERY_CHARGE":
+            dock_id = str(task.payload.get("charging_dock_id") or self._assigned_charging_dock(agent))
+            if dock_id != self._assigned_charging_dock(agent):
+                task.payload["failure_reason"] = "wrong_charging_dock"
+                return False
+            if agent.battery_service_owner is not None and agent.battery_service_owner != agent.agent_id:
+                return False
+            agent.battery_service_owner = agent.agent_id
+            completed = False
+            charge_started_at: float | None = None
+            try:
+                self._set_humanoid_primitive_hint(agent, "CHECK_CONTEXT")
+                self._set_humanoid_primitive_hint(agent, "EXECUTE_SYSTEM_ACTION")
+                yield from self.move_agent(agent, dock_id, emit_move_events=True)
+                if not self._confirm_object_service_tile(agent, dock_id, task, "battery_charge"):
+                    task.payload["failure_reason"] = "charging_dock_not_reached"
+                    return False
+                yield from self._dock_agent_at_target(agent, task, reason="charging_dock_alignment")
+
+                current_budget = max(0.0, float(self.battery_remaining(agent)))
+                target_budget = min(
+                    float(self.battery_swap_period_min),
+                    float(self.battery_swap_period_min) * float(task.payload.get("target_soc", self.battery_charge_target_soc)),
+                )
+                missing_ratio = max(
+                    0.0,
+                    (target_budget - current_budget) / max(1e-9, float(self.battery_swap_period_min)),
+                )
+                sampled_full_charge_min = max(
+                    0.0,
+                    self.active_primitive_duration(task, self.timing.expected_call_duration("MANAGE_ROBOT_POWER", "EXECUTE_SYSTEM_ACTION")),
+                )
+                charge_duration = sampled_full_charge_min * missing_ratio
+                task.payload.update(
+                    {
+                        "sampled_full_charge_min": sampled_full_charge_min,
+                        "missing_soc_ratio": missing_ratio,
+                        "charge_duration_min": charge_duration,
+                    }
+                )
+                agent.charging_started_at = float(self.env.now)
+                charge_started_at = float(self.env.now)
+                agent.charging_start_budget_min = current_budget
+                agent.charging_target_budget_min = target_budget
+                agent.charging_duration_min = charge_duration
+                agent.charging_dock_id = dock_id
+                agent.discharged = False
+                agent.discharged_since = None
+                self._transition_humanoid_state(
+                    agent,
+                    "power_charging",
+                    task=task,
+                    reason="dock_charge",
+                    source="mansim.power",
+                )
+                distribution = self.timing.distribution_for_step(
+                    "MANAGE_ROBOT_POWER", "MANAGE_ROBOT_POWER/s02_execute_system_action"
+                ).to_dict()
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="BATTERY_CHARGE_STARTED",
+                    entity_id=agent.agent_id,
+                    location=dock_id,
+                    details={
+                        "task_id": task.task_id,
+                        "charging_dock_id": dock_id,
+                        "start_soc": round(current_budget / self.battery_swap_period_min, 6),
+                        "target_soc": round(target_budget / self.battery_swap_period_min, 6),
+                        "sampled_full_charge_min": round(sampled_full_charge_min, 6),
+                        "charge_duration_min": round(charge_duration, 6),
+                        "distribution": distribution,
+                    },
+                )
+                if charge_duration > 0.0:
+                    yield self.env.timeout(charge_duration)
+                self._update_battery_accounting(agent)
+                agent.battery_remaining_budget_min = target_budget
+                agent.battery_last_accounted_at = float(self.env.now)
+                agent.battery_accounting_swap_at = float(self.env.now)
+                agent.last_battery_swap = float(self.env.now)
+                agent.low_battery_alerted = False
+                completed = True
+                details = {
+                    "task_id": task.task_id,
+                    "charging_dock_id": dock_id,
+                    "target_soc": round(target_budget / self.battery_swap_period_min, 6),
+                    "charge_duration_min": round(charge_duration, 6),
+                }
+                for event_type in ("BATTERY_CHARGE_COMPLETED", "AGENT_RECHARGED"):
+                    self.logger.log(
+                        t=self.env.now,
+                        day=self.day_for_time(self.env.now),
+                        event_type=event_type,
+                        entity_id=agent.agent_id,
+                        location=dock_id,
+                        details=details,
+                    )
+                task.payload["_battery_charge_completed"] = True
+                task.payload["_domain_action_duration_complete"] = True
+                self._set_humanoid_primitive_hint(agent, "VERIFY_ROBOT_STATE")
+                return True
+            finally:
+                if charge_started_at is not None:
+                    if not completed:
+                        self._close_interrupted_direct_charge(
+                            agent,
+                            task_id=task.task_id,
+                            reason="task_interrupted",
+                        )
+                        task.payload["_battery_charge_interrupted"] = True
+                    else:
+                        agent.charging_started_at = None
+                        agent.charging_start_budget_min = None
+                        agent.charging_target_budget_min = None
+                        agent.charging_duration_min = 0.0
+                        agent.charging_dock_id = None
+                        self._sync_humanoid_power_state(agent)
+                if agent.battery_service_owner == agent.agent_id:
+                    agent.battery_service_owner = None
 
         if task_type == "BATTERY_SWAP":
             if agent.battery_service_owner is not None and agent.battery_service_owner != agent.agent_id:
@@ -10173,7 +13385,7 @@ class ManufacturingWorld:
                     reason="battery_swap",
                     source="mansim.power",
                 )
-                yield self.env.timeout(float(self.agent_cfg["battery_pickup_time_min"]))
+                yield self.env.timeout(self.active_primitive_duration(task, self.agent_cfg["battery_pickup_time_min"]))
                 battery_item_id = str(task.payload.get("battery_item_id", ""))
                 if not battery_item_id:
                     battery_item_id = self._next_item_id("BAT")
@@ -10210,6 +13422,7 @@ class ManufacturingWorld:
         if task_type == "REPAIR_MACHINE":
             machine = self.machines[task.payload["machine_id"]]
             if not machine.broken:
+                task.payload["failure_reason"] = "machine_already_repaired"
                 return False
             self._set_humanoid_primitive_hint(agent, "CHECK_SAFETY_ZONE")
             yield from self.move_agent(agent, machine.machine_id, emit_move_events=True)
@@ -10227,6 +13440,7 @@ class ManufacturingWorld:
             )
             try:
                 if not machine.broken:
+                    task.payload["failure_reason"] = "machine_already_repaired"
                     return False
                 if not self._join_repair_team(machine, agent.agent_id):
                     return False
@@ -10246,12 +13460,17 @@ class ManufacturingWorld:
         if task_type == "UNLOAD_MACHINE":
             machine = self.machines[task.payload["machine_id"]]
             if machine.unload_owner is not None and machine.unload_owner != agent.agent_id:
+                task.payload["failure_reason"] = "machine_unload_reserved"
                 return False
             machine.unload_owner = agent.agent_id
             try:
                 output_id = str(task.payload.get("unloaded_output_id", "") or "")
                 carrying_unloaded_output = bool(output_id and agent.carrying_item_id == output_id)
-                if machine.broken or (machine.output_intermediate is None and not carrying_unloaded_output):
+                if machine.broken:
+                    task.payload["failure_reason"] = "machine_broken"
+                    return False
+                if machine.output_intermediate is None and not carrying_unloaded_output:
+                    task.payload["failure_reason"] = "missing_machine_output"
                     return False
 
                 if not carrying_unloaded_output:
@@ -10270,10 +13489,12 @@ class ManufacturingWorld:
                         source="mansim.machine",
                     )
                     if machine.broken:
+                        task.payload["failure_reason"] = "machine_broken"
                         return False
                     self._set_humanoid_primitive_hint(agent, "EXECUTE_MACHINE_ACTION")
-                    yield self.env.timeout(float(self.movement_cfg["unload_min"]))
+                    yield self.env.timeout(self.active_primitive_duration(task, self.movement_cfg["unload_min"]))
                     if machine.broken:
+                        task.payload["failure_reason"] = "machine_broken"
                         return False
                     output_id = str(machine.output_intermediate or "")
                     carried_kind = "product" if machine.station == self.last_processing_station else "intermediate"
@@ -10292,7 +13513,12 @@ class ManufacturingWorld:
                         return False
                     yield from self._dock_agent_at_target(agent, task, reason="unload_output_alignment")
                     self._set_humanoid_primitive_hint(agent, "PLACE")
-                    self.output_buffers[machine.station].append(output_id)
+                    if not self._push_output_buffer_item(machine.station, output_id, task=task):
+                        machine.output_intermediate = output_id
+                        self._set_machine_state(machine, MachineState.DONE_WAIT_UNLOAD, reason="output_buffer_full")
+                        self._clear_agent_carrying(agent, destination=machine.machine_id)
+                        task.payload["failure_reason"] = "destination_buffer_full"
+                        return False
                     output_item_type = "product" if machine.station == self.last_processing_station else "intermediate"
                     self._set_item_state(
                         output_id,
@@ -10349,7 +13575,7 @@ class ManufacturingWorld:
                             reason="battery_delivery_pickup",
                             source="mansim.power",
                         )
-                        yield self.env.timeout(float(self.agent_cfg["battery_pickup_time_min"]))
+                        yield self.env.timeout(self.active_primitive_duration(task) * 0.5)
                         if not battery_item_id:
                             battery_item_id = self._next_item_id("BAT")
                             task.payload["transfer_item_id"] = battery_item_id
@@ -10409,7 +13635,7 @@ class ManufacturingWorld:
                     agent.battery_swap_critical = True
                     target_agent.battery_swap_critical = True
                     try:
-                        yield self.env.timeout(float(self.agent_cfg["battery_delivery_extra_min"]))
+                        yield self.env.timeout(self.active_primitive_duration(task) * 0.5)
                     finally:
                         agent.battery_swap_critical = False
                         target_agent.battery_swap_critical = False
@@ -10568,7 +13794,11 @@ class ManufacturingWorld:
                         return False
                     yield from self._dock_agent_at_target(agent, task, reason="inter_station_dropoff_alignment")
                     self._set_humanoid_primitive_hint(agent, "PLACE")
-                    self._push_intermediate_queue(target_queue_station, moved_item_id)
+                    if not self._push_intermediate_queue(target_queue_station, moved_item_id, task=task):
+                        self._appendleft_if_absent(self.output_buffers[from_station], moved_item_id)
+                        self._clear_agent_carrying(agent, destination=f"output_buffer_station_{from_station}")
+                        task.payload["failure_reason"] = "destination_buffer_full"
+                        return False
                 task.payload.pop("transfer_item_id", None)
                 moved_item_kind = "product" if from_station >= self.last_processing_station else "intermediate"
                 self._set_humanoid_primitive_hint(agent, "RELEASE")
@@ -10603,12 +13833,17 @@ class ManufacturingWorld:
                         location="CompletedProducts",
                         details={"target": "completed_product_buffer"},
                     )
+                    self._record_initial_batch_terminal_output(
+                        moved_item_id,
+                        outcome="accepted_product",
+                        completed_by_agent_id=agent.agent_id,
+                    )
                 return True
 
             if transfer_kind == "material_supply":
                 station = int(task.payload["station"])
                 owner = self.material_supply_owner.get(station)
-                if owner is not None and owner != agent.agent_id:
+                if not self.is_mfg_flow_shop and owner is not None and owner != agent.agent_id:
                     task.payload["failure_reason"] = "material_supply_owner_changed"
                     if bool(self.humanoid_incident_natural_cfg.get("RESOURCE_PREEMPTED", True)):
                         self._emit_humanoid_incident(
@@ -10620,7 +13855,8 @@ class ManufacturingWorld:
                             context={"station": station, "owner": owner, "resource": "material_supply"},
                         )
                     return False
-                self.material_supply_owner[station] = agent.agent_id
+                if not self.is_mfg_flow_shop:
+                    self.material_supply_owner[station] = agent.agent_id
                 try:
                     item_id = str(task.payload.get("transfer_item_id", ""))
                     if agent.carrying_item_id != item_id:
@@ -10637,7 +13873,8 @@ class ManufacturingWorld:
                                 exclude_slot_ids=excluded_slot_ids,
                             )
                             if slot is None:
-                                self._log_material_shelf_empty_once()
+                                if self._material_shelf_count() <= 0:
+                                    self._log_material_shelf_empty_once()
                                 task.payload["failure_reason"] = "material_shelf_empty"
                                 self._emit_humanoid_incident(
                                     agent,
@@ -10681,6 +13918,7 @@ class ManufacturingWorld:
                                     agent.agent_id,
                                     task.task_id,
                                     exclude_slot_ids=excluded_slot_ids,
+                                    station=station,
                                 ) is not None:
                                     continue
                                 if self._material_shelf_count() <= 0:
@@ -10721,7 +13959,9 @@ class ManufacturingWorld:
                         task.payload["failure_reason"] = "material_supply_dropoff_unreachable"
                         return False
                     yield from self._dock_agent_at_target(agent, task, reason="material_supply_dropoff_alignment")
-                    self._push_material_queue(station, item_id)
+                    if not self._push_material_queue(station, item_id, task=task):
+                        task.payload["failure_reason"] = "destination_buffer_full"
+                        return False
                     self._clear_agent_carrying(agent, destination=f"Station{station}")
                     self._set_humanoid_primitive_hint(agent, "VERIFY_LEVEL_OR_QUANTITY")
                     self.logger.log(
@@ -10735,7 +13975,7 @@ class ManufacturingWorld:
                     self._set_humanoid_primitive_hint(agent, "UPDATE_RECORD")
                     return True
                 finally:
-                    if self.material_supply_owner.get(station) == agent.agent_id:
+                    if not self.is_mfg_flow_shop and self.material_supply_owner.get(station) == agent.agent_id:
                         self.material_supply_owner[station] = None
 
             return False
@@ -10819,7 +14059,6 @@ class ManufacturingWorld:
                     return False
                 yield from self._dock_agent_at_target(agent, task, reason=f"load_machine_{load_slot}_dropoff_alignment")
                 self._set_humanoid_primitive_hint(agent, "PLACE")
-                yield self.env.timeout(max(0.0, float(getattr(getattr(self, "humanoid_runtime", None), "default_primitive_min_duration", 0.0) or 0.0)))
                 if load_slot == "material":
                     if machine.input_material is not None:
                         self._appendleft_if_absent(self.material_queues[station], item_id)
@@ -10889,6 +14128,9 @@ class ManufacturingWorld:
                 if not self._confirm_object_service_tile(agent, machine.machine_id, task, "setup_machine"):
                     return False
                 yield from self._dock_agent_at_target(agent, task, reason="setup_machine_alignment")
+                if machine.broken:
+                    task.payload["failure_reason"] = "machine_broken"
+                    return False
                 self._set_humanoid_primitive_hint(agent, "READ_MACHINE_STATE")
                 self._transition_humanoid_state(
                     agent,
@@ -10899,7 +14141,7 @@ class ManufacturingWorld:
                     source="mansim.machine",
                 )
 
-                setup_step = float(self.movement_cfg["setup_min"])
+                setup_step = self.active_primitive_duration(task, self.movement_cfg["setup_min"])
                 self._set_machine_state(machine, MachineState.SETUP, reason="setup_started")
                 self._set_humanoid_primitive_hint(agent, "EXECUTE_MACHINE_ACTION")
                 setup_started = True
@@ -10913,6 +14155,10 @@ class ManufacturingWorld:
                     details={"by": agent.agent_id, "task_id": task.task_id, "setup_id": setup_event_id},
                 )
                 yield self.env.timeout(setup_step)
+                if machine.broken:
+                    task.payload["failure_reason"] = "machine_broken"
+                    _close_setup_event("aborted_machine_broken")
+                    return False
                 machine.setup_ready = True
                 self._set_machine_state(machine, MachineState.IDLE, reason="setup_completed")
                 self._set_humanoid_primitive_hint(agent, "VERIFY_MACHINE_STATE")
@@ -10922,160 +14168,10 @@ class ManufacturingWorld:
             finally:
                 if machine.setup_owner == agent.agent_id:
                     machine.setup_owner = None
-                    if machine.state == MachineState.SETUP and not machine.setup_ready:
-                        _close_setup_event("aborted")
+                    if setup_started:
+                        _close_setup_event("aborted_machine_broken" if machine.broken else "aborted")
+                    if machine.state == MachineState.SETUP and not machine.setup_ready and not machine.broken:
                         self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="setup_aborted")
-        if task_type == "INSPECT_PRODUCT":
-            try:
-                if self.inspection_owner is not None and self.inspection_owner != agent.agent_id:
-                    return False
-                self.inspection_owner = agent.agent_id
-                product_id = str(task.payload.get("inspection_product_id", ""))
-                if not product_id and not self.intermediate_queues[self.inspection_queue_station]:
-                    return False
-
-                if not product_id or agent.carrying_item_id != product_id:
-                    self._set_humanoid_primitive_hint(agent, "LOCALIZE_OBJECT")
-                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
-                    yield from self.move_agent(agent, "intermediate_queue_4", emit_move_events=True)
-                    if not self._confirm_object_service_tile(agent, "intermediate_queue_4", task, "inspect_product_pickup"):
-                        return False
-                    yield from self._dock_agent_at_target(agent, task, reason="inspect_pickup_alignment")
-                    self._set_humanoid_primitive_hint(agent, "PRIMITIVE_IDENTIFY_ITEM")
-                    self._transition_humanoid_state(
-                        agent,
-                        "task_started",
-                        task=task,
-                        status="running",
-                        reason="inspect_product_pickup",
-                        source="mansim.quality",
-                    )
-                    popped = self._pop_intermediate_queue(self.inspection_queue_station, product_id or None)
-                    if popped is None:
-                        task.payload["failure_reason"] = "RESOURCE_PREEMPTED" if product_id else "missing_inspection_input"
-                        if product_id and bool(self.humanoid_incident_natural_cfg.get("RESOURCE_PREEMPTED", True)):
-                            self._emit_humanoid_incident(
-                                agent,
-                                "RESOURCE_PREEMPTED",
-                                task=task,
-                                primitive_call_code="PRIMITIVE_IDENTIFY_ITEM",
-                                source="mansim.resource_race",
-                                context={
-                                    "item_id": product_id,
-                                    "resource": "inspection_input_queue",
-                                },
-                            )
-                        return False
-                    product_id = popped
-                    task.payload["inspection_product_id"] = product_id
-                    self._set_humanoid_primitive_hint(agent, "GRASP")
-                    if not self._set_agent_carrying(agent, "product", product_id):
-                        self._appendleft_if_absent(self.intermediate_queues[self.inspection_queue_station], product_id)
-                        task.payload.pop("inspection_product_id", None)
-                        return False
-                    self._set_humanoid_primitive_hint(agent, "LIFT")
-
-                self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
-                yield from self.move_agent(agent, "inspection_table", emit_move_events=True)
-                if not self._confirm_object_service_tile(agent, "inspection_table", task, "inspect_product_table"):
-                    return False
-                yield from self._dock_agent_at_target(agent, task, reason="inspection_table_alignment")
-                self._complete_product_transport_session_keep_primary_cargo(
-                    agent,
-                    destination="inspection_table",
-                    outcome="arrived_for_inspection",
-                )
-                self._set_humanoid_primitive_hint(agent, "EXECUTE_QUALITY_ACTION")
-                self._transition_humanoid_state(
-                    agent,
-                    "task_started",
-                    task=task,
-                    status="running",
-                    reason="inspect_product_at_table",
-                    source="mansim.quality",
-                )
-                self.inspection_active_agents += 1
-                try:
-                    yield self.env.timeout(max(self.inspection_min_time_min, self.inspection_base_time_min))
-                finally:
-                    self.inspection_active_agents = max(0, self.inspection_active_agents - 1)
-                defect_prob = float(self.quality_cfg["defect_prob"])
-                self._set_humanoid_primitive_hint(agent, "CLASSIFY_RESULT")
-                if self.rng.random() < defect_prob:
-                    self.scrap_count += 1
-                    self.logger.log(
-                        t=self.env.now,
-                        day=self.day_for_time(self.env.now),
-                        event_type="INSPECT_FAIL",
-                        entity_id=product_id,
-                        location="inspection_table",
-                        details={"inspector": agent.agent_id},
-                    )
-                    self.logger.log(
-                        t=self.env.now,
-                        day=self.day_for_time(self.env.now),
-                        event_type="SCRAP",
-                        entity_id=product_id,
-                        location="inspection_table",
-                        details={"queue_id": "inspection_scrap_queue"},
-                    )
-                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
-                    yield from self.move_agent(agent, "inspection_scrap_queue", emit_move_events=True)
-                    if not self._confirm_object_service_tile(agent, "inspection_scrap_queue", task, "inspect_product_scrap_dropoff"):
-                        return False
-                    yield from self._dock_agent_at_target(agent, task, reason="inspection_scrap_alignment")
-                    self._set_humanoid_primitive_hint(agent, "PLACE")
-                    self._push_inspection_scrap_queue(product_id)
-                    self._clear_agent_carrying(agent, destination="inspection_scrap_queue")
-                    self._set_humanoid_primitive_hint(agent, "RELEASE")
-                else:
-                    # Inspection pass: carry the product from the table to the output buffer.
-                    self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
-                    yield from self.move_agent(agent, "inspection_output_queue", emit_move_events=True)
-                    if not self._confirm_object_service_tile(agent, "inspection_output_queue", task, "inspect_product_output_dropoff"):
-                        return False
-                    yield from self._dock_agent_at_target(agent, task, reason="inspection_output_alignment")
-                    self._set_humanoid_primitive_hint(agent, "PLACE")
-                    self.logger.log(
-                        t=self.env.now,
-                        day=self.day_for_time(self.env.now),
-                        event_type="ITEM_MOVED",
-                        entity_id=product_id,
-                        location="Inspection",
-                        details={
-                            "from": "inspection_table",
-                            "to": f"output_buffer_station_{self.inspection_queue_station}",
-                            "item_type": "product",
-                        },
-                    )
-                    self.output_buffers[self.inspection_queue_station].append(product_id)
-                    self._set_item_state(
-                        product_id,
-                        ItemState.WAITING_INSPECTION_OUTPUT,
-                        location="Inspection",
-                        ref=f"output_buffer_station_{self.inspection_queue_station}",
-                        item_type="product",
-                    )
-                    self.logger.log(
-                        t=self.env.now,
-                        day=self.day_for_time(self.env.now),
-                        event_type="INSPECT_PASS",
-                        entity_id=product_id,
-                        location="Inspection",
-                        details={"inspector": agent.agent_id},
-                    )
-                    self._clear_agent_carrying(
-                        agent,
-                        destination=f"output_buffer_station_{self.inspection_queue_station}",
-                    )
-                    self._set_humanoid_primitive_hint(agent, "RELEASE")
-                self._set_humanoid_primitive_hint(agent, "RECORD_RESULT")
-                task.payload.pop("inspection_product_id", None)
-                return True
-            finally:
-                if self.inspection_owner == agent.agent_id:
-                    self.inspection_owner = None
-
         if task_type == "COLLECT_WASTE_OR_SCRAP":
             if self.scrap_disposal_owner is not None and self.scrap_disposal_owner != agent.agent_id:
                 return False
@@ -11172,6 +14268,12 @@ class ManufacturingWorld:
                         "humanoid_state": self._humanoid_state_payload(agent),
                     },
                 )
+                for item_id in item_ids:
+                    self._record_initial_batch_terminal_output(
+                        item_id,
+                        outcome="disposed_scrap",
+                        completed_by_agent_id=agent.agent_id,
+                    )
                 self._clear_agent_carrying(agent, destination="scrap_disposal_bin")
                 self._set_humanoid_primitive_hint(agent, "RELEASE")
                 task.payload.pop("item_ids", None)
@@ -11214,7 +14316,7 @@ class ManufacturingWorld:
                     location=f"Station{machine.station}",
                     details={"by": agent.agent_id},
                 )
-                yield self.env.timeout(float(self.machine_failure_cfg["pm_time_min"]))
+                yield self.env.timeout(self.active_primitive_duration(task, self.machine_failure_cfg["pm_time_min"]))
                 pm_duration = self.env.now - pm_start
                 machine.total_pm_min += pm_duration
                 machine.pm_count += 1
@@ -11237,8 +14339,30 @@ class ManufacturingWorld:
         return False
 
     def start_machine_cycle(self, machine: Machine) -> str:
-        cycle_id = self._next_cycle_id()
-        self._set_machine_state(machine, MachineState.PROCESSING, reason="cycle_started")
+        resumed = bool(machine.active_cycle_id and machine.cycle_remaining_process_min > 0.0)
+        if resumed:
+            cycle_id = str(machine.active_cycle_id)
+        else:
+            cycle_id = self._next_cycle_id()
+            distribution = self.processing_time_distribution[machine.station]
+            sampled = sample_triangular(
+                distribution,
+                seed=self.seed,
+                namespace=f"{self.scenario_key}:machine:station{machine.station}",
+                sample_key=cycle_id,
+            )
+            machine.active_cycle_id = cycle_id
+            machine.cycle_sampled_process_min = sampled
+            machine.cycle_remaining_process_min = sampled
+            self.timing.record_sample(
+                "machine_processing",
+                cycle_id,
+                sampled,
+                distribution,
+                machine_id=machine.machine_id,
+                station=machine.station,
+            )
+        self._set_machine_state(machine, MachineState.PROCESSING, reason="cycle_resumed" if resumed else "cycle_started")
         if machine.input_material:
             self._set_item_state(machine.input_material, ItemState.PROCESSING, location=f"Station{machine.station}", ref=machine.machine_id, item_type="material")
         if machine.input_intermediate:
@@ -11246,16 +14370,24 @@ class ManufacturingWorld:
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
-            event_type="MACHINE_START",
+            event_type="MACHINE_RESUME" if resumed else "MACHINE_START",
             entity_id=machine.machine_id,
             location=f"Station{machine.station}",
-            details={"cycle_id": cycle_id, "input_material": machine.input_material, "input_intermediate": machine.input_intermediate},
+            details={
+                "cycle_id": cycle_id,
+                "input_material": machine.input_material,
+                "input_intermediate": machine.input_intermediate,
+                "sampled_process_time_min": round(machine.cycle_sampled_process_min, 6),
+                "remaining_process_time_min": round(machine.cycle_remaining_process_min, 6),
+                "processing_time_distribution": self.processing_time_distribution[machine.station].to_dict(),
+            },
         )
         return cycle_id
 
     def complete_machine_cycle(self, machine: Machine, cycle_id: str) -> None:
         input_material_id = machine.input_material
         input_intermediate_id = machine.input_intermediate
+        sampled_process_time_min = float(machine.cycle_sampled_process_min)
         if machine.station == self.last_processing_station:
             output_id = self._next_item_id("PRODUCT")
             output_type = "product"
@@ -11295,7 +14427,22 @@ class ManufacturingWorld:
                 "transformed_from_item_ids": list(dict.fromkeys(source_item_ids)),
             }
         )
+        for source_item_id in source_item_ids:
+            source_item = self.items.get(source_item_id)
+            if source_item is None:
+                continue
+            source_item.metadata["transformed_to_item_id"] = output_id
+            self._set_item_state(
+                source_item_id,
+                ItemState.TRANSFORMED,
+                location=f"Station{machine.station}",
+                ref=output_id,
+                item_type=source_item.item_type,
+            )
         machine.active_process = None
+        machine.active_cycle_id = None
+        machine.cycle_sampled_process_min = 0.0
+        machine.cycle_remaining_process_min = 0.0
         machine.input_material = None
         machine.input_intermediate = None
         machine.setup_ready = False
@@ -11317,6 +14464,8 @@ class ManufacturingWorld:
                 "source_item_ids": list(dict.fromkeys(source_item_ids)),
                 "source_material_ids": list(dict.fromkeys(source_material_ids)),
                 "source_intermediate_ids": list(dict.fromkeys(source_intermediate_ids)),
+                "sampled_process_time_min": round(sampled_process_time_min, 6),
+                "processing_time_distribution": self.processing_time_distribution[machine.station].to_dict(),
             },
         )
 
@@ -11324,7 +14473,11 @@ class ManufacturingWorld:
         input_material_id = machine.input_material
         input_intermediate_id = machine.input_intermediate
         machine.active_process = None
-        machine.setup_ready = False
+        machine.cycle_remaining_process_min = max(
+            0.0,
+            float(machine.cycle_remaining_process_min) - max(0.0, float(elapsed_min)),
+        )
+        machine.setup_ready = True
         if input_material_id:
             self._set_item_state(
                 input_material_id,
@@ -11354,13 +14507,15 @@ class ManufacturingWorld:
                 "elapsed_min": round(float(elapsed_min), 3),
                 "retained_input_material": input_material_id,
                 "retained_input_intermediate": input_intermediate_id,
-                "progress_policy": "restart_after_repair",
+                "sampled_process_time_min": round(float(machine.cycle_sampled_process_min), 6),
+                "remaining_process_time_min": round(float(machine.cycle_remaining_process_min), 6),
+                "progress_policy": "resume_after_repair",
             },
         )
 
     def _empty_agent_priority_counter(self, *, float_values: bool = False) -> dict[str, float] | dict[str, int]:
         default_value: float | int = 0.0 if float_values else 0
-        return {key: default_value for key in default_task_priority_weights().keys()}
+        return {key: default_value for key in self._scenario_priority_keys()}
 
     def _agent_day_experience(self, task_slice: list[dict[str, Any]]) -> dict[str, Any]:
         # Build the per-agent behavioral summary that feeds next-day overlay updates and
@@ -11368,7 +14523,7 @@ class ManufacturingWorld:
         experience: dict[str, Any] = {}
         downstream_keys = {"unload_machine", "inter_station_transfer", "inspect_product"}
         reliability_keys = {"repair_machine", "preventive_maintenance"}
-        battery_keys = {"battery_swap", "battery_delivery_low_battery", "battery_delivery_discharged"}
+        battery_keys = {"battery_swap", "battery_charge", "battery_delivery_low_battery", "battery_delivery_discharged"}
         supply_keys = {"material_supply", "load_machine", "setup_machine"}
 
         for agent_id in sorted(self.agents.keys()):
@@ -11408,10 +14563,10 @@ class ManufacturingWorld:
                 )
 
             contribution_signals = {
-                "downstream_flow_completed": sum(completed_counts[key] for key in downstream_keys),
-                "reliability_completed": sum(completed_counts[key] for key in reliability_keys),
-                "battery_support_completed": sum(completed_counts[key] for key in battery_keys),
-                "supply_support_completed": sum(completed_counts[key] for key in supply_keys),
+                "downstream_flow_completed": sum(completed_counts.get(key, 0) for key in downstream_keys),
+                "reliability_completed": sum(completed_counts.get(key, 0) for key in reliability_keys),
+                "battery_support_completed": sum(completed_counts.get(key, 0) for key in battery_keys),
+                "supply_support_completed": sum(completed_counts.get(key, 0) for key in supply_keys),
             }
             ranked = sorted(
                 completed_minutes.items(),
@@ -11448,7 +14603,11 @@ class ManufacturingWorld:
         """Close observation events that are still open when the run horizon stops SimPy."""
         for agent in self.agents.values():
             if agent.current_move_id:
-                self._close_current_move_segment(agent, logical_destination=agent.current_move_logical_destination)
+                self._close_current_move_segment(
+                    agent,
+                    logical_destination=agent.current_move_logical_destination,
+                    reason=reason,
+                )
                 self._log_interrupted_move(agent, reason=reason, logical_destination=agent.current_move_logical_destination)
                 self._traffic_complete_plan(str(agent.current_move_id))
                 self._clear_current_move(agent)
@@ -11513,6 +14672,15 @@ class ManufacturingWorld:
                     )
                 runtime._log_task_event("HUMANOID_TASK_END", agent, task, status="interrupted")
 
+            if agent.charging_started_at is not None:
+                self._close_interrupted_direct_charge(
+                    agent,
+                    task_id=str(agent.current_task_id or task.task_id),
+                    reason=reason,
+                )
+                if agent.battery_service_owner == agent.agent_id:
+                    agent.battery_service_owner = None
+
             self.finish_agent_task(
                 agent,
                 task,
@@ -11533,6 +14701,8 @@ class ManufacturingWorld:
         inspection_passes = 0
         agent_discharged_count = 0
         battery_delivery_count = 0
+        battery_charge_count = 0
+        battery_charge_time_min = 0.0
         inspect_product_task_count = 0
         incident_event_count = 0
         physical_incident_count = 0
@@ -11555,6 +14725,8 @@ class ManufacturingWorld:
                 agent_discharged_count += 1
             elif event_type == "BATTERY_DELIVERED":
                 battery_delivery_count += 1
+            elif event_type == "BATTERY_CHARGE_COMPLETED":
+                battery_charge_count += 1
             elif event_type == "AGENT_TASK_START":
                 details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
                 if str(details.get("task_type", "")).strip() == "INSPECT_PRODUCT":
@@ -11619,6 +14791,11 @@ class ManufacturingWorld:
         discharged_intervals = self._agent_discharged_intervals()
         day_start_t = float((day - 1) * self.minutes_per_day)
         day_end_t = float(day * self.minutes_per_day)
+        battery_charge_time_min = self._battery_charge_time_in_interval(
+            self._battery_charge_sessions(),
+            day_start_t,
+            min(day_end_t, float(self.env.now)),
+        )
         agent_discharged_min = 0.0
         for _agent_id, start_t, end_t in discharged_intervals:
             overlap_start = max(day_start_t, float(start_t))
@@ -11656,6 +14833,8 @@ class ManufacturingWorld:
             "agent_discharged_count": int(agent_discharged_count),
             "agent_discharged_min": round(agent_discharged_min, 3),
             "battery_delivery_count": int(battery_delivery_count),
+            "battery_charge_count": int(battery_charge_count),
+            "battery_charge_time_min": round(battery_charge_time_min, 3),
             "incident_event_count": int(incident_event_count),
             "physical_incident_count": int(physical_incident_count),
             "coordination_incident_count": int(coordination_incident_count),
@@ -11676,7 +14855,7 @@ class ManufacturingWorld:
             "manager_queue_skipped_total": int(sum(self.manager_queue_skipped_counts.values())),
             "manager_queue_skipped_by_agent": {agent_id: int(self.manager_queue_skipped_counts.get(agent_id, 0)) for agent_id in sorted(self.agents.keys())},
             "agent_experience": agent_experience,
-            "shared_task_priority_weights": dict(self.current_job_plan.task_priority_weights or {}),
+            "shared_task_priority_weights": self._current_shared_task_priority_weights(),
             "agent_priority_multipliers": {agent_id: self.current_agent_priority_multipliers(agent_id) for agent_id in sorted(self.agents.keys())},
             "agent_effective_task_priority_weights": {agent_id: self.current_effective_task_priority_weights(agent_id) for agent_id in sorted(self.agents.keys())},
             "plan_revision": int(self._active_plan_revision()),
@@ -11690,6 +14869,40 @@ class ManufacturingWorld:
     def finalize_kpis(self) -> dict[str, Any]:
         total_checked = self.product_count + self.scrap_count
         total_time = max(1.0, float(self.env.now))
+        initial_batch_material_count = len(self.initial_batch_material_ids)
+        initial_batch_terminal_material_count = len(self.initial_batch_terminal_material_ids)
+        initial_batch_progress_ratio = (
+            initial_batch_terminal_material_count / max(1, initial_batch_material_count)
+            if initial_batch_material_count
+            else 0.0
+        )
+        initial_batch_terminal_output_count = (
+            len(self.initial_batch_accepted_output_ids) + len(self.initial_batch_disposed_scrap_ids)
+        )
+        initial_batch_yield_ratio = (
+            len(self.initial_batch_accepted_output_ids) / initial_batch_terminal_output_count
+            if initial_batch_terminal_output_count
+            else 0.0
+        )
+        if not self.is_mfg_flow_shop:
+            objective_status = "not_applicable"
+            makespan_status = "not_applicable"
+        elif self.minimize_makespan_enabled:
+            if self.termination_reason == "initial_material_batch_terminal_complete":
+                objective_status = "complete"
+                makespan_status = "complete"
+            elif self.termination_reason == "makespan_max_days_reached":
+                objective_status = "incomplete"
+                makespan_status = "incomplete"
+            elif self.termination_reason:
+                objective_status = "failed"
+                makespan_status = "incomplete"
+            else:
+                objective_status = "running"
+                makespan_status = "pending"
+        else:
+            objective_status = "complete" if self.termination_reason == "completed_horizon" else "failed"
+            makespan_status = "not_applicable"
 
         humanoid_task_totals: dict[str, float] = defaultdict(float)
         for rec in self.task_records:
@@ -11718,6 +14931,7 @@ class ManufacturingWorld:
         traffic_metrics = self._traffic_metrics()
         humanoid_incident_metrics = self._humanoid_incident_metrics()
         transport_metrics = self._transport_metrics()
+        battery_service_metrics = self._battery_service_metrics()
         repair_collaboration_metrics = self._repair_collaboration_metrics()
         incident_event_total = sum(int(summary.get("incident_event_count", 0) or 0) for summary in self.daily_summaries)
         physical_incident_total = sum(int(summary.get("physical_incident_count", 0) or 0) for summary in self.daily_summaries)
@@ -11738,7 +14952,58 @@ class ManufacturingWorld:
         }
         stage_throughput["Inspection"] = int(inspection_pass_total)
 
+        adp_summary: dict[str, Any] = {"enabled": False}
+        if self._adp_active():
+            self.adp_coordinator.finalize_episode()
+            adp_summary = self.adp_coordinator.summary()
+
+        self._refresh_blocked_after_service_metrics()
+        blocked_after_service_by_machine = {
+            machine_id: float(minutes)
+            for machine_id, minutes in self.buffer_metrics["blocked_after_service_min_by_machine"].items()
+        }
+        for machine_id, started_at in self.buffer_metrics["blocked_after_service_started_at"].items():
+            blocked_after_service_by_machine[machine_id] = blocked_after_service_by_machine.get(machine_id, 0.0) + max(
+                0.0,
+                float(self.env.now) - float(started_at),
+            )
+        buffer_avg_occupancy: dict[str, float] = {}
+        for buffer_id in sorted(self.buffer_capacities):
+            values: list[int] = []
+            for snapshot in self.minute_snapshots:
+                if buffer_id.startswith("material_queue_"):
+                    station = int(buffer_id.rsplit("_", 1)[1])
+                    values.append(int(snapshot.get("material_queue_lengths", {}).get(station, 0)))
+                elif buffer_id.startswith("intermediate_queue_"):
+                    station = int(buffer_id.rsplit("_", 1)[1])
+                    values.append(int(snapshot.get("intermediate_queue_lengths", {}).get(station, 0)))
+                elif buffer_id.startswith("output_buffer_station_"):
+                    station = int(buffer_id.rsplit("_", 1)[1])
+                    values.append(int(snapshot.get("output_buffer_lengths", {}).get(station, 0)))
+                elif buffer_id == "inspection_scrap_queue":
+                    values.append(int(snapshot.get("inspection_scrap_queue_length", 0)))
+            buffer_avg_occupancy[buffer_id] = round(float(mean(values)) if values else 0.0, 6)
+        candidate_scans = int(self.buffer_metrics.get("candidate_scan_count", 0) or 0)
+        buffer_reservation_leak_count = sum(
+            len(rows) for rows in self.buffer_slot_reservations.values()
+        )
+
         return {
+            "task_primitive_timing": self.timing.summary(),
+            "sim_elapsed_min": round(float(self.env.now), 6),
+            "objective_mode": self.objective_mode if self.is_mfg_flow_shop else "",
+            "objective_status": objective_status,
+            "configured_max_sim_days": int(self.objective.get("max_sim_days", self.num_days) or self.num_days),
+            "configured_throughput_days": int(self.configured_throughput_days),
+            "initial_batch_material_count": initial_batch_material_count,
+            "initial_batch_terminal_material_count": initial_batch_terminal_material_count,
+            "initial_batch_progress_ratio": round(initial_batch_progress_ratio, 6),
+            "initial_batch_expected_output_count": self.initial_batch_expected_output_count(),
+            "initial_batch_accepted_product_count": len(self.initial_batch_accepted_output_ids),
+            "initial_batch_disposed_scrap_count": len(self.initial_batch_disposed_scrap_ids),
+            "initial_batch_yield_ratio": round(initial_batch_yield_ratio, 6),
+            "makespan_min": round(float(self.makespan_min), 6) if self.makespan_min is not None else None,
+            "makespan_status": makespan_status,
             "total_products": self.product_count,
             "scrap_count": self.scrap_count,
             "disposed_scrap_count": int(self.disposed_scrap_count),
@@ -11749,9 +15014,37 @@ class ManufacturingWorld:
             "inspection_scrap_queue_length": len(self.inspection_scrap_queue),
             "scrap_transport_batches": int(self.scrap_transport_batches),
             "scrap_transport_items": int(self.scrap_transport_items),
+            "buffer_capacities": dict(self.buffer_capacities),
+            "buffer_avg_occupancy": buffer_avg_occupancy,
+            "buffer_max_occupancy": {
+                key: int(value)
+                for key, value in self.buffer_metrics["max_occupancy_by_buffer"].items()
+            },
+            "buffer_max_reserved_slots": {
+                key: int(value)
+                for key, value in self.buffer_metrics["max_reserved_by_buffer"].items()
+            },
+            "buffer_max_committed_plus_reserved": {
+                key: int(value)
+                for key, value in self.buffer_metrics["max_committed_plus_reserved_by_buffer"].items()
+            },
+            "buffer_overflow_attempt_count": int(self.buffer_metrics["overflow_attempt_count"]),
+            "buffer_reservation_failure_count": int(self.buffer_metrics["reservation_failure_count"]),
+            "buffer_reservation_leak_count": int(buffer_reservation_leak_count),
+            "machine_blocked_after_service_count": int(self.buffer_metrics["blocked_after_service_count"]),
+            "machine_blocked_after_service_min": round(sum(blocked_after_service_by_machine.values()), 6),
+            "machine_blocked_after_service_min_by_machine": {
+                key: round(value, 6) for key, value in sorted(blocked_after_service_by_machine.items())
+            },
+            "candidate_scan_count": candidate_scans,
+            "candidate_count_avg": round(
+                float(self.buffer_metrics.get("candidate_count_total", 0)) / max(1, candidate_scans),
+                6,
+            ),
+            "candidate_count_max": int(self.buffer_metrics.get("candidate_count_max", 0)),
             "station_throughput": dict(self.station_throughput),
             "stage_throughput": stage_throughput,
-            "avg_daily_products": round(self.product_count / self.num_days, 4),
+            "avg_daily_products": round(self.product_count / self._objective_reporting_days(), 4),
             "throughput_per_sim_hour": round(self.product_count / max(1e-6, total_time / 60.0), 4),
             "avg_wip_material": round(
                 mean(sum(s["material_queue_lengths"].values()) for s in self.minute_snapshots),
@@ -11802,10 +15095,39 @@ class ManufacturingWorld:
             "humanoid_unavailable_ratio_avg": round(float(humanoid_unavailable_ratio_avg), 6),
             "humanoid_primitive_minutes": humanoid_primitive_minutes,
             "humanoid_task_taxonomy": humanoid_task_taxonomy,
+            "adp_checkpoint_id": str(adp_summary.get("checkpoint_id", "")),
+            "adp_decision_count": int(adp_summary.get("decision_count", 0) or 0),
+            "adp_wait_count": int(adp_summary.get("wait_count", 0) or 0),
+            "adp_candidate_available_wait_count": int(
+                adp_summary.get("candidate_available_wait_count", 0) or 0
+            ),
+            "adp_no_candidate_unassigned_count": int(
+                adp_summary.get("no_candidate_unassigned_count", 0) or 0
+            ),
+            "adp_candidate_available_wait_ratio": round(
+                float(adp_summary.get("candidate_available_wait_ratio", 0.0) or 0.0),
+                6,
+            ),
+            "adp_no_candidate_unassigned_ratio": round(
+                float(adp_summary.get("no_candidate_unassigned_ratio", 0.0) or 0.0),
+                6,
+            ),
+            "adp_joint_all_wait_with_candidate_ratio": round(
+                float(
+                    adp_summary.get("joint_all_wait_with_candidate_ratio", 0.0)
+                    or 0.0
+                ),
+                6,
+            ),
+            "adp_avg_candidate_count": round(float(adp_summary.get("avg_candidate_count", 0.0) or 0.0), 6),
+            "adp_inference_latency_ms_avg": round(float(adp_summary.get("inference_latency_ms_avg", 0.0) or 0.0), 6),
+            "adp_validation_completed_products_avg": round(float(adp_summary.get("validation_completed_products_avg", 0.0) or 0.0), 6),
+            "simulation_based_adp": adp_summary,
             **operational_complexity_metrics,
             **humanoid_incident_metrics,
             **traffic_metrics,
             **transport_metrics,
+            **battery_service_metrics,
             **repair_collaboration_metrics,
             "rolling_horizon_window_count": int(self.rolling_horizon_metrics.get("started_window_count", 0)),
             "rolling_horizon_candidate_collected_count": int(self.rolling_horizon_metrics.get("candidate_collected_count", 0)),
@@ -11814,6 +15136,16 @@ class ManufacturingWorld:
             "rolling_horizon_stale_skipped_task_count": int(self.rolling_horizon_metrics.get("stale_skipped_task_count", 0)),
             "rolling_horizon_requeued_task_count": int(self.rolling_horizon_metrics.get("requeued_task_count", 0)),
             "rolling_horizon_max_worker_queue_length": int(self.rolling_horizon_metrics.get("max_worker_queue_length", 0)),
+            "rolling_horizon_scheduler_mode": self.rolling_horizon_scheduler_mode,
+            "rolling_horizon_strict_boundary_count": int(
+                self.rolling_horizon_metrics.get("strict_boundary_count", 0)
+            ),
+            "rolling_horizon_late_boundary_count": int(
+                self.rolling_horizon_metrics.get("late_boundary_count", 0)
+            ),
+            "rolling_horizon_max_boundary_lag_min": round(
+                float(self.rolling_horizon_max_boundary_lag_min), 9
+            ),
             "throughput_optimizer_window_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_window_count", 0)),
             "throughput_optimizer_solved_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_solved_count", 0)),
             "throughput_optimizer_failed_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_failed_count", 0)),
@@ -11824,6 +15156,8 @@ class ManufacturingWorld:
                 "dedicated_roles": bool(self._rolling_horizon_dedicated_roles_active()),
                 "throughput_optimizer": bool(self._rolling_horizon_throughput_optimizer_active()),
                 "window_min": round(float(self.rolling_horizon_window_min), 3),
+                "scheduler_mode": self.rolling_horizon_scheduler_mode,
+                "candidate_collection_mode": self.rolling_horizon_candidate_collection_mode,
                 "dispatch_policy": self.rolling_horizon_dispatch_policy,
                 "window_count": int(self.rolling_horizon_metrics.get("started_window_count", 0)),
                 "dispatched_window_count": int(self.rolling_horizon_metrics.get("window_count", 0)),
@@ -11833,6 +15167,13 @@ class ManufacturingWorld:
                 "stale_skipped_task_count": int(self.rolling_horizon_metrics.get("stale_skipped_task_count", 0)),
                 "requeued_task_count": int(self.rolling_horizon_metrics.get("requeued_task_count", 0)),
                 "empty_window_count": int(self.rolling_horizon_metrics.get("empty_window_count", 0)),
+                "strict_boundary_count": int(
+                    self.rolling_horizon_metrics.get("strict_boundary_count", 0)
+                ),
+                "late_boundary_count": int(
+                    self.rolling_horizon_metrics.get("late_boundary_count", 0)
+                ),
+                "max_boundary_lag_min": round(float(self.rolling_horizon_max_boundary_lag_min), 9),
                 "throughput_optimizer_window_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_window_count", 0)),
                 "throughput_optimizer_solved_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_solved_count", 0)),
                 "throughput_optimizer_failed_count": int(self.rolling_horizon_metrics.get("throughput_optimizer_failed_count", 0)),
@@ -11843,6 +15184,9 @@ class ManufacturingWorld:
                 "max_worker_queue_length": int(self.rolling_horizon_metrics.get("max_worker_queue_length", 0)),
                 "max_queue_length_by_worker": dict(self.rolling_horizon_max_queue_length_by_worker),
                 "task_code_priority_order": list(getattr(self, "rolling_horizon_task_code_priority_order", [])),
+                "task_rule_priority_order": list(
+                    getattr(getattr(self, "mfg_flow_task_policy", None), "priority_order", [])
+                ),
                 "rank_boost_per_window": int(getattr(self, "rolling_horizon_rank_boost_per_window", 1) or 0),
                 "immediate_queue_policy": str(getattr(self, "rolling_horizon_immediate_queue_policy", "")),
                 "immediate_protect_from_window_requeue": bool(

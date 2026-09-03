@@ -66,6 +66,65 @@ class ReplayExportTests(unittest.TestCase):
         self.assertEqual(20.0, window["ended_at"])
         self.assertEqual("REPAIR_MACHINE", window["task_code"])
 
+    def test_dedicated_charging_docks_are_exported_and_track_charge_state(self) -> None:
+        layout = {
+            "scenario_type": "mfg_flow_shop",
+            "regions": [],
+            "nodes": [
+                {
+                    "entity_id": "charging_dock_A1",
+                    "entity_type": "charger",
+                    "position": {"x": 10.0, "y": 20.0},
+                    "tile": {"x": 4, "y": 7},
+                }
+            ],
+        }
+        state = build_initial_state(["A1"], [], layout, battery_period_min=200.0, repair_total_min=30.0)
+        entities = state["entities"]
+
+        self.assertNotIn("battery_rack", entities)
+        self.assertEqual("A1 Charging Dock", entities["charging_dock_A1"]["label"])
+        self.assertEqual("A1", entities["charging_dock_A1"]["attributes"]["assigned_worker_id"])
+        self.assertFalse(entities["charging_dock_A1"]["attributes"]["charging"])
+
+        raw_events = [
+            {
+                "t": 15.0,
+                "type": "BATTERY_CHARGE_STARTED",
+                "entity_id": "A1",
+                "location": "charging_dock_A1",
+                "details": {
+                    "task_id": "BAT-000001",
+                    "charging_dock_id": "charging_dock_A1",
+                    "start_soc": 0.25,
+                    "target_soc": 1.0,
+                    "charge_duration_min": 7.5,
+                },
+            },
+            {
+                "t": 22.5,
+                "type": "BATTERY_CHARGE_COMPLETED",
+                "entity_id": "A1",
+                "location": "charging_dock_A1",
+                "details": {
+                    "task_id": "BAT-000001",
+                    "charging_dock_id": "charging_dock_A1",
+                    "target_soc": 1.0,
+                    "charge_duration_min": 7.5,
+                },
+            },
+        ]
+        events = convert_events(raw_events, layout, battery_period_min=200.0, repair_total_min=30.0)
+        dock_events = [
+            event
+            for event in events
+            if event["event_type"] == "state_changed" and event["entity_refs"].get("primary") == "charging_dock_A1"
+        ]
+
+        self.assertEqual(["charging", "available"], [event["payload"]["state"] for event in dock_events])
+        self.assertEqual("A1", dock_events[0]["payload"]["attributes"]["occupied_by"])
+        self.assertEqual("", dock_events[1]["payload"]["attributes"]["occupied_by"])
+
     def test_output_buffer_queue_pop_uses_visible_queue_alias(self) -> None:
         raw_events = [
             {

@@ -6,7 +6,15 @@ ui:
   streamlit_preferred_port: 8505
   replay_studio_preferred_port: 5173
   replay_studio_3d_preferred_port: 5174
+  # Policy experiments override this to false. Core events, KPI, Gantt, and
+  # the compact map layout remain available for comparison and audits.
+  export_replay_artifacts: true
   # Legacy 2D Replay Studio is no longer exposed in the shared hub UI.
   auto_start_replay_studio: false
   auto_start_replay_studio_3d: true
   replay_studio_auto_install: true
+
+artifacts:
+  # Keep events in memory for KPI/Gantt generation, but do not persist the
+  # large events.jsonl file unless a replay or forensic audit is requested.
+  export_events: false

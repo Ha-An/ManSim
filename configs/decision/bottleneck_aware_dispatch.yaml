@@ -12,6 +12,8 @@ throughput_policy:
     machine_continuity_weight: 1.0
   factory_mfg_basic:
     enabled: true
+  mfg_flow_shop:
+    enabled: true
 
 battery:
   low_threshold_ratio: 0.30

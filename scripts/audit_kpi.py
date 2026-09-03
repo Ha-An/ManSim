@@ -25,6 +25,8 @@ def load_json(path: Path) -> dict:
 
 def load_jsonl(path: Path) -> list[dict]:
     rows: list[dict] = []
+    if not path.is_file():
+        return rows
     with path.open("r", encoding="utf-8") as handle:
         for raw in handle:
             raw = raw.strip()
@@ -100,6 +102,69 @@ def event_intervals(events: list[dict], start_events: set[str], end_events: set[
         if sim_end > start:
             rows[entity_id].append((start, sim_end))
     return {entity_id: merge_intervals(chunks) for entity_id, chunks in rows.items()}
+
+
+def battery_charge_sessions(events: list[dict], sim_end: float) -> list[dict]:
+    active: dict[tuple[str, str], tuple[float, str]] = {}
+    sessions: list[dict] = []
+
+    def close(key: tuple[str, str], end_t: float, *, completed: bool, details: dict | None = None) -> None:
+        row = active.pop(key, None)
+        event_details = details if isinstance(details, dict) else {}
+        if row is None:
+            if not completed:
+                return
+            duration = max(
+                0.0,
+                float(
+                    event_details.get("actual_charge_duration_min")
+                    or event_details.get("charge_duration_min")
+                    or 0.0
+                ),
+            )
+            row = (max(0.0, float(end_t) - duration), "")
+        sessions.append(
+            {
+                "worker_id": key[0],
+                "task_id": key[1],
+                "started_at": float(row[0]),
+                "ended_at": float(end_t),
+                "duration_min": max(0.0, float(end_t) - float(row[0])),
+                "completed": bool(completed),
+            }
+        )
+
+    for event in events:
+        event_type = str(event.get("type", "")).strip().upper()
+        if event_type not in {
+            "BATTERY_CHARGE_STARTED",
+            "BATTERY_CHARGE_COMPLETED",
+            "BATTERY_CHARGE_INTERRUPTED",
+            "AGENT_TASK_END",
+        }:
+            continue
+        details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+        payload = details.get("payload", {}) if isinstance(details.get("payload", {}), dict) else {}
+        worker_id = str(event.get("entity_id", "")).strip()
+        task_id = str(details.get("task_id", "")).strip()
+        key = (worker_id, task_id)
+        event_t = float(event.get("t", 0.0) or 0.0)
+        if event_type == "BATTERY_CHARGE_STARTED":
+            active[key] = (event_t, str(details.get("charging_dock_id", "")))
+        elif event_type == "BATTERY_CHARGE_COMPLETED":
+            close(key, event_t, completed=True, details=details)
+        elif event_type == "BATTERY_CHARGE_INTERRUPTED":
+            close(key, event_t, completed=False, details=details)
+        elif str(payload.get("action", "")).strip().lower() == "dock_charge":
+            close(key, event_t, completed=False, details=details)
+
+    for key in list(active):
+        close(key, float(sim_end), completed=False)
+    return sessions
+
+
+def interval_overlap(start: float, end: float, interval_start: float, interval_end: float) -> float:
+    return max(0.0, min(float(end), float(interval_end)) - max(float(start), float(interval_start)))
 
 
 def humanoid_state_time_from_events(events: list[dict], agent_ids: set[str], sim_end: float) -> dict[str, dict[str, dict[str, float]]]:
@@ -348,8 +413,60 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
         agent_ids = {str(worker_id) for worker_id in kpi.get("humanoid_state_time_by_worker", {}).keys()}
     machine_ids = set(kpi.get("machine_time_by_machine", {}).keys())
     num_days = len(daily)
+    objective_mode = str(kpi.get("objective_mode") or run_meta.get("objective_mode") or "").strip()
+    scenario_type = str(kpi.get("scenario_type") or run_meta.get("scenario_type") or "").strip()
+    minutes_per_day = float(run_meta.get("minutes_per_day") or 240.0)
+    event_log_cfg = run_meta.get("event_log", {}) if isinstance(run_meta, dict) else {}
+    event_log_enabled = (
+        bool(event_log_cfg.get("enabled", False))
+        if isinstance(event_log_cfg, dict) and "enabled" in event_log_cfg
+        else (output_dir / "events.jsonl").is_file()
+    )
+    if not event_log_enabled:
+        compare_scalar(
+            findings,
+            "daily_summary total products",
+            sum(int(day.get("products", 0) or 0) for day in daily),
+            int(kpi.get("total_products", 0) or 0),
+            0.0,
+        )
+        compare_scalar(
+            findings,
+            "daily_summary total scrap",
+            sum(int(day.get("scrap", 0) or 0) for day in daily),
+            int(kpi.get("scrap_count", 0) or 0),
+            0.0,
+        )
+        if scenario_type == "mfg_flow_shop":
+            for key in (
+                "buffer_overflow_attempt_count",
+                "buffer_reservation_failure_count",
+                "buffer_reservation_leak_count",
+            ):
+                if int(kpi.get(key, 0) or 0) != 0:
+                    findings.append(f"{key}: expected 0, found {kpi.get(key)}")
+            capacities = kpi.get("buffer_capacities", {})
+            combined = kpi.get("buffer_max_committed_plus_reserved", {})
+            if not isinstance(capacities, dict) or not capacities:
+                findings.append("buffer_capacities: missing finite-buffer capacity map")
+            elif not isinstance(combined, dict):
+                findings.append("buffer_max_committed_plus_reserved: missing capacity audit map")
+            else:
+                for buffer_id, raw_capacity in capacities.items():
+                    capacity = int(raw_capacity or 0)
+                    observed = int(combined.get(buffer_id, 0) or 0)
+                    if capacity <= 0 or observed > capacity:
+                        findings.append(
+                            f"buffer capacity: {buffer_id} observed={observed} capacity={capacity}"
+                        )
+        return findings, {
+            "output_dir": str(output_dir),
+            "finding_count": len(findings),
+            "sim_end": sim_end,
+            "event_log_enabled": False,
+            "event_cross_checks": "skipped",
+        }
 
-    scenario_type = str(kpi.get("scenario_type") or kpi.get("run_meta", {}).get("scenario_type") or "").strip()
     if scenario_type == "shipyard_basic":
         final_surface_state: dict[str, str] = {}
         completed_at: dict[str, float] = {}
@@ -422,8 +539,112 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
     if expected_stage != kpi.get("stage_throughput", {}):
         findings.append(f"stage_throughput mismatch: expected {expected_stage}, found {kpi.get('stage_throughput', {})}")
 
-    compare_scalar(findings, "avg_daily_products", kpi.get("avg_daily_products", 0.0), round4(total_products / max(1, num_days)))
+    if scenario_type == "mfg_flow_shop" and objective_mode == "minimize_makespan":
+        reporting_days = max(1e-9, sim_end / max(1.0, minutes_per_day))
+    else:
+        reporting_days = float(max(1, num_days))
+    compare_scalar(
+        findings,
+        "avg_daily_products",
+        kpi.get("avg_daily_products", 0.0),
+        round4(total_products / reporting_days),
+    )
     compare_scalar(findings, "throughput_per_sim_hour", kpi.get("throughput_per_sim_hour", 0.0), round4(total_products / max(1e-6, sim_end / 60.0)))
+
+    charge_sessions = battery_charge_sessions(events, sim_end)
+    completed_charge_sessions = [session for session in charge_sessions if bool(session.get("completed"))]
+    expected_charge_time = round3(sum(float(session.get("duration_min", 0.0) or 0.0) for session in charge_sessions))
+    expected_charge_starts = sum(
+        1 for event in events if str(event.get("type", "")).strip().upper() == "BATTERY_CHARGE_STARTED"
+    )
+    compare_scalar(
+        findings,
+        "battery_charge_started_count",
+        kpi.get("battery_charge_started_count", 0),
+        expected_charge_starts,
+        0.0,
+    )
+    compare_scalar(
+        findings,
+        "battery_charge_count",
+        kpi.get("battery_charge_count", 0),
+        len(completed_charge_sessions),
+        0.0,
+    )
+    compare_scalar(
+        findings,
+        "battery_charge_time_min",
+        kpi.get("battery_charge_time_min", 0.0),
+        expected_charge_time,
+        0.001,
+    )
+    expected_charge_count_by_worker: dict[str, int] = defaultdict(int)
+    expected_charge_time_by_worker: dict[str, float] = defaultdict(float)
+    for session in charge_sessions:
+        worker_id = str(session.get("worker_id", "")).strip()
+        if not worker_id:
+            continue
+        if bool(session.get("completed")):
+            expected_charge_count_by_worker[worker_id] += 1
+        expected_charge_time_by_worker[worker_id] += float(session.get("duration_min", 0.0) or 0.0)
+    observed_charge_count_by_worker = kpi.get("battery_charge_count_by_worker", {})
+    observed_charge_count_by_worker = observed_charge_count_by_worker if isinstance(observed_charge_count_by_worker, dict) else {}
+    observed_charge_time_by_worker = kpi.get("battery_charge_time_min_by_worker", {})
+    observed_charge_time_by_worker = observed_charge_time_by_worker if isinstance(observed_charge_time_by_worker, dict) else {}
+    charge_worker_ids = set(expected_charge_count_by_worker) | set(expected_charge_time_by_worker) | set(observed_charge_count_by_worker) | set(observed_charge_time_by_worker)
+    for worker_id in sorted(charge_worker_ids):
+        compare_scalar(
+            findings,
+            f"battery_charge_count_by_worker[{worker_id}]",
+            observed_charge_count_by_worker.get(worker_id, 0),
+            expected_charge_count_by_worker.get(worker_id, 0),
+            0.0,
+        )
+        compare_scalar(
+            findings,
+            f"battery_charge_time_min_by_worker[{worker_id}]",
+            observed_charge_time_by_worker.get(worker_id, 0.0),
+            round3(expected_charge_time_by_worker.get(worker_id, 0.0)),
+            0.001,
+        )
+
+    for day_row in daily:
+        day = int(day_row.get("day", 0) or 0)
+        if day <= 0:
+            continue
+        day_start = float((day - 1) * minutes_per_day)
+        day_end = min(float(day * minutes_per_day), sim_end)
+        expected_day_charge_time = round3(
+            sum(
+                interval_overlap(
+                    float(session.get("started_at", 0.0) or 0.0),
+                    float(session.get("ended_at", 0.0) or 0.0),
+                    day_start,
+                    day_end,
+                )
+                for session in charge_sessions
+            )
+        )
+        expected_day_charge_count = sum(
+            1
+            for event in events
+            if str(event.get("type", "")).strip().upper() == "BATTERY_CHARGE_COMPLETED"
+            and int(event.get("day", 0) or 0) == day
+        )
+        compare_scalar(
+            findings,
+            f"daily_summary[{day}].battery_charge_count",
+            day_row.get("battery_charge_count", 0),
+            expected_day_charge_count,
+            0.0,
+        )
+        compare_scalar(
+            findings,
+            f"daily_summary[{day}].battery_charge_time_min",
+            day_row.get("battery_charge_time_min", 0.0),
+            expected_day_charge_time,
+            0.001,
+        )
 
     if snapshots:
         expected_avg_wip_material = round4(mean(sum(snapshot.get("material_queue_lengths", {}).values()) for snapshot in snapshots))
@@ -450,7 +671,7 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
         details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
         t = float(event.get("t", 0.0) or 0.0)
         if entity_id in machine_ids:
-            if event_type == "MACHINE_START":
+            if event_type in {"MACHINE_START", "MACHINE_RESUME"}:
                 processing_active[entity_id] = t
             elif event_type in {"MACHINE_END", "MACHINE_ABORTED"}:
                 start = processing_active.pop(entity_id, None)

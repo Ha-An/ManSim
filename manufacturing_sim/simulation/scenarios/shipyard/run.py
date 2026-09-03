@@ -11,6 +11,7 @@ from agents import build_decision_module
 from agents.modes import normalize_decision_mode
 from dashboards.dashboard import export_kpi_dashboard
 from dashboards.gantt import export_gantt
+from manufacturing_sim import __version__ as mansim_version
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
 from manufacturing_sim.simulation.scenarios.shipyard.world import ShipyardWorld
 
@@ -35,6 +36,14 @@ def _format_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _export_events_enabled(experiment_cfg: dict[str, Any]) -> bool:
+    runtime_cfg = experiment_cfg.get("runtime", {})
+    runtime_cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    artifacts_cfg = runtime_cfg.get("artifacts", {})
+    artifacts_cfg = artifacts_cfg if isinstance(artifacts_cfg, dict) else {}
+    return bool(artifacts_cfg.get("export_events", False))
+
+
 def run(
     experiment_cfg: dict[str, Any],
     logger: EventLogger | None = None,
@@ -45,7 +54,10 @@ def run(
 
     output_root = Path(output_dir or Path.cwd() / "outputs")
     output_root.mkdir(parents=True, exist_ok=True)
-    event_logger = logger or EventLogger(output_root)
+    event_logger = logger or EventLogger(
+        output_root,
+        persist_events=_export_events_enabled(experiment_cfg),
+    )
     decision_cfg = experiment_cfg.get("decision", {}) if isinstance(experiment_cfg.get("decision", {}), dict) else {}
     decision_mode = normalize_decision_mode(str(decision_cfg.get("mode", "rolling_horizon_dedicated_roles")))
     decision_module = decision_modules or build_decision_module(experiment_cfg=experiment_cfg, decision_mode=decision_mode)
@@ -56,6 +68,7 @@ def run(
     started_at = _utc_now_iso()
     wall_started = perf_counter()
     run_meta: dict[str, Any] = {
+        "mansim_version": mansim_version,
         "scenario_type": "shipyard_basic",
         "decision_mode": decision_mode,
         "seed": int(experiment_cfg.get("seed", 2026)),
@@ -66,10 +79,29 @@ def run(
         "finished_at_utc": "",
         "wall_clock_sec": 0.0,
         "wall_clock_human": "0s",
+        "event_log": {
+            "enabled": bool(getattr(event_logger, "persist_events", True)),
+            "path": (
+                str((output_root / "events.jsonl").resolve())
+                if bool(getattr(event_logger, "persist_events", True))
+                else ""
+            ),
+        },
     }
     try:
         env = simpy.Environment()
         world = ShipyardWorld(env=env, cfg=experiment_cfg, logger=event_logger, decision_module=decision_module)
+        run_meta["task_primitive_timing"] = {
+            "scenario_type": world.timing.scenario_type,
+            "profile_fingerprint": world.timing.profile_fingerprint,
+        }
+        run_meta["rolling_horizon_scheduler"] = {
+            "enabled": bool(world.rolling_horizon_enabled),
+            "scheduler_mode": world.rolling_horizon_scheduler_mode,
+            "candidate_collection_mode": world.rolling_horizon_candidate_collection_mode,
+            "window_min": round(float(world.rolling_horizon_window_min), 6),
+            "first_dispatch_min": round(float(world.rolling_horizon_window_min), 6),
+        }
         world.start()
         for day in range(1, total_days + 1):
             until = min(sim_total_min, day * minutes_per_day)
@@ -83,6 +115,19 @@ def run(
         run_meta["wall_clock_sec"] = round(elapsed, 3)
         run_meta["wall_clock_human"] = _format_duration(elapsed)
         kpi = world.finalize_kpis()
+        run_meta["rolling_horizon_scheduler"].update(
+            {
+                "strict_boundary_count": int(
+                    world.rolling_horizon_metrics.get("strict_boundary_count", 0)
+                ),
+                "late_boundary_count": int(
+                    world.rolling_horizon_metrics.get("late_boundary_count", 0)
+                ),
+                "max_boundary_lag_min": round(
+                    float(world.rolling_horizon_max_boundary_lag_min), 9
+                ),
+            }
+        )
         kpi["wall_clock_sec"] = run_meta["wall_clock_sec"]
         kpi["wall_clock_human"] = run_meta["wall_clock_human"]
         kpi["run_meta"] = run_meta
@@ -111,7 +156,11 @@ def run(
         "kpi": kpi,
         "daily_summary": world.daily_summaries,
         "output_dir": str(output_root),
-        "events_path": str(output_root / "events.jsonl"),
+        "events_path": (
+            str(output_root / "events.jsonl")
+            if bool(getattr(event_logger, "persist_events", True))
+            else ""
+        ),
         "gantt_path": str(output_root / "gantt.html"),
         "kpi_dashboard_path": str(dashboard_path) if dashboard_path else "",
         "task_priority_dashboard_path": "",

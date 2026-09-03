@@ -1,6 +1,6 @@
 # ManSim Installation Guide
 
-이 문서는 빈 개발 환경에서 ManSim v0.5를 설치하고 simulation, Results Hub, 3D Replay Studio를 실행하는 절차를 정리합니다.
+이 문서는 빈 개발 환경에서 ManSim v0.6을 설치하고 simulation, Results Hub, 3D Replay Studio를 실행하는 절차를 정리합니다.
 
 ## 1. System Requirements
 
@@ -11,7 +11,11 @@
 | Node.js | 20.19 이상, 24 권장, 선택 | 개별 run의 3D Replay Studio |
 | npm | Node.js에 포함, 선택 | Replay frontend dependency/build |
 
-ManSim의 기본 설치 대상은 `factory_mfg_basic` 6개 정책 비교 실험입니다. 이 실험과 정적 비교 dashboard에는 Node.js, ROS2, Gazebo, OpenClaw CLI, 외부 LLM API가 필요하지 않습니다. 이들은 개별 3D replay 또는 해당 integration을 명시적으로 사용할 때만 설치합니다.
+ManSim의 기본 설치 대상은 `mfg_flow_shop`의 4개 rule-based 정책, 두 목적함수와 worker 3~6명을
+비교하는 32-run 실험입니다. Legacy `factory_mfg_basic` 6-policy/180-run profile도 같은 기본
+환경에서 실행할 수 있습니다. 이 실험들과 정적 비교 dashboard에는 Node.js, ROS2, Gazebo,
+OpenClaw CLI, 외부 LLM API가 필요하지 않습니다. 이들은 개별 3D replay 또는 해당 integration을
+명시적으로 사용할 때만 설치합니다.
 
 ## 2. Repository Layout
 
@@ -59,7 +63,7 @@ HumanoidSim은 editable install합니다. 따라서 sibling working tree의 Stat
 
 ## 4. Python Libraries
 
-`requirements.txt`는 6개 정책 비교 실험에 필요한 최소 Python package를 설치합니다.
+`requirements.txt`는 기본 32-run과 legacy 6-policy 비교에 필요한 Python package를 설치합니다.
 
 | 라이브러리 | 역할 |
 | --- | --- |
@@ -101,7 +105,7 @@ cd C:\Github\HumanoidSim
 ..\ManSim\.venv\Scripts\python.exe -m humanoidsim validate-lab --all --out outputs\validation\latest
 ```
 
-## 6. Run The Six-Policy Experiment
+## 6. Run The Default Policy Experiment
 
 명령 생성과 공통 override를 먼저 확인합니다.
 
@@ -116,7 +120,9 @@ cd C:\Github\ManSim
 .\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --worker-counts 3 --seeds 2026 --days 1
 ```
 
-이 명령은 6개 정책을 worker 3대, seed 2026, 1일 horizon으로 각각 한 번 실행합니다. 6개 run과 audit, 집계, dashboard 자동 열기까지 통과하면 기본 실험 설치가 완료된 것입니다.
+이 명령은 두 목적함수와 4개 정책을 worker 3대, seed 2026으로 실행합니다. 8개 run과 audit,
+집계, dashboard 자동 열기까지 통과하면 기본 실험 설치가 완료된 것입니다. Throughput은 `--days
+1`을 적용하고 Makespan은 initial batch 완료 시 조기 종료합니다.
 
 기본 full experiment:
 
@@ -124,7 +130,21 @@ cd C:\Github\ManSim
 .\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py
 ```
 
-Full experiment는 6개 정책, worker 3~8대, seed 5개, 5일 horizon의 180개 run입니다. 결과 비교 화면은 생성된 결과 폴더의 `comparison_dashboard.html`이며 audit와 집계가 끝나면 기본 브라우저에서 자동으로 열립니다. GUI가 없는 서버나 CI에서는 `--no-open-dashboard`를 사용합니다. Artifact audit은 worker 경로의 인접 타일 연속성, map 경계, wall/blocking object 통과, Replay 경로 endpoint, item pickup/carry/drop과 destination state 연결을 검사합니다. 공정성, artifact 또는 KPI audit가 실패하면 runner는 non-zero exit code로 종료됩니다.
+기본 full experiment는 4개 정책, 두 목적함수, worker 3~6명과 seed 2026의 32개 run입니다. 결과
+비교 화면은 생성된 결과 폴더의 `comparison_dashboard.html`이며 audit와 집계가 끝나면 기본
+브라우저에서 자동으로 열립니다. GUI가 없는 서버나 CI에서는 `--no-open-dashboard`를 사용합니다.
+Artifact audit은 worker 경로의 인접 타일 연속성, map 경계, wall/blocking object 통과, Replay
+경로 endpoint, item pickup/carry/drop과 destination state 연결을 검사합니다. 공정성, artifact
+또는 KPI audit가 실패하면 runner는 non-zero exit code로 종료됩니다.
+
+Legacy `factory_mfg_basic` 6-policy, worker 3~8명, seed 5개의 180-run 실험은 다음 profile로
+실행합니다.
+
+```powershell
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --config experiments\factory_policy_comparison\config_factory_mfg_basic.yaml
+```
+
+Policy experiment runner는 `events.jsonl`, 대용량 `replay_studio_log.json`, `operations_replay.json`과 관련 Replay HTML을 기본 생성하지 않습니다. KPI와 Gantt는 메모리 event에서 생성되고, compact stochastic signature와 `replay_studio_layout.json`은 유지됩니다. 이벤트 단위 감사 또는 시각 Replay까지 보존하려면 experiment config의 `common_overrides`에 `runtime.artifacts.export_events=true`와 `runtime.ui.export_replay_artifacts=true`를 추가합니다.
 
 ## 7. Optional Replay Studio 3D
 
@@ -165,7 +185,11 @@ Factory와 Shipyard를 명시적으로 실행할 수 있습니다.
 ## 9. Optional Features
 
 - `rolling_horizon_throughput_optimizer`: `requirements.txt`의 OR-Tools가 반드시 필요합니다.
-- LLM/OpenClaw manager modes: `requirements-optional.txt`, provider credential과 manager별 설정이 추가로 필요합니다. 6개 정책 비교에는 필요하지 않습니다.
+- `simulation_based_adp`: `requirements-adp.txt`의 CUDA PyTorch가 필요합니다. 표준 profile은
+  `mfg_flow_shop`, worker 3명, 5일 throughput 전용이며 `cuda:0` update와 CPU 20-process
+  rollout을 사용합니다. 학습 후에는 `config_mfg_flow_shop_worker3_adp.yaml`로 held-out seed
+  5개에서 random baseline, 네 rule-based 정책과 ADP를 총 30회 비교합니다.
+- LLM/OpenClaw manager modes: `requirements-optional.txt`, provider credential과 manager별 설정이 추가로 필요합니다. 기본 또는 legacy 정책 비교에는 필요하지 않습니다.
 - Knowledge Graph: graph/curator 설정이 활성화된 run에서만 사용합니다.
 - HumanoidSim ROS2/Gazebo validation: ManSim 실행과 독립된 HumanoidSim integration입니다. HumanoidSim의 ROS 문서를 따릅니다.
 
