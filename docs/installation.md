@@ -11,9 +11,11 @@
 | Node.js | 20.19 이상, 24 권장, 선택 | 개별 run의 3D Replay Studio |
 | npm | Node.js에 포함, 선택 | Replay frontend dependency/build |
 
-ManSim의 기본 설치 대상은 `mfg_flow_shop`의 4개 rule-based 정책, 두 목적함수와 worker 3~6명을
-비교하는 32-run 실험입니다. Legacy `factory_mfg_basic` 6-policy/180-run profile도 같은 기본
-환경에서 실행할 수 있습니다. 이 실험들과 정적 비교 dashboard에는 Node.js, ROS2, Gazebo,
+ManSim의 기본 정책 비교는 `mfg_flow_shop`의 worker 3, 5일 throughput 환경에서 ADP,
+Immediate Shared와 Random Feasible을 held-out seed 5개로 비교하는 15-run 실험입니다. ADP 학습에는
+`requirements-adp.txt`가 필요하지만 LLM/OpenClaw 라이브러리는 필요하지 않습니다. Legacy
+`factory_mfg_basic` 6-policy/180-run profile도 실행할 수 있습니다. 정적 비교 dashboard에는
+Node.js, ROS2, Gazebo,
 OpenClaw CLI, 외부 LLM API가 필요하지 않습니다. 이들은 개별 3D replay 또는 해당 integration을
 명시적으로 사용할 때만 설치합니다.
 
@@ -63,7 +65,8 @@ HumanoidSim은 editable install합니다. 따라서 sibling working tree의 Stat
 
 ## 4. Python Libraries
 
-`requirements.txt`는 기본 32-run과 legacy 6-policy 비교에 필요한 Python package를 설치합니다.
+`requirements.txt`는 rule-based simulation과 legacy 비교에 필요한 Python package를 설치합니다.
+기본 ADP 학습·비교에는 추가로 `requirements-adp.txt`를 설치합니다.
 
 | 라이브러리 | 역할 |
 | --- | --- |
@@ -111,31 +114,31 @@ cd C:\Github\HumanoidSim
 
 ```powershell
 cd C:\Github\ManSim
-.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --dry-run
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --adp-checkpoint C:\path\to\best.pt --dry-run
 ```
 
 짧은 smoke experiment:
 
 ```powershell
-.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --worker-counts 3 --seeds 2026 --days 1
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --adp-checkpoint C:\path\to\best.pt --limit 3 --days 1
 ```
 
-이 명령은 두 목적함수와 4개 정책을 worker 3대, seed 2026으로 실행합니다. 8개 run과 audit,
-집계, dashboard 자동 열기까지 통과하면 기본 실험 설치가 완료된 것입니다. Throughput은 `--days
-1`을 적용하고 Makespan은 initial batch 완료 시 조기 종료합니다.
+이 명령은 ADP, Immediate Shared와 Random Feasible을 worker 3대와 첫 held-out seed에서 실행합니다.
+3개 run과 audit, 집계, dashboard 자동 열기까지 통과하면 기본 비교 환경이 준비된 것입니다.
 
 기본 full experiment:
 
 ```powershell
-.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --adp-checkpoint C:\path\to\best.pt --jobs 5
 ```
 
-기본 full experiment는 4개 정책, 두 목적함수, worker 3~6명과 seed 2026의 32개 run입니다. 결과
+기본 full experiment는 3개 정책, worker 3명과 held-out seed 5개의 15개 run입니다. 결과
 비교 화면은 생성된 결과 폴더의 `comparison_dashboard.html`이며 audit와 집계가 끝나면 기본
 브라우저에서 자동으로 열립니다. GUI가 없는 서버나 CI에서는 `--no-open-dashboard`를 사용합니다.
-Artifact audit은 worker 경로의 인접 타일 연속성, map 경계, wall/blocking object 통과, Replay
-경로 endpoint, item pickup/carry/drop과 destination state 연결을 검사합니다. 공정성, artifact
-또는 KPI audit가 실패하면 runner는 non-zero exit code로 종료됩니다.
+기본 축약 run의 artifact audit은 KPI, compact layout과 필수 산출물 계약을 검사합니다. 상세 event를
+켠 검증 run에서는 worker 경로의 인접 타일 연속성, map 경계, wall/blocking object 통과,
+item pickup/carry/drop과 destination state 연결까지 검사합니다. 공정성, artifact 또는 KPI audit가
+실패하면 runner는 non-zero exit code로 종료됩니다.
 
 Legacy `factory_mfg_basic` 6-policy, worker 3~8명, seed 5개의 180-run 실험은 다음 profile로
 실행합니다.
@@ -143,6 +146,22 @@ Legacy `factory_mfg_basic` 6-policy, worker 3~8명, seed 5개의 180-run 실험�
 ```powershell
 .\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --config experiments\factory_policy_comparison\config_factory_mfg_basic.yaml
 ```
+
+이전 `mfg_flow_shop` 4-policy, 두 목적함수, worker 3~6명의 32-run 실험은
+`config_mfg_flow_shop_4policy_objectives.yaml`로 실행합니다.
+
+논문용 worker 2~6 확증 실험은 별도 suite로 준비하고 실행합니다. 이 경로는 worker별 ADP
+학습 1회, ADP·Immediate Shared·Random Feasible과 20개 공통 seed의 300-run 평가를 사용합니다.
+각 학습 checkpoint는 재사용할 수 있도록 독립 폴더에 보존됩니다. 먼저 전용 README의 예상
+시간과 디스크 요구량을 확인합니다.
+
+```powershell
+.\.venv\Scripts\python.exe experiments\mfg_flow_shop_paper\prepare_experiment.py
+.\.venv\Scripts\python.exe experiments\mfg_flow_shop_paper\run_training.py
+.\.venv\Scripts\python.exe experiments\mfg_flow_shop_paper\run_evaluation.py --jobs 5
+```
+
+자세한 계약은 [mfg_flow_shop Confirmatory Policy Experiment](../experiments/mfg_flow_shop_paper/README.md)에 있습니다.
 
 Policy experiment runner는 `events.jsonl`, 대용량 `replay_studio_log.json`, `operations_replay.json`과 관련 Replay HTML을 기본 생성하지 않습니다. KPI와 Gantt는 메모리 event에서 생성되고, compact stochastic signature와 `replay_studio_layout.json`은 유지됩니다. 이벤트 단위 감사 또는 시각 Replay까지 보존하려면 experiment config의 `common_overrides`에 `runtime.artifacts.export_events=true`와 `runtime.ui.export_replay_artifacts=true`를 추가합니다.
 
@@ -185,10 +204,15 @@ Factory와 Shipyard를 명시적으로 실행할 수 있습니다.
 ## 9. Optional Features
 
 - `rolling_horizon_throughput_optimizer`: `requirements.txt`의 OR-Tools가 반드시 필요합니다.
-- `simulation_based_adp`: `requirements-adp.txt`의 CUDA PyTorch가 필요합니다. 표준 profile은
-  `mfg_flow_shop`, worker 3명, 5일 throughput 전용이며 `cuda:0` update와 CPU 20-process
-  rollout을 사용합니다. 학습 후에는 `config_mfg_flow_shop_worker3_adp.yaml`로 held-out seed
-  5개에서 random baseline, 네 rule-based 정책과 ADP를 총 30회 비교합니다.
+- `simulation_based_adp`: `requirements-adp.txt`의 CUDA PyTorch가 필요합니다. 기본 profile은
+  `mfg_flow_shop`, worker 3, 5일 throughput을 학습하며 `cuda:0` update와 CPU 10-process,
+  10-episode wave를 사용합니다. 기본 n-step TD(상한 `n=30`)는 초기 50 episode를 5 wave로 수집해
+  한 번 학습하고, 이후 매 wave마다 75회 갱신합니다. 매 정책 업데이트는 현재 10 episode와
+  과거 replay에서 추출한 20 episode를 사용합니다. 총 800 training episode, 초기 포함 76회
+  업데이트이며 checkpoint `0, 5, 10, ..., 75`에서 greedy 검증합니다.
+  [설정과 그래프](adp_n_step_td.md)를 참고하세요.
+  학습 후 기본 비교는 held-out seed 5개에서 ADP,
+  Immediate Shared와 Random Feasible을 총 15회 실행합니다.
 - LLM/OpenClaw manager modes: `requirements-optional.txt`, provider credential과 manager별 설정이 추가로 필요합니다. 기본 또는 legacy 정책 비교에는 필요하지 않습니다.
 - Knowledge Graph: graph/curator 설정이 활성화된 run에서만 사용합니다.
 - HumanoidSim ROS2/Gazebo validation: ManSim 실행과 독립된 HumanoidSim integration입니다. HumanoidSim의 ROS 문서를 따릅니다.

@@ -10,6 +10,7 @@ templates:
   unload: &unload {type: triangular, min: 1.6, mode: 2.0, max: 2.4}
   inspection: &inspection {type: triangular, min: 8.0, mode: 10.0, max: 12.0}
   repair: &repair {type: triangular, min: 16.0, mode: 20.0, max: 24.0}
+  preventive_maintenance: &preventive_maintenance {type: triangular, min: 24.0, mode: 30.0, max: 36.0}
   # 완전 방전 상태에서 100%까지 충전할 때의 기준시간이다.
   # Full-charge duration from 0% to 100% SOC.
   full_charge: &full_charge {type: triangular, min: 8.0, mode: 10.0, max: 12.0}
@@ -110,6 +111,15 @@ tasks:
       REPAIR_MACHINE/s03_execute_maintenance_action: {call_code: EXECUTE_MAINTENANCE_ACTION, distribution: *repair}
       REPAIR_MACHINE/s04_verify_machine_state: {call_code: VERIFY_MACHINE_STATE, distribution: *standard}
       REPAIR_MACHINE/s05_log_result: {call_code: LOG_RESULT, distribution: *standard}
+
+  PREVENTIVE_MAINTENANCE:
+    steps:
+      PREVENTIVE_MAINTENANCE/s01_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *standard}
+      PREVENTIVE_MAINTENANCE/s02_inspect_machine/s01_check_safety_zone: {call_code: CHECK_SAFETY_ZONE, distribution: *standard}
+      PREVENTIVE_MAINTENANCE/s02_inspect_machine/s02_verify_lockout_if_required: {call_code: VERIFY_LOCKOUT_IF_REQUIRED, distribution: *standard}
+      PREVENTIVE_MAINTENANCE/s02_inspect_machine/s03_inspect_or_diagnose: {call_code: INSPECT_OR_DIAGNOSE, distribution: *preventive_maintenance}
+      PREVENTIVE_MAINTENANCE/s02_inspect_machine/s04_log_result: {call_code: LOG_RESULT, distribution: *standard}
+      PREVENTIVE_MAINTENANCE/s03_log_result: {call_code: LOG_RESULT, distribution: *standard}
 
   MANAGE_ROBOT_POWER:
     steps:

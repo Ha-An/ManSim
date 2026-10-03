@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
+MACHINE_LIFECYCLE_CONTRACT = "exclusive_pm_v1"
+
 
 def default_humanoid_state_payload(humanoid_id: str = "") -> dict[str, Any]:
     try:
@@ -61,6 +63,16 @@ class Machine:
     failed_since: Optional[float] = None
     pm_until: float = 0.0
     last_pm_at: float = 0.0
+    processing_since_maintenance_min: float = 0.0
+    pm_protected_processing_remaining_min: float = 0.0
+    pm_protected_processing_total_min: float = 0.0
+    failure_exposure_budget_min: float = 0.0
+    failure_exposure_used_min: float = 0.0
+    failure_cycle_processing_min: float = 0.0
+    last_failure_processing_min: float = 0.0
+    failures_while_pm_protected: int = 0
+    last_repair_urgency_score: float = -1.0
+    last_repair_urgency_tier: str = ""
     repair_owner: Optional[str] = None
     repair_team: list[str] = field(default_factory=list)
     repair_work_remaining_min: float = 0.0
@@ -101,6 +113,8 @@ class Worker:
     current_move_started_at: Optional[float] = None
     discharged: bool = False
     discharged_since: Optional[float] = None
+    depleted_recovery_due_day: Optional[int] = None
+    depleted_recovery_due_min: Optional[float] = None
     current_task_id: Optional[str] = None
     current_task_type: Optional[str] = None
     current_task_code: Optional[str] = None

@@ -1,69 +1,27 @@
-# mfg_flow_shop policy, fleet-size, and objective comparison experiment.
+# Default worker-3 held-out throughput comparison for a trained ADP checkpoint.
+# Pass the checkpoint with --adp-checkpoint or set adp_checkpoint_path below.
+adp_checkpoint_path: ""
 scenario: mfg_flow_shop
 horizon_days: 5
 makespan_max_sim_days: 30
 minutes_per_day: 480
-
-objective_modes:
-  - maximize_throughput
-  - minimize_makespan
-
-seeds: [2026]
-worker_counts: [3, 4, 5, 6]
-
+objective_modes: [maximize_throughput]
+seeds: [50001, 50002, 50003, 50004, 50005]
+benchmark_seeds_locked: true
+worker_counts: [3]
 modes:
+  - simulation_based_adp
   - immediate_shared
-  - immediate_dedicated_roles
-  - rolling_horizon_shared
-  - rolling_horizon_dedicated_roles
-
+  - random_feasible_dispatch
 common_overrides:
   - runtime.ui.auto_open_results=false
   - runtime.ui.auto_start_replay_studio_3d=false
-
+  - runtime.ui.export_replay_artifacts=false
+  - runtime.artifacts.export_events=false
 metrics:
-  objective:
-    - objective_status
-    - total_products
-    - throughput_per_sim_hour
-    - avg_daily_products
-    - warehouse_material_restock_count
-    - makespan_min
-    - makespan_status
-    - initial_batch_material_count
-    - initial_batch_terminal_material_count
-    - initial_batch_progress_ratio
-    - initial_batch_accepted_product_count
-    - initial_batch_disposed_scrap_count
-    - initial_batch_yield_ratio
-  flow:
-    - completed_product_lead_time_avg_min
-    - downstream_closure_ratio
-    - avg_wip_material
-    - avg_wip_intermediate
-    - avg_wip_output
-    - buffer_wait_avg_min.material_input
-    - buffer_wait_avg_min.intermediate_input
-    - buffer_wait_avg_min.product_input
-  robot:
-    - humanoid_execution_ratio_avg
-    - humanoid_blocked_ratio_avg
-    - humanoid_unavailable_ratio_avg
-    - agent_discharged_time_min_total
-    - agent_discharged_ratio
-  safety:
-    - humanoid_incident_total
-    - physical_incident_total
-    - coordination_incident_total
-    - traffic_conflicts_by_type.TRAFFIC_WAIT
-    - near_miss_count
-    - collision_count
-  complexity:
-    - otc
-    - cumulative_operational_complexity_over_n_days
-  policy:
-    - rolling_horizon_window_count
-    - rolling_horizon_dispatched_task_count
-    - rolling_horizon_stale_skipped_task_count
-    - rolling_horizon_requeued_task_count
-    - rolling_horizon_max_worker_queue_length
+  productivity: [total_products, throughput_per_sim_hour, avg_daily_products]
+  robot: [humanoid_execution_ratio_avg, humanoid_blocked_ratio_avg, humanoid_unavailable_ratio_avg, agent_discharged_ratio]
+  flow: [buffer_overflow_attempt_count, buffer_reservation_failure_count, buffer_reservation_leak_count, machine_blocked_after_service_min, candidate_count_avg, candidate_count_max]
+  reliability: [machine_failure_count, machine_failure_observed_processing_mttf_min, repair_response_time_avg_min, preventive_maintenance_count, preventive_maintenance_protected_processing_min]
+  battery_risk: [battery_risk_assignment_count, battery_risk_expected_margin_avg_min, worker_depleted_during_task_count, worker_depleted_during_move_count, worker_returned_next_day_count, agent_discharged_time_min_total]
+  adp: [adp_decision_count, adp_wait_count, adp_candidate_available_wait_count, adp_no_candidate_unassigned_count, adp_candidate_available_wait_ratio, adp_no_candidate_unassigned_ratio, adp_avg_candidate_count, adp_beam_value_entropy_avg, adp_beam_value_entropy_decision_count, adp_inference_latency_ms_avg]

@@ -87,6 +87,7 @@ MFG_FLOW_SHOP_TASK_CODES = {
     "INSPECT_PRODUCT",
     "LOAD_UNLOAD_TRANSFER_INTERFACE",
     "REPAIR_MACHINE",
+    "PREVENTIVE_MAINTENANCE",
     "MANAGE_ROBOT_POWER",
     "COLLECT_WASTE_OR_SCRAP",
 }
@@ -452,12 +453,47 @@ class ManufacturingWorld:
             int(getattr(decision_module, "worker_queue_limit", orchestration_cfg.get("worker_queue_limit", 4)) or 4),
         )
 
-        mean_ttf = float(self.machine_failure_cfg["mean_time_to_fail_min"])
+        self.machine_failure_distribution = str(
+            self.machine_failure_cfg.get("distribution", "exponential") or "exponential"
+        ).strip().lower()
+        self.machine_failure_time_basis = str(
+            self.machine_failure_cfg.get("time_basis", "calendar_time") or "calendar_time"
+        ).strip().lower()
+        if self.machine_failure_distribution != "exponential":
+            raise ValueError("machine_failure.distribution currently supports only 'exponential'.")
+        if self.machine_failure_time_basis not in {"calendar_time", "active_processing"}:
+            raise ValueError(
+                "machine_failure.time_basis must be 'calendar_time' or 'active_processing'."
+            )
+        mean_ttf = float(
+            self.machine_failure_cfg.get(
+                "mean_processing_time_to_failure_min",
+                self.machine_failure_cfg.get("mean_time_to_fail_min", 300.0),
+            )
+        )
         self.machine_failure_base_lambda = 1.0 / max(1.0, mean_ttf)
+        self.machine_failure_mean_exposure_min = max(1.0, mean_ttf)
         self.max_repair_agents = max(1, int(self.machine_failure_cfg.get("max_repair_agents", 3) or 3))
-        self.pm_lambda_multiplier = float(self.machine_failure_cfg.get("pm_lambda_multiplier", 1.0))
-        self.pm_effect_duration_min = float(self.machine_failure_cfg.get("pm_effect_duration_min", 0.0))
-        self.pm_interval_target_min = float(self.machine_failure_cfg.get("pm_interval_target_min", math.inf))
+        self.pm_lambda_multiplier = float(
+            preventive_cfg.get(
+                "hazard_multiplier",
+                self.machine_failure_cfg.get("pm_lambda_multiplier", 1.0),
+            )
+        )
+        self.pm_effect_duration_min = float(
+            preventive_cfg.get(
+                "protected_processing_min",
+                self.machine_failure_cfg.get("pm_effect_duration_min", 0.0),
+            )
+        )
+        self.pm_interval_target_min = float(
+            preventive_cfg.get(
+                "due_processing_min",
+                self.machine_failure_cfg.get("pm_interval_target_min", math.inf),
+            )
+        )
+        if not 0.0 <= self.pm_lambda_multiplier <= 1.0:
+            raise ValueError("preventive_maintenance.hazard_multiplier must be between 0 and 1.")
 
         self.battery_swap_period_min = float(
             self.agent_cfg.get("battery_capacity_min", self.agent_cfg["battery_swap_period_min"])
@@ -471,6 +507,40 @@ class ManufacturingWorld:
             0.0,
             float(battery_drain_cfg.get("non_available_rate_multiplier", 2.0) or 2.0),
         )
+        battery_safety_cfg = (
+            worker_cfg.get("battery_safety", {})
+            if isinstance(worker_cfg.get("battery_safety", {}), dict)
+            else {}
+        )
+        self.battery_assignment_mode = str(
+            battery_safety_cfg.get("assignment_mode", "hard_reserve") or "hard_reserve"
+        ).strip().lower()
+        if self.battery_assignment_mode not in {"hard_reserve", "policy_decides"}:
+            raise ValueError(
+                "worker.battery_safety.assignment_mode must be 'hard_reserve' or 'policy_decides'."
+            )
+        self.expose_battery_risk_metadata = bool(
+            battery_safety_cfg.get("expose_risk_metadata", True)
+        )
+        depleted_recovery_cfg = (
+            worker_cfg.get("depleted_recovery", {})
+            if isinstance(worker_cfg.get("depleted_recovery", {}), dict)
+            else {}
+        )
+        self.depleted_recovery_enabled = bool(depleted_recovery_cfg.get("enabled", False))
+        self.depleted_recovery_schedule = str(
+            depleted_recovery_cfg.get("schedule", "next_day_start") or "next_day_start"
+        ).strip().lower()
+        self.depleted_recovery_restart_location = str(
+            depleted_recovery_cfg.get("restart_location", "assigned_charging_dock")
+            or "assigned_charging_dock"
+        ).strip().lower()
+        self.depleted_recovery_restart_soc = min(
+            1.0,
+            max(0.0, float(depleted_recovery_cfg.get("restart_soc", 1.0) or 1.0)),
+        )
+        if self.depleted_recovery_enabled and self.depleted_recovery_schedule != "next_day_start":
+            raise ValueError("worker.depleted_recovery.schedule currently supports only 'next_day_start'.")
 
         self.current_day = 1
         self.current_strategy = StrategyState()
@@ -1122,8 +1192,10 @@ class ManufacturingWorld:
                 self._warehouse_push_material(station)
 
         for machine_id in self.machines:
+            self.initialize_machine_failure_exposure(self.machines[machine_id])
             self.env.process(processes.machine_lifecycle(self.env, self, machine_id))
-            self.env.process(processes.machine_failure_monitor(self.env, self, machine_id))
+            if self.machine_failure_time_basis != "active_processing":
+                self.env.process(processes.machine_failure_monitor(self.env, self, machine_id))
 
         if self._rolling_horizon_active():
             self.env.process(strict_periodic_rolling_horizon_loop(self.env, self))
@@ -1143,6 +1215,7 @@ class ManufacturingWorld:
     def start_day(self, day: int, strategy: StrategyState, job_plan: JobPlan) -> None:
         self.current_day = day
         self.current_strategy = strategy
+        self._recover_depleted_workers_at_day_start(day)
         self.prepare_objective_day(day)
         if not self.is_mfg_flow_shop and self.material_shelf_restock_policy == "day_boundary":
             self._restock_material_shelf(reason="day_boundary")
@@ -1233,6 +1306,7 @@ class ManufacturingWorld:
             "inter_station_transfer",
             "load_machine",
             "material_supply",
+            "preventive_maintenance",
             "repair_machine",
             "scrap_disposal",
             "setup_machine",
@@ -1976,6 +2050,67 @@ class ManufacturingWorld:
             },
         )
         self._set_worker_cargo(agent, None, None, destination="dropped")
+
+    def _drop_agent_cargo_due_to_depletion(self, agent: Worker, task: Task) -> list[str]:
+        item_ids = [
+            str(item_id)
+            for item_id in getattr(agent, "carrying_item_ids", [])
+            if str(item_id).strip()
+        ]
+        if not item_ids and agent.carrying_item_id:
+            item_ids = [str(agent.carrying_item_id)]
+        if not item_ids:
+            return []
+        item_type = str(agent.carrying_item_type or "unknown")
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        destination = str(
+            payload.get("destination")
+            or payload.get("destination_buffer_id")
+            or task.location
+            or ""
+        )
+        logical_destination = str(agent.current_move_logical_destination or destination)
+        move_id = str(agent.current_move_id or "")
+        for item_id in item_ids:
+            self._register_dropped_item(
+                item_id,
+                item_type=item_type,
+                tile=agent.tile,
+                dropped_by=agent.agent_id,
+                destination=destination,
+                logical_destination=logical_destination,
+                move_id=move_id,
+            )
+            self._set_item_state(
+                item_id,
+                ItemState.DROPPED,
+                location=self.agent_display_location(agent),
+                ref=f"battery_depleted:{agent.agent_id}",
+                item_type=item_type,
+                tile=agent.tile,
+            )
+            self._abort_product_transport_session_for_item(
+                item_id,
+                reason="battery_depleted",
+                destination="dropped",
+            )
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="WORKER_DEPLETION_CARGO_DROPPED",
+            entity_id=agent.agent_id,
+            location=self.agent_display_location(agent),
+            details={
+                "task_id": str(task.task_id or ""),
+                "item_ids": item_ids,
+                "item_count": len(item_ids),
+                "item_type": item_type,
+                "tile": self._tile_payload(agent.tile),
+                "destination": destination,
+            },
+        )
+        self._set_worker_cargo(agent, None, None, destination="dropped")
+        return item_ids
 
     def _emit_humanoid_incident(
         self,
@@ -4767,6 +4902,10 @@ class ManufacturingWorld:
     def _finalize_selected_task(self, agent: Agent, task: Task | None) -> Task | None:
         if task is None:
             return None
+        if self.expose_battery_risk_metadata:
+            risk_metadata = self._task_battery_risk_metadata(agent, task)
+            task.payload.update(risk_metadata)
+            task.selection_meta["battery_risk"] = copy.deepcopy(risk_metadata)
         if self._mfg_flow_policy_active():
             rule = self._mfg_flow_task_rule(task)
             allowed_worker_ids = self._mfg_flow_allowed_worker_ids_for_task(task)
@@ -5597,6 +5736,138 @@ class ManufacturingWorld:
             "battery_swap_count": int(swap_count),
             "battery_delivery_count": int(delivery_count),
             "preventive_maintenance_task_count": int(preventive_maintenance_task_count),
+        }
+
+    def _reliability_and_risk_metrics(self) -> dict[str, Any]:
+        failure_processing_samples: list[float] = []
+        failure_count_by_machine: dict[str, int] = defaultdict(int)
+        repair_count_by_tier: dict[str, int] = defaultdict(int)
+        repair_response_by_tier: dict[str, list[float]] = defaultdict(list)
+        active_failures: dict[str, dict[str, Any]] = {}
+        battery_risk_margins: list[float] = []
+        battery_risk_assignment_count = 0
+        depleted_during_task_count = 0
+        depleted_during_move_count = 0
+        returned_count = 0
+        recovery_scheduled_count = 0
+        interrupted_by_depletion_count = 0
+        dropped_by_depletion_count = 0
+
+        ordered_events = sorted(
+            enumerate(self.logger.events),
+            key=lambda pair: (float(pair[1].get("t", 0.0) or 0.0), pair[0]),
+        )
+        for _index, event in ordered_events:
+            event_type = str(event.get("type", "")).strip().upper()
+            entity_id = str(event.get("entity_id", "")).strip()
+            details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+            event_t = float(event.get("t", 0.0) or 0.0)
+            if event_type == "MACHINE_FAILURE_PROCESSING_THRESHOLD_REACHED":
+                failure_processing_samples.append(
+                    float(details.get("actual_processing_since_repair_min", 0.0) or 0.0)
+                )
+            elif event_type == "MACHINE_BROKEN":
+                tier = str(details.get("repair_urgency_tier", "normal") or "normal").lower()
+                failure_count_by_machine[entity_id] += 1
+                active_failures[entity_id] = {"started_at": event_t, "tier": tier, "responded": False}
+            elif event_type in {"MACHINE_REPAIR_START", "MACHINE_REPAIR_HELPER_JOIN"}:
+                row = active_failures.get(entity_id)
+                if isinstance(row, dict) and not bool(row.get("responded", False)):
+                    tier = str(
+                        details.get("repair_urgency_tier", row.get("tier", "normal"))
+                        or "normal"
+                    ).lower()
+                    repair_count_by_tier[tier] += 1
+                    repair_response_by_tier[tier].append(max(0.0, event_t - float(row["started_at"])))
+                    row["tier"] = tier
+                    row["responded"] = True
+            elif event_type == "MACHINE_REPAIRED":
+                active_failures.pop(entity_id, None)
+            elif event_type == "AGENT_TASK_START":
+                selection = details.get("selection", {}) if isinstance(details.get("selection", {}), dict) else {}
+                payload = details.get("payload", {}) if isinstance(details.get("payload", {}), dict) else {}
+                risk = selection.get("battery_risk", {}) if isinstance(selection.get("battery_risk", {}), dict) else {}
+                if not risk:
+                    risk = payload
+                if bool(risk.get("battery_depletion_risk", False)):
+                    battery_risk_assignment_count += 1
+                    battery_risk_margins.append(
+                        float(risk.get("expected_battery_margin_min", 0.0) or 0.0)
+                    )
+            elif event_type == "AGENT_DISCHARGED":
+                if str(details.get("current_task_id", "")).strip():
+                    depleted_during_task_count += 1
+                if bool(details.get("during_move", False)):
+                    depleted_during_move_count += 1
+            elif event_type == "WORKER_RECOVERY_SCHEDULED":
+                recovery_scheduled_count += 1
+            elif event_type == "WORKER_RETURNED_NEXT_DAY":
+                returned_count += 1
+            elif event_type == "WORKER_DEPLETION_CARGO_DROPPED":
+                dropped_by_depletion_count += int(details.get("item_count", 0) or 0)
+            elif event_type == "AGENT_TASK_END":
+                if (
+                    str(details.get("status", "")).strip().lower() == "interrupted"
+                    and str(details.get("reason", "")).strip().lower() == "battery_depleted"
+                ):
+                    interrupted_by_depletion_count += 1
+
+        response_all = [value for values in repair_response_by_tier.values() for value in values]
+        return {
+            "machine_failure_time_basis": self.machine_failure_time_basis,
+            "machine_failure_configured_mean_processing_min": round(
+                float(self.machine_failure_mean_exposure_min), 6
+            ),
+            "machine_failure_count": int(sum(failure_count_by_machine.values())),
+            "machine_failure_count_by_machine": dict(sorted(failure_count_by_machine.items())),
+            "machine_failure_observed_processing_mttf_min": (
+                round(float(mean(failure_processing_samples)), 6)
+                if failure_processing_samples
+                else None
+            ),
+            "machine_failure_processing_samples_min": [round(value, 6) for value in failure_processing_samples],
+            "machine_processing_exposure_by_machine": {
+                machine_id: round(float(machine.failure_cycle_processing_min), 6)
+                for machine_id, machine in sorted(self.machines.items())
+            },
+            "machine_failure_threshold_by_machine": {
+                machine_id: round(float(machine.failure_exposure_budget_min), 6)
+                for machine_id, machine in sorted(self.machines.items())
+            },
+            "repair_count_by_urgency_tier": {
+                tier: int(repair_count_by_tier.get(tier, 0))
+                for tier in ("critical", "high", "normal")
+            },
+            "repair_response_time_avg_min": (
+                round(float(mean(response_all)), 6) if response_all else None
+            ),
+            "repair_response_time_avg_min_by_urgency_tier": {
+                tier: round(float(mean(repair_response_by_tier[tier])), 6)
+                if repair_response_by_tier.get(tier)
+                else None
+                for tier in ("critical", "high", "normal")
+            },
+            "preventive_maintenance_count": int(sum(machine.pm_count for machine in self.machines.values())),
+            "preventive_maintenance_protected_processing_min": round(
+                sum(float(machine.pm_protected_processing_total_min) for machine in self.machines.values()),
+                6,
+            ),
+            "preventive_maintenance_failure_count": int(
+                sum(machine.failures_while_pm_protected for machine in self.machines.values())
+            ),
+            "battery_assignment_mode": self.battery_assignment_mode,
+            "battery_risk_assignment_count": int(battery_risk_assignment_count),
+            "battery_risk_expected_margin_avg_min": (
+                round(float(mean(battery_risk_margins)), 6)
+                if battery_risk_margins
+                else None
+            ),
+            "worker_depleted_during_task_count": int(depleted_during_task_count),
+            "worker_depleted_during_move_count": int(depleted_during_move_count),
+            "worker_recovery_scheduled_count": int(recovery_scheduled_count),
+            "worker_returned_next_day_count": int(returned_count),
+            "worker_task_interrupted_by_depletion_count": int(interrupted_by_depletion_count),
+            "worker_item_dropped_by_depletion_count": int(dropped_by_depletion_count),
         }
 
     def _repair_collaboration_metrics(self) -> dict[str, Any]:
@@ -6501,7 +6772,14 @@ class ManufacturingWorld:
         return str(slot.get("slot_id", "")), stored_item_id
 
     def machine_failure_lambda(self, machine: Machine) -> float:
-        multiplier = self.pm_lambda_multiplier if self.env.now < machine.pm_until else 1.0
+        if self.machine_failure_time_basis == "active_processing":
+            multiplier = (
+                self.pm_lambda_multiplier
+                if machine.pm_protected_processing_remaining_min > 1e-9
+                else 1.0
+            )
+        else:
+            multiplier = self.pm_lambda_multiplier if self.env.now < machine.pm_until else 1.0
         return self.machine_failure_base_lambda * multiplier
 
     def sample_machine_failure_delay(self, machine: Machine, failure_rate: float) -> float:
@@ -6509,18 +6787,241 @@ class ManufacturingWorld:
         rng = self.machine_failure_rngs.get(machine_id)
         if rng is None:
             rng = _stable_random_stream(
-                self.seed,
+                getattr(self, "_diagnostic_sampling_seed", self.seed),
                 f"{self.scenario_key}:machine_failure:{machine_id}",
             )
             self.machine_failure_rngs[machine_id] = rng
         return max(1.0, float(rng.expovariate(float(failure_rate))))
+
+    def _sample_machine_failure_exposure(self, machine: Machine, *, reason: str) -> float:
+        machine_id = str(machine.machine_id)
+        rng = self.machine_failure_rngs.get(machine_id)
+        if rng is None:
+            rng = _stable_random_stream(
+                getattr(self, "_diagnostic_sampling_seed", self.seed),
+                f"{self.scenario_key}:machine_failure:{machine_id}",
+            )
+            self.machine_failure_rngs[machine_id] = rng
+        sampled = max(1e-9, float(rng.expovariate(self.machine_failure_base_lambda)))
+        machine.failure_exposure_budget_min = sampled
+        machine.failure_exposure_used_min = 0.0
+        machine.failure_cycle_processing_min = 0.0
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="MACHINE_FAILURE_EXPOSURE_SAMPLED",
+            entity_id=machine.machine_id,
+            location=f"Station{machine.station}",
+            details={
+                "reason": reason,
+                "time_basis": self.machine_failure_time_basis,
+                "distribution": self.machine_failure_distribution,
+                "mean_processing_time_to_failure_min": round(
+                    float(self.machine_failure_mean_exposure_min), 6
+                ),
+                "sampled_failure_exposure_min": round(sampled, 6),
+            },
+        )
+        return sampled
+
+    def initialize_machine_failure_exposure(self, machine: Machine) -> None:
+        if self.machine_failure_time_basis != "active_processing":
+            return
+        if machine.failure_exposure_budget_min <= 0.0:
+            self._sample_machine_failure_exposure(machine, reason="initialization")
+
+    def machine_processing_segment_limit(self, machine: Machine, remaining_process_min: float) -> float:
+        """Return the next exact processing segment ending at failure or PM expiry."""
+        self.initialize_machine_failure_exposure(machine)
+        remaining = max(0.0, float(remaining_process_min))
+        if remaining <= 0.0:
+            return 0.0
+        multiplier = (
+            self.pm_lambda_multiplier
+            if machine.pm_protected_processing_remaining_min > 1e-9
+            else 1.0
+        )
+        exposure_left = max(
+            0.0,
+            float(machine.failure_exposure_budget_min)
+            - float(machine.failure_exposure_used_min),
+        )
+        until_failure = exposure_left / max(1e-12, multiplier)
+        segment = min(remaining, until_failure)
+        if machine.pm_protected_processing_remaining_min > 1e-9:
+            segment = min(segment, float(machine.pm_protected_processing_remaining_min))
+        return max(1e-9, segment)
+
+    def record_machine_processing_exposure(self, machine: Machine, elapsed_min: float) -> None:
+        elapsed = max(0.0, float(elapsed_min))
+        if elapsed <= 0.0:
+            return
+        protected_before = max(0.0, float(machine.pm_protected_processing_remaining_min))
+        protected_elapsed = min(elapsed, protected_before)
+        unprotected_elapsed = elapsed - protected_elapsed
+        machine.total_processing_min += elapsed
+        machine.processing_since_maintenance_min += elapsed
+        machine.failure_cycle_processing_min += elapsed
+        machine.failure_exposure_used_min += (
+            protected_elapsed * self.pm_lambda_multiplier + unprotected_elapsed
+        )
+        if protected_elapsed > 0.0:
+            machine.pm_protected_processing_total_min += protected_elapsed
+            machine.pm_protected_processing_remaining_min = max(
+                0.0,
+                protected_before - protected_elapsed,
+            )
+            if protected_before > 1e-9 and machine.pm_protected_processing_remaining_min <= 1e-9:
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="MACHINE_PM_EFFECT_EXPIRED",
+                    entity_id=machine.machine_id,
+                    location=f"Station{machine.station}",
+                    details={
+                        "protected_processing_min": round(
+                            float(self.pm_effect_duration_min), 6
+                        ),
+                        "hazard_multiplier": round(float(self.pm_lambda_multiplier), 6),
+                    },
+                )
+
+    def machine_failure_threshold_reached(self, machine: Machine) -> bool:
+        return bool(
+            machine.failure_exposure_budget_min > 0.0
+            and machine.failure_exposure_used_min
+            >= machine.failure_exposure_budget_min - 1e-8
+        )
+
+    def log_machine_failure_processing_threshold(self, machine: Machine) -> None:
+        machine.last_failure_processing_min = float(machine.failure_cycle_processing_min)
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="MACHINE_FAILURE_PROCESSING_THRESHOLD_REACHED",
+            entity_id=machine.machine_id,
+            location=f"Station{machine.station}",
+            details={
+                "actual_processing_since_repair_min": round(
+                    float(machine.failure_cycle_processing_min), 6
+                ),
+                "effective_failure_exposure_min": round(
+                    float(machine.failure_exposure_used_min), 6
+                ),
+                "sampled_failure_exposure_min": round(
+                    float(machine.failure_exposure_budget_min), 6
+                ),
+                "pm_protected_at_failure": bool(
+                    machine.pm_protected_processing_remaining_min > 1e-9
+                ),
+            },
+        )
+
+    def reset_machine_failure_exposure(self, machine: Machine, *, reason: str) -> None:
+        if self.machine_failure_time_basis != "active_processing":
+            return
+        self._sample_machine_failure_exposure(machine, reason=reason)
+
+    def machine_preventive_maintenance_due(self, machine: Machine) -> bool:
+        if self.machine_failure_time_basis == "active_processing":
+            return bool(
+                machine.processing_since_maintenance_min
+                >= self.pm_interval_target_min - 1e-9
+            )
+        return bool(self.env.now - machine.last_pm_at >= self.pm_interval_target_min)
+
+    def repair_urgency(self, machine: Machine, *, emit_event: bool = True) -> dict[str, Any]:
+        station_machines = [
+            candidate
+            for candidate in self.machines.values()
+            if int(candidate.station) == int(machine.station)
+        ]
+        machine_count = max(1, len(station_machines))
+        unavailable = [
+            candidate
+            for candidate in station_machines
+            if candidate.broken
+            or candidate.state
+            in {MachineState.BROKEN, MachineState.UNDER_REPAIR, MachineState.UNDER_PM}
+        ]
+        available_count = max(0, machine_count - len(unavailable))
+        station_outage = 1.0 if available_count == 0 else 0.0
+        capacity_loss_ratio = min(1.0, len(unavailable) / machine_count)
+        material_ready = len(self.material_queues.get(machine.station, ()))
+        if self._station_requires_intermediate(machine.station):
+            intermediate_ready = len(self.intermediate_queues.get(machine.station, ()))
+            ready_sets = min(material_ready, intermediate_ready)
+        else:
+            ready_sets = material_ready
+        demand_ratio = min(1.0, float(ready_sets) / float(machine_count))
+        holds_wip = float(
+            bool(
+                machine.active_cycle_id
+                or machine.input_material
+                or machine.input_intermediate
+                or machine.output_intermediate
+            )
+        )
+        score = min(
+            1.0,
+            max(
+                0.0,
+                0.50 * station_outage
+                + 0.25 * capacity_loss_ratio
+                + 0.15 * demand_ratio
+                + 0.10 * holds_wip,
+            ),
+        )
+        tier = "critical" if score >= 0.75 else "high" if score >= 0.35 else "normal"
+        components = {
+            "station_outage": station_outage,
+            "capacity_loss_ratio": round(capacity_loss_ratio, 6),
+            "ready_demand_ratio": round(demand_ratio, 6),
+            "machine_holds_wip": holds_wip,
+        }
+        changed = bool(
+            tier != machine.last_repair_urgency_tier
+            or abs(score - float(machine.last_repair_urgency_score)) >= 0.05
+        )
+        if emit_event and machine.broken and changed:
+            self.logger.log(
+                t=self.env.now,
+                day=self.day_for_time(self.env.now),
+                event_type="REPAIR_URGENCY_UPDATED",
+                entity_id=machine.machine_id,
+                location=f"Station{machine.station}",
+                details={
+                    "repair_urgency_score": round(score, 6),
+                    "repair_urgency_tier": tier,
+                    "components": components,
+                },
+            )
+        machine.last_repair_urgency_score = score
+        machine.last_repair_urgency_tier = tier
+        return {
+            "repair_urgency_score": round(score, 6),
+            "repair_urgency_tier": tier,
+            "repair_urgency_components": components,
+        }
+
+    @staticmethod
+    def _repair_urgency_sort_key(task: Task) -> tuple[int, float, float, str]:
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        tier = str(payload.get("repair_urgency_tier", "normal")).strip().lower()
+        tier_rank = {"critical": 0, "high": 1, "normal": 2}.get(tier, 3)
+        return (
+            tier_rank,
+            -float(payload.get("repair_urgency_score", 0.0) or 0.0),
+            float(payload.get("failed_since", math.inf) or math.inf),
+            str(payload.get("machine_id", "")),
+        )
 
     def _humanoid_incident_random(self, worker_id: str, incident_code: str) -> float:
         key = (str(worker_id).strip(), str(incident_code).strip().upper())
         rng = self.humanoid_incident_rngs.get(key)
         if rng is None:
             rng = _stable_random_stream(
-                self.seed,
+                getattr(self, "_diagnostic_sampling_seed", self.seed),
                 f"{self.scenario_key}:humanoid_incident:{key[0]}:{key[1]}",
             )
             self.humanoid_incident_rngs[key] = rng
@@ -6590,12 +7091,14 @@ class ManufacturingWorld:
         }
 
     def _log_repair_team_event(self, machine: Machine, event_type: str, *, by: str, reason: str = "") -> None:
+        urgency = self.repair_urgency(machine, emit_event=False)
         details = {
             "by": by,
             "repair_team": list(machine.repair_team),
             "repair_team_size": self._repair_team_size(machine),
             "repair_remaining_min": round(float(machine.repair_work_remaining_min), 3),
             "repair_total_min": round(self._repair_total_work_min(machine), 3),
+            **urgency,
         }
         if reason:
             details["reason"] = reason
@@ -6671,6 +7174,7 @@ class ManufacturingWorld:
             machine.total_broken_min += self.env.now - machine.failed_since
         machine.broken = False
         machine.failed_since = None
+        self.reset_machine_failure_exposure(machine, reason="repair_completed")
         self._set_machine_state(
             machine,
             MachineState.DONE_WAIT_UNLOAD if machine.output_intermediate is not None else MachineState.WAIT_INPUT,
@@ -6725,13 +7229,21 @@ class ManufacturingWorld:
                     return
                 continue
 
-    def break_machine(self, machine: Machine, reason: str) -> None:
+    def break_machine(
+        self,
+        machine: Machine,
+        reason: str,
+        *,
+        interrupt_active_process: bool = True,
+    ) -> None:
         if machine.broken or machine.state in (MachineState.UNDER_REPAIR, MachineState.UNDER_PM):
             return
         was_processing = machine.state == MachineState.PROCESSING
         machine.broken = True
         machine.failures += 1
         machine.failed_since = self.env.now
+        if machine.pm_protected_processing_remaining_min > 1e-9:
+            machine.failures_while_pm_protected += 1
         machine.repair_team = []
         machine.repair_owner = None
         machine.repair_sampled_work_min = self.timing.sample_step_duration(
@@ -6746,6 +7258,7 @@ class ManufacturingWorld:
         machine.repair_monitor_process = None
         machine.repair_monitor_token += 1
         self._set_machine_state(machine, MachineState.BROKEN, reason=reason)
+        urgency = self.repair_urgency(machine, emit_event=False)
         self.logger.log(
             t=self.env.now,
             day=self.day_for_time(self.env.now),
@@ -6754,11 +7267,33 @@ class ManufacturingWorld:
             location=f"Station{machine.station}",
             details={
                 "reason": reason,
+                "failure_time_basis": self.machine_failure_time_basis,
+                "actual_processing_since_repair_min": round(
+                    float(machine.failure_cycle_processing_min), 6
+                ),
+                "effective_failure_exposure_min": round(
+                    float(machine.failure_exposure_used_min), 6
+                ),
+                "sampled_failure_exposure_min": round(
+                    float(machine.failure_exposure_budget_min), 6
+                ),
+                "pm_protected_at_failure": bool(
+                    machine.pm_protected_processing_remaining_min > 1e-9
+                ),
+                **urgency,
                 "sampled_repair_time_min": round(float(machine.repair_sampled_work_min), 6),
                 "repair_time_distribution": self.timing.distribution_for_step(
                     "REPAIR_MACHINE", "REPAIR_MACHINE/s03_execute_maintenance_action"
                 ).to_dict(),
             },
+        )
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="REPAIR_URGENCY_UPDATED",
+            entity_id=machine.machine_id,
+            location=f"Station{machine.station}",
+            details=urgency,
         )
         self._rolling_horizon_invalidate_machine_work(machine.machine_id)
         self.emit_incident(
@@ -6769,7 +7304,14 @@ class ManufacturingWorld:
             notify_workers=[agent_id for agent_id, agent in self.agents.items() if self.agent_display_location(agent) == f"Station{machine.station}"],
         )
         self._rolling_horizon_request_candidate_refresh("machine_broken")
-        if was_processing and machine.active_process is not None and machine.active_process.is_alive:
+        if urgency.get("repair_urgency_tier") == "critical":
+            self._rolling_horizon_collect_immediate_candidates("machine_broken_critical")
+        if (
+            interrupt_active_process
+            and was_processing
+            and machine.active_process is not None
+            and machine.active_process.is_alive
+        ):
             machine.active_process.interrupt("machine_breakdown")
 
     def battery_remaining(self, agent: Agent, at_t: float | None = None) -> float:
@@ -7165,8 +7707,103 @@ class ManufacturingWorld:
     def check_all_agents_discharged(self) -> None:
         if self.terminated:
             return
+        if self.depleted_recovery_enabled:
+            return
         if self.agents and all(a.discharged for a in self.agents.values()):
             self._terminate_simulation("all_agents_discharged")
+
+    def _schedule_depleted_worker_recovery(self, agent: Agent) -> None:
+        if not self.depleted_recovery_enabled:
+            return
+        current_day = int(float(self.env.now) // max(1.0, float(self.minutes_per_day))) + 1
+        due_day = current_day + 1
+        due_min = float(current_day * self.minutes_per_day)
+        agent.depleted_recovery_due_day = due_day
+        agent.depleted_recovery_due_min = due_min
+        self.logger.log(
+            t=self.env.now,
+            day=self.day_for_time(self.env.now),
+            event_type="WORKER_RECOVERY_SCHEDULED",
+            entity_id=agent.agent_id,
+            location=self.agent_display_location(agent),
+            details={
+                "recovery_day": due_day,
+                "recovery_at_min": round(due_min, 6),
+                "restart_location": self._assigned_charging_dock(agent),
+                "restart_soc": round(self.depleted_recovery_restart_soc, 6),
+            },
+        )
+
+    def _recover_depleted_workers_at_day_start(self, day: int) -> None:
+        if not self.depleted_recovery_enabled:
+            return
+        for agent in self.agents.values():
+            due_day = getattr(agent, "depleted_recovery_due_day", None)
+            if not agent.discharged or due_day is None or int(due_day) > int(day):
+                continue
+            old_location = self.agent_display_location(agent)
+            old_tile = agent.tile
+            dock_id = self._assigned_charging_dock(agent)
+            if self.grid_map is not None:
+                self.grid_map.release_reservation(agent.agent_id)
+                target_tile = self.grid_map.initial_worker_tile(agent.agent_id)
+                self.grid_map.move_worker(agent.agent_id, target_tile)
+                agent.tile = target_tile
+                agent.location = self.grid_map.zone_for_tile(target_tile) or "BatteryStation"
+            else:
+                agent.location = "BatteryStation"
+            self._clear_in_transit(agent)
+            self._clear_current_move(agent)
+            self._reset_worker_battery(agent)
+            agent.battery_remaining_budget_min = (
+                float(self.battery_swap_period_min) * self.depleted_recovery_restart_soc
+            )
+            agent.battery_last_accounted_at = float(self.env.now)
+            agent.discharged = False
+            agent.discharged_since = None
+            agent.low_battery_alerted = False
+            agent.awaiting_battery_from = None
+            agent.battery_service_owner = None
+            agent.suspended_task = None
+            agent.depleted_recovery_due_day = None
+            agent.depleted_recovery_due_min = None
+            details = {
+                "from_location": old_location,
+                "to_location": agent.location,
+                "from_tile": self._tile_payload(old_tile),
+                "to_tile": self._tile_payload(agent.tile),
+                "charging_dock_id": dock_id,
+                "restart_soc": round(self.depleted_recovery_restart_soc, 6),
+                "relocation_kind": "scheduled_external_recovery",
+            }
+            self.logger.log(
+                t=self.env.now,
+                day=int(day),
+                event_type="WORKER_RETURNED_NEXT_DAY",
+                entity_id=agent.agent_id,
+                location=agent.location,
+                details=details,
+            )
+            # Record the authorized external relocation before publishing a
+            # state snapshot at the new tile. Replay/audit consumers can then
+            # reset the worker's spatial anchor without treating it as travel.
+            self._transition_humanoid_state(
+                agent,
+                "task_completed",
+                reason="next_day_depleted_recovery",
+                source="mansim.depleted_recovery",
+                metadata={"cargo_present": False, "power_normal": True},
+            )
+            self.logger.log(
+                t=self.env.now,
+                day=int(day),
+                event_type="AGENT_RECHARGED",
+                entity_id=agent.agent_id,
+                location=agent.location,
+                details={**details, "recovery_source": "next_day_external_recovery"},
+            )
+            self._rolling_horizon_notify_worker(agent.agent_id)
+            self._rolling_horizon_request_candidate_refresh("worker_returned_next_day")
 
     def _clear_in_transit(self, agent: Agent) -> None:
         agent.in_transit_from = None
@@ -7497,7 +8134,15 @@ class ManufacturingWorld:
         agent.discharged = True
         agent.discharged_since = self.env.now
         agent.low_battery_alerted = False
-        details: dict[str, Any] = {"reason": reason}
+        details: dict[str, Any] = {
+            "reason": reason,
+            "current_task_id": str(agent.current_task_id or ""),
+            "current_task_type": str(agent.current_task_type or ""),
+            "during_move": bool(agent.current_move_id or self._has_in_transit_position(agent)),
+            "battery_risk": copy.deepcopy(
+                (agent.current_task_selection_meta or {}).get("battery_risk", {})
+            ),
+        }
         if self._has_in_transit_position(agent):
             details.update(
                 {
@@ -7524,6 +8169,7 @@ class ManufacturingWorld:
             details=details,
             notify_workers=[agent.agent_id],
         )
+        self._schedule_depleted_worker_recovery(agent)
         if interrupt_process and agent.process_ref is not None and agent.process_ref.is_alive:
             agent.process_ref.interrupt("battery_depleted")
         self.check_all_agents_discharged()
@@ -7832,7 +8478,8 @@ class ManufacturingWorld:
             self._terminate_simulation(reason_to_emit)
 
     def handle_task_interruption(self, agent: Agent, task: Task, reason: str) -> None:
-        if reason in {"battery_depleted", "battery_swap_wait"}:
+        recovery_depletion = bool(reason == "battery_depleted" and self.depleted_recovery_enabled)
+        if reason in {"battery_depleted", "battery_swap_wait"} and not recovery_depletion:
             if (
                 reason == "battery_depleted"
                 and task.task_type == "BATTERY_CHARGE"
@@ -7903,6 +8550,11 @@ class ManufacturingWorld:
                 notify_workers=[agent.agent_id],
             )
             return
+
+        if recovery_depletion:
+            agent.suspended_task = None
+            task.payload["_depletion_recovery_abandoned"] = True
+            self._drop_agent_cargo_due_to_depletion(agent, task)
 
         if task.task_type in {"BATTERY_SWAP", "BATTERY_CHARGE"}:
             if agent.battery_service_owner == agent.agent_id:
@@ -8059,6 +8711,8 @@ class ManufacturingWorld:
         self._clear_agent_carrying(agent, emit_event=False)
 
     def mandatory_task_for_agent(self, agent: Agent) -> Task | None:
+        if self.battery_assignment_mode == "policy_decides":
+            return None
         if agent.discharged and not (
             self.battery_direct_charge_enabled
             and self.grid_map is not None
@@ -8303,6 +8957,49 @@ class ManufacturingWorld:
         ).strip().upper()
         return int(self.mfg_flow_task_policy.rank_for_task(task, task_code))
 
+    def _mfg_flow_task_order_key(self, task: Task, agent: Agent) -> tuple[Any, ...]:
+        repair_key: tuple[Any, ...] = (9, 0.0, math.inf, "")
+        if str(task.task_type).strip().upper() == "REPAIR_MACHINE":
+            repair_key = self._repair_urgency_sort_key(task)
+        return (
+            self._mfg_flow_task_rank(task),
+            *repair_key,
+            float(self.travel_time(agent.location, task.location)),
+            float(self._task_estimated_duration(agent, task)),
+            str(task.task_id),
+        )
+
+    def _task_battery_risk_metadata(self, agent: Agent, task: Task) -> dict[str, Any]:
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        family = self._task_priority_key(task)
+        estimated_duration = max(0.0, float(self._task_estimated_duration(agent, task)))
+        if family in {"battery_swap", "battery_charge"}:
+            return_to_dock = 0.0
+        else:
+            task_end = str(
+                payload.get("destination")
+                or payload.get("destination_buffer_id")
+                or payload.get("machine_id")
+                or task.location
+                or self.agent_display_location(agent)
+            )
+            return_to_dock = max(
+                0.0,
+                float(self.travel_time(task_end, self._battery_service_target(agent))),
+            )
+        reserve_margin = 0.0 if family in {"battery_swap", "battery_charge"} else self._battery_service_margin_min()
+        required = estimated_duration + return_to_dock + reserve_margin
+        remaining = max(0.0, float(self.battery_remaining(agent)))
+        margin = remaining - required
+        return {
+            "battery_remaining_min": round(remaining, 6),
+            "estimated_task_duration_min": round(estimated_duration, 6),
+            "estimated_return_to_dock_min": round(return_to_dock, 6),
+            "estimated_battery_required_min": round(required, 6),
+            "expected_battery_margin_min": round(margin, 6),
+            "battery_depletion_risk": bool(margin < 0.0),
+        }
+
     def _filter_candidates_for_agent(self, agent: Agent, candidates: list[Task]) -> list[Task]:
         filtered = list(candidates)
         battery_reserve = self._battery_swap_service_min(agent) + self._battery_service_margin_min()
@@ -8321,7 +9018,7 @@ class ManufacturingWorld:
             self._rolling_horizon_dedicated_roles_active()
             and agent.agent_id in set(getattr(self, "rolling_horizon_battery_delivery_receiver_agent_ids", []))
         )
-        if self._rolling_horizon_self_battery_swap_due(agent):
+        if self.battery_assignment_mode != "policy_decides" and self._rolling_horizon_self_battery_swap_due(agent):
             self_swaps = [task for task in filtered if self._rolling_horizon_is_self_battery_swap(task, agent)]
             if self_swaps:
                 # A worker that owns MANAGE_ROBOT_POWER must service itself
@@ -8330,8 +9027,15 @@ class ManufacturingWorld:
                 filtered = self_swaps
         battery_safe: list[Task] = []
         for task in filtered:
+            risk_metadata = self._task_battery_risk_metadata(agent, task)
+            if self.expose_battery_risk_metadata:
+                task.payload.update(risk_metadata)
+                task.selection_meta["battery_risk"] = copy.deepcopy(risk_metadata)
             family = self._task_priority_key(task)
             if family in {"battery_swap", "battery_charge", "battery_delivery_low_battery", "battery_delivery_discharged"}:
+                battery_safe.append(task)
+                continue
+            if self.battery_assignment_mode == "policy_decides":
                 battery_safe.append(task)
                 continue
             if delivery_receiver:
@@ -8379,6 +9083,8 @@ class ManufacturingWorld:
         return bound
 
     def _select_battery_safety_task(self, candidates: list[Task], agent: Agent) -> Task | None:
+        if self.battery_assignment_mode == "policy_decides":
+            return None
         if self.battery_remaining(agent) > self._battery_proactive_swap_threshold(agent):
             return None
         battery_candidates = [
@@ -8834,12 +9540,7 @@ class ManufacturingWorld:
             return None
         task = min(
             candidates,
-            key=lambda candidate: (
-                self._mfg_flow_task_rank(candidate),
-                float(self.travel_time(agent.location, candidate.location)),
-                float(self._task_estimated_duration(agent, candidate)),
-                str(candidate.task_id),
-            ),
+            key=lambda candidate: self._mfg_flow_task_order_key(candidate, agent),
         )
         rule = self._mfg_flow_task_rule(task)
         selected = self._annotate_task_selection(
@@ -8931,6 +9632,8 @@ class ManufacturingWorld:
         return str(payload.get("target_agent_id", "")).strip() == str(agent.agent_id)
 
     def _rolling_horizon_self_battery_swap_due(self, agent: Agent) -> bool:
+        if self.battery_assignment_mode == "policy_decides":
+            return False
         if not self._rolling_horizon_active() or agent.discharged:
             return False
         if agent.battery_service_owner is not None and agent.battery_service_owner != agent.agent_id:
@@ -9012,6 +9715,16 @@ class ManufacturingWorld:
         waited_windows = self._rolling_horizon_waited_window_count(entry)
         boost = int(getattr(self, "rolling_horizon_rank_boost_per_window", 1) or 0)
         return max(1, base_rank - waited_windows * boost)
+
+    @staticmethod
+    def _rolling_horizon_repair_urgency_key(entry: dict[str, Any]) -> tuple[int, float]:
+        if str(entry.get("task_code", "")).strip().upper() != "REPAIR_MACHINE":
+            return 9, 0.0
+        tier = str(entry.get("repair_urgency_tier", "normal")).strip().lower()
+        return (
+            {"critical": 0, "high": 1, "normal": 2}.get(tier, 3),
+            -float(entry.get("repair_urgency_score", 0.0) or 0.0),
+        )
 
     def _rolling_horizon_task_signature(self, task: Task) -> dict[str, Any]:
         payload = task.payload if isinstance(task.payload, dict) else {}
@@ -9599,6 +10312,12 @@ class ManufacturingWorld:
         if not task_code_filter:
             return
         event_name = str(event_name or "").strip().lower() or "immediate"
+        if event_name == "worker_low_battery" and self.battery_assignment_mode == "policy_decides":
+            self._rolling_horizon_collect_candidates(
+                task_code_filter=task_code_filter,
+                collection_trigger="worker_low_battery_observed",
+            )
+            return
         if event_name == "worker_low_battery" and self.battery_delivery_enabled:
             task_code_filter = set(task_code_filter) | {"TRANSFER"}
         self._rolling_horizon_log_window_start()
@@ -9731,6 +10450,15 @@ class ManufacturingWorld:
                         "role_display_name": str(task_rule.display_name) if task_rule is not None else "",
                         "role_owner_agent_id": role_owner_agent_id,
                         "allowed_worker_ids": list(allowed_worker_ids),
+                        "repair_urgency_score": float(
+                            task.payload.get("repair_urgency_score", 0.0) or 0.0
+                        ),
+                        "repair_urgency_tier": str(
+                            task.payload.get("repair_urgency_tier", "") or ""
+                        ),
+                        "repair_urgency_components": dict(
+                            task.payload.get("repair_urgency_components", {}) or {}
+                        ),
                         "workers": set(),
                         "tasks_by_worker": {},
                         "last_logged_window_index": None,
@@ -9743,6 +10471,15 @@ class ManufacturingWorld:
                 if not str(entry.get("task_id", "") or "").strip():
                     entry["task_id"] = self._next_task_id_for_task_code(task_code)
                 entry["last_seen_min"] = now
+                entry["repair_urgency_score"] = float(
+                    task.payload.get("repair_urgency_score", 0.0) or 0.0
+                )
+                entry["repair_urgency_tier"] = str(
+                    task.payload.get("repair_urgency_tier", "") or ""
+                )
+                entry["repair_urgency_components"] = dict(
+                    task.payload.get("repair_urgency_components", {}) or {}
+                )
                 entry["effective_priority_rank"] = self._rolling_horizon_effective_rank(entry)
                 if collection_trigger == "boundary_reconciliation":
                     entry["boundary_seen_index"] = int(self.rolling_horizon_window_index)
@@ -9847,9 +10584,15 @@ class ManufacturingWorld:
                 if bool(entry.get("immediate_trigger", False))
                 and str(entry.get("collection_trigger", "")).strip().lower() == event_name
                 and str(entry.get("task_code", "")).strip().upper() in normalized_task_code_filter
+                and (
+                    event_name != "machine_broken_critical"
+                    or str(entry.get("repair_urgency_tier", "")).strip().lower()
+                    == "critical"
+                )
             ],
             key=lambda entry: (
                 self._rolling_horizon_effective_rank(entry),
+                *self._rolling_horizon_repair_urgency_key(entry),
                 float(entry.get("first_seen_min", 0.0) or 0.0),
                 str(entry.get("task_code", "")),
                 str(entry.get("opportunity_id", "")),
@@ -9984,6 +10727,13 @@ class ManufacturingWorld:
                     "role_display_name": str(entry.get("role_display_name", "")),
                     "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                     "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
+                    "repair_urgency_score": float(
+                        entry.get("repair_urgency_score", 0.0) or 0.0
+                    ),
+                    "repair_urgency_tier": str(entry.get("repair_urgency_tier", "") or ""),
+                    "repair_urgency_components": dict(
+                        entry.get("repair_urgency_components", {}) or {}
+                    ),
                     "assigned_worker_id": worker_id,
                     "queue_length_before": int(_queue_length),
                     "assigned_at_min": round(float(self.env.now), 3),
@@ -10105,6 +10855,7 @@ class ManufacturingWorld:
             self.rolling_horizon_pending.values(),
             key=lambda entry: (
                 self._rolling_horizon_effective_rank(entry),
+                *self._rolling_horizon_repair_urgency_key(entry),
                 float(entry.get("first_seen_min", 0.0) or 0.0),
                 str(entry.get("task_code", "")),
                 str(entry.get("opportunity_id", "")),
@@ -10370,6 +11121,13 @@ class ManufacturingWorld:
                 "role_display_name": str(entry.get("role_display_name", "")),
                 "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                 "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
+                "repair_urgency_score": float(
+                    entry.get("repair_urgency_score", 0.0) or 0.0
+                ),
+                "repair_urgency_tier": str(entry.get("repair_urgency_tier", "") or ""),
+                "repair_urgency_components": dict(
+                    entry.get("repair_urgency_components", {}) or {}
+                ),
                 "assigned_worker_id": worker_id,
                 "queue_length_before": int(row.get("queue_length", 0) or 0),
                 "assigned_at_min": round(float(self.env.now), 3),
@@ -10454,6 +11212,7 @@ class ManufacturingWorld:
             self.rolling_horizon_pending.values(),
             key=lambda entry: (
                 self._rolling_horizon_effective_rank(entry),
+                *self._rolling_horizon_repair_urgency_key(entry),
                 float(entry.get("first_seen_min", 0.0) or 0.0),
                 str(entry.get("task_code", "")),
                 str(entry.get("opportunity_id", "")),
@@ -10620,6 +11379,13 @@ class ManufacturingWorld:
                     "role_display_name": str(entry.get("role_display_name", "")),
                     "role_owner_agent_id": str(entry.get("role_owner_agent_id", "")),
                     "allowed_worker_ids": list(entry.get("allowed_worker_ids", [])),
+                    "repair_urgency_score": float(
+                        entry.get("repair_urgency_score", 0.0) or 0.0
+                    ),
+                    "repair_urgency_tier": str(entry.get("repair_urgency_tier", "") or ""),
+                    "repair_urgency_components": dict(
+                        entry.get("repair_urgency_components", {}) or {}
+                    ),
                     "assigned_worker_id": worker_id,
                     "queue_length_before": int(_queue_length),
                     "assigned_at_min": round(float(self.env.now), 3),
@@ -11443,6 +12209,7 @@ class ManufacturingWorld:
 
         for machine in self.machines.values():
             if machine.broken and agent.agent_id not in machine.repair_team and self._repair_team_size(machine) < self.max_repair_agents:
+                urgency = self.repair_urgency(machine)
                 tasks.append(
                     Task(
                         task_id=self._next_task_id("RM"),
@@ -11456,6 +12223,8 @@ class ManufacturingWorld:
                             "repair_team_size": self._repair_team_size(machine),
                             "repair_slots_remaining": self._repair_slots_remaining(machine),
                             "repair_remaining_min": round(float(machine.repair_work_remaining_min), 3),
+                            "failed_since": float(machine.failed_since or self.env.now),
+                            **urgency,
                         },
                     )
                 )
@@ -11555,7 +12324,7 @@ class ManufacturingWorld:
                         )
                     )
 
-            pm_due = self.env.now - machine.last_pm_at >= self.pm_interval_target_min
+            pm_due = self.machine_preventive_maintenance_due(machine)
             if (
                 self.preventive_maintenance_enabled
                 and
@@ -11572,7 +12341,16 @@ class ManufacturingWorld:
                         priority_key="preventive_maintenance",
                         priority=priority_pm,
                         location=f"Station{machine.station}",
-                        payload={"machine_id": machine.machine_id, "station": machine.station},
+                        payload={
+                            "machine_id": machine.machine_id,
+                            "station": machine.station,
+                            "processing_since_maintenance_min": round(
+                                float(machine.processing_since_maintenance_min), 6
+                            ),
+                            "pm_due_processing_min": round(
+                                float(self.pm_interval_target_min), 6
+                            ),
+                        },
                     )
                 )
 
@@ -14287,8 +15065,15 @@ class ManufacturingWorld:
             if machine.pm_owner is not None and machine.pm_owner != agent.agent_id:
                 return False
             machine.pm_owner = agent.agent_id
+            restore_state = machine.state
+            pm_start = None
+            pm_completed = False
             try:
-                if machine.broken or machine.state == MachineState.PROCESSING:
+                if (
+                    machine.broken
+                    or machine.state in {MachineState.PROCESSING, MachineState.UNDER_REPAIR}
+                    or machine.output_intermediate is not None
+                ):
                     return False
                 self._set_humanoid_primitive_hint(agent, "CHECK_SAFETY_ZONE")
                 self._set_humanoid_primitive_hint(agent, "NAVIGATE_TO")
@@ -14321,19 +15106,70 @@ class ManufacturingWorld:
                 machine.total_pm_min += pm_duration
                 machine.pm_count += 1
                 machine.last_pm_at = self.env.now
-                machine.pm_until = self.env.now + self.pm_effect_duration_min
-                self._set_machine_state(machine, MachineState.WAIT_INPUT, reason="pm_completed")
+                machine.processing_since_maintenance_min = 0.0
+                if self.machine_failure_time_basis == "active_processing":
+                    machine.pm_until = self.env.now
+                    machine.pm_protected_processing_remaining_min = max(
+                        0.0, float(self.pm_effect_duration_min)
+                    )
+                else:
+                    machine.pm_until = self.env.now + self.pm_effect_duration_min
+                next_state = (
+                    MachineState.DONE_WAIT_UNLOAD
+                    if machine.output_intermediate is not None
+                    else MachineState.WAIT_INPUT
+                    if restore_state == MachineState.WAIT_INPUT
+                    else MachineState.IDLE
+                )
+                self._set_machine_state(machine, next_state, reason="pm_completed")
                 self._set_humanoid_primitive_hint(agent, "VERIFY_MACHINE_STATE")
+                self.logger.log(
+                    t=self.env.now,
+                    day=self.day_for_time(self.env.now),
+                    event_type="MACHINE_PM_EFFECT_STARTED",
+                    entity_id=machine.machine_id,
+                    location=f"Station{machine.station}",
+                    details={
+                        "time_basis": self.machine_failure_time_basis,
+                        "protected_processing_min": round(
+                            float(self.pm_effect_duration_min), 6
+                        ),
+                        "hazard_multiplier": round(float(self.pm_lambda_multiplier), 6),
+                        "failure_exposure_remaining_min": round(
+                            max(
+                                0.0,
+                                float(machine.failure_exposure_budget_min)
+                                - float(machine.failure_exposure_used_min),
+                            ),
+                            6,
+                        ),
+                    },
+                )
                 self.logger.log(
                     t=self.env.now,
                     day=self.day_for_time(self.env.now),
                     event_type="MACHINE_PM_END",
                     entity_id=machine.machine_id,
                     location=f"Station{machine.station}",
-                    details={"by": agent.agent_id, "duration": round(pm_duration, 3)},
+                    details={"by": agent.agent_id, "duration": round(pm_duration, 3), "outcome": "completed"},
                 )
+                pm_completed = True
                 return True
             finally:
+                if pm_start is not None and not pm_completed:
+                    elapsed = max(0.0, self.env.now - pm_start)
+                    machine.total_pm_min += elapsed
+                    if machine.state == MachineState.UNDER_PM:
+                        self._set_machine_state(machine, restore_state, reason="pm_interrupted")
+                    if not self.logger.closed:
+                        self.logger.log(
+                            t=self.env.now,
+                            day=self.day_for_time(self.env.now),
+                            event_type="MACHINE_PM_END",
+                            entity_id=machine.machine_id,
+                            location=f"Station{machine.station}",
+                            details={"by": agent.agent_id, "duration": round(elapsed, 3), "outcome": "interrupted"},
+                        )
                 if machine.pm_owner == agent.agent_id:
                     machine.pm_owner = None
         return False
@@ -14347,7 +15183,7 @@ class ManufacturingWorld:
             distribution = self.processing_time_distribution[machine.station]
             sampled = sample_triangular(
                 distribution,
-                seed=self.seed,
+                seed=getattr(self, "_diagnostic_sampling_seed", self.seed),
                 namespace=f"{self.scenario_key}:machine:station{machine.station}",
                 sample_key=cycle_id,
             )
@@ -14932,6 +15768,7 @@ class ManufacturingWorld:
         humanoid_incident_metrics = self._humanoid_incident_metrics()
         transport_metrics = self._transport_metrics()
         battery_service_metrics = self._battery_service_metrics()
+        reliability_and_risk_metrics = self._reliability_and_risk_metrics()
         repair_collaboration_metrics = self._repair_collaboration_metrics()
         incident_event_total = sum(int(summary.get("incident_event_count", 0) or 0) for summary in self.daily_summaries)
         physical_incident_total = sum(int(summary.get("physical_incident_count", 0) or 0) for summary in self.daily_summaries)
@@ -15120,6 +15957,13 @@ class ManufacturingWorld:
                 6,
             ),
             "adp_avg_candidate_count": round(float(adp_summary.get("avg_candidate_count", 0.0) or 0.0), 6),
+            "adp_beam_value_entropy_avg": round(
+                float(adp_summary.get("beam_value_entropy_avg", 0.0) or 0.0),
+                6,
+            ),
+            "adp_beam_value_entropy_decision_count": int(
+                adp_summary.get("beam_value_entropy_decision_count", 0) or 0
+            ),
             "adp_inference_latency_ms_avg": round(float(adp_summary.get("inference_latency_ms_avg", 0.0) or 0.0), 6),
             "adp_validation_completed_products_avg": round(float(adp_summary.get("validation_completed_products_avg", 0.0) or 0.0), 6),
             "simulation_based_adp": adp_summary,
@@ -15128,6 +15972,7 @@ class ManufacturingWorld:
             **traffic_metrics,
             **transport_metrics,
             **battery_service_metrics,
+            **reliability_and_risk_metrics,
             **repair_collaboration_metrics,
             "rolling_horizon_window_count": int(self.rolling_horizon_metrics.get("started_window_count", 0)),
             "rolling_horizon_candidate_collected_count": int(self.rolling_horizon_metrics.get("candidate_collected_count", 0)),

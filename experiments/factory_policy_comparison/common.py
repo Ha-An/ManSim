@@ -30,12 +30,9 @@ SUMMARY_JSON = "comparison_summary.json"
 DASHBOARD_HTML = "comparison_dashboard.html"
 
 DEFAULT_MODES = [
-    "fixed_priority",
-    "adaptive_priority",
-    "rolling_horizon_aging_priority",
-    "rolling_horizon_dedicated_roles",
-    "bottleneck_aware_dispatch",
-    "rolling_horizon_throughput_optimizer",
+    "simulation_based_adp",
+    "immediate_shared",
+    "random_feasible_dispatch",
 ]
 
 SCENARIO_DEFAULT_OBJECTIVE = "scenario_default"
@@ -58,6 +55,7 @@ class ExperimentConfig:
     common_overrides: list[str]
     metrics: dict[str, list[str]]
     adp_checkpoint_path: str = ""
+    benchmark_seeds_locked: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +101,7 @@ def load_experiment_config(path: Path = DEFAULT_CONFIG_PATH) -> ExperimentConfig
         if isinstance(values, list)
     }
     adp_checkpoint_path = str(data.get("adp_checkpoint_path", "") or "").strip()
+    benchmark_seeds_locked = bool(data.get("benchmark_seeds_locked", False))
     return ExperimentConfig(
         scenario=scenario,
         horizon_days=horizon_days,
@@ -115,6 +114,7 @@ def load_experiment_config(path: Path = DEFAULT_CONFIG_PATH) -> ExperimentConfig
         common_overrides=common_overrides,
         metrics=normalized_metrics,
         adp_checkpoint_path=adp_checkpoint_path,
+        benchmark_seeds_locked=benchmark_seeds_locked,
     )
 
 

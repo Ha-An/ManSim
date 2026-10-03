@@ -86,6 +86,10 @@ ManSim v0.6.0에서 factory flow에 연결된 HumanoidSim task subset은 다음�
 
 HumanoidSim catalog의 모든 task가 ManSim에서 실행되는 것은 아닙니다. ManSim은 현재 factory scenario에 필요한 subset만 candidate 생성과 primitive side effect에 연결합니다.
 
+`mfg_flow_shop`은 19개 granular role로 task 후보를 분류합니다. 생산·운반·inspection 역할 1~16과 `PREVENTIVE_MAINTENANCE` 역할 19는 dedicated mode에서 단일 owner를 가지며, 자기 충전 역할 17과 공동수리 역할 18은 모든 worker에게 허용됩니다. PM은 실제 가공 240분마다 due가 되고, repair 후보에는 현재 생산능력 영향을 반영한 urgency가 포함됩니다.
+
+Battery 후보는 정책의 일반 선택지입니다. 예상 task 시간, dock 복귀시간, battery margin과 depletion risk를 제공하지만 위험 task를 사전에 제거하지 않습니다. Worker가 방전되면 실제 현재 tile에서 작업을 중단하고, 운반 item과 resource reservation을 안전하게 반환한 뒤 다음 day boundary에 자신의 charging dock에 SOC 100%로 복귀합니다.
+
 ## Dedicated Roles Mode
 
 `rolling_horizon_dedicated_roles`는 worker별 task code를 명확히 나누는 rolling horizon mode입니다. 현재 root config의 기본 decision mode입니다.

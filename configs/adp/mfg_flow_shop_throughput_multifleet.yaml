@@ -11,6 +11,7 @@ algorithm:
   td_bootstrap_enabled: false
   initial_policy: uniform_random_feasible_no_wait
   allow_wait_action: false
+  worker_order_strategy: cyclic
 
 training:
   initial_random_episodes: 100

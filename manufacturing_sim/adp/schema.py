@@ -6,11 +6,11 @@ from typing import Any
 import numpy as np
 
 
-FEATURE_SCHEMA_VERSION = "mfg_flow_shop_adp_v5"
-GLOBAL_FEATURE_DIM = 16
+FEATURE_SCHEMA_VERSION = "mfg_flow_shop_adp_v9"
+GLOBAL_FEATURE_DIM = 35
 WORKER_FEATURE_DIM = 16
-TASK_FEATURE_DIM = 20
-PAIR_FEATURE_DIM = 4
+TASK_FEATURE_DIM = 21
+PAIR_FEATURE_DIM = 8
 
 
 @dataclass

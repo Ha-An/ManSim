@@ -7,42 +7,107 @@ base_seed: 2026
 seed_partitions:
   enforce_disjoint: true
   screening_validation: [102626, 102627, 102628, 102629, 102630, 102631, 102632, 102633, 102634, 102635]
-  final_selection_validation: [102646, 102647, 102648, 102649, 102650, 102651, 102652, 102653, 102654, 102655, 102656, 102657, 102658, 102659, 102660, 102661, 102662, 102663, 102664, 102665, 102666, 102667, 102668, 102669, 102670]
+  final_selection_validation: [102646, 102647, 102648, 102649, 102650, 102651, 102652, 102653, 102654, 102655,
+                               102656, 102657, 102658, 102659, 102660, 102661, 102662, 102663, 102664, 102665]
   held_out_test: [50001, 50002, 50003, 50004, 50005]
 
+diagnostics:
+  # Run after checkpoint selection. Separate diagnostic seeds/cost, no training reuse.
+  value_validation:
+    # Disabled in the 5.79-hour baseline contract. Enable for a separate audit run.
+    enabled: false
+    checkpoints: [initial, best, last]
+    mc_seeds: [942001, 942002, 942003]
+    action_checkpoints: [best]
+    action_seeds: [943001]
+    decision_thresholds: [20, 100]
+    candidates_per_state: 3
+    future_seeds: [944001, 944002, 944003, 944004, 944005]
+    process_count: 10
+  ood_support:
+    enabled: true
+    reference_samples: 1024
+    calibration_samples: 1024
+    evaluation_samples: 4096
+    quantile: 0.95
+  fixed_action_probe:
+    enabled: false
+
 algorithm:
-  return_estimator: monte_carlo
-  n_step_enabled: false
-  td_bootstrap_enabled: false
+  return_estimator: n_step_td
+  n_step_enabled: true
+  n_step: 30
+  td_bootstrap_enabled: true
+  off_policy_correction: truncate_on_greedy_mismatch
   initial_policy: uniform_random_feasible_no_wait
   allow_wait_action: false
+  worker_order_strategy: cyclic
+
+policy_update:
+  mode: always_accept
+  enabled: false
+  acceptance_metric: completed_products_mean
+  min_improvement: 0.0
+  rollback_model: false
+  rollback_optimizer: false
 
 training:
-  # Use fewer, more conservative policy updates with a larger on-policy MC batch.
-  initial_random_episodes: 100
-  policy_iterations: 15
-  episodes_per_iteration: 100
-  replay_scope: current_iteration
+  # One continuous run combines broad exploration with low-rate stabilization.
+  initial_random_episodes: 50
+  policy_iterations: 75
+  episodes_per_iteration: 10
+  replay_scope: recent_episodes
+  replay_capacity_episodes: 100
+  # Initial update sees all 50 episodes once. Policy updates include the
+  # current 10 episodes plus 20 uniformly sampled historical episodes.
+  replay_sample_episodes_per_update: 30
+  initial_update_epochs: 1
+  target_tau: 0.03
   compact_episode_tensors: true
+  # Compact batches are released as soon as they expire from the replay window.
   release_samples_after_update: true
   validation_episode_fraction: 0.10
-  epsilon_start: 0.20
-  epsilon_end: 0.10
+  epsilon_start: 0.50
+  epsilon_end: 0.05
+  epsilon_schedule:
+    type: piecewise_linear
+    points:
+      0: 0.50
+      25: 0.15
+      50: 0.08
+      75: 0.05
   max_review_interval_min: 1.0
   gamma: 1.0
   batch_size: 512
   learning_rate: 0.00005
+  learning_rate_schedule:
+    type: piecewise_linear
+    points:
+      0: 0.00005
+      20: 0.00005
+      30: 0.00002
+      60: 0.00002
+      75: 0.00001
   loss_type: mse
   gradient_clip: 0.5
-  max_epochs_per_iteration: 3
-  early_stopping_patience: 2
+  max_epochs_per_iteration: 2
+  # Pairwise MC is not mixed into the TD target.
+  pairwise_mc_advantage:
+    enabled: false
+    loss_weight: 1.0
+    capture_episode_fraction: 0.20
+    minimum_pairs_per_batch: 2
+    decision_thresholds: [20, 100, 300]
+    candidates_per_state: 3
 
 validation:
-  # Spend the validation budget on more reliable checkpoint comparisons.
-  screening_interval_iterations: 2
+  combined_checkpoint_evaluation: false
+  screening_interval_iterations: 5
+  screening_iterations: [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75]
+  screening_include_initial: true
   screening_seed_count: 10
   final_candidate_count: 3
-  final_selection_seed_count: 25
+  final_selection_seed_count: 20
 
 model:
   embedding_dim: 128
@@ -52,8 +117,8 @@ model:
 
 rollout:
   parallel: true
-  process_count: 20
-  wave_size: 20
+  process_count: 10
+  wave_size: 10
   device: cpu
   start_method: spawn
   torch_threads_per_process: 1
@@ -62,6 +127,7 @@ rollout:
 runtime:
   device: cuda:0
   require_cuda_training: true
-  output_root: outputs/adp_training
+  output_root: outputs/adp_training_worker3_n_step_td
   auto_open_dashboard: true
   retain_episode_events: false
+  export_replay_artifacts: false

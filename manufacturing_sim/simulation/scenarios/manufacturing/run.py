@@ -22,6 +22,7 @@ from agents.modes import is_llm_mode, normalize_decision_mode
 from manufacturing_sim import __version__ as mansim_version
 from manufacturing_sim.simulation.pre_run_diagnostics import build_factory_pre_run_diagnostics
 from manufacturing_sim.simulation.scenarios.manufacturing.logging import EventLogger
+from manufacturing_sim.simulation.scenarios.manufacturing.entities import MACHINE_LIFECYCLE_CONTRACT
 from manufacturing_sim.simulation.scenarios.manufacturing.world import (
     ManufacturingWorld,
     resolve_manufacturing_objective,
@@ -74,12 +75,12 @@ def _event_audit_signature(events: list[dict[str, Any]]) -> dict[str, Any]:
         event_type = str(event.get("type", ""))
         if event_type in {"INSPECT_PASS", "INSPECT_FAIL"}:
             quality.append("P" if event_type == "INSPECT_PASS" else "F")
-        elif event_type == "MACHINE_REPAIR_START":
+        elif event_type == "MACHINE_BROKEN":
             details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
             machine_id = str(event.get("entity_id", ""))
-            if machine_id and details.get("repair_total_min") is not None:
+            if machine_id and details.get("sampled_repair_time_min") is not None:
                 repair_samples.setdefault(machine_id, []).append(
-                    round(float(details["repair_total_min"]), 6)
+                    round(float(details["sampled_repair_time_min"]), 6)
                 )
         elif event_type == "WAREHOUSE_MATERIAL_RESTOCK":
             restock_times.append(round(float(event.get("t", 0.0)), 6))
@@ -351,6 +352,7 @@ def run(
     base_seed = int(series_cfg.get("base_seed", run_seed) or run_seed)
 
     run_meta: dict[str, Any] = {
+        "machine_lifecycle_contract": MACHINE_LIFECYCLE_CONTRACT,
         "mansim_version": mansim_version,
         "scenario_type": scenario_kind,
         "decision_mode": decision_mode,
@@ -498,6 +500,31 @@ def run(
     }
     if world.is_mfg_flow_shop:
         run_meta.update(world.objective_metadata())
+        run_meta["mfg_flow_shop_reliability"] = {
+            "machine_failure": {
+                "distribution": world.machine_failure_distribution,
+                "time_basis": world.machine_failure_time_basis,
+                "mean_processing_time_to_failure_min": round(
+                    float(world.machine_failure_mean_exposure_min), 6
+                ),
+            },
+            "preventive_maintenance": {
+                "enabled": bool(world.preventive_maintenance_enabled),
+                "due_processing_min": round(float(world.pm_interval_target_min), 6),
+                "protected_processing_min": round(float(world.pm_effect_duration_min), 6),
+                "hazard_multiplier": round(float(world.pm_lambda_multiplier), 6),
+            },
+            "battery_safety": {
+                "assignment_mode": world.battery_assignment_mode,
+                "expose_risk_metadata": bool(world.expose_battery_risk_metadata),
+            },
+            "depleted_recovery": {
+                "enabled": bool(world.depleted_recovery_enabled),
+                "schedule": world.depleted_recovery_schedule,
+                "restart_location": world.depleted_recovery_restart_location,
+                "restart_soc": round(float(world.depleted_recovery_restart_soc), 6),
+            },
+        }
     run_meta["task_primitive_timing"] = {
         "scenario_type": world.timing.scenario_type,
         "profile_fingerprint": world.timing.profile_fingerprint,
@@ -745,6 +772,22 @@ def run(
                 "sim_elapsed_min",
             ):
                 run_meta[key] = kpi.get(key)
+            run_meta["mfg_flow_shop_reliability_summary"] = {
+                key: kpi.get(key)
+                for key in (
+                    "machine_failure_count",
+                    "machine_failure_observed_processing_mttf_min",
+                    "repair_count_by_urgency_tier",
+                    "repair_response_time_avg_min",
+                    "preventive_maintenance_count",
+                    "preventive_maintenance_protected_processing_min",
+                    "preventive_maintenance_failure_count",
+                    "battery_risk_assignment_count",
+                    "battery_risk_expected_margin_avg_min",
+                    "worker_recovery_scheduled_count",
+                    "worker_returned_next_day_count",
+                )
+            }
         run_meta["event_audit_signature"] = _event_audit_signature(event_logger.events)
         kpi["run_meta"] = run_meta
 

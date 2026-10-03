@@ -1,0 +1,65 @@
+study_name: mfg_flow_shop_adp_confirmatory
+scenario: mfg_flow_shop
+objective_mode: maximize_throughput
+horizon_days: 5
+minutes_per_day: 480
+rolling_horizon_window_min: 5.0
+
+# Primary fleet-size factor.
+worker_counts: [2, 3, 4, 5, 6]
+
+# One reusable worker-specific checkpoint per fleet size. Training-seed
+# variability is outside this compact experiment's estimand.
+adp_training_replicates: 1
+adp_training_template: configs/adp/mfg_flow_shop_throughput.yaml
+
+policies:
+  - immediate_shared
+  - random_feasible_dispatch
+  - simulation_based_adp
+
+# Keep all 800 learning episodes, but reduce checkpoint-evaluation waves.
+# Ten seeds fill one 10-process wave; using five would take almost the same
+# wall time while producing a less stable checkpoint comparison.
+validation:
+  screening_iterations: [0, 15, 30, 45, 60, 75]
+  screening_seed_count: 10
+  final_candidate_count: 2
+  final_selection_seed_count: 10
+
+# These seeds have not been used by the development comparison suite.
+test_seeds:
+  - 910001
+  - 910002
+  - 910003
+  - 910004
+  - 910005
+  - 910006
+  - 910007
+  - 910008
+  - 910009
+  - 910010
+  - 910011
+  - 910012
+  - 910013
+  - 910014
+  - 910015
+  - 910016
+  - 910017
+  - 910018
+  - 910019
+  - 910020
+
+seed_layout:
+  training_base: 1000000
+  worker_stride: 100000
+  replicate_stride: 10000
+  screening_base: 3000000
+  final_selection_base: 4000000
+
+execution:
+  training_jobs: 1
+  evaluation_jobs: 5
+  rollout_processes_per_training: 10
+  replay_artifacts: false
+  detailed_events: false

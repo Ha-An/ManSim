@@ -22,7 +22,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import simpy
 
@@ -35,7 +35,15 @@ from manufacturing_sim.simulation.scenarios.manufacturing.world import Manufactu
 from runtime.compat import build_legacy_experiment_cfg
 
 from .checkpoint import checkpoint_fingerprint, save_checkpoint
-from .compact import CompactMCBatch, compact_episode_transitions, merge_compact_batches, stratified_episode_split
+from .compact import (
+    CompactMCBatch,
+    CompactPairwiseMCBatch,
+    compact_episode_transitions,
+    merge_compact_batches,
+    merge_pairwise_mc_batches,
+    select_compact_samples,
+    stratified_episode_split,
+)
 from .model import build_value_network, predict_values, require_torch
 from .ood_diagnostics import build_ood_support_bank, evaluate_ood_selected_actions
 from .schema import (
@@ -83,6 +91,8 @@ class EpisodeResult:
     joint_no_candidate_count: int = 0
     max_consecutive_all_wait_decisions: int = 0
     max_consecutive_candidate_all_wait_decisions: int = 0
+    beam_value_entropy_avg: float = 0.0
+    beam_value_entropy_decision_count: int = 0
     compact_sample_count: int = 0
     compact_memory_bytes: int = 0
     iteration: int = 0
@@ -95,6 +105,15 @@ class EpisodeResult:
     probe_target_product_count: int | None = None
     probe_id: str = ""
     probe_candidate_id: int = -1
+    probe_target_post_state: dict[str, Any] | None = None
+    value_validation_samples: list[dict[str, Any]] | None = None
+    simulation_end_min: float = 0.0
+    termination_reason: str = ""
+    greedy_mc_sample_count: int = 0
+    greedy_mc_squared_error_sum: float = 0.0
+    greedy_mc_error_sum: float = 0.0
+    greedy_mc_prediction_sum: float = 0.0
+    greedy_mc_target_sum: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -152,6 +171,53 @@ def _snapshot_state_dict(model: Any | None) -> tuple[dict[str, Any] | None, str]
         torch.save(tensor, buffer)
         digest.update(buffer.getvalue())
     return state, digest.hexdigest()[:16]
+
+
+def _payload_hash(value: Any) -> str:
+    """Return a stable digest for nested optimizer/checkpoint state."""
+
+    torch = require_torch()
+    digest = hashlib.sha256()
+
+    def update(current: Any) -> None:
+        if torch.is_tensor(current):
+            tensor = current.detach().cpu().contiguous()
+            digest.update(b"tensor")
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            buffer = io.BytesIO()
+            torch.save(tensor, buffer)
+            digest.update(buffer.getvalue())
+            return
+        if isinstance(current, dict):
+            digest.update(b"dict")
+            for key in sorted(current, key=lambda item: repr(item)):
+                update(key)
+                update(current[key])
+            return
+        if isinstance(current, (list, tuple)):
+            digest.update(type(current).__name__.encode("ascii"))
+            for item in current:
+                update(item)
+            return
+        digest.update(type(current).__name__.encode("ascii", errors="replace"))
+        digest.update(repr(current).encode("utf-8"))
+
+    update(value)
+    return digest.hexdigest()[:16]
+
+
+def _should_accept_candidate(
+    *,
+    enabled: bool,
+    iteration: int,
+    candidate_mean: float,
+    incumbent_mean: float | None,
+    min_improvement: float,
+) -> bool:
+    if not enabled or int(iteration) == 0 or incumbent_mean is None:
+        return True
+    return float(candidate_mean) > float(incumbent_mean) + float(min_improvement)
 
 
 def _initialize_rollout_process(
@@ -338,9 +404,27 @@ def run_training_episode(
         world.termination_reason = "completed_horizon"
     transitions = world.adp_coordinator.finalize_episode()
     raw_return = sum(float(row["raw_reward"]) for row in transitions)
+    probe_index = int(adp_cfg.get("_probe_target_decision_number", 0)) - 1
+    target_post_state = None
+    if probe_index >= 0:
+        if probe_index >= len(transitions):
+            raise RuntimeError("Counterfactual episode did not reach the target decision.")
+        from .schema import serialize_state
+
+        target_post_state = serialize_state(transitions[probe_index]["post_state"])
+    compact_transitions = transitions
+    if collect_compact_samples and adp_cfg.get("_probe_collect_target_only", False):
+        if probe_index < 0 or float(gamma) != 1.0:
+            raise ValueError("Counterfactual target-only sampling requires a target decision and gamma=1.")
+        compact_transitions = [
+            {
+                **transitions[probe_index],
+                "raw_reward": sum(float(row["raw_reward"]) for row in transitions[probe_index:]),
+            }
+        ]
     compact_batch = (
         compact_episode_transitions(
-            transitions,
+            compact_transitions,
             episode_id=episode,
             worker_count=worker_count,
             gamma=gamma,
@@ -348,6 +432,22 @@ def run_training_episode(
         if collect_compact_samples
         else None
     )
+    if compact_batch is not None and adp_cfg.get("_collect_td_replay", False):
+        from .td import CompactTDData
+
+        compact_batch.td_data = CompactTDData.from_transitions(
+            transitions, episode, worker_count, repair_capacity=int(world.max_repair_agents)
+        )
+    greedy_mc = (0, 0.0, 0.0, 0.0, 0.0)
+    if not collect_compact_samples and adp_cfg.get("_collect_td_replay", False):
+        from .td import greedy_mc_errors
+
+        greedy_mc = greedy_mc_errors(model, transitions, device)
+    value_validation_samples = None
+    if adp_cfg.get("_value_validation_predictions", False):
+        from .value_validation import score_episode
+
+        value_validation_samples = score_episode(model, transitions, device)
     result = EpisodeResult(
         episode=episode,
         phase=phase,
@@ -357,7 +457,9 @@ def run_training_episode(
         scrap=int(world.scrap_count),
         raw_return=raw_return,
         decisions=int(world.adp_coordinator.metrics["decision_count"]),
-        fingerprint=checkpoint_fingerprint(world),
+        fingerprint=checkpoint_fingerprint(
+            world, return_estimator="n_step_td" if adp_cfg.get("_collect_td_replay", False) else "monte_carlo"
+        ),
         wait_count=int(world.adp_coordinator.metrics["wait_count"]),
         candidate_available_wait_count=int(
             world.adp_coordinator.metrics["candidate_available_wait_count"]
@@ -381,12 +483,35 @@ def run_training_episode(
                 "max_consecutive_candidate_all_wait_decisions"
             ]
         ),
+        beam_value_entropy_avg=(
+            float(world.adp_coordinator.metrics["beam_value_entropy_sum"])
+            / max(
+                1,
+                int(
+                    world.adp_coordinator.metrics[
+                        "beam_value_entropy_decision_count"
+                    ]
+                ),
+            )
+        ),
+        beam_value_entropy_decision_count=int(
+            world.adp_coordinator.metrics["beam_value_entropy_decision_count"]
+        ),
         compact_sample_count=len(compact_batch) if compact_batch is not None else 0,
         compact_memory_bytes=compact_batch.memory_bytes if compact_batch is not None else 0,
         probe_records=list(world.adp_coordinator.probe_records),
         probe_target_product_count=world.adp_coordinator.probe_target_product_count,
         probe_id=str(adp_cfg.get("_probe_id", "") or ""),
         probe_candidate_id=int(adp_cfg.get("_probe_candidate_id", -1)),
+        probe_target_post_state=target_post_state,
+        value_validation_samples=value_validation_samples,
+        simulation_end_min=float(env.now),
+        termination_reason=str(world.termination_reason),
+        greedy_mc_sample_count=greedy_mc[0],
+        greedy_mc_squared_error_sum=greedy_mc[1],
+        greedy_mc_error_sum=greedy_mc[2],
+        greedy_mc_prediction_sum=greedy_mc[3],
+        greedy_mc_target_sum=greedy_mc[4],
     )
     transitions.clear()
     logger.close()
@@ -409,6 +534,7 @@ def _run_rollout_jobs_parallel(
     output_dir: Path,
     episode_rows: list[dict[str, Any]],
     wave_rows: list[dict[str, Any]],
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[EpisodeResult], CompactMCBatch, RolloutBatchMetrics]:
     if not jobs:
         return [], merge_compact_batches([]), RolloutBatchMetrics()
@@ -417,6 +543,8 @@ def _run_rollout_jobs_parallel(
     all_results: list[EpisodeResult] = []
     compact_episodes: list[CompactMCBatch] = []
     batch_started = time.perf_counter()
+    from .live import TrainingProgress
+    report_progress = progress_callback or TrainingProgress(output_dir).rollout
     context = multiprocessing.get_context(start_method)
     with ProcessPoolExecutor(
         max_workers=max_processes,
@@ -426,6 +554,13 @@ def _run_rollout_jobs_parallel(
     ) as executor:
         for wave_jobs in chunks:
             wave_started = time.perf_counter()
+            progress_event = {
+                "phase": wave_jobs[0].phase, "iteration": wave_jobs[0].iteration,
+                "wave_id": wave_jobs[0].wave_id, "wave_episode_count": len(wave_jobs),
+                "process_count": max_processes,
+            }
+            report_progress({**progress_event, "event": "wave_started", "wave_completed": 0,
+                             "completed_episode_count": len(episode_rows)})
             futures = {executor.submit(_execute_rollout_job, job): job for job in wave_jobs}
             wave_results: list[EpisodeResult] = []
             wave_compact: list[CompactMCBatch] = []
@@ -435,6 +570,9 @@ def _run_rollout_jobs_parallel(
                     wave_results.append(result)
                     if compact is not None:
                         wave_compact.append(compact)
+                    report_progress({**progress_event, "event": "episode_completed",
+                                     "wave_completed": len(wave_results),
+                                     "completed_episode_count": len(episode_rows) + len(wave_results)})
             except BaseException as exc:
                 cancelled_count = 0
                 for future in futures:
@@ -480,7 +618,7 @@ def _run_rollout_jobs_parallel(
                 )
                 render_training_dashboard(output_dir, episode_rows, [], wave_rows, partial_summary)
                 raise RuntimeError(
-                    f"ADP rollout wave {wave_jobs[0].wave_id} failed; no partial MC update was applied."
+                    f"ADP rollout wave {wave_jobs[0].wave_id} failed; no partial value update was applied."
                 ) from exc
             wave_wall = time.perf_counter() - wave_started
             wave_results.sort(key=lambda item: item.episode)
@@ -507,6 +645,9 @@ def _run_rollout_jobs_parallel(
             )
             _write_csv(output_dir / "episode_metrics.csv", episode_rows)
             _write_csv(output_dir / "wave_metrics.csv", wave_rows)
+            report_progress({**progress_event, "event": "wave_completed",
+                             "wave_completed": len(wave_results),
+                             "completed_episode_count": len(episode_rows)})
     all_results.sort(key=lambda item: item.episode)
     compact_episodes.sort(
         key=lambda item: int(item.episode_ids[0].item()) if len(item) else 0
@@ -571,6 +712,165 @@ def _mc_regression_loss(predictions: Any, targets: Any) -> Any:
     return torch.nn.functional.mse_loss(predictions, targets)
 
 
+def _weighted_mc_regression_loss(
+    predictions: Any,
+    targets: Any,
+    sample_weights: Any | None = None,
+) -> Any:
+    if sample_weights is None:
+        return _mc_regression_loss(predictions, targets)
+    torch = require_torch()
+    weights = sample_weights.to(device=predictions.device, dtype=predictions.dtype)
+    if weights.ndim != 1 or weights.shape != predictions.shape:
+        raise ValueError("MC sample weights must be a vector matching predictions.")
+    if not bool(torch.isfinite(weights).all()) or bool((weights <= 0).any()):
+        raise ValueError("MC sample weights must be finite and strictly positive.")
+    squared_error = (predictions - targets) ** 2
+    return (squared_error * weights).sum() / weights.sum()
+
+
+def build_short_replay_batch(
+    history: list[tuple[int, CompactMCBatch]],
+    *,
+    window_iterations: int,
+    latest_iteration_weight: float,
+) -> tuple[CompactMCBatch, Any, dict[str, Any]]:
+    """Merge a bounded compact MC window and up-weight only its newest wave."""
+    torch = require_torch()
+    if not history:
+        raise ValueError("Short replay requires at least one compact batch.")
+    if int(window_iterations) < 1:
+        raise ValueError("replay_window_iterations must be at least one.")
+    if not math.isfinite(float(latest_iteration_weight)) or float(latest_iteration_weight) < 1.0:
+        raise ValueError("latest_iteration_weight must be finite and at least one.")
+    selected = history[-int(window_iterations) :]
+    iterations = [int(iteration) for iteration, _ in selected]
+    if iterations != sorted(set(iterations)):
+        raise ValueError("Replay history iterations must be unique and increasing.")
+    batch = merge_compact_batches([item for _, item in selected])
+    weights = torch.ones((len(batch),), dtype=torch.float32)
+    latest_iteration = iterations[-1]
+    offset = 0
+    current_sample_count = 0
+    for iteration, item in selected:
+        end = offset + len(item)
+        if int(iteration) == latest_iteration:
+            weights[offset:end] = float(latest_iteration_weight)
+            current_sample_count = len(item)
+        offset = end
+    effective_sample_count = float(weights.sum().item())
+    return batch, weights, {
+        "replay_iteration_count": len(selected),
+        "replay_oldest_iteration": iterations[0],
+        "replay_newest_iteration": iterations[-1],
+        "replay_episode_count": batch.episode_count,
+        "replay_sample_count": len(batch),
+        "replay_current_sample_count": current_sample_count,
+        "replay_effective_sample_count": effective_sample_count,
+        "replay_compact_mib": batch.memory_bytes / (1024.0**2),
+        "latest_iteration_weight": float(latest_iteration_weight),
+    }
+
+
+def build_short_pairwise_replay_batch(
+    history: list[tuple[int, CompactPairwiseMCBatch]],
+    *,
+    window_iterations: int,
+    latest_iteration_weight: float,
+) -> tuple[CompactPairwiseMCBatch, Any]:
+    """Merge the bounded same-state action-pair window with replay weights."""
+
+    torch = require_torch()
+    selected = [
+        (int(iteration), batch)
+        for iteration, batch in history[-max(1, int(window_iterations)) :]
+        if len(batch)
+    ]
+    if not selected:
+        return merge_pairwise_mc_batches([]), torch.zeros((0,), dtype=torch.float32)
+    iterations = [iteration for iteration, _ in selected]
+    if iterations != sorted(set(iterations)):
+        raise ValueError("Pairwise replay history iterations must be unique and increasing.")
+    batch = merge_pairwise_mc_batches([item for _, item in selected])
+    weights = torch.ones((len(batch),), dtype=torch.float32)
+    latest_iteration = iterations[-1]
+    offset = 0
+    for iteration, item in selected:
+        end = offset + len(item)
+        if iteration == latest_iteration:
+            weights[offset:end] = float(latest_iteration_weight)
+        offset = end
+    return batch, weights
+
+
+def _pairwise_mc_advantage_loss(
+    model: Any,
+    samples: CompactPairwiseMCBatch,
+    indices: list[int],
+    device: Any,
+    sample_weights: Any | None = None,
+) -> Any:
+    torch = require_torch()
+    selected_inputs, alternative_inputs, target_advantage = samples.model_batch(
+        indices, device
+    )
+    predicted_advantage = model(**selected_inputs) - model(**alternative_inputs)
+    if sample_weights is None:
+        return torch.nn.functional.mse_loss(predicted_advantage, target_advantage)
+    index = torch.as_tensor(indices, dtype=torch.long)
+    weights = sample_weights.index_select(0, index).to(
+        device=predicted_advantage.device,
+        dtype=predicted_advantage.dtype,
+    )
+    squared_error = (predicted_advantage - target_advantage) ** 2
+    return (squared_error * weights).sum() / weights.sum()
+
+
+def pairwise_mc_advantage_diagnostics(
+    model: Any,
+    samples: CompactPairwiseMCBatch | None,
+    *,
+    device: Any,
+    batch_size: int,
+) -> dict[str, float | int]:
+    if samples is None or not len(samples):
+        return {
+            "pair_count": 0,
+            "mse": 0.0,
+            "mae": 0.0,
+            "sign_accuracy": 0.0,
+            "informative_pair_count": 0,
+        }
+    torch = require_torch()
+    squared_error_sum = 0.0
+    absolute_error_sum = 0.0
+    sign_match_count = 0
+    informative_count = 0
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(samples), max(1, int(batch_size))):
+            indices = list(range(start, min(start + max(1, int(batch_size)), len(samples))))
+            selected_inputs, alternative_inputs, targets = samples.model_batch(
+                indices, device
+            )
+            predictions = model(**selected_inputs) - model(**alternative_inputs)
+            errors = predictions - targets
+            squared_error_sum += float((errors**2).sum().item())
+            absolute_error_sum += float(errors.abs().sum().item())
+            informative = targets != 0
+            informative_count += int(informative.sum().item())
+            sign_match_count += int(
+                ((torch.sign(predictions) == torch.sign(targets)) & informative).sum().item()
+            )
+    return {
+        "pair_count": len(samples),
+        "mse": squared_error_sum / len(samples),
+        "mae": absolute_error_sum / len(samples),
+        "sign_accuracy": sign_match_count / informative_count if informative_count else 0.0,
+        "informative_pair_count": informative_count,
+    }
+
+
 def fit_mc_value(
     *,
     model: Any,
@@ -583,6 +883,12 @@ def fit_mc_value(
     patience: int,
     validation_episode_fraction: float,
     rng: random.Random,
+    counterfactual_samples: CompactMCBatch | None = None,
+    counterfactual_fraction: float = 0.1,
+    sample_weights: Any | None = None,
+    pairwise_samples: CompactPairwiseMCBatch | None = None,
+    pairwise_loss_weight: float = 0.0,
+    pairwise_sample_weights: Any | None = None,
 ) -> tuple[float, int]:
     torch = require_torch()
     if not len(samples):
@@ -595,6 +901,62 @@ def fit_mc_value(
     if not train_indices:
         train_indices = list(validation_indices)
         validation_indices = []
+    if sample_weights is not None:
+        sample_weights = sample_weights.detach().cpu().to(dtype=torch.float32)
+        if sample_weights.ndim != 1 or len(sample_weights) != len(samples):
+            raise ValueError("sample_weights must match the compact MC batch.")
+        if not bool(torch.isfinite(sample_weights).all()) or bool((sample_weights <= 0).any()):
+            raise ValueError("sample_weights must be finite and strictly positive.")
+    if not math.isfinite(float(pairwise_loss_weight)) or float(pairwise_loss_weight) < 0.0:
+        raise ValueError("pairwise_loss_weight must be finite and non-negative.")
+    pairwise_train_indices: list[int] = []
+    if pairwise_samples is not None and len(pairwise_samples):
+        if float(pairwise_loss_weight) <= 0.0:
+            raise ValueError("Pairwise MC samples require a positive pairwise_loss_weight.")
+        train_episode_ids = {int(samples.episode_ids[index]) for index in train_indices}
+        pairwise_train_indices = [
+            index
+            for index, episode_id in enumerate(
+                pairwise_samples.selected.episode_ids.tolist()
+            )
+            if int(episode_id) in train_episode_ids
+        ]
+        if not pairwise_train_indices:
+            raise ValueError("No pairwise MC samples belong to training episodes.")
+        if pairwise_sample_weights is not None:
+            pairwise_sample_weights = pairwise_sample_weights.detach().cpu().to(
+                dtype=torch.float32
+            )
+            if (
+                pairwise_sample_weights.ndim != 1
+                or len(pairwise_sample_weights) != len(pairwise_samples)
+            ):
+                raise ValueError("pairwise_sample_weights must match the pair batch.")
+            if not bool(torch.isfinite(pairwise_sample_weights).all()) or bool(
+                (pairwise_sample_weights <= 0).any()
+            ):
+                raise ValueError(
+                    "pairwise_sample_weights must be finite and strictly positive."
+                )
+    counterfactual_indices: list[int] = []
+    counterfactual_rng = random.Random()
+    counterfactual_rng.setstate(rng.getstate())
+    if counterfactual_samples is not None and len(counterfactual_samples):
+        if not 0.0 < counterfactual_fraction < 1.0:
+            raise ValueError("counterfactual_fraction must be strictly between zero and one.")
+        train_episode_ids = {int(samples.episode_ids[index]) for index in train_indices}
+        counterfactual_indices = [
+            len(samples) + index
+            for index, episode_id in enumerate(counterfactual_samples.episode_ids.tolist())
+            if int(episode_id) in train_episode_ids
+        ]
+        if not counterfactual_indices:
+            raise ValueError("No counterfactual samples belong to training episodes.")
+        samples = merge_compact_batches([samples, counterfactual_samples])
+        if sample_weights is not None:
+            sample_weights = torch.cat(
+                [sample_weights, torch.ones((len(counterfactual_samples),), dtype=torch.float32)]
+            )
     best_loss = math.inf
     best_state: dict[str, Any] | None = None
     best_optimizer_state: dict[str, Any] | None = None
@@ -605,9 +967,37 @@ def fit_mc_value(
         model.train()
         for start in range(0, len(train_indices), max(1, int(batch_size))):
             batch_indices = train_indices[start : start + max(1, int(batch_size))]
+            if counterfactual_indices and len(batch_indices) >= 2:
+                count = min(len(batch_indices) - 1, max(1, round(len(batch_indices) * counterfactual_fraction)))
+                # Keep the original number of SGD steps and holdout episodes in both arms.
+                batch_indices = batch_indices[:-count] + counterfactual_rng.choices(
+                    counterfactual_indices, k=count
+                )
             batch, targets = samples.model_batch(batch_indices, device)
             predictions = model(**batch)
-            loss = _mc_regression_loss(predictions, targets)
+            batch_weights = (
+                sample_weights.index_select(
+                    0, torch.as_tensor(batch_indices, dtype=torch.long)
+                ).to(device)
+                if sample_weights is not None
+                else None
+            )
+            loss = _weighted_mc_regression_loss(predictions, targets, batch_weights)
+            if pairwise_train_indices:
+                pair_count = min(max(1, int(batch_size)), len(pairwise_train_indices))
+                pair_indices = (
+                    list(pairwise_train_indices)
+                    if pair_count == len(pairwise_train_indices)
+                    else rng.sample(pairwise_train_indices, pair_count)
+                )
+                pair_loss = _pairwise_mc_advantage_loss(
+                    model,
+                    pairwise_samples,
+                    pair_indices,
+                    device,
+                    pairwise_sample_weights,
+                )
+                loss = loss + float(pairwise_loss_weight) * pair_loss
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(gradient_clip))
@@ -621,9 +1011,25 @@ def fit_mc_value(
             for start in range(0, len(evaluation_indices), max(1, int(batch_size))):
                 batch_indices = evaluation_indices[start : start + max(1, int(batch_size))]
                 batch, targets = samples.model_batch(batch_indices, device)
-                batch_loss = float(_mc_regression_loss(model(**batch), targets).item())
-                weighted_loss_sum += batch_loss * len(batch_indices)
-                evaluated_sample_count += len(batch_indices)
+                evaluation_weights = (
+                    sample_weights.index_select(
+                        0, torch.as_tensor(batch_indices, dtype=torch.long)
+                    ).to(device)
+                    if sample_weights is not None
+                    else None
+                )
+                batch_weight = (
+                    float(evaluation_weights.sum().item())
+                    if evaluation_weights is not None
+                    else float(len(batch_indices))
+                )
+                batch_loss = float(
+                    _weighted_mc_regression_loss(
+                        model(**batch), targets, evaluation_weights
+                    ).item()
+                )
+                weighted_loss_sum += batch_loss * batch_weight
+                evaluated_sample_count += batch_weight
         current = weighted_loss_sum / evaluated_sample_count if evaluated_sample_count else 0.0
         if current + 1e-9 < best_loss:
             best_loss = current
@@ -666,10 +1072,11 @@ def _svg_chart(
     series: list[tuple[str, list[float], str]],
     *,
     x_values: list[float] | None,
+    series_x_values: dict[str, list[float]] | None = None,
     x_label: str,
     y_label: str,
     include_zero: bool = False,
-    error_ranges: dict[str, tuple[list[float], list[float]]] | None = None,
+    error_ranges: dict[str, tuple[list[float | None], list[float | None]]] | None = None,
     dashed_series: set[str] | None = None,
     width: int = 720,
     height: int = 250,
@@ -679,16 +1086,26 @@ def _svg_chart(
         return "<div class='empty'>No data</div>"
 
     point_count = max(len(values) for _, values, _ in non_empty)
-    xs = list(x_values or range(point_count))
-    if len(xs) < point_count:
-        xs.extend(float(index) for index in range(len(xs), point_count))
-    xs = [float(value) for value in xs[:point_count]]
+    default_xs = list(x_values or range(point_count))
+    if len(default_xs) < point_count:
+        default_xs.extend(float(index) for index in range(len(default_xs), point_count))
+    default_xs = [float(value) for value in default_xs]
+    xs_by_series: dict[str, list[float]] = {}
+    for name, values, _ in non_empty:
+        configured_xs = (series_x_values or {}).get(name)
+        current_xs = list(configured_xs if configured_xs is not None else default_xs)
+        if len(current_xs) < len(values):
+            current_xs.extend(
+                float(index) for index in range(len(current_xs), len(values))
+            )
+        xs_by_series[name] = [float(value) for value in current_xs[: len(values)]]
+    all_x = [value for values in xs_by_series.values() for value in values]
     all_y = [float(value) for _, values, _ in non_empty for value in values]
     for name, _, _ in non_empty:
         if error_ranges and name in error_ranges:
             lows, highs = error_ranges[name]
-            all_y.extend(float(value) for value in lows)
-            all_y.extend(float(value) for value in highs)
+            all_y.extend(float(value) for value in lows if value is not None)
+            all_y.extend(float(value) for value in highs if value is not None)
     low = min(all_y)
     high = max(all_y)
     if include_zero:
@@ -699,8 +1116,8 @@ def _svg_chart(
         low -= padding
         high += padding
 
-    x_low = min(xs)
-    x_high = max(xs)
+    x_low = min(all_x)
+    x_high = max(all_x)
     if math.isclose(x_low, x_high, abs_tol=1e-12):
         x_low -= 0.5
         x_high += 0.5
@@ -725,12 +1142,16 @@ def _svg_chart(
         )
 
     x_grid: list[str] = []
-    x_tick_count = min(6, point_count)
+    unique_xs = sorted(set(all_x))
+    x_tick_count = min(6, len(unique_xs))
     x_tick_indexes = sorted(
-        {int(round(index * (point_count - 1) / max(1, x_tick_count - 1))) for index in range(x_tick_count)}
+        {
+            int(round(index * (len(unique_xs) - 1) / max(1, x_tick_count - 1)))
+            for index in range(x_tick_count)
+        }
     )
     for index in x_tick_indexes:
-        value = xs[index]
+        value = unique_xs[index]
         x = map_x(value)
         x_grid.append(
             f"<line x1='{x:.1f}' y1='{margin_top:.1f}' x2='{x:.1f}' y2='{height - margin_bottom:.1f}' class='grid-line'/>"
@@ -740,13 +1161,16 @@ def _svg_chart(
     lines: list[str] = []
     legend: list[str] = []
     for name, values, color in non_empty:
+        series_xs = xs_by_series[name]
         coordinates = [
-            (map_x(xs[index]), map_y(float(value)), float(value))
+            (map_x(series_xs[index]), map_y(float(value)), float(value))
             for index, value in enumerate(values)
         ]
         if error_ranges and name in error_ranges:
             lows, highs = error_ranges[name]
             for index in range(min(len(coordinates), len(lows), len(highs))):
+                if lows[index] is None or highs[index] is None:
+                    continue
                 x, _, _ = coordinates[index]
                 y_low = map_y(float(lows[index]))
                 y_high = map_y(float(highs[index]))
@@ -813,6 +1237,12 @@ def render_training_dashboard(
     wave_rows: list[dict[str, Any]],
     summary: dict[str, Any],
 ) -> Path:
+    if summary.get("return_estimator") == "n_step_td":
+        from .td_dashboard import render_td_dashboard
+
+        return render_td_dashboard(output_dir, episode_rows, iteration_rows, wave_rows, summary)
+    from .value_validation import dashboard_panels
+
     training_episode_rows = [
         row
         for row in episode_rows
@@ -863,7 +1293,8 @@ def render_training_dashboard(
     checkpoint_wait_rows = [
         row
         for row in episode_rows
-        if str(row.get("phase", "")) in {"checkpoint_validation", "screening_validation"}
+        if str(row.get("phase", ""))
+        in {"checkpoint_validation", "screening_validation", "candidate_validation"}
     ]
     checkpoint_wait_iterations = sorted(
         {int(row.get("iteration", 0)) for row in checkpoint_wait_rows}
@@ -894,15 +1325,53 @@ def render_training_dashboard(
             if rows
             else 0.0
         )
+
+    def weighted_beam_entropy(rows: list[dict[str, Any]]) -> float | None:
+        weighted_sum = 0.0
+        sample_count = 0
+        for row in rows:
+            count = int(float(row.get("beam_value_entropy_decision_count", 0) or 0))
+            if count <= 0:
+                continue
+            weighted_sum += float(row.get("beam_value_entropy_avg", 0.0) or 0.0) * count
+            sample_count += count
+        return weighted_sum / sample_count if sample_count else None
+
+    training_entropy_x: list[float] = []
+    training_entropy_values: list[float] = []
+    for iteration in training_iterations:
+        rows = [
+            row
+            for row in training_episode_rows
+            if int(row.get("iteration", 0)) == iteration
+        ]
+        value = weighted_beam_entropy(rows)
+        if value is not None:
+            training_entropy_x.append(float(iteration))
+            training_entropy_values.append(float(value))
+    validation_entropy_x: list[float] = []
+    validation_entropy_values: list[float] = []
+    for iteration in checkpoint_wait_iterations:
+        rows = [
+            row
+            for row in checkpoint_wait_rows
+            if int(row.get("iteration", 0)) == iteration
+        ]
+        value = weighted_beam_entropy(rows)
+        if value is not None:
+            validation_entropy_x.append(float(iteration))
+            validation_entropy_values.append(float(value))
     exploratory_checkpoint_mean: list[float] = []
     exploratory_checkpoint_std: list[float] = []
-    for rollout_iteration in sorted(iteration for iteration in training_iterations if iteration > 0):
+    exploratory_checkpoint_x: list[float] = []
+    for rollout_iteration in training_iterations:
         rows = [
             row
             for row in training_episode_rows
             if int(row.get("iteration", 0)) == rollout_iteration
         ]
         mean, std = _mean_and_std([float(row.get("products", 0)) for row in rows])
+        exploratory_checkpoint_x.append(float(rollout_iteration))
         exploratory_checkpoint_mean.append(mean)
         exploratory_checkpoint_std.append(std)
     random_rows = [row for row in training_episode_rows if row.get("phase") == "initial_random"]
@@ -919,6 +1388,15 @@ def render_training_dashboard(
     )
     wall_clock_complete = bool(summary.get("wall_clock_complete", True))
     wait_action_enabled = bool(summary.get("wait_action_enabled", False))
+    replay_scope_value = str(summary.get("replay_scope", "current_iteration"))
+    recent_replay_enabled = replay_scope_value == "recent_window"
+    replay_intro = (
+        "현재 rollout과 제한된 최근 Monte Carlo replay를 함께 학습합니다. "
+        "Replay window를 벗어난 compact episode tensor는 즉시 폐기합니다."
+        if recent_replay_enabled
+        else "현재 rollout의 Monte Carlo batch만 학습하며, 업데이트 후 compact episode "
+        "tensor를 폐기합니다."
+    )
     losses = (
         [float(row.get("mc_loss", 0)) for row in iteration_rows]
         if fit_diagnostics_available
@@ -944,14 +1422,18 @@ def render_training_dashboard(
         if fit_diagnostics_available
         else []
     )
-    action_rank_correlation_values = [
-        float(row.get("action_rank_correlation", 0)) for row in iteration_rows
+    pairwise_enabled = bool(summary.get("pairwise_mc_advantage_enabled", False))
+    pairwise_mse_before = [
+        float(row.get("pairwise_mc_advantage_mse_before", 0.0))
+        for row in iteration_rows
     ]
-    candidate_top1_agreement_values = [
-        float(row.get("candidate_top1_agreement", 0)) for row in iteration_rows
+    pairwise_mse_after = [
+        float(row.get("pairwise_mc_advantage_mse_after", 0.0))
+        for row in iteration_rows
     ]
-    selected_action_regret_values = [
-        float(row.get("selected_action_regret", 0)) for row in iteration_rows
+    pairwise_sign_accuracy = [
+        100.0 * float(row.get("pairwise_mc_advantage_sign_accuracy", 0.0))
+        for row in iteration_rows
     ]
     ood_rows = [
         row
@@ -971,17 +1453,36 @@ def render_training_dashboard(
     ]
     epsilon_values = [float(row.get("epsilon", 0)) for row in iteration_rows]
     iteration_x = [float(row.get("iteration", index)) for index, row in enumerate(iteration_rows)]
-    validation_rows = [row for row in iteration_rows if bool(row.get("validation_performed", False))]
+    validation_rows = [
+        row
+        for row in iteration_rows
+        if _as_bool(row.get("validation_performed", False))
+    ]
     validation = [float(row.get("validation_products_avg", 0)) for row in validation_rows]
     validation_x = [float(row.get("iteration", index)) for index, row in enumerate(validation_rows)]
     validation_ci_low = [float(row.get("validation_products_ci95_low", 0)) for row in validation_rows]
     validation_ci_high = [float(row.get("validation_products_ci95_high", 0)) for row in validation_rows]
-    train_eval_rows = [row for row in iteration_rows if bool(row.get("train_eval_performed", False))]
-    train_eval = [float(row.get("train_eval_products_avg", 0)) for row in train_eval_rows]
-    train_eval_x = [float(row.get("iteration", index)) for index, row in enumerate(train_eval_rows)]
-    train_eval_ci_low = [float(row.get("train_eval_products_ci95_low", 0)) for row in train_eval_rows]
-    train_eval_ci_high = [float(row.get("train_eval_products_ci95_high", 0)) for row in train_eval_rows]
+    conservative_update_enabled = _as_bool(
+        summary.get("conservative_policy_update", False)
+    )
+    gate_rows = [
+        row
+        for row in validation_rows
+        if str(row.get("candidate_validation_products_avg", "")).strip()
+    ]
+    gate_x = [float(row.get("iteration", index)) for index, row in enumerate(gate_rows)]
+    gate_candidate = [
+        float(row.get("candidate_validation_products_avg", 0.0)) for row in gate_rows
+    ]
+    gate_effective = [
+        float(row.get("effective_incumbent_validation_products_avg", 0.0))
+        for row in gate_rows
+    ]
     compact_memory = [float(row.get("compact_batch_mib", 0)) for row in iteration_rows]
+    replay_memory = [float(row.get("replay_buffer_mib", 0)) for row in iteration_rows]
+    replay_episode_counts = [
+        float(row.get("replay_episode_count", 0)) for row in iteration_rows
+    ]
     process_memory = (
         [float(row.get("process_rss_mib", 0)) for row in iteration_rows]
         if process_memory_diagnostics_available
@@ -1035,10 +1536,10 @@ def render_training_dashboard(
     )
     phase_waves = summary.get("phase_wave_counts", {})
     checkpoint_diagnostic_waves = int(
-        phase_waves.get(
-            "checkpoint_diagnostic",
-            phase_waves.get("screening_validation", phase_waves.get("validation", 0)),
-        )
+        phase_waves.get("checkpoint_diagnostic", 0)
+        or phase_waves.get("candidate_validation", 0)
+        or phase_waves.get("screening_validation", 0)
+        or phase_waves.get("validation", 0)
     )
     device_meta = summary.get("training_device_metadata", {})
     environment_meta = summary.get("runtime_environment", {})
@@ -1049,16 +1550,49 @@ def render_training_dashboard(
         for label, value in [
             ("Training Episodes", summary.get("training_episode_count", 0)),
             ("Validation Episodes", summary.get("validation_episode_count", 0)),
-            ("Train-Eval Episodes", summary.get("train_evaluation_episode_count", 0)),
             ("Best Validation Products", f"{float(summary.get('best_validation_completed_products_avg', 0)):.3f}"),
             ("Best Iteration", summary.get("best_iteration", "-")),
-            ("Policy Updates", summary.get("policy_iterations", "-")),
+            (
+                "Value Updates (incl. initial)",
+                summary.get(
+                    "value_update_count",
+                    int(summary.get("policy_iterations", 0)) + 1,
+                ),
+            ),
+            ("Policy Iterations", summary.get("policy_iterations", "-")),
             ("Episodes / Update", summary.get("episodes_per_iteration", "-")),
             ("MC Loss", loss_label),
+            (
+                "Pairwise MC Advantage",
+                "Enabled" if pairwise_enabled else "Disabled",
+            ),
+            (
+                "Pairwise Loss Weight",
+                f"{float(summary.get('pairwise_mc_advantage_loss_weight', 0.0)):.2f}",
+            ),
+            (
+                "Pairwise Samples / Branch Episodes",
+                f"{int(summary.get('pairwise_mc_advantage_pair_count', 0))} / "
+                f"{int(summary.get('pairwise_mc_advantage_branch_episode_count', 0))}",
+            ),
             ("Reward", "Completed-product MC"),
             ("WAIT Action", "Enabled" if wait_action_enabled else "Disabled"),
+            (
+                "Supported Worker Counts",
+                ", ".join(str(value) for value in summary.get("worker_counts", [])),
+            ),
+            ("Beam Worker Order", summary.get("worker_order_strategy", "-")),
+            ("Policy Update", summary.get("policy_update_mode", "always_accept")),
+            ("Accepted Updates", summary.get("accepted_update_count", 0)),
+            ("Rejected Updates", summary.get("rejected_update_count", 0)),
             ("Learning Rate", f"{float(summary.get('learning_rate', 0)):.1e}"),
             ("Max Epochs / Update", summary.get("max_epochs_per_iteration", "-")),
+            ("Replay Scope", replay_scope_value),
+            ("Replay Window", f"{int(summary.get('replay_window_iterations', 1))} updates"),
+            (
+                "Latest Wave Weight",
+                f"{float(summary.get('latest_iteration_weight', 1.0)):.1f}x",
+            ),
             (
                 "Latest OOD Selection Rate",
                 f"{100.0 * float(latest_ood_row.get('ood_selection_rate', 0.0)):.2f}%"
@@ -1083,6 +1617,10 @@ def render_training_dashboard(
             ),
             ("Peak Compact Batch", f"{float(summary.get('peak_compact_batch_mib', 0)):.2f} MiB"),
             (
+                "Peak Replay Buffer",
+                f"{float(summary.get('peak_replay_buffer_mib', 0)):.2f} MiB",
+            ),
+            (
                 "Parent Peak RSS",
                 f"{float(summary.get('observed_peak_process_rss_mib', 0)):.1f} MiB"
                 if process_memory_diagnostics_available
@@ -1104,25 +1642,20 @@ def render_training_dashboard(
                 if gpu_memory_diagnostics_available
                 else "N/A (recovered run)",
             ),
-            ("Checkpoint", summary.get("best_checkpoint", "-")),
+            (
+                "Checkpoint",
+                f"{Path(str(summary.get('best_checkpoint', 'best.pt'))).name} "
+                f"(iteration {summary.get('best_iteration', '-')})",
+            ),
         ]
     )
     def screening_cell(row: dict[str, Any]) -> str:
-        if not bool(row.get("validation_performed", False)):
+        if not _as_bool(row.get("validation_performed", False)):
             return "-"
         return (
             f"{float(row.get('validation_products_avg', 0)):.3f} "
             f"[{float(row.get('validation_products_ci95_low', 0)):.3f}, "
             f"{float(row.get('validation_products_ci95_high', 0)):.3f}]"
-        )
-
-    def train_eval_cell(row: dict[str, Any]) -> str:
-        if not bool(row.get("train_eval_performed", False)):
-            return "-"
-        return (
-            f"{float(row.get('train_eval_products_avg', 0)):.3f} "
-            f"[{float(row.get('train_eval_products_ci95_low', 0)):.3f}, "
-            f"{float(row.get('train_eval_products_ci95_high', 0)):.3f}]"
         )
 
     def fit_cell(row: dict[str, Any], key: str) -> str:
@@ -1148,23 +1681,38 @@ def render_training_dashboard(
         f"<td>{int(row.get('batch_episode_count', 0))}</td>"
         f"<td>{int(row.get('sample_count', 0))}</td>"
         f"<td>{float(row.get('compact_batch_mib', 0)):.3f}</td>"
+        f"<td>{int(row.get('replay_oldest_iteration', row.get('iteration', 0)))}-"
+        f"{int(row.get('replay_newest_iteration', row.get('iteration', 0)))}</td>"
+        f"<td>{int(row.get('replay_episode_count', row.get('batch_episode_count', 0)))}</td>"
+        f"<td>{int(row.get('replay_sample_count', row.get('sample_count', 0)))} "
+        f"({float(row.get('replay_effective_sample_count', row.get('sample_count', 0))):.0f})</td>"
+        f"<td>{float(row.get('replay_buffer_mib', row.get('compact_batch_mib', 0))):.3f}</td>"
         f"<td>{float(row.get('rollout_wall_sec', 0)):.2f}s</td>"
         f"<td>{update_time_cell(row)}</td>"
         f"<td>{fit_cell(row, 'mc_mae')}</td>"
         f"<td>{fit_cell(row, 'mc_rmse')}</td>"
+        f"<td>{int(row.get('pairwise_mc_advantage_pair_count', 0))}</td>"
+        f"<td>{float(row.get('pairwise_mc_advantage_mse_after', 0)):.3f}</td>"
+        f"<td>{100.0 * float(row.get('pairwise_mc_advantage_sign_accuracy', 0)):.1f}%</td>"
         f"<td>{float(row.get('epsilon', 0)):.3f}</td>"
         f"<td>{ood_cell(row, 'ood_selection_rate', percent=True)}</td>"
         f"<td>{ood_cell(row, 'ood_overestimation_excess')}</td>"
-        f"<td>{train_eval_cell(row)}</td>"
+        f"<td>{ood_cell(row, 'candidate_validation_products_avg')}</td>"
+        f"<td>{ood_cell(row, 'effective_incumbent_validation_products_avg')}</td>"
+        f"<td>{html_lib.escape(str(row.get('policy_update_accepted', '-')))}</td>"
         f"<td>{screening_cell(row)}</td>"
         "</tr>"
         for row in iteration_rows
     )
     iteration_table = (
-        "<table><thead><tr><th>Update</th><th>Episodes</th><th>MC samples</th>"
-        "<th>Compact MiB</th><th>Rollout</th><th>GPU update</th><th>MAE</th><th>RMSE</th><th>Epsilon</th>"
+        "<table><thead><tr><th>Update</th><th>Current episodes</th><th>Current MC samples</th>"
+        "<th>Current MiB</th><th>Replay span</th><th>Replay episodes</th>"
+        "<th>Replay samples (weighted)</th><th>Replay MiB</th>"
+        "<th>Rollout</th><th>GPU update</th><th>MAE</th><th>RMSE</th>"
+        "<th>Pair count</th><th>Pair MSE</th><th>Pair sign accuracy</th><th>Epsilon</th>"
         "<th>OOD 선택률</th><th>OOD 추가 과대평가</th>"
-        "<th>Train-eval mean [95% CI]</th><th>Held-out validation mean [95% CI]</th></tr></thead><tbody>"
+        "<th>Candidate validation</th><th>Effective incumbent</th><th>Accepted</th>"
+        "<th>Validation mean [95% CI]</th></tr></thead><tbody>"
         + iteration_table_rows
         + "</tbody></table>"
     )
@@ -1178,12 +1726,14 @@ def render_training_dashboard(
         f"<tr><th>GPU index / name</th><td>{html_lib.escape(str(device_meta.get('gpu_index', '-')))} / {html_lib.escape(str(device_meta.get('gpu_name', '-')))}</td></tr>"
         f"<tr><th>GPU memory</th><td>{float(device_meta.get('gpu_total_memory_mib', 0)):.1f} MiB</td></tr>"
         f"<tr><th>PyTorch / CUDA / cuDNN</th><td>{html_lib.escape(str(device_meta.get('torch_version', '-')))} / {html_lib.escape(str(device_meta.get('cuda_runtime_version', '-')))} / {html_lib.escape(str(device_meta.get('cudnn_version', '-')))}</td></tr>"
+        f"<tr><th>Training seed / deterministic</th><td>{html_lib.escape(str(device_meta.get('determinism', {}).get('seed', '-')))} / {('yes' if device_meta.get('determinism', {}).get('torch_deterministic_algorithms', False) else 'no')}</td></tr>"
         f"<tr><th>GPU count / compute capability</th><td>{int(device_meta.get('gpu_count', 0))} / {html_lib.escape(str(device_meta.get('gpu_compute_capability', '-')))}</td></tr>"
         f"<tr><th>CPU / logical processors</th><td>{html_lib.escape(str(environment_meta.get('cpu_model', '-')))} / {int(environment_meta.get('logical_cpu_count', 0))}</td></tr>"
         f"<tr><th>Host / OS</th><td>{html_lib.escape(str(environment_meta.get('host_name', '-')))} / {html_lib.escape(str(environment_meta.get('operating_system', '-')))}</td></tr>"
         f"<tr><th>Python</th><td>{html_lib.escape(str(environment_meta.get('python_version', '-')))}</td></tr>"
         f"<tr><th>Torch threads per process</th><td>{int(summary.get('torch_threads_per_process', 0))}</td></tr>"
         f"<tr><th>Initial / policy / checkpoint diagnostic / final waves</th><td>{int(phase_waves.get('initial_random', 0))} / {int(phase_waves.get('policy_iteration', 0))} / {checkpoint_diagnostic_waves} / {int(phase_waves.get('final_selection_validation', 0))}</td></tr>"
+        f"<tr><th>Pairwise counterfactual waves</th><td>{int(phase_waves.get('pairwise_mc_advantage', 0))}</td></tr>"
         f"<tr><th>Total waves</th><td>{int(summary.get('total_wave_count', 0))}</td></tr>"
         f"<tr><th>Active-slot utilization</th><td>{100.0 * float(summary.get('active_slot_utilization', 0)):.1f}%</td></tr>"
         f"<tr><th>IPC payload</th><td>{float(summary.get('ipc_payload_mib', 0)):.2f} MiB</td></tr>"
@@ -1193,7 +1743,16 @@ def render_training_dashboard(
     time_parts = [
         ("고정 행동 probe", float(summary.get("fixed_action_probe_wall_sec", 0)), "#4dc6c6"),
         ("OOD 진단", float(summary.get("ood_diagnostic_sec", 0)), "#ff8b72"),
-        ("Training rollout", float(summary.get("training_rollout_sec", 0)), "#43a5ff"),
+        (
+            "Training rollout",
+            float(summary.get("ordinary_training_rollout_sec", summary.get("training_rollout_sec", 0))),
+            "#43a5ff",
+        ),
+        (
+            "Pairwise counterfactual rollout",
+            float(summary.get("pairwise_mc_advantage_rollout_sec", 0)),
+            "#4dc6c6",
+        ),
         ("Validation", float(summary.get("validation_wall_sec", 0)), "#d78cff"),
         ("Finalization", float(summary.get("checkpoint_dashboard_write_sec", 0)), "#f5b85b"),
     ]
@@ -1260,13 +1819,12 @@ def render_training_dashboard(
         "<div class='empty'>No final checkpoint selection data</div>"
         if not selection_rows
         else (
-            "<table><thead><tr><th>Iteration</th><th>Screen rank</th><th>Train-eval mean +/- std</th><th>Screen mean +/- std</th>"
+            "<table><thead><tr><th>Iteration</th><th>Screen rank</th><th>Validation mean +/- std</th>"
             "<th>Final mean +/- std</th><th>Final 95% CI</th><th>Selected</th></tr></thead><tbody>"
             + "".join(
                 "<tr>"
                 f"<td>{int(float(row.get('iteration', 0)))}</td>"
                 f"<td>{int(float(row.get('screening_rank', 0)))}</td>"
-                f"<td>{float(row.get('train_eval_mean_products', 0) or 0):.3f} +/- {float(row.get('train_eval_std_products', 0) or 0):.3f}</td>"
                 f"<td>{float(row.get('screening_mean_products', 0)):.3f} +/- {float(row.get('screening_std_products', 0)):.3f}</td>"
                 f"<td>{float(row.get('final_mean_products', 0)):.3f} +/- {float(row.get('final_std_products', 0)):.3f}</td>"
                 f"<td>[{float(row.get('final_ci95_low', 0)):.3f}, {float(row.get('final_ci95_high', 0)):.3f}]</td>"
@@ -1285,25 +1843,35 @@ def render_training_dashboard(
         for name, values in seed_meta.items()
         if isinstance(values, dict) and "count" in values
     ) + "</tbody></table>"
-    checkpoint_x = train_eval_x or validation_x
+    checkpoint_x = list(range(int(summary.get("policy_iterations", 0)) + 1))
     checkpoint_series: list[tuple[str, list[float], str]] = []
     checkpoint_error_ranges: dict[str, tuple[list[float], list[float]]] = {}
-    if train_eval:
-        checkpoint_series.append(("Train-eval (epsilon=0)", train_eval, "#43a5ff"))
-        checkpoint_error_ranges["Train-eval (epsilon=0)"] = (
-            train_eval_ci_low,
-            train_eval_ci_high,
-        )
     if validation:
-        checkpoint_series.append(("Held-out validation (epsilon=0)", validation, "#d78cff"))
-        checkpoint_error_ranges["Held-out validation (epsilon=0)"] = (
+        checkpoint_series.append(("Validation (epsilon=0)", validation, "#d78cff"))
+        checkpoint_error_ranges["Validation (epsilon=0)"] = (
             validation_ci_low,
             validation_ci_high,
         )
-    if train_eval and exploratory_checkpoint_mean:
+    if exploratory_checkpoint_mean:
         checkpoint_series.append(
-            ("Exploratory rollout for next update", exploratory_checkpoint_mean, "#91a3b8")
+            ("업데이트용 탐색 rollout", exploratory_checkpoint_mean, "#91a3b8")
         )
+    checkpoint_series_x = {
+        "Validation (epsilon=0)": validation_x,
+        "업데이트용 탐색 rollout": exploratory_checkpoint_x,
+    }
+    fleet_validation_colors = ["#43a5ff", "#72d69b", "#d78cff", "#ffb84d"]
+    fleet_validation_series = [
+        (
+            f"Worker {worker_count}",
+            [
+                float(row.get(f"validation_products_avg_workers_{worker_count}", 0.0))
+                for row in validation_rows
+            ],
+            fleet_validation_colors[index % len(fleet_validation_colors)],
+        )
+        for index, worker_count in enumerate(worker_counts)
+    ]
     wait_metric_name = (
         "후보가 있는 Worker의 미배정 비율"
         if explicit_wait_metrics
@@ -1385,27 +1953,102 @@ def render_training_dashboard(
         )
     )
     checkpoint_detail = (
-        "실선은 동일한 고정 checkpoint와 epsilon=0을 사용하며 오차 막대는 95% 신뢰구간입니다. "
-        "점선은 탐색이 포함된 다음 업데이트용 MC rollout입니다. "
+        "보라색은 지정된 iteration의 checkpoint를 고정 validation seed와 epsilon=0으로 평가한 결과이며 "
+        "오차 막대는 95% 신뢰구간입니다. 회색 점선의 iteration 0은 초기 Random Feasible sample, "
+        "iteration n은 n번째 가치함수 업데이트에 사용된 탐색 rollout의 평균입니다. "
         f"초기 무작위 정책 기준은 {random_baseline_mean:.3f} +/- {random_baseline_std:.3f}개입니다."
+    )
+    conservative_gate_panel = (
+        _chart_panel(
+            "Conservative Update 후보와 채택 정책 생산량",
+            _svg_chart(
+                [
+                    ("Candidate", gate_candidate, "#ff8b72"),
+                    ("Effective incumbent", gate_effective, "#72d69b"),
+                ],
+                x_values=gate_x,
+                x_label="가치함수 업데이트",
+                y_label=f"{int(summary.get('horizon_days', 5))}일 episode 완료 제품 수",
+                include_zero=True,
+            ),
+            "Candidate가 기존 incumbent보다 높은 validation 생산량을 기록할 때만 다음 rollout 정책으로 채택됩니다. 초록색 선이 하락하지 않으면 gate가 정책 붕괴를 차단한 것입니다.",
+            "같은 고정 validation seed와 epsilon=0으로 비교합니다. Candidate 곡선의 하락은 허용되지만, 거부된 candidate는 model과 optimizer 모두 복원되어 다음 rollout에 영향을 주지 않습니다.",
+        )
+        if conservative_update_enabled and gate_rows
+        else ""
+    )
+    pairwise_advantage_panel = (
+        _chart_panel(
+            "동일 상태 행동쌍의 Pairwise MC Advantage 오차",
+            _svg_chart(
+                [
+                    ("업데이트 전 Pair MSE", pairwise_mse_before, "#ff8b72"),
+                    ("업데이트 후 Pair MSE", pairwise_mse_after, "#72d69b"),
+                ],
+                x_values=iteration_x,
+                x_label="가치함수 업데이트 iteration",
+                y_label="MC advantage 차이의 MSE",
+                include_zero=True,
+            ),
+            "같은 pre-decision state에서 실제 선택 행동과 대안 행동을 각각 끝까지 실행한 뒤, "
+            "두 Monte Carlo return의 차이를 가치망이 얼마나 정확히 재현하는지 보여줍니다. "
+            "초록선이 주황선보다 낮아지면 해당 업데이트가 후보 행동의 상대 순위를 직접 학습했다는 뜻입니다.",
+            "이 지표는 절대 미래 생산량 MSE와 별개입니다. MC advantage가 0인 행동쌍은 부호 정확도에서 제외하며, "
+            "Pair MSE 감소만으로 held-out 생산성 향상이 보장되지는 않으므로 validation 생산량과 함께 봐야 합니다.",
+        )
+        if pairwise_enabled
+        else ""
     )
     chart_grid = "".join(
         [
             "<div class='chart-section-title'><h2>1. 정책 성능과 미관측 행동 진단</h2>"
             "<p>업데이트 후 생산 성능과, 직전 on-policy 학습 범위를 벗어난 greedy 행동 선택을 먼저 확인합니다.</p></div>",
             _chart_panel(
-                "업데이트 후 Checkpoint 생산량",
+                "Iteration별 탐색 Rollout 및 Validation 생산량",
                 _svg_chart(
                     checkpoint_series,
                     x_values=checkpoint_x,
-                    x_label="가치함수 업데이트 후 checkpoint",
-                    y_label="5일 episode 완료 제품 수",
+                    series_x_values=checkpoint_series_x,
+                    x_label="Iteration",
+                    y_label=f"{int(summary.get('horizon_days', 5))}일 episode 완료 제품 수",
                     include_zero=True,
                     error_ranges=checkpoint_error_ranges,
-                    dashed_series={"Exploratory rollout for next update"},
+                    dashed_series={"업데이트용 탐색 rollout"},
                 ),
-                "같은 checkpoint의 train-eval과 미사용 validation 생산량을 비교합니다. 두 곡선의 간격이 커지면 과적합, 함께 급락하면 정책 불안정 가능성이 큽니다.",
+                "회색 탐색 rollout과 이후 checkpoint의 보라색 greedy validation을 같은 iteration 축에서 비교합니다. 보라색이 지속적으로 상승하면 정책 개선, 회색만 높고 보라색이 낮으면 탐색 성능이 greedy 정책으로 이어지지 않은 것입니다.",
                 checkpoint_detail,
+            ),
+            _chart_panel(
+                "Beam 후보 가치 엔트로피",
+                _svg_chart(
+                    [
+                        ("탐색 rollout의 greedy 결정", training_entropy_values, "#43a5ff"),
+                        ("Validation (epsilon=0)", validation_entropy_values, "#d78cff"),
+                    ],
+                    x_values=checkpoint_x,
+                    series_x_values={
+                        "탐색 rollout의 greedy 결정": training_entropy_x,
+                        "Validation (epsilon=0)": validation_entropy_x,
+                    },
+                    x_label="가치함수 업데이트 후 checkpoint",
+                    y_label="정규화 엔트로피 (0~1)",
+                    include_zero=True,
+                ),
+                "각 의사결정에서 beam에 남은 공동 할당들의 예측가치를 표준화한 뒤 계산한 Shannon entropy입니다. 1에 가까우면 후보 가치를 비슷하게 보며, 0에 가까우면 한 후보에 강하게 집중합니다.",
+                "낮은 엔트로피와 생산량 상승은 유효한 수렴 신호입니다. 낮은 엔트로피와 생산량 하락이 함께 나타나면 잘못된 행동에 대한 과신을 의심해야 합니다. 후보가 하나뿐이거나 random/mandatory 결정인 경우는 집계에서 제외합니다.",
+            ),
+            conservative_gate_panel,
+            _chart_panel(
+                "Worker 수별 미사용 Validation 생산량",
+                _svg_chart(
+                    fleet_validation_series,
+                    x_values=validation_x,
+                    x_label="가치함수 업데이트 후 checkpoint",
+                    y_label=f"{int(summary.get('horizon_days', 5))}일 episode 완료 제품 수",
+                    include_zero=True,
+                ),
+                "동일한 통합 checkpoint를 3대와 5대 환경에서 각각 epsilon=0으로 평가한 평균 생산량입니다. 두 곡선이 함께 개선되는지 확인해 통합학습이 한 fleet에만 치우치지 않았는지 판단합니다.",
+                "각 점은 worker 수별 고정 validation seed의 평균입니다. worker 수 사이의 절대 생산량보다 같은 worker 수 곡선의 checkpoint 간 변화를 우선 해석해야 합니다.",
             ),
             _chart_panel(
                 "미관측 행동 선택률",
@@ -1431,46 +2074,14 @@ def render_training_dashboard(
                 "OOD 행동의 평균 가치 예측오차에서 관측 범위 내 행동의 평균 예측오차를 뺀 값입니다. 양수이면 미관측 행동을 상대적으로 더 낙관적으로 평가했다는 뜻입니다.",
                 "미관측 행동 선택률과 이 값이 함께 상승하면서 validation 생산량이 하락하면 미관측 행동 과대평가가 정책 저하 원인이라는 근거가 됩니다.",
             ),
-            "<div class='chart-section-title'><h2>2. 행동 선택 품질</h2>"
-            "<p>제한된 반사실 후보집합의 순위 품질과 실제 WAIT 선택을 확인합니다.</p></div>",
-            _chart_panel(
-                "후보 행동 가치 순위 상관계수",
-                _svg_chart(
-                    [("Spearman 상관계수", action_rank_correlation_values, "#72d69b")],
-                    x_values=iteration_x,
-                    x_label="정책 업데이트",
-                    y_label="평균 순위 상관계수",
-                    include_zero=True,
-                ),
-                "예측한 행동 순위와 반사실 MC 성과 순위의 일치도를 나타냅니다. 1에 가까울수록 좋고, 0은 순위 관계가 약하며, 음수는 반대 방향으로 평가한다는 뜻입니다.",
-                "후보별 실제 return이 모두 같은 비정보 상태는 이 평균에서 제외합니다.",
-            ),
-            _chart_panel(
-                "후보집합 최선 행동 Top-1 일치율",
-                _svg_chart(
-                    [("Top-1 일치율", candidate_top1_agreement_values, "#43a5ff")],
-                    x_values=iteration_x,
-                    x_label="정책 업데이트",
-                    y_label="Top-1 일치율",
-                    include_zero=True,
-                ),
-                "가치망이 가장 높게 평가한 행동이 probe 후보집합에서 가장 큰 경험적 return을 얻었는지 측정합니다. 1에 가까울수록 좋습니다.",
-                "수학적 전역 최적행동이 아니라, 대시보드에 기록된 제한된 후보집합 안의 경험적 최선입니다.",
-            ),
-            _chart_panel(
-                "선택 행동 Regret",
-                _svg_chart(
-                    [("평균 regret", selected_action_regret_values, "#ff8b72")],
-                    x_values=iteration_x,
-                    x_label="정책 업데이트",
-                    y_label="완료 제품 수 차이",
-                    include_zero=True,
-                ),
-                "가치망이 고른 행동의 경험적 return과 후보집합 최선 return의 차이입니다. 0에 가까울수록 좋으며, 값이 커지면 행동 선택의 운영 손실이 커졌다는 뜻입니다.",
-            ),
+            dashboard_panels(output_dir),
             wait_panel,
             "<div class='chart-section-title'><h2>3. 가치함수 학습 상태</h2>"
-            "<p>현재 on-policy MC batch에 대한 적합도와 return 분산을 확인합니다. 낮은 오차만으로 좋은 행동 순위를 보장하지는 않습니다.</p></div>",
+            + (
+                "<p>현재 rollout과 짧은 recent-policy MC replay의 적합도 및 return 분산을 확인합니다. 낮은 오차만으로 좋은 행동 순위를 보장하지는 않습니다.</p></div>"
+                if recent_replay_enabled
+                else "<p>현재 rollout MC batch의 적합도와 return 분산을 확인합니다. 낮은 오차만으로 좋은 행동 순위를 보장하지는 않습니다.</p></div>"
+            ),
             _chart_panel(
                 (
                     f"Post-Decision 가치함수 Holdout {loss_label}"
@@ -1485,11 +2096,16 @@ def render_training_dashboard(
                     include_zero=True,
                 ),
                 (
-                    "현재 on-policy batch의 episode 단위 holdout에서 early stopping용 적합 오차를 측정합니다. 아래 MAE/RMSE와 표본 범위가 달라 제곱값이 정확히 일치하지 않으며, 낮은 loss만으로 dispatch 정책 개선을 증명할 수는 없습니다."
+                    (
+                        "최근 replay window를 episode 단위로 나눈 holdout에서 early stopping용 적합 오차를 측정합니다. 현재 wave에는 설정된 추가 가중치를 적용합니다. 아래 MAE/RMSE는 현재 rollout만 평가하므로 표본 범위가 다르며, 낮은 loss만으로 dispatch 정책 개선을 증명할 수는 없습니다."
+                        if recent_replay_enabled
+                        else "현재 rollout batch의 episode 단위 holdout에서 early stopping용 적합 오차를 측정합니다. 아래 MAE/RMSE와 표본 범위가 달라 제곱값이 정확히 일치하지 않으며, 낮은 loss만으로 dispatch 정책 개선을 증명할 수는 없습니다."
+                    )
                     if fit_diagnostics_available
                     else "중단된 실행에서 업데이트별 loss가 보존되지 않았습니다. 누락값을 0으로 해석하면 안 됩니다."
                 ),
             ),
+            pairwise_advantage_panel,
             _chart_panel(
                 (
                     "Monte Carlo 가치 예측 오차"
@@ -1504,7 +2120,7 @@ def render_training_dashboard(
                     include_zero=True,
                 ),
                 (
-                    "MAE와 RMSE는 감소하거나 안정되어야 합니다. RMSE와 MAE 간격이 커지면 일부 상태에서 큰 예측오차가 발생한다는 뜻입니다."
+                    "업데이트 후 현재 rollout batch 전체(학습 표본 포함)의 MAE/RMSE입니다. 독립 greedy validation 오차가 아닙니다. iteration마다 표본과 후속 정책이 바뀌므로 단순 감소만으로 수렴을 판단하지 마세요."
                     if fit_diagnostics_available
                     else "중단된 실행에서 MAE/RMSE가 보존되지 않았습니다. 사용할 수 없는 값이지 0이 아닙니다."
                 ),
@@ -1526,7 +2142,7 @@ def render_training_dashboard(
                     include_zero=True,
                 ),
                 (
-                    "예측값의 산포가 목표값의 산포를 대체로 따라야 합니다. 예측 표준편차가 0에 가까워지면 모든 행동을 비슷하게 평가하는 가치함수 붕괴를 의심해야 합니다."
+                    "현재 batch 전체의 예측·목표 표준편차입니다. 상수 예측이나 규모 차이를 감지하지만 산포가 같아도 개별 예측과 행동 순위는 틀릴 수 있습니다."
                     if fit_diagnostics_available
                     else "중단된 실행에서 예측값과 MC 목표값의 산포가 보존되지 않았습니다. 누락값은 0이 아닙니다."
                 ),
@@ -1624,7 +2240,30 @@ def render_training_dashboard(
                     y_label="Compact batch 크기(MiB)",
                     include_zero=True,
                 ),
-                "의사결정 수에 따라 달라질 수 있지만 각 on-policy 업데이트가 끝난 뒤 해제되어야 합니다.",
+                "해당 iteration에서 새로 수집한 current rollout만의 compact tensor 크기입니다.",
+            ),
+            _chart_panel(
+                "Short Replay 보관 규모",
+                _svg_chart(
+                    [("Replay episodes", replay_episode_counts, "#72d69b")],
+                    x_values=iteration_x,
+                    x_label="정책 업데이트",
+                    y_label="보관 episode 수",
+                    include_zero=True,
+                ),
+                "현재 wave와 직전 wave들을 합쳐 실제 가치망 업데이트에 사용한 bounded replay 규모입니다. 설정된 window에 도달한 뒤에는 일정하게 유지되어야 합니다.",
+                "과거 표본은 수집 당시 정책의 complete MC return을 유지합니다. 이는 target network나 TD replay가 아니며, window 밖으로 밀려난 compact batch는 즉시 해제합니다.",
+            ),
+            _chart_panel(
+                "Short Replay 메모리",
+                _svg_chart(
+                    [("Replay buffer", replay_memory, "#4dc6c6")],
+                    x_values=iteration_x,
+                    x_label="정책 업데이트",
+                    y_label="보관 메모리(MiB)",
+                    include_zero=True,
+                ),
+                "최근 replay window가 parent process에서 차지하는 compact tensor 메모리입니다. Window가 찬 뒤 지속적으로 증가하면 FIFO 해제 누락을 의심해야 합니다.",
             ),
             _chart_panel(
                 (
@@ -1655,13 +2294,13 @@ def render_training_dashboard(
         else ""
     )
     html = f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>ManSim ADP Training</title>
-<style>body{{margin:0;background:#08111f;color:#e8f1ff;font:14px Segoe UI,Arial;overflow-x:hidden}}main{{max-width:1480px;min-width:0;margin:auto;padding:28px}}h1{{letter-spacing:0;overflow-wrap:anywhere}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}}.card,.panel{{min-width:0;border:1px solid #294567;background:#101d31;border-radius:6px;padding:16px}}.warning{{margin:12px 0;padding:14px;border:1px solid #b88932;background:#2b2312;color:#ffe4a3;border-radius:6px;overflow-wrap:anywhere}}.card span{{display:block;color:#8fb2de}}.card strong{{font-size:20px;overflow-wrap:anywhere}}.grid{{min-width:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:14px}}.chart-section-title{{grid-column:1/-1;border-top:1px solid #294567;padding:18px 4px 0;margin-top:4px}}.chart-section-title h2{{margin:0 0 6px}}.chart-section-title p{{margin:0;color:#91add0}}.metric-chart{{width:100%;height:auto;aspect-ratio:720/250;background:#0b1728}}.grid-line{{stroke:#223752;stroke-width:1}}.axis-line{{stroke:#86a5c9;stroke-width:1.4}}.tick{{fill:#9eb5d1;font-size:11px}}.x-tick{{text-anchor:middle}}.y-tick{{text-anchor:end}}.axis-label{{fill:#d8e8fa;font-size:13px;font-weight:600}}.x-axis-label,.y-axis-label{{text-anchor:middle}}.point-label{{fill:#ffffff;font-size:12px;font-weight:700;text-anchor:middle}}.chart-legend{{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;color:#b8cae0}}.chart-legend i{{display:inline-block;width:12px;height:3px;margin:0 6px 3px 0}}.chart-diagnosis{{color:#d5e3f4;line-height:1.5;margin:12px 0 0}}.chart-detail{{color:#91add0;line-height:1.45;margin:6px 0 0}}code{{color:#77d3a8;overflow-wrap:anywhere}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #294567;text-align:right}}th:first-child,td:first-child{{text-align:left}}.stack{{height:28px;display:flex;background:#0b1728;overflow:hidden;border-radius:4px}}.stack div{{min-width:2px}}.legend{{display:flex;gap:14px;flex-wrap:wrap;margin-top:12px;color:#a9bfdb}}.legend i{{display:inline-block;width:10px;height:10px;margin-right:5px}}@media(max-width:900px){{main{{padding:18px}}.grid{{grid-template-columns:1fr}}.chart-section-title{{grid-column:1}}.panel{{overflow-x:auto}}.chart-panel{{overflow-x:hidden}}table{{min-width:620px}}}}@media(max-width:600px){{main{{padding:14px}}.cards{{grid-template-columns:1fr}}.card strong{{font-size:18px}}}}</style></head><body><main>
-<h1>Simulation-Based ADP 학습 대시보드</h1><p>현재 on-policy Monte Carlo batch만 학습하며, 각 업데이트가 끝나면 compact episode tensor를 폐기합니다.</p>
+<style>body{{margin:0;background:#08111f;color:#e8f1ff;font:14px Segoe UI,Arial;overflow-x:hidden}}main{{max-width:1480px;min-width:0;margin:auto;padding:28px}}h1{{letter-spacing:0;overflow-wrap:anywhere}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}}.card,.panel{{min-width:0;border:1px solid #294567;background:#101d31;border-radius:6px;padding:16px}}.wide-table{{overflow-x:auto}}.warning{{margin:12px 0;padding:14px;border:1px solid #b88932;background:#2b2312;color:#ffe4a3;border-radius:6px;overflow-wrap:anywhere}}.card span{{display:block;color:#8fb2de}}.card strong{{font-size:20px;overflow-wrap:anywhere}}.grid{{min-width:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:14px}}.chart-section-title{{grid-column:1/-1;border-top:1px solid #294567;padding:18px 4px 0;margin-top:4px}}.chart-section-title h2{{margin:0 0 6px}}.chart-section-title p{{margin:0;color:#91add0}}.metric-chart{{width:100%;height:auto;aspect-ratio:720/250;background:#0b1728}}.grid-line{{stroke:#223752;stroke-width:1}}.axis-line{{stroke:#86a5c9;stroke-width:1.4}}.tick{{fill:#9eb5d1;font-size:11px}}.x-tick{{text-anchor:middle}}.y-tick{{text-anchor:end}}.axis-label{{fill:#d8e8fa;font-size:13px;font-weight:600}}.x-axis-label,.y-axis-label{{text-anchor:middle}}.point-label{{fill:#ffffff;font-size:12px;font-weight:700;text-anchor:middle}}.chart-legend{{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;color:#b8cae0}}.chart-legend i{{display:inline-block;width:12px;height:3px;margin:0 6px 3px 0}}.chart-diagnosis{{color:#d5e3f4;line-height:1.5;margin:12px 0 0}}.chart-detail{{color:#91add0;line-height:1.45;margin:6px 0 0}}code{{color:#77d3a8;overflow-wrap:anywhere}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #294567;text-align:right}}th:first-child,td:first-child{{text-align:left}}.stack{{height:28px;display:flex;background:#0b1728;overflow:hidden;border-radius:4px}}.stack div{{min-width:2px}}.legend{{display:flex;gap:14px;flex-wrap:wrap;margin-top:12px;color:#a9bfdb}}.legend i{{display:inline-block;width:10px;height:10px;margin-right:5px}}@media(max-width:900px){{main{{padding:18px}}.grid{{grid-template-columns:1fr}}.chart-section-title{{grid-column:1}}.panel{{overflow-x:auto}}.chart-panel{{overflow-x:hidden}}table{{min-width:620px}}}}@media(max-width:600px){{main{{padding:14px}}.cards{{grid-template-columns:1fr}}.card strong{{font-size:18px}}}}</style></head><body><main>
+<h1>Simulation-Based ADP 학습 대시보드</h1><p>{replay_intro}</p>
 {recovery_banner}<div class='cards'>{cards}</div><div class='grid'>
 <section class='panel'><h2>병렬 실행 설정</h2>{parallel_config_table}</section>
 <section class='panel'><h2>전체 시간 구성</h2>{time_bar}<p>Compact 병합: {float(summary.get('compact_merge_sec', 0)):.2f}s · IPC/조정 overhead: {float(summary.get('coordination_ipc_overhead_sec', 0)):.2f}s</p>{"<p class='chart-detail'>복구된 실행은 원래 parent wall clock과 GPU update 시간이 없어 저장된 rollout·validation wave 시간만 표시합니다.</p>" if not wall_clock_complete else ""}</section>
 {chart_grid}
-</div><section class='panel' style='margin-top:14px'><h2>Checkpoint 선정 결과</h2>{checkpoint_table}</section><section class='panel' style='margin-top:14px'><h2>Seed 분할</h2>{seed_table}</section><section class='panel' style='margin-top:14px'><h2>On-Policy 업데이트 Batch</h2>{iteration_table}</section><section class='panel' style='margin-top:14px'><h2>Worker 수별 성능</h2>{worker_table}</section><div class='grid'><section class='panel'><h2>가장 느린 Episode</h2>{slow_episode_table}</section><section class='panel'><h2>가장 느린 Wave</h2>{slow_wave_table}</section></div><section class='panel' style='margin-top:14px'><h2>실패한 Wave</h2>{failed_wave_table}</section><p>Feature schema: <code>{FEATURE_SCHEMA_VERSION}</code></p></main></body></html>"""
+</div><section class='panel' style='margin-top:14px'><h2>Checkpoint 선정 결과</h2>{checkpoint_table}</section><section class='panel' style='margin-top:14px'><h2>Seed 분할</h2>{seed_table}</section><section class='panel wide-table' style='margin-top:14px'><h2>MC 업데이트 Batch와 Short Replay</h2>{iteration_table}</section><section class='panel' style='margin-top:14px'><h2>Worker 수별 성능</h2>{worker_table}</section><div class='grid'><section class='panel'><h2>가장 느린 Episode</h2>{slow_episode_table}</section><section class='panel'><h2>가장 느린 Wave</h2>{slow_wave_table}</section></div><section class='panel' style='margin-top:14px'><h2>실패한 Wave</h2>{failed_wave_table}</section><p>Feature schema: <code>{FEATURE_SCHEMA_VERSION}</code></p></main></body></html>"""
     path = output_dir / "training_dashboard.html"
     path.write_text(html, encoding="utf-8")
     return path
@@ -1716,6 +2355,20 @@ def _process_rss_mib(*, peak: bool = False) -> float:
         return 0.0
 
 
+def _as_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n"}:
+            return False
+    return bool(value)
+
+
 def _episode_metric_row(result: EpisodeResult) -> dict[str, Any]:
     return {
         "episode": result.episode,
@@ -1728,6 +2381,8 @@ def _episode_metric_row(result: EpisodeResult) -> dict[str, Any]:
         "products": result.products,
         "scrap": result.scrap,
         "raw_return": result.raw_return,
+        "simulation_end_min": result.simulation_end_min,
+        "termination_reason": result.termination_reason,
         "decision_count": result.decisions,
         "wait_count": result.wait_count,
         "candidate_available_wait_count": result.candidate_available_wait_count,
@@ -1750,11 +2405,18 @@ def _episode_metric_row(result: EpisodeResult) -> dict[str, Any]:
         "max_consecutive_candidate_all_wait_decisions": (
             result.max_consecutive_candidate_all_wait_decisions
         ),
+        "beam_value_entropy_avg": round(result.beam_value_entropy_avg, 6),
+        "beam_value_entropy_decision_count": result.beam_value_entropy_decision_count,
         "compact_sample_count": result.compact_sample_count,
         "compact_memory_mib": round(result.compact_memory_bytes / (1024.0**2), 6),
         "elapsed_sec": round(result.elapsed_sec, 6),
         "child_peak_rss_mib": round(result.child_peak_rss_mib, 6),
         "snapshot_hash": result.snapshot_hash,
+        "greedy_mc_sample_count": result.greedy_mc_sample_count,
+        "greedy_mc_squared_error_sum": result.greedy_mc_squared_error_sum,
+        "greedy_mc_error_sum": result.greedy_mc_error_sum,
+        "greedy_mc_prediction_sum": result.greedy_mc_prediction_sum,
+        "greedy_mc_target_sum": result.greedy_mc_target_sum,
     }
 
 
@@ -1779,6 +2441,45 @@ def _should_validate(
             and int(iteration) % max(1, int(interval)) == 0
         )
     )
+
+
+def _resolve_screening_iterations(
+    *,
+    policy_iterations: int,
+    interval: int,
+    include_initial: bool,
+    configured: list[int] | tuple[int, ...] | None = None,
+) -> list[int]:
+    if configured is None:
+        return [
+            iteration
+            for iteration in range(int(policy_iterations) + 1)
+            if _should_validate(
+                iteration,
+                policy_iterations,
+                interval,
+                include_initial=include_initial,
+            )
+        ]
+    values = [int(value) for value in configured]
+    if len(values) != len(set(values)):
+        raise ValueError("validation.screening_iterations must not contain duplicates.")
+    if any(value < 0 or value > int(policy_iterations) for value in values):
+        raise ValueError(
+            "validation.screening_iterations must be within "
+            f"0..{int(policy_iterations)}."
+        )
+    values = sorted(values)
+    if bool(include_initial) and 0 not in values:
+        raise ValueError(
+            "validation.screening_iterations must include 0 when "
+            "screening_include_initial=true."
+        )
+    if int(policy_iterations) not in values:
+        raise ValueError(
+            "validation.screening_iterations must include the final policy iteration."
+        )
+    return values
 
 
 def _seed_digest(values: list[int]) -> str:
@@ -2010,12 +2711,38 @@ def _training_device_metadata(torch: Any, device: Any) -> dict[str, Any]:
     return metadata
 
 
+def _configure_training_determinism(torch: Any, seed: int) -> dict[str, Any]:
+    """Fix parent-process model initialization and CUDA update randomness."""
+
+    resolved_seed = int(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(resolved_seed)
+    torch.manual_seed(resolved_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(resolved_seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+    return {
+        "seed": resolved_seed,
+        "torch_deterministic_algorithms": True,
+        "cudnn_deterministic": True,
+        "cudnn_benchmark": False,
+        "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
+    }
+
+
 def train(config_path: Path, args: argparse.Namespace) -> Path:
     training_started = time.perf_counter()
     torch = require_torch()
     cfg = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
     if not isinstance(cfg, dict):
         raise ValueError("ADP config must be a YAML mapping.")
+    if cfg.get("algorithm", {}).get("return_estimator") == "n_step_td":
+        from .td_train import train_td
+
+        return train_td(cfg, args)
+    determinism_meta = _configure_training_determinism(torch, int(cfg["base_seed"]))
     algorithm = cfg.get("algorithm", {})
     if (
         str(algorithm.get("return_estimator", "")).lower() != "monte_carlo"
@@ -2024,6 +2751,11 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
     ):
         raise ValueError("Simulation-Based ADP supports complete Monte Carlo returns only; n-step and TD bootstrap must be disabled.")
     allow_wait_action = bool(algorithm.get("allow_wait_action", False))
+    worker_order_strategy = str(
+        algorithm.get("worker_order_strategy", "cyclic") or "cyclic"
+    ).strip().lower()
+    if worker_order_strategy not in {"cyclic", "fixed"}:
+        raise ValueError("algorithm.worker_order_strategy must be 'cyclic' or 'fixed'.")
     random_policy_name = (
         "uniform_random_feasible_with_wait"
         if allow_wait_action
@@ -2037,6 +2769,46 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         )
     training = cfg["training"]
     validation_cfg = cfg.get("validation", {}) if isinstance(cfg.get("validation", {}), dict) else {}
+    policy_update_cfg = (
+        cfg.get("policy_update", {})
+        if isinstance(cfg.get("policy_update", {}), dict)
+        else {}
+    )
+    conservative_update_enabled = bool(policy_update_cfg.get("enabled", False))
+    policy_update_mode = str(
+        policy_update_cfg.get(
+            "mode",
+            "conservative_validation_gate" if conservative_update_enabled else "always_accept",
+        )
+        or ""
+    ).strip().lower()
+    expected_update_mode = (
+        "conservative_validation_gate" if conservative_update_enabled else "always_accept"
+    )
+    if policy_update_mode != expected_update_mode:
+        raise ValueError(
+            "policy_update.mode must be "
+            f"{expected_update_mode!r} when policy_update.enabled="
+            f"{conservative_update_enabled}."
+        )
+    acceptance_metric = str(
+        policy_update_cfg.get("acceptance_metric", "completed_products_mean")
+        or "completed_products_mean"
+    ).strip().lower()
+    if acceptance_metric != "completed_products_mean":
+        raise ValueError(
+            "policy_update.acceptance_metric must be 'completed_products_mean'."
+        )
+    min_policy_improvement = float(policy_update_cfg.get("min_improvement", 0.0) or 0.0)
+    if min_policy_improvement < 0.0:
+        raise ValueError("policy_update.min_improvement must be non-negative.")
+    rollback_model = bool(policy_update_cfg.get("rollback_model", True))
+    rollback_optimizer = bool(policy_update_cfg.get("rollback_optimizer", True))
+    if conservative_update_enabled and (not rollback_model or not rollback_optimizer):
+        raise ValueError(
+            "Conservative policy update requires rollback_model=true and "
+            "rollback_optimizer=true."
+        )
     diagnostics_cfg = cfg.get("diagnostics", {}) if isinstance(cfg.get("diagnostics", {}), dict) else {}
     fixed_probe_cfg = (
         diagnostics_cfg.get("fixed_action_probe", {})
@@ -2072,6 +2844,9 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
     rollout_cfg = cfg.get("rollout", {})
     runtime = cfg["runtime"]
     worker_counts = [int(value) for value in (args.worker_counts or cfg["worker_counts"])]
+    if not worker_counts or len(set(worker_counts)) != len(worker_counts):
+        raise ValueError("worker_counts must contain unique worker counts.")
+    worker_counts = sorted(worker_counts)
     initial_random = int(args.initial_random_episodes if args.initial_random_episodes is not None else training["initial_random_episodes"])
     policy_iterations = int(args.policy_iterations if args.policy_iterations is not None else training["policy_iterations"])
     episodes_per_iteration = int(args.episodes_per_iteration if args.episodes_per_iteration is not None else training["episodes_per_iteration"])
@@ -2086,6 +2861,39 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         )
     if "potential_shaping" in cfg:
         raise ValueError("potential_shaping was removed; ADP uses raw completed-product rewards.")
+    pairwise_cfg = (
+        training.get("pairwise_mc_advantage", {})
+        if isinstance(training.get("pairwise_mc_advantage", {}), dict)
+        else {}
+    )
+    pairwise_enabled = bool(pairwise_cfg.get("enabled", False))
+    pairwise_loss_weight = float(pairwise_cfg.get("loss_weight", 1.0) or 0.0)
+    pairwise_capture_fraction = float(
+        pairwise_cfg.get("capture_episode_fraction", 0.20) or 0.0
+    )
+    pairwise_min_pairs_per_batch = max(
+        1, int(pairwise_cfg.get("minimum_pairs_per_batch", 1) or 1)
+    )
+    pairwise_candidate_limit = max(
+        2, int(pairwise_cfg.get("candidates_per_state", 3) or 3)
+    )
+    pairwise_decision_thresholds = [
+        max(1, int(value))
+        for value in pairwise_cfg.get("decision_thresholds", [20, 100, 300])
+    ]
+    if pairwise_enabled:
+        if not math.isfinite(pairwise_loss_weight) or pairwise_loss_weight <= 0.0:
+            raise ValueError(
+                "training.pairwise_mc_advantage.loss_weight must be finite and positive."
+            )
+        if not 0.0 < pairwise_capture_fraction <= 1.0:
+            raise ValueError(
+                "training.pairwise_mc_advantage.capture_episode_fraction must be in (0, 1]."
+            )
+        if not pairwise_decision_thresholds:
+            raise ValueError(
+                "training.pairwise_mc_advantage.decision_thresholds must not be empty."
+            )
     days = int(args.days if args.days is not None else cfg["horizon_days"])
     screening_interval = max(
         1,
@@ -2095,6 +2903,18 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
     combined_checkpoint_evaluation = bool(
         validation_cfg.get("combined_checkpoint_evaluation", False)
     )
+    configured_screening_iterations = validation_cfg.get("screening_iterations")
+    screening_iterations = _resolve_screening_iterations(
+        policy_iterations=policy_iterations,
+        interval=screening_interval,
+        include_initial=screening_include_initial,
+        configured=(
+            [int(value) for value in configured_screening_iterations]
+            if configured_screening_iterations is not None
+            else None
+        ),
+    )
+    screening_iteration_set = set(screening_iterations)
     train_eval_seed_count = max(
         1,
         int(validation_cfg.get("train_eval_seed_count", 10)),
@@ -2142,10 +2962,9 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             f"got {len(final_selection_seeds)}"
         )
     if combined_checkpoint_evaluation:
-        if screening_interval != 1 or not screening_include_initial:
+        if not screening_include_initial:
             raise ValueError(
-                "Combined checkpoint evaluation requires screening_interval_iterations=1 "
-                "and screening_include_initial=true so checkpoints 0..N are all evaluated."
+                "Combined checkpoint evaluation requires screening_include_initial=true."
             )
         if len(train_eval_seeds) != train_eval_seed_count:
             raise ValueError(
@@ -2163,6 +2982,13 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                 "checkpoint train-eval seeds must not overlap validation or held-out seeds: "
                 f"{overlap}"
             )
+    if conservative_update_enabled and screening_iterations != list(
+        range(policy_iterations + 1)
+    ):
+        raise ValueError(
+            "Conservative policy update requires validation at every iteration so every "
+            "candidate is gated."
+        )
     seed_partition_meta = _validate_seed_partitions(
         training_seeds=training_seeds,
         screening_seeds=screening_seeds,
@@ -2192,6 +3018,15 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             train_eval_seeds,
             relationship="subset_of_training",
         )
+    independent_cfg = diagnostics_cfg.get("value_validation", {})
+    if independent_cfg.get("enabled", False):
+        from .value_validation import validate_config
+
+        independent_cfg = validate_config(
+            independent_cfg,
+            set(training_seeds) | set(screening_seeds) | set(final_selection_seeds)
+            | set(held_out_seeds) | (set(fixed_probe_seeds) if fixed_probe_enabled else set()),
+        )
     requested_device = str(args.device or runtime.get("device", "cuda:0")).lower()
     require_cuda_training = bool(runtime.get("require_cuda_training", True))
     device = _resolve_training_device(
@@ -2200,6 +3035,7 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         require_cuda=require_cuda_training,
     )
     training_device_meta = _training_device_metadata(torch, device)
+    training_device_meta["determinism"] = dict(determinism_meta)
     runtime_environment_meta = {
         "host_name": socket.gethostname(),
         "operating_system": platform.platform(),
@@ -2252,23 +3088,43 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         "beam_width": int(model_cfg["beam_width"]),
         "max_review_interval_min": float(training.get("max_review_interval_min", 1.0)),
         "allow_wait_action": allow_wait_action,
+        "worker_order_strategy": worker_order_strategy,
     }
     replay_scope = str(training.get("replay_scope", "current_iteration")).strip().lower()
+    replay_window_iterations = int(training.get("replay_window_iterations", 1))
+    latest_iteration_weight = float(training.get("latest_iteration_weight", 1.0))
     compact_enabled = bool(training.get("compact_episode_tensors", True))
     release_after_update = bool(training.get("release_samples_after_update", True))
-    if replay_scope != "current_iteration" or not compact_enabled or not release_after_update:
+    if replay_scope not in {"current_iteration", "recent_window"}:
+        raise ValueError("training.replay_scope must be current_iteration or recent_window.")
+    if replay_scope == "current_iteration":
+        replay_window_iterations = 1
+        latest_iteration_weight = 1.0
+    if replay_window_iterations < 1 or not math.isfinite(latest_iteration_weight) or latest_iteration_weight < 1.0:
         raise ValueError(
-            "Simulation-Based ADP training requires replay_scope=current_iteration, "
-            "compact_episode_tensors=true, and release_samples_after_update=true."
+            "Short replay requires replay_window_iterations >= 1 and "
+            "latest_iteration_weight >= 1.0."
+        )
+    if not compact_enabled or not release_after_update:
+        raise ValueError(
+            "Simulation-Based ADP training requires compact_episode_tensors=true and "
+            "release_samples_after_update=true. Expired recent-window samples are released."
         )
     validation_episode_fraction = min(0.5, max(0.0, float(training.get("validation_episode_fraction", 0.20))))
     gamma = float(training.get("gamma", 1.0))
+    if pairwise_enabled and not math.isclose(gamma, 1.0, abs_tol=1e-12):
+        raise ValueError(
+            "Pairwise MC advantage replay currently requires training.gamma=1.0."
+        )
     episode_rows: list[dict[str, Any]] = []
     iteration_rows: list[dict[str, Any]] = []
     wave_rows: list[dict[str, Any]] = []
     episode_index = 0
     fingerprint: dict[str, Any] | None = None
+    environment_fingerprints_by_worker_count: dict[int, str] = {}
     peak_compact_batch_mib = 0.0
+    peak_replay_buffer_mib = 0.0
+    peak_replay_training_batch_mib = 0.0
     peak_process_rss_mib = _process_rss_mib(peak=True)
     peak_child_rss_mib = 0.0
     total_training_rollout_sec = 0.0
@@ -2276,7 +3132,48 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
     total_merge_sec = 0.0
     total_update_sec = 0.0
     total_fixed_probe_sec = 0.0
+    total_pairwise_rollout_sec = 0.0
+    pairwise_branch_episode_count = 0
+    pairwise_pair_count = 0
+    peak_pairwise_replay_mib = 0.0
     ood_support_bank = None
+    replay_history: list[tuple[int, CompactMCBatch]] = []
+    pairwise_replay_history: list[tuple[int, CompactPairwiseMCBatch]] = []
+    pairwise_rows: list[dict[str, Any]] = []
+
+    def register_fingerprint(result: RolloutResult) -> None:
+        nonlocal fingerprint
+        current = dict(result.fingerprint)
+        worker_count = int(result.worker_count)
+        environment = str(current.get("environment_fingerprint", ""))
+        previous_environment = environment_fingerprints_by_worker_count.get(worker_count)
+        if previous_environment is not None and previous_environment != environment:
+            raise RuntimeError(
+                "ADP environment fingerprint changed within one worker-count group: "
+                f"worker_count={worker_count}."
+            )
+        environment_fingerprints_by_worker_count[worker_count] = environment
+        if fingerprint is None:
+            fingerprint = current
+            return
+        for key in (
+            "scenario_type",
+            "objective_mode",
+            "feature_schema_version",
+            "timing_fingerprint",
+            "reward_mode",
+            "loss_type",
+            "random_policy",
+            "wait_action_enabled",
+            "worker_order_strategy",
+            "potential_shaping",
+        ):
+            if str(current.get(key, "")) != str(fingerprint.get(key, "")):
+                raise RuntimeError(
+                    "ADP rollout contract changed across worker counts: "
+                    f"key={key}, expected={fingerprint.get(key)!r}, "
+                    f"actual={current.get(key)!r}."
+                )
 
     def collect_batch(
         count: int,
@@ -2286,15 +3183,53 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         force_random: bool,
         epsilon: float,
         active_model: Any | None,
-    ) -> tuple[CompactMCBatch, RolloutBatchMetrics]:
-        nonlocal episode_index, fingerprint, peak_compact_batch_mib, peak_process_rss_mib
+    ) -> tuple[
+        CompactMCBatch,
+        RolloutBatchMetrics,
+        CompactPairwiseMCBatch,
+        RolloutBatchMetrics,
+    ]:
+        nonlocal episode_index, peak_compact_batch_mib, peak_process_rss_mib
         nonlocal peak_child_rss_mib, total_training_rollout_sec, total_merge_sec
+        nonlocal total_pairwise_rollout_sec, pairwise_branch_episode_count
+        nonlocal pairwise_pair_count
         model_state, snapshot_hash = _snapshot_state_dict(None if force_random else active_model)
         schedule = _balanced_worker_schedule(worker_counts, count)
+        capture_count = 0
+        capture_indices: set[int] = set()
+        if pairwise_enabled and count > 0:
+            capture_count = min(
+                count,
+                max(
+                    pairwise_min_pairs_per_batch,
+                    int(math.ceil(count * pairwise_capture_fraction)),
+                ),
+            )
+            if capture_count == 1:
+                capture_indices = {0}
+            else:
+                capture_indices = {
+                    round(index * (count - 1) / (capture_count - 1))
+                    for index in range(capture_count)
+                }
         jobs: list[RolloutJob] = []
+        capture_ordinal = 0
         for local_index, worker_count in enumerate(schedule):
             absolute_episode = episode_index + local_index + 1
             wave_number = local_index // rollout_wave_size + 1
+            episode_adp_cfg = dict(adp_runtime_cfg)
+            if local_index in capture_indices:
+                threshold = pairwise_decision_thresholds[
+                    (iteration * max(1, capture_count) + capture_ordinal)
+                    % len(pairwise_decision_thresholds)
+                ]
+                episode_adp_cfg.update(
+                    {
+                        "_probe_capture_decision_thresholds": [threshold],
+                        "_probe_candidate_limit": pairwise_candidate_limit,
+                    }
+                )
+                capture_ordinal += 1
             jobs.append(
                 RolloutJob(
                     episode=absolute_episode,
@@ -2305,7 +3240,7 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                     days=days,
                     epsilon=epsilon,
                     force_random=force_random,
-                    adp_cfg=adp_runtime_cfg,
+                    adp_cfg=episode_adp_cfg,
                     collect_compact_samples=True,
                     gamma=gamma,
                     wave_id=f"{phase}-I{iteration:02d}-W{wave_number:02d}",
@@ -2325,7 +3260,7 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             wave_rows=wave_rows,
         )
         for result in results:
-            fingerprint = fingerprint or result.fingerprint
+            register_fingerprint(result)
         episode_index += len(results)
         total_training_rollout_sec += batch_metrics.wall_sec
         total_merge_sec += batch_metrics.merge_sec
@@ -2333,7 +3268,191 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         compact_mib = compact_batch.memory_bytes / (1024.0**2)
         peak_compact_batch_mib = max(peak_compact_batch_mib, compact_mib)
         peak_process_rss_mib = max(peak_process_rss_mib, _process_rss_mib(peak=True))
-        return compact_batch, batch_metrics
+        empty_pairwise = merge_pairwise_mc_batches([])
+        pairwise_metrics = RolloutBatchMetrics()
+        if not pairwise_enabled:
+            return compact_batch, batch_metrics, empty_pairwise, pairwise_metrics
+
+        captured: list[tuple[EpisodeResult, dict[str, Any], dict[str, Any]]] = []
+        for result in results:
+            records = result.probe_records or []
+            if not records:
+                continue
+            if len(records) != 1:
+                raise RuntimeError(
+                    "Pairwise MC capture expected at most one decision per episode: "
+                    f"episode={result.episode}, captured={len(records)}."
+                )
+            record = records[0]
+            alternatives = [
+                candidate
+                for candidate in record["candidates"]
+                if candidate["assignment"] != record["selected_assignment"]
+            ]
+            if not alternatives:
+                continue
+            alternative_rng = random.Random(
+                int(cfg["base_seed"])
+                ^ (int(result.episode) << 9)
+                ^ (int(record["decision_number"]) << 3)
+                ^ 0xA6D2026
+            )
+            captured.append((result, record, alternative_rng.choice(alternatives)))
+        if len(captured) < pairwise_min_pairs_per_batch:
+            raise RuntimeError(
+                "Pairwise MC advantage sampling did not capture enough multi-action states: "
+                f"required={pairwise_min_pairs_per_batch}, captured={len(captured)}, "
+                f"iteration={iteration}."
+            )
+
+        branch_jobs: list[RolloutJob] = []
+        branch_context: dict[int, tuple[EpisodeResult, dict[str, Any], dict[str, Any]]] = {}
+        for local_index, (origin, record, alternative) in enumerate(captured):
+            branch_episode = 3_000_000 + pairwise_branch_episode_count + local_index + 1
+            branch_cfg = {
+                **adp_runtime_cfg,
+                "_probe_forced_action_script": [
+                    *[dict(row) for row in record["prefix_actions"]],
+                    dict(alternative["assignment"]),
+                ],
+                "_probe_target_decision_number": int(record["decision_number"]),
+                "_probe_expected_pre_state": dict(record["pre_state"]),
+                "_probe_expected_post_state": dict(alternative["post_state"]),
+                "_probe_policy_rng_state_after_selection": record[
+                    "policy_rng_state_after_selection"
+                ],
+                "_probe_collect_target_only": True,
+                "_probe_id": (
+                    f"I{iteration:02d}-E{origin.episode}-"
+                    f"D{int(record['decision_number']):05d}"
+                ),
+                "_probe_candidate_id": int(alternative.get("candidate_id", -1)),
+            }
+            branch_jobs.append(
+                RolloutJob(
+                    episode=branch_episode,
+                    phase="pairwise_mc_advantage",
+                    iteration=iteration,
+                    worker_count=origin.worker_count,
+                    seed=origin.seed,
+                    days=days,
+                    epsilon=epsilon,
+                    force_random=force_random,
+                    adp_cfg=branch_cfg,
+                    collect_compact_samples=True,
+                    gamma=gamma,
+                    wave_id=f"pairwise_mc_advantage-I{iteration:02d}-W01",
+                    snapshot_hash=snapshot_hash,
+                )
+            )
+            branch_context[branch_episode] = (origin, record, alternative)
+        branch_results, alternative_batch, pairwise_metrics = _run_rollout_jobs_parallel(
+            jobs=branch_jobs,
+            model_state=model_state,
+            model_cfg=model_cfg,
+            process_count=rollout_process_count,
+            wave_size=rollout_wave_size,
+            start_method=rollout_start_method,
+            torch_threads=rollout_torch_threads,
+            output_dir=output_dir,
+            episode_rows=episode_rows,
+            wave_rows=wave_rows,
+        )
+        branch_result_by_episode = {result.episode: result for result in branch_results}
+        anchor_indices: list[int] = []
+        alternative_indices: list[int] = []
+        parent_episode_ids: list[int] = []
+        for branch_job in branch_jobs:
+            branch_result = branch_result_by_episode[branch_job.episode]
+            origin, record, alternative = branch_context[branch_job.episode]
+            register_fingerprint(branch_result)
+            if branch_result.probe_target_post_state != alternative["post_state"]:
+                raise RuntimeError(
+                    "Pairwise MC alternative afterstate does not match the captured candidate."
+                )
+            origin_positions = (
+                compact_batch.episode_ids == int(origin.episode)
+            ).nonzero().flatten().tolist()
+            decision_index = int(record["decision_number"]) - 1
+            if decision_index < 0 or decision_index >= len(origin_positions):
+                raise RuntimeError(
+                    "Pairwise MC anchor decision is missing from the compact origin episode."
+                )
+            alternative_positions = (
+                alternative_batch.episode_ids == int(branch_job.episode)
+            ).nonzero().flatten().tolist()
+            if len(alternative_positions) != 1:
+                raise RuntimeError(
+                    "Pairwise MC branch must retain exactly one target-decision sample."
+                )
+            anchor_indices.append(origin_positions[decision_index])
+            alternative_indices.append(alternative_positions[0])
+            parent_episode_ids.append(int(origin.episode))
+        selected_batch = select_compact_samples(compact_batch, anchor_indices)
+        alternative_batch = select_compact_samples(
+            alternative_batch, alternative_indices
+        )
+        alternative_batch.episode_ids = selected_batch.episode_ids.clone()
+        pairwise_batch = CompactPairwiseMCBatch(
+            selected=selected_batch,
+            alternative=alternative_batch,
+        )
+        for pair_index, branch_job in enumerate(branch_jobs):
+            origin, record, alternative = branch_context[branch_job.episode]
+            selected_target = float(pairwise_batch.selected.targets[pair_index].item())
+            alternative_target = float(
+                pairwise_batch.alternative.targets[pair_index].item()
+            )
+            expected_selected = float(origin.products - int(record["products_before"]))
+            expected_alternative = float(
+                branch_result_by_episode[branch_job.episode].products
+                - int(record["products_before"])
+            )
+            if not math.isclose(selected_target, expected_selected, abs_tol=1e-6):
+                raise RuntimeError("Pairwise MC selected-action return mismatch.")
+            if not math.isclose(alternative_target, expected_alternative, abs_tol=1e-6):
+                raise RuntimeError("Pairwise MC alternative-action return mismatch.")
+            pairwise_rows.append(
+                {
+                    "iteration": iteration,
+                    "parent_episode": parent_episode_ids[pair_index],
+                    "seed": origin.seed,
+                    "worker_count": origin.worker_count,
+                    "decision_number": int(record["decision_number"]),
+                    "decision_time_min": float(record["time_min"]),
+                    "selected_candidate_id": next(
+                        (
+                            int(candidate.get("candidate_id", -1))
+                            for candidate in record["candidates"]
+                            if candidate["assignment"] == record["selected_assignment"]
+                        ),
+                        -1,
+                    ),
+                    "alternative_candidate_id": int(
+                        alternative.get("candidate_id", -1)
+                    ),
+                    "selected_mc_return": selected_target,
+                    "alternative_mc_return": alternative_target,
+                    "mc_advantage": selected_target - alternative_target,
+                }
+            )
+        _write_csv(output_dir / "pairwise_mc_advantage_samples.csv", pairwise_rows)
+        pairwise_branch_episode_count += len(branch_results)
+        pairwise_pair_count += len(pairwise_batch)
+        total_pairwise_rollout_sec += pairwise_metrics.wall_sec
+        total_training_rollout_sec += pairwise_metrics.wall_sec
+        total_merge_sec += pairwise_metrics.merge_sec
+        peak_child_rss_mib = max(
+            peak_child_rss_mib, pairwise_metrics.child_peak_rss_max_mib
+        )
+        peak_compact_batch_mib = max(
+            peak_compact_batch_mib,
+            (compact_batch.memory_bytes + pairwise_batch.memory_bytes) / (1024.0**2),
+        )
+        peak_process_rss_mib = max(
+            peak_process_rss_mib, _process_rss_mib(peak=True)
+        )
+        return compact_batch, batch_metrics, pairwise_batch, pairwise_metrics
 
     validation_episode_count = 0
     train_evaluation_episode_count = 0
@@ -2390,6 +3509,7 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             raise RuntimeError("Validation episodes must not retain compact training samples.")
         del compact_batch
         for result in results:
+            register_fingerprint(result)
             validation_products_by_worker[result.worker_count].append(result.products)
         evaluation_episode_index += len(results)
         validation_episode_count += len(results)
@@ -2456,6 +3576,8 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         if len(compact_batch):
             raise RuntimeError("Checkpoint evaluation episodes must not retain training samples.")
         del compact_batch
+        for result in results:
+            register_fingerprint(result)
         evaluation_episode_index += len(results)
         train_evaluation_episode_count += sum(
             1 for result in results if result.phase == "checkpoint_train_eval"
@@ -2663,7 +3785,12 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
 
     fixed_action_probe_rows = build_fixed_action_probe()
 
-    current_batch, current_rollout_metrics = collect_batch(
+    (
+        current_batch,
+        current_rollout_metrics,
+        current_pairwise_batch,
+        current_pairwise_metrics,
+    ) = collect_batch(
         initial_random,
         iteration=0,
         phase="initial_random",
@@ -2681,10 +3808,61 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
     last_train_eval = 0.0
     last_train_eval_std = 0.0
     last_train_eval_by_worker = {worker_count: 0.0 for worker_count in worker_counts}
+    incumbent_validation: float | None = None
+    incumbent_validation_std = 0.0
+    incumbent_validation_by_worker = {
+        worker_count: 0.0 for worker_count in worker_counts
+    }
+    incumbent_train_eval: float | None = None
+    incumbent_train_eval_std = 0.0
+    incumbent_train_eval_by_worker = {
+        worker_count: 0.0 for worker_count in worker_counts
+    }
+    incumbent_iteration = -1
+    accepted_update_count = 0
+    rejected_update_count = 0
     for iteration in range(policy_iterations + 1):
         batch_episode_count = current_batch.episode_count
         batch_sample_count = len(current_batch)
         compact_batch_mib = current_batch.memory_bytes / (1024.0**2)
+        replay_history.append((iteration, current_batch))
+        while len(replay_history) > replay_window_iterations:
+            replay_history.pop(0)
+        if pairwise_enabled:
+            pairwise_replay_history.append((iteration, current_pairwise_batch))
+            while len(pairwise_replay_history) > replay_window_iterations:
+                pairwise_replay_history.pop(0)
+        replay_batch, replay_sample_weights, replay_metrics = build_short_replay_batch(
+            replay_history,
+            window_iterations=replay_window_iterations,
+            latest_iteration_weight=latest_iteration_weight,
+        )
+        replay_pairwise_batch, replay_pairwise_weights = (
+            build_short_pairwise_replay_batch(
+                pairwise_replay_history,
+                window_iterations=replay_window_iterations,
+                latest_iteration_weight=latest_iteration_weight,
+            )
+            if pairwise_enabled
+            else (merge_pairwise_mc_batches([]), torch.zeros((0,), dtype=torch.float32))
+        )
+        pairwise_replay_mib = replay_pairwise_batch.memory_bytes / (1024.0**2)
+        peak_pairwise_replay_mib = max(
+            peak_pairwise_replay_mib, pairwise_replay_mib
+        )
+        replay_buffer_mib = sum(
+            batch.memory_bytes for _, batch in replay_history
+        ) / (1024.0**2)
+        peak_replay_buffer_mib = max(peak_replay_buffer_mib, replay_buffer_mib)
+        peak_replay_training_batch_mib = max(
+            peak_replay_training_batch_mib,
+            float(replay_metrics["replay_compact_mib"]),
+        )
+        model_before_state, model_before_hash = _snapshot_state_dict(model)
+        optimizer_before_state = copy.deepcopy(optimizer.state_dict())
+        optimizer_before_hash = _payload_hash(optimizer_before_state)
+        incumbent_before_iteration = incumbent_iteration
+        incumbent_before_validation = incumbent_validation
         ood_started = time.perf_counter()
         ood_metrics = evaluate_ood_selected_actions(
             model,
@@ -2710,11 +3888,17 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         ood_diagnostic_sec = time.perf_counter() - ood_started
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
+        pairwise_before = pairwise_mc_advantage_diagnostics(
+            model,
+            current_pairwise_batch if pairwise_enabled else None,
+            device=device,
+            batch_size=int(training["batch_size"]),
+        )
         update_started = time.perf_counter()
         loss, epochs = fit_mc_value(
             model=model,
             optimizer=optimizer,
-            samples=current_batch,
+            samples=replay_batch,
             device=device,
             batch_size=int(training["batch_size"]),
             max_epochs=int(training["max_epochs_per_iteration"]),
@@ -2722,6 +3906,22 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             patience=int(training["early_stopping_patience"]),
             validation_episode_fraction=validation_episode_fraction,
             rng=rng,
+            sample_weights=replay_sample_weights,
+            pairwise_samples=(
+                replay_pairwise_batch if pairwise_enabled else None
+            ),
+            pairwise_loss_weight=(
+                pairwise_loss_weight if pairwise_enabled else 0.0
+            ),
+            pairwise_sample_weights=(
+                replay_pairwise_weights if pairwise_enabled else None
+            ),
+        )
+        pairwise_after = pairwise_mc_advantage_diagnostics(
+            model,
+            current_pairwise_batch if pairwise_enabled else None,
+            device=device,
+            batch_size=int(training["batch_size"]),
         )
         fit_diagnostics = _mc_fit_diagnostics(
             model,
@@ -2729,6 +3929,8 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             device,
             int(training["batch_size"]),
         )
+        _candidate_model_state, candidate_model_hash = _snapshot_state_dict(model)
+        candidate_optimizer_hash = _payload_hash(optimizer.state_dict())
         fixed_probe_metrics = evaluate_fixed_action_probe(
             model,
             fixed_action_probe_rows,
@@ -2757,17 +3959,18 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             else 0.0
         )
         peak_process_rss_mib = max(peak_process_rss_mib, _process_rss_mib(peak=True))
-        validation_performed = (
-            True
-            if combined_checkpoint_evaluation
-            else _should_validate(
-                iteration,
-                policy_iterations,
-                screening_interval,
-                include_initial=screening_include_initial,
-            )
-        )
+        validation_performed = iteration in screening_iteration_set
         validation_metrics = RolloutBatchMetrics()
+        candidate_validation: float | None = None
+        candidate_validation_std = 0.0
+        candidate_validation_by_worker = {
+            worker_count: 0.0 for worker_count in worker_counts
+        }
+        candidate_train_eval: float | None = None
+        candidate_train_eval_std = 0.0
+        candidate_train_eval_by_worker = {
+            worker_count: 0.0 for worker_count in worker_counts
+        }
         if validation_performed:
             if combined_checkpoint_evaluation:
                 checkpoint_evaluation, validation_metrics = evaluate_checkpoint(
@@ -2776,24 +3979,95 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                 )
                 train_eval_summary = checkpoint_evaluation["checkpoint_train_eval"]
                 validation_summary = checkpoint_evaluation["checkpoint_validation"]
-                last_train_eval = float(train_eval_summary["mean"])
-                last_train_eval_std = float(train_eval_summary["std"])
-                last_train_eval_by_worker = dict(train_eval_summary["by_worker"])
-                last_validation = float(validation_summary["mean"])
-                last_validation_std = float(validation_summary["std"])
-                last_validation_by_worker = dict(validation_summary["by_worker"])
+                candidate_train_eval = float(train_eval_summary["mean"])
+                candidate_train_eval_std = float(train_eval_summary["std"])
+                candidate_train_eval_by_worker = dict(train_eval_summary["by_worker"])
+                candidate_validation = float(validation_summary["mean"])
+                candidate_validation_std = float(validation_summary["std"])
+                candidate_validation_by_worker = dict(validation_summary["by_worker"])
             else:
                 (
-                    last_validation,
-                    last_validation_std,
-                    last_validation_by_worker,
+                    candidate_validation,
+                    candidate_validation_std,
+                    candidate_validation_by_worker,
                     validation_metrics,
                 ) = validate_policy(
                     iteration,
                     active_model=model,
                     seeds=screening_seeds,
-                    phase="screening_validation",
+                    phase=(
+                        "candidate_validation"
+                        if conservative_update_enabled
+                        else "screening_validation"
+                    ),
                 )
+        policy_update_accepted = _should_accept_candidate(
+            enabled=conservative_update_enabled,
+            iteration=iteration,
+            candidate_mean=float(candidate_validation or 0.0),
+            incumbent_mean=incumbent_validation,
+            min_improvement=min_policy_improvement,
+        )
+        rollback_model_hash_match: bool | str = ""
+        rollback_optimizer_hash_match: bool | str = ""
+        if conservative_update_enabled:
+            if candidate_validation is None:
+                raise RuntimeError(
+                    "Conservative policy update requires candidate validation at every iteration."
+                )
+            if policy_update_accepted:
+                incumbent_iteration = iteration
+                incumbent_validation = float(candidate_validation)
+                incumbent_validation_std = float(candidate_validation_std)
+                incumbent_validation_by_worker = dict(candidate_validation_by_worker)
+                if candidate_train_eval is not None:
+                    incumbent_train_eval = float(candidate_train_eval)
+                    incumbent_train_eval_std = float(candidate_train_eval_std)
+                    incumbent_train_eval_by_worker = dict(candidate_train_eval_by_worker)
+                accepted_update_count += 1
+            else:
+                if model_before_state is None:
+                    raise RuntimeError("Incumbent model state is unavailable for rollback.")
+                model.load_state_dict(model_before_state)
+                optimizer.load_state_dict(copy.deepcopy(optimizer_before_state))
+                _, restored_model_hash = _snapshot_state_dict(model)
+                restored_optimizer_hash = _payload_hash(optimizer.state_dict())
+                rollback_model_hash_match = restored_model_hash == model_before_hash
+                rollback_optimizer_hash_match = (
+                    restored_optimizer_hash == optimizer_before_hash
+                )
+                if not rollback_model_hash_match or not rollback_optimizer_hash_match:
+                    raise RuntimeError(
+                        "Conservative policy update rollback hash mismatch: "
+                        f"model={rollback_model_hash_match}, "
+                        f"optimizer={rollback_optimizer_hash_match}."
+                    )
+                rejected_update_count += 1
+            last_validation = float(incumbent_validation or 0.0)
+            last_validation_std = float(incumbent_validation_std)
+            last_validation_by_worker = dict(incumbent_validation_by_worker)
+            if incumbent_train_eval is not None:
+                last_train_eval = float(incumbent_train_eval)
+                last_train_eval_std = float(incumbent_train_eval_std)
+                last_train_eval_by_worker = dict(incumbent_train_eval_by_worker)
+        else:
+            incumbent_iteration = iteration
+            accepted_update_count += 1
+            if validation_performed and candidate_validation is not None:
+                last_validation = float(candidate_validation)
+                last_validation_std = float(candidate_validation_std)
+                last_validation_by_worker = dict(candidate_validation_by_worker)
+                if candidate_train_eval is not None:
+                    last_train_eval = float(candidate_train_eval)
+                    last_train_eval_std = float(candidate_train_eval_std)
+                    last_train_eval_by_worker = dict(candidate_train_eval_by_worker)
+        _effective_model_state, effective_model_hash = _snapshot_state_dict(model)
+        effective_optimizer_hash = _payload_hash(optimizer.state_dict())
+        candidate_incumbent_difference = (
+            float(candidate_validation) - float(incumbent_before_validation)
+            if candidate_validation is not None and incumbent_before_validation is not None
+            else None
+        )
         train_eval_sample_count = len(train_eval_seeds) * len(worker_counts)
         validation_sample_count = len(screening_seeds) * len(worker_counts)
         iteration_row = {
@@ -2804,6 +4078,37 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             "mc_rmse": round(fit_diagnostics["rmse"], 6),
             "prediction_std": round(fit_diagnostics["prediction_std"], 6),
             "target_std": round(fit_diagnostics["target_std"], 6),
+            "pairwise_mc_advantage_enabled": pairwise_enabled,
+            "pairwise_mc_advantage_loss_weight": (
+                pairwise_loss_weight if pairwise_enabled else 0.0
+            ),
+            "pairwise_mc_advantage_pair_count": int(
+                pairwise_after["pair_count"]
+            ),
+            "pairwise_mc_advantage_informative_pair_count": int(
+                pairwise_after["informative_pair_count"]
+            ),
+            "pairwise_mc_advantage_mse_before": round(
+                float(pairwise_before["mse"]), 6
+            ),
+            "pairwise_mc_advantage_mse_after": round(
+                float(pairwise_after["mse"]), 6
+            ),
+            "pairwise_mc_advantage_mae_after": round(
+                float(pairwise_after["mae"]), 6
+            ),
+            "pairwise_mc_advantage_sign_accuracy": round(
+                float(pairwise_after["sign_accuracy"]), 6
+            ),
+            "pairwise_mc_advantage_replay_pair_count": len(
+                replay_pairwise_batch
+            ),
+            "pairwise_mc_advantage_replay_mib": round(
+                pairwise_replay_mib, 6
+            ),
+            "pairwise_mc_advantage_rollout_wall_sec": round(
+                current_pairwise_metrics.wall_sec, 6
+            ),
             "action_rank_correlation": round(
                 float(fixed_probe_metrics["action_rank_correlation"]), 6
             ),
@@ -2842,6 +4147,18 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             "batch_episode_count": batch_episode_count,
             "sample_count": batch_sample_count,
             "compact_batch_mib": round(compact_batch_mib, 6),
+            "replay_scope": replay_scope,
+            "replay_iteration_count": int(replay_metrics["replay_iteration_count"]),
+            "replay_oldest_iteration": int(replay_metrics["replay_oldest_iteration"]),
+            "replay_newest_iteration": int(replay_metrics["replay_newest_iteration"]),
+            "replay_episode_count": int(replay_metrics["replay_episode_count"]),
+            "replay_sample_count": int(replay_metrics["replay_sample_count"]),
+            "replay_effective_sample_count": round(
+                float(replay_metrics["replay_effective_sample_count"]), 3
+            ),
+            "replay_compact_mib": round(float(replay_metrics["replay_compact_mib"]), 6),
+            "replay_buffer_mib": round(replay_buffer_mib, 6),
+            "latest_iteration_weight": float(replay_metrics["latest_iteration_weight"]),
             "process_rss_mib": round(_process_rss_mib(), 6),
             "epsilon": 1.0 if iteration == 0 else _linear(
                 float(training["epsilon_start"]),
@@ -2900,6 +4217,37 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                 if validation_performed and combined_checkpoint_evaluation
                 else "screening" if validation_performed else ""
             ),
+            "policy_update_mode": policy_update_mode,
+            "policy_update_accepted": policy_update_accepted,
+            "candidate_validation_products_avg": (
+                float(candidate_validation) if candidate_validation is not None else ""
+            ),
+            "incumbent_before_validation_products_avg": (
+                float(incumbent_before_validation)
+                if incumbent_before_validation is not None
+                else ""
+            ),
+            "effective_incumbent_validation_products_avg": (
+                float(last_validation) if validation_performed else ""
+            ),
+            "candidate_incumbent_paired_difference": (
+                float(candidate_incumbent_difference)
+                if candidate_incumbent_difference is not None
+                else ""
+            ),
+            "incumbent_before_iteration": incumbent_before_iteration,
+            "effective_incumbent_iteration": incumbent_iteration,
+            "model_hash_before_update": model_before_hash,
+            "candidate_model_hash": candidate_model_hash,
+            "effective_model_hash": effective_model_hash,
+            "optimizer_hash_before_update": optimizer_before_hash,
+            "candidate_optimizer_hash": candidate_optimizer_hash,
+            "effective_optimizer_hash": effective_optimizer_hash,
+            "rollback_model_hash_match": rollback_model_hash_match,
+            "rollback_optimizer_hash_match": rollback_optimizer_hash_match,
+            "next_rollout_incumbent_checkpoint_id": (
+                f"ADP-{output_dir.name}-I{incumbent_iteration:02d}"
+            ),
         }
         iteration_row.update(
             {
@@ -2928,6 +4276,7 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             "loss_type": "mse",
             "random_policy": random_policy_name,
             "wait_action_enabled": allow_wait_action,
+            "worker_order_strategy": worker_order_strategy,
             "potential_shaping": False,
             "seed_partitions": seed_partition_meta,
             "fixed_action_probe": {
@@ -2950,8 +4299,41 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                 "quantile": ood_quantile,
                 "greedy_selections_only": True,
             },
-            "checkpoint_id": f"ADP-{output_dir.name}-I{iteration:02d}",
+            "policy_update": {
+                "mode": policy_update_mode,
+                "enabled": conservative_update_enabled,
+                "acceptance_metric": acceptance_metric,
+                "min_improvement": min_policy_improvement,
+                "candidate_accepted": policy_update_accepted,
+                "candidate_validation_products_avg": candidate_validation,
+                "incumbent_before_validation_products_avg": (
+                    incumbent_before_validation
+                ),
+                "effective_incumbent_validation_products_avg": last_validation,
+                "candidate_incumbent_paired_difference": (
+                    candidate_incumbent_difference
+                ),
+                "incumbent_before_iteration": incumbent_before_iteration,
+                "effective_incumbent_iteration": incumbent_iteration,
+                "rollback_model_hash_match": rollback_model_hash_match,
+                "rollback_optimizer_hash_match": rollback_optimizer_hash_match,
+                "effective_model_hash": effective_model_hash,
+                "effective_optimizer_hash": effective_optimizer_hash,
+            },
+            "checkpoint_id": (
+                f"ADP-{output_dir.name}-I{iteration:02d}"
+                if not conservative_update_enabled
+                else (
+                    f"ADP-{output_dir.name}-I{iteration:02d}"
+                    f"-INC{incumbent_iteration:02d}"
+                )
+            ),
             "worker_count_range": [min(worker_counts), max(worker_counts)],
+            "supported_worker_counts": list(worker_counts),
+            "environment_fingerprints_by_worker_count": {
+                str(worker_count): environment_fingerprints_by_worker_count[worker_count]
+                for worker_count in worker_counts
+            },
             "horizon_days": days,
             "model": {
                 "embedding_dim": int(model_cfg["embedding_dim"]),
@@ -2967,6 +4349,10 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                 "reward_mode": "completed_product_mc",
                 "potential_shaping": False,
                 "replay_scope": replay_scope,
+                "replay_window_iterations": replay_window_iterations,
+                "latest_iteration_weight": latest_iteration_weight,
+                "replay_target_contract": "complete_mc_return_under_collection_policy",
+                "target_network": False,
                 "compact_episode_tensors": compact_enabled,
                 "release_samples_after_update": release_after_update,
                 "policy_iterations": policy_iterations,
@@ -2981,13 +4367,31 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                 "final_selection_seed_count": final_selection_seed_count,
                 "training_episode_count": initial_random + policy_iterations * episodes_per_iteration,
                 "loss_type": "mse",
+                "pairwise_mc_advantage": {
+                    "enabled": pairwise_enabled,
+                    "loss_weight": pairwise_loss_weight,
+                    "capture_episode_fraction": pairwise_capture_fraction,
+                    "minimum_pairs_per_batch": pairwise_min_pairs_per_batch,
+                    "decision_thresholds": list(pairwise_decision_thresholds),
+                    "candidates_per_state": pairwise_candidate_limit,
+                    "target": "selected_mc_return_minus_alternative_mc_return",
+                    "common_random_seed_replay": True,
+                },
                 "learning_rate": float(training["learning_rate"]),
                 "max_epochs_per_iteration": int(training["max_epochs_per_iteration"]),
                 "epsilon_start": float(training["epsilon_start"]),
                 "epsilon_end": float(training["epsilon_end"]),
                 "max_review_interval_min": float(adp_runtime_cfg["max_review_interval_min"]),
                 "wait_action_enabled": allow_wait_action,
+                "worker_order_strategy": worker_order_strategy,
+                "policy_update_mode": policy_update_mode,
+                "conservative_policy_update": conservative_update_enabled,
+                "policy_update_min_improvement": min_policy_improvement,
                 "peak_compact_batch_mib": round(peak_compact_batch_mib, 6),
+                "peak_replay_buffer_mib": round(peak_replay_buffer_mib, 6),
+                "peak_replay_training_batch_mib": round(
+                    peak_replay_training_batch_mib, 6
+                ),
                 "observed_peak_process_rss_mib": round(peak_process_rss_mib, 6),
                 "rollout_parallel": True,
                 "rollout_process_count": rollout_process_count,
@@ -3032,12 +4436,33 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                     "screening_mean_products": round(last_validation, 6),
                     "screening_std_products": round(last_validation_std, 6),
                     "screening_seed_count": len(screening_seeds),
+                    "candidate_validation_products_avg": (
+                        round(float(candidate_validation), 6)
+                        if candidate_validation is not None
+                        else ""
+                    ),
+                    "candidate_incumbent_paired_difference": (
+                        round(float(candidate_incumbent_difference), 6)
+                        if candidate_incumbent_difference is not None
+                        else ""
+                    ),
+                    "policy_update_accepted": policy_update_accepted,
+                    "effective_incumbent_iteration": incumbent_iteration,
                     "iteration_checkpoint": str(iteration_checkpoint.resolve()),
                     "selection_checkpoint": str(candidate_checkpoint.resolve()),
                 }
             )
         ood_support_bank = next_ood_support_bank
+        del model_before_state
+        del optimizer_before_state
+        del _candidate_model_state
+        del _effective_model_state
+        del replay_batch
+        del replay_sample_weights
+        del replay_pairwise_batch
+        del replay_pairwise_weights
         del current_batch
+        del current_pairwise_batch
         gc.collect()
         peak_process_rss_mib = max(peak_process_rss_mib, _process_rss_mib(peak=True))
         if iteration < policy_iterations:
@@ -3047,7 +4472,12 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                 iteration,
                 policy_iterations,
             )
-            current_batch, current_rollout_metrics = collect_batch(
+            (
+                current_batch,
+                current_rollout_metrics,
+                current_pairwise_batch,
+                current_pairwise_metrics,
+            ) = collect_batch(
                 episodes_per_iteration,
                 iteration=iteration + 1,
                 phase=f"policy_iteration_{iteration + 1}",
@@ -3055,6 +4485,10 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                 epsilon=epsilon,
                 active_model=model,
             )
+
+    replay_history.clear()
+    pairwise_replay_history.clear()
+    gc.collect()
 
     ranked_screening = sorted(
         screening_rows,
@@ -3078,13 +4512,14 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         ).to(device)
         candidate_model.load_state_dict(payload["model_state_dict"])
         candidate_model.eval()
-        final_mean, final_std, _worker_means, final_metrics = validate_policy(
+        final_mean, final_std, worker_means, final_metrics = validate_policy(
             candidate_iteration,
             active_model=candidate_model,
             seeds=final_selection_seeds,
             phase="final_selection_validation",
         )
         selection_payloads[candidate_iteration] = payload
+        final_sample_count = len(final_selection_seeds) * len(worker_counts)
         selection_rows.append(
             {
                 **row,
@@ -3092,11 +4527,18 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
                 "final_mean_products": round(final_mean, 6),
                 "final_std_products": round(final_std, 6),
                 "final_seed_count": len(final_selection_seeds),
+                "final_sample_count": final_sample_count,
+                **{
+                    f"final_mean_products_workers_{worker_count}": round(
+                        float(worker_means[worker_count]), 6
+                    )
+                    for worker_count in worker_counts
+                },
                 "final_ci95_low": round(
-                    final_mean - 1.96 * final_std / math.sqrt(len(final_selection_seeds)), 6
+                    final_mean - 1.96 * final_std / math.sqrt(final_sample_count), 6
                 ),
                 "final_ci95_high": round(
-                    final_mean + 1.96 * final_std / math.sqrt(len(final_selection_seeds)), 6
+                    final_mean + 1.96 * final_std / math.sqrt(final_sample_count), 6
                 ),
                 "final_validation_wall_sec": round(final_metrics.wall_sec, 6),
             }
@@ -3121,6 +4563,12 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
     best_manifest = dict(best_payload.get("manifest", checkpoint_manifests[best_iteration]))
     best_manifest["validation_completed_products_avg"] = best_validation
     best_manifest["validation_completed_products_std"] = best_validation_std
+    best_manifest["validation_completed_products_avg_by_worker_count"] = {
+        str(worker_count): float(
+            winner[f"final_mean_products_workers_{worker_count}"]
+        )
+        for worker_count in worker_counts
+    }
     best_manifest["checkpoint_selection"] = {
         "stage": "final_selection",
         "screening_rank": int(winner["screening_rank"]),
@@ -3155,8 +4603,10 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             "fixed_probe_counterfactual",
             "initial_random",
             "policy_iteration",
+            "pairwise_mc_advantage",
             "checkpoint_diagnostic",
             "screening_validation",
+            "candidate_validation",
             "final_selection_validation",
         )
     }
@@ -3174,6 +4624,7 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         {
             "initial_random_episodes": initial_random,
             "policy_iterations": policy_iterations,
+            "value_update_count": policy_iterations + 1,
             "episodes_per_iteration": episodes_per_iteration,
             "training_episode_count": episode_index,
             "loss_type": "mse",
@@ -3186,6 +4637,9 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             "epsilon_start": float(training["epsilon_start"]),
             "epsilon_end": float(training["epsilon_end"]),
             "screening_interval_iterations": screening_interval,
+            "screening_schedule_mode": (
+                "explicit" if configured_screening_iterations is not None else "interval"
+            ),
             "screening_include_initial": screening_include_initial,
             "screening_seed_count": screening_seed_count,
             "combined_checkpoint_evaluation": combined_checkpoint_evaluation,
@@ -3199,9 +4653,17 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             ],
             "best_iteration": best_iteration,
             "replay_scope": replay_scope,
+            "replay_window_iterations": replay_window_iterations,
+            "latest_iteration_weight": latest_iteration_weight,
+            "replay_target_contract": "complete_mc_return_under_collection_policy",
+            "target_network": False,
             "compact_episode_tensors": compact_enabled,
             "release_samples_after_update": release_after_update,
             "peak_compact_batch_mib": round(peak_compact_batch_mib, 6),
+            "peak_replay_buffer_mib": round(peak_replay_buffer_mib, 6),
+            "peak_replay_training_batch_mib": round(
+                peak_replay_training_batch_mib, 6
+            ),
             "observed_peak_process_rss_mib": round(peak_process_rss_mib, 6),
             "peak_child_rss_mib": round(peak_child_rss_mib, 6),
             "rollout_parallel": True,
@@ -3222,6 +4684,24 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
             "ood_support_diagnostics": dict(
                 best_manifest.get("ood_support_diagnostics", {})
             ),
+            "policy_update_mode": policy_update_mode,
+            "conservative_policy_update": conservative_update_enabled,
+            "policy_update_min_improvement": min_policy_improvement,
+            "accepted_update_count": accepted_update_count,
+            "rejected_update_count": rejected_update_count,
+            "pairwise_mc_advantage": {
+                "enabled": pairwise_enabled,
+                "loss_weight": pairwise_loss_weight,
+                "capture_episode_fraction": pairwise_capture_fraction,
+                "minimum_pairs_per_batch": pairwise_min_pairs_per_batch,
+                "decision_thresholds": list(pairwise_decision_thresholds),
+                "candidates_per_state": pairwise_candidate_limit,
+                "target": "selected_mc_return_minus_alternative_mc_return",
+                "common_random_seed_replay": True,
+                "branch_episode_count": pairwise_branch_episode_count,
+                "pair_count": pairwise_pair_count,
+                "peak_replay_mib": round(peak_pairwise_replay_mib, 6),
+            },
         }
     )
     best_manifest["training"] = final_training_meta
@@ -3245,12 +4725,37 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         "horizon_days": days,
         "device": str(device),
         "policy_iterations": policy_iterations,
+        "value_update_count": policy_iterations + 1,
         "episodes_per_iteration": episodes_per_iteration,
         "loss_type": "mse",
         "reward_mode": "completed_product_mc",
         "potential_shaping": False,
         "random_policy": random_policy_name,
         "wait_action_enabled": allow_wait_action,
+        "worker_order_strategy": worker_order_strategy,
+        "policy_update_mode": policy_update_mode,
+        "conservative_policy_update": conservative_update_enabled,
+        "policy_update_min_improvement": min_policy_improvement,
+        "accepted_update_count": accepted_update_count,
+        "rejected_update_count": rejected_update_count,
+        "pairwise_mc_advantage_enabled": pairwise_enabled,
+        "pairwise_mc_advantage_loss_weight": pairwise_loss_weight,
+        "pairwise_mc_advantage_capture_episode_fraction": pairwise_capture_fraction,
+        "pairwise_mc_advantage_minimum_pairs_per_batch": pairwise_min_pairs_per_batch,
+        "pairwise_mc_advantage_decision_thresholds": list(
+            pairwise_decision_thresholds
+        ),
+        "pairwise_mc_advantage_candidates_per_state": pairwise_candidate_limit,
+        "pairwise_mc_advantage_branch_episode_count": pairwise_branch_episode_count,
+        "pairwise_mc_advantage_pair_count": pairwise_pair_count,
+        "pairwise_mc_advantage_peak_replay_mib": round(
+            peak_pairwise_replay_mib, 6
+        ),
+        "supported_worker_counts": list(worker_counts),
+        "environment_fingerprints_by_worker_count": {
+            str(worker_count): environment_fingerprints_by_worker_count.get(worker_count, "")
+            for worker_count in worker_counts
+        },
         "learning_rate": float(training["learning_rate"]),
         "max_epochs_per_iteration": int(training["max_epochs_per_iteration"]),
         "epsilon_start": float(training["epsilon_start"]),
@@ -3278,6 +4783,10 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         "best_checkpoint": str((output_dir / "best.pt").resolve()),
         "last_checkpoint": str((output_dir / "last.pt").resolve()),
         "replay_scope": replay_scope,
+        "replay_window_iterations": replay_window_iterations,
+        "latest_iteration_weight": latest_iteration_weight,
+        "replay_target_contract": "complete_mc_return_under_collection_policy",
+        "target_network": False,
         "compact_episode_tensors": compact_enabled,
         "release_samples_after_update": release_after_update,
         "max_review_interval_min": float(adp_runtime_cfg["max_review_interval_min"]),
@@ -3294,6 +4803,10 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         ),
         "checkpoint_selection_file": str((output_dir / "checkpoint_selection.csv").resolve()),
         "peak_compact_batch_mib": round(peak_compact_batch_mib, 6),
+        "peak_replay_buffer_mib": round(peak_replay_buffer_mib, 6),
+        "peak_replay_training_batch_mib": round(
+            peak_replay_training_batch_mib, 6
+        ),
         "observed_peak_process_rss_mib": round(peak_process_rss_mib, 6),
         "peak_child_rss_mib": round(peak_child_rss_mib, 6),
         "rollout_parallel": True,
@@ -3325,6 +4838,12 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         "total_wave_count": len(completed_wave_rows),
         "phase_wave_counts": phase_wave_counts,
         "training_rollout_sec": round(total_training_rollout_sec, 6),
+        "ordinary_training_rollout_sec": round(
+            total_training_rollout_sec - total_pairwise_rollout_sec, 6
+        ),
+        "pairwise_mc_advantage_rollout_sec": round(
+            total_pairwise_rollout_sec, 6
+        ),
         "validation_wall_sec": round(total_validation_sec, 6),
         "compact_merge_sec": round(total_merge_sec, 6),
         "mc_update_sec": round(total_update_sec, 6),
@@ -3353,6 +4872,8 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
         "mc_return_only": True,
         "n_step_used": False,
         "td_bootstrap_used": False,
+        "independent_value_validation_config": independent_cfg,
+        "total_simulation_episode_count": len(episode_rows),
     }
     summary["total_wall_clock_sec"] = round(time.perf_counter() - training_started, 6)
     (output_dir / "training_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -3362,6 +4883,11 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
     summary["total_wall_clock_sec"] = round(time.perf_counter() - training_started, 6)
     (output_dir / "training_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     dashboard = render_training_dashboard(output_dir, episode_rows, iteration_rows, wave_rows, summary)
+    if independent_cfg.get("enabled", False):
+        from .value_validation import refresh_dashboard, run_validation
+
+        run_validation(output_dir, independent_cfg)
+        dashboard = refresh_dashboard(output_dir)
     if not args.no_open_dashboard and bool(runtime.get("auto_open_dashboard", True)):
         webbrowser.open(dashboard.resolve().as_uri())
     return dashboard
@@ -3369,7 +4895,15 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the mfg_flow_shop simulation-based ADP policy.")
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).resolve().parents[2]
+        / "configs"
+        / "adp"
+        / "mfg_flow_shop_throughput.yaml",
+        help="Training profile. Defaults to fleet-specific n-step TD with n=30.",
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--worker-counts", nargs="*", type=int, default=None)
@@ -3379,13 +4913,50 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episodes-per-iteration", type=int, default=None)
     parser.add_argument("--validation-episodes-per-worker", type=int, default=None)
     parser.add_argument("--rollout-processes", type=int, default=None)
+    parser.add_argument(
+        "--warm-start-checkpoint",
+        type=Path,
+        default=None,
+        help="Override the n-step TD warm-start checkpoint configured in YAML.",
+    )
     parser.add_argument("--no-open-dashboard", action="store_true")
+    parser.add_argument("--background", action="store_true",
+                        help="Launch an independent process and return immediately with a live monitor path.")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    dashboard = train(args.config.resolve(), args)
+    from .live import TrainingProgress
+    if args.background:
+        from .background import launch
+        cfg = OmegaConf.load(args.config)
+        output = (args.output or Path(str(cfg.runtime.output_root)) / datetime.now().strftime("%Y%m%d_%H%M%S_%f")).resolve()
+        if any((output / name).exists() for name in ("training_summary.json", "episode_metrics.csv")):
+            raise ValueError("Use a new output directory for background training; existing results are preserved.")
+        forwarded = [arg for arg in sys.argv[1:] if arg != "--background"]
+        # The explicit trailing output wins over any earlier --output argument.
+        command = [sys.executable, "-u", "-m", "manufacturing_sim.adp.train", *forwarded,
+                   "--output", str(output), "--no-open-dashboard"]
+        monitor = launch(command=command, job_dir=output / "background_job",
+                         runs=[{"label": output.name, "output": str(output)}],
+                         cwd=Path.cwd(), open_browser=not args.no_open_dashboard)
+        print(f"Background training launched.\nMonitor: {monitor}\nJob: {monitor.parent}", flush=True)
+        return
+    if args.output is None:
+        cfg = OmegaConf.load(args.config)
+        args.output = Path(str(cfg.runtime.output_root)) / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    progress = TrainingProgress(args.output.resolve())
+    # Check before publishing progress so a mistaken command cannot modify an old result.
+    if any((args.output / name).exists() for name in ("training_summary.json", "episode_metrics.csv")):
+        raise ValueError("Refusing to overwrite an existing training run.")
+    progress.update(status="running", phase="starting")
+    try:
+        dashboard = train(args.config.resolve(), args)
+    except BaseException as exc:
+        progress.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        raise
+    progress.update(status="completed", phase="completed")
     print(str(dashboard.resolve()))
 
 

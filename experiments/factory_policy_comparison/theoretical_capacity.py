@@ -104,6 +104,7 @@ def calculate_theoretical_capacity(
     worker_counts: Iterable[int],
     horizon_days: int,
     minutes_per_day: float,
+    resolved_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build ideal and realistic scenario-level production references.
 
@@ -124,8 +125,8 @@ def calculate_theoretical_capacity(
 
     scenario_path = REPO_ROOT / "configs" / "scenario" / f"{scenario_key}.yaml"
     timing_path = REPO_ROOT / "configs" / "task_primitive_timing" / f"{scenario_key}.yaml"
-    scenario_cfg = _load_yaml(scenario_path)
-    timing_cfg = _load_yaml(timing_path)
+    scenario_cfg = copy.deepcopy(resolved_config["scenario"]) if resolved_config is not None else _load_yaml(scenario_path)
+    timing_cfg = copy.deepcopy(resolved_config["task_primitive_timing"]) if resolved_config is not None else _load_yaml(timing_path)
     movement_cfg = timing_cfg.get("movement", {})
     per_tile_cfg = movement_cfg.get("per_tile_min", {}) if isinstance(movement_cfg, dict) else {}
     multipliers = {
@@ -184,9 +185,36 @@ def calculate_theoretical_capacity(
         min(1.0, 1.0 - float(scenario_cfg.get("quality", {}).get("defect_prob", 0.0) or 0.0)),
     )
     failure_cfg = scenario_cfg.get("machine_failure", {})
-    mean_ttf = max(1e-9, float(failure_cfg.get("mean_time_to_fail_min", 0.0) or 0.0))
+    mean_ttf = max(
+        1e-9,
+        float(
+            failure_cfg.get(
+                "mean_processing_time_to_failure_min",
+                failure_cfg.get("mean_time_to_fail_min", 300.0),
+            )
+            or 300.0
+        ),
+    )
+    failure_time_basis = str(
+        failure_cfg.get("time_basis", "calendar_time") or "calendar_time"
+    ).strip().lower()
+    pm_cfg = (
+        failure_cfg.get("preventive_maintenance", {})
+        if isinstance(failure_cfg.get("preventive_maintenance", {}), dict)
+        else {}
+    )
+    pm_enabled = bool(pm_cfg.get("enabled", False))
+    pm_due_processing_min = max(
+        1e-9, float(pm_cfg.get("due_processing_min", math.inf) or math.inf)
+    )
+    pm_protected_processing_min = max(
+        0.0, float(pm_cfg.get("protected_processing_min", 0.0) or 0.0)
+    )
+    pm_hazard_multiplier = min(
+        1.0, max(0.0, float(pm_cfg.get("hazard_multiplier", 1.0) or 1.0))
+    )
     humanoid_cfg_path = REPO_ROOT / "configs" / "humanoidsim" / "default.yaml"
-    humanoid_cfg = _load_yaml(humanoid_cfg_path)
+    humanoid_cfg = copy.deepcopy(resolved_config["humanoidsim"]) if resolved_config is not None else _load_yaml(humanoid_cfg_path)
     recovery_cfg = humanoid_cfg.get("recovery_protocol", {})
     recovery_step_min = float(
         recovery_cfg.get("default_step_min", 0.0) if isinstance(recovery_cfg, dict) else 0.0
@@ -492,14 +520,53 @@ def calculate_theoretical_capacity(
             "EXECUTE_MAINTENANCE_ACTION",
             basis="expected",
         )
-        machine_availability = mean_ttf / (mean_ttf + expected_repair_work)
-        expected_station1_cycle = expected["station1_parallel_cycle_min"] / max(1e-9, machine_availability)
-        expected_station2_cycle = expected["station2_parallel_cycle_min"] / max(1e-9, machine_availability)
+        expected_pm_work = (
+            _task_service(timing_cfg, "PREVENTIVE_MAINTENANCE", basis="expected")
+            if pm_enabled
+            else 0.0
+        )
+        protected_fraction = (
+            min(1.0, pm_protected_processing_min / pm_due_processing_min)
+            if pm_enabled and math.isfinite(pm_due_processing_min)
+            else 0.0
+        )
+        effective_hazard_multiplier = max(
+            1e-9,
+            1.0 - protected_fraction * (1.0 - pm_hazard_multiplier),
+        )
+        effective_processing_mttf = (
+            mean_ttf / effective_hazard_multiplier
+            if failure_time_basis == "active_processing"
+            else mean_ttf
+        )
+        repair_downtime_per_processing_min = expected_repair_work / effective_processing_mttf
+        pm_downtime_per_processing_min = (
+            expected_pm_work / pm_due_processing_min
+            if pm_enabled and math.isfinite(pm_due_processing_min)
+            else 0.0
+        )
+        machine_capacity_factor = 1.0 / max(
+            1e-9,
+            1.0
+            + repair_downtime_per_processing_min
+            + pm_downtime_per_processing_min,
+        )
+        expected_station1_cycle = expected["station1_parallel_cycle_min"] / machine_capacity_factor
+        expected_station2_cycle = expected["station2_parallel_cycle_min"] / machine_capacity_factor
         total_machine_count = 2 * machines_per_station
-        expected_repair_worker_rate = total_machine_count * expected_repair_work / mean_ttf
+        expected_repair_worker_rate = total_machine_count * expected_repair_work / effective_processing_mttf
+        expected_pm_worker_rate = (
+            total_machine_count
+            * expected_pm_work
+            / pm_due_processing_min
+            if pm_enabled and math.isfinite(pm_due_processing_min)
+            else 0.0
+        )
         expected_worker_capacity_rate = max(
             1e-9,
-            worker_count * expected["battery_duty_fraction"] - expected_repair_worker_rate,
+            worker_count * expected["battery_duty_fraction"]
+            - expected_repair_worker_rate
+            - expected_pm_worker_rate,
         )
         expected_worker_cycle = (
             expected["worker_busy_attempt_min"]
@@ -521,7 +588,7 @@ def calculate_theoretical_capacity(
             + expected["downstream_closure_min"]
         )
         expected_first_product = expected["first_product_min"] + sum(
-            process_time * (1.0 / max(1e-9, machine_availability) - 1.0)
+            process_time * (1.0 / max(1e-9, machine_capacity_factor) - 1.0)
             for process_time in expected["process_time"].values()
         )
         expected_pipeline_attempts = (
@@ -559,7 +626,15 @@ def calculate_theoretical_capacity(
             "expected_pipeline_cycle_min": round(expected_pipeline_cycle, 6),
             "expected_downstream_closure_min": round(expected["downstream_closure_min"], 6),
             "expected_operational_cycle_min": round(expected_operational_cycle, 6),
-            "machine_availability": round(machine_availability, 6),
+            "machine_availability": round(machine_capacity_factor, 6),
+            "failure_time_basis": failure_time_basis,
+            "configured_processing_mttf_min": round(mean_ttf, 6),
+            "effective_processing_mttf_min": round(effective_processing_mttf, 6),
+            "pm_enabled": pm_enabled,
+            "pm_due_processing_min": round(pm_due_processing_min, 6),
+            "pm_protected_processing_min": round(pm_protected_processing_min, 6),
+            "pm_hazard_multiplier": round(pm_hazard_multiplier, 6),
+            "pm_downtime_per_processing_min": round(pm_downtime_per_processing_min, 6),
             "battery_duty_fraction": round(expected["battery_duty_fraction"], 6),
             "quality_yield": round(quality_yield, 6),
             "expected_incident_count_per_attempt": round(
@@ -602,10 +677,10 @@ def calculate_theoretical_capacity(
         )
 
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "scenario": scenario_key,
         "available": True,
-        "method": "parallel_resource_finite_buffer_shortest_path_bound_v2",
+        "method": "parallel_resource_finite_buffer_shortest_path_bound_v3",
         "timing_basis": "triangular_minimum",
         "movement_basis": "static shortest-path tiles with item-load multipliers",
         "product_contract": (
@@ -615,19 +690,19 @@ def calculate_theoretical_capacity(
         "formula": "UB=min(material bound, worker bound, 1+floor((H-L_first)/C*)); C*=max(C_S1,C_S2,C_inspection,C_workers)",
         "components": component_template or {},
         "assumptions": [
-            "모든 제품이 검사를 통과한다고 가정하고 설비 고장, incident, 동적 교통 대기와 확률적 queue 대기는 제외합니다.",
+            "모든 제품이 검사를 통과한다고 가정하고 설비 고장, 예방정비, incident, 동적 교통 대기와 확률적 queue 대기는 제외합니다.",
             "모든 필수 출발지-도착지 item 이동과 최초 charging dock 접근 이동을 포함합니다.",
             "Station 1·2의 병렬 설비 대수, 단일 inspection desk, 전체 worker 작업량과 직접 충전 duty cycle을 자원 제약으로 반영합니다.",
             "유한 버퍼는 실제 설정 용량을 사용하며, 상한에서는 slot reservation을 지키는 무대기 인계가 가능하다고 가정합니다.",
             "연속 작업 사이의 빈 이동은 최적으로 배치된다고 가정하므로 실제 기대 생산량이 아니라 낙관적 상한입니다.",
         ],
         "expected_reference": {
-            "method": "configuration_derived_stochastic_mean_reference_v2",
+            "method": "configuration_derived_stochastic_mean_reference_v3",
             "timing_basis": "triangular_expected_value",
             "formula": "E[N_good]=min(material bound, 1+(H-E[L_first])/E[C_operational])*(1-defect probability)",
             "included_losses": [
                 "서비스, 이동, 병렬 설비 가공, 검사와 충전시간에는 삼각분포 기댓값을 사용합니다.",
-                "설정된 평균 고장 간격과 평균 수리시간으로 네 설비의 가용률 및 수리 인력 부하를 계산합니다.",
+                "실제 가공시간 기준 고장 노출, 평균 수리시간, 예방정비 downtime과 PM hazard 감소를 반영합니다.",
                 "worker의 직접 충전 duty cycle과 설정된 검사 불량률을 반영합니다.",
                 "설정된 humanoid incident의 1차 기대 복구 부하를 반영합니다.",
                 "Station 2 배출부터 운반, 검사와 최종 적치까지를 보수적인 표준 작업 cycle로 연결합니다.",

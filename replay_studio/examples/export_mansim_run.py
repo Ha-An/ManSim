@@ -1074,6 +1074,42 @@ def convert_events(
             push("state_changed", timestamp, {"primary": entity_id}, payload, suffix=f"cart-tile-end-{details.get('segment_index', 0)}")
             continue
 
+        if raw_type == "WORKER_RETURNED_NEXT_DAY" and entity_id:
+            active_tasks.pop(entity_id, None)
+            tile_position = tile_to_position(layout, details.get("to_tile"))
+            attributes = canonical_worker_attributes(
+                details,
+                index,
+                entity_id,
+                prefer_next_state=True,
+                timestamp=timestamp,
+            )
+            attributes.update({
+                "external_relocation": True,
+                "relocation_kind": details.get("relocation_kind", "scheduled_external_recovery"),
+                "from_location": details.get("from_location"),
+                "to_location": details.get("to_location"),
+                "from_tile": details.get("from_tile"),
+                "to_tile": details.get("to_tile"),
+                "battery_pct": round(float(details.get("restart_soc", 1.0) or 1.0) * 100.0, 3),
+                "active_task": None,
+                "motion": None,
+                "carrying_item_id": None,
+                "carrying_item_type": None,
+            })
+            payload: Dict[str, Any] = {"state": "idle", "attributes": attributes}
+            if tile_position is not None:
+                payload["position"] = tile_position
+                attributes["position_source"] = "scheduled_external_recovery"
+            push(
+                "state_changed",
+                timestamp,
+                {"primary": entity_id},
+                payload,
+                suffix="next-day-recovery",
+            )
+            continue
+
         if raw_type == "WORKER_STATE_CHANGED" and entity_id:
             tile_position = tile_to_position(layout, details.get("tile"))
             payload: Dict[str, Any] = {
@@ -1575,12 +1611,15 @@ def convert_events(
             # A battery handover temporarily interrupts the receiver's current task.
             # Keep that task visible as STARTED in rolling-horizon replay tables
             # until the resumed task emits its real completion event.
-            temporary_interrupt_reasons = {"battery_swap_wait", "battery_depleted", "horizon_reached"}
+            task_payload = details.get("payload") if isinstance(details.get("payload"), dict) else {}
+            abandoned_for_recovery = bool(task_payload.get("_depletion_recovery_abandoned", False))
+            temporary_interrupt_reasons = {"battery_swap_wait", "horizon_reached"}
+            if task_reason == "battery_depleted" and not abandoned_for_recovery:
+                temporary_interrupt_reasons.add("battery_depleted")
             emit_lifecycle_completion = not (
                 task_status == "interrupted" and task_reason in temporary_interrupt_reasons
             )
             if task_id and emit_lifecycle_completion:
-                task_payload = details.get("payload") if isinstance(details.get("payload"), dict) else {}
                 push(
                     "rolling_horizon_task_completed",
                     timestamp,

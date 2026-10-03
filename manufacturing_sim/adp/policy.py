@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .model import predict_values
@@ -14,6 +15,28 @@ class ActionSelection:
     predicted_value: float
     candidate_matching_count: int
     policy: str
+    worker_order: list[str] = field(default_factory=list)
+    candidate_value_entropy: float | None = None
+    candidate_value_count: int = 0
+
+
+def normalized_beam_value_entropy(values: list[float]) -> float | None:
+    """Return scale-invariant Shannon entropy for a set of beam values."""
+
+    if len(values) < 2:
+        return None
+    mean = sum(float(value) for value in values) / len(values)
+    variance = sum((float(value) - mean) ** 2 for value in values) / len(values)
+    scale = math.sqrt(variance)
+    if scale <= 1e-12:
+        return 1.0
+    logits = [(float(value) - mean) / scale for value in values]
+    peak = max(logits)
+    weights = [math.exp(value - peak) for value in logits]
+    total = sum(weights)
+    probabilities = [weight / total for weight in weights]
+    entropy = -sum(probability * math.log(probability) for probability in probabilities)
+    return float(max(0.0, min(1.0, entropy / math.log(len(probabilities)))))
 
 
 def _task_is_shareable(state: EncodedDecisionState, worker_id: str, opportunity_id: str) -> bool:
@@ -67,7 +90,7 @@ def random_feasible_matching(
         if allow_wait_action
         else "uniform_random_feasible_no_wait"
     )
-    return ActionSelection(assignment, 0.0, 1, policy_name)
+    return ActionSelection(assignment, 0.0, 1, policy_name, worker_order=list(workers))
 
 
 def probe_feasible_matchings(
@@ -142,9 +165,15 @@ def _expand_matchings(
     model: Any,
     device: Any,
     allow_wait_action: bool,
+    worker_order: list[str] | None = None,
 ) -> list[tuple[dict[str, str | None], float]]:
     beams: list[tuple[dict[str, str | None], dict[str, int], set[str], float]] = [({}, {}, set(), 0.0)]
-    for worker_id in state.decision_worker_ids:
+    ordered_workers = list(worker_order or state.decision_worker_ids)
+    if set(ordered_workers) != set(state.decision_worker_ids) or len(ordered_workers) != len(
+        state.decision_worker_ids
+    ):
+        raise ValueError("worker_order must contain every decision worker exactly once")
+    for worker_id in ordered_workers:
         expanded: list[tuple[dict[str, str | None], dict[str, int], set[str], float]] = []
         for assignment, used, used_resources, _ in beams:
             feasible_choices: list[tuple[str | None, set[str]]] = []
@@ -198,7 +227,9 @@ def greedy_beam_matching(
     beam_width: int = 64,
     repair_capacity: int = 3,
     allow_wait_action: bool = False,
+    worker_order: list[str] | None = None,
 ) -> ActionSelection:
+    ordered_workers = list(worker_order or state.decision_worker_ids)
     rows = _expand_matchings(
         state,
         beam_width=max(1, int(beam_width)),
@@ -206,8 +237,24 @@ def greedy_beam_matching(
         model=model,
         device=device,
         allow_wait_action=bool(allow_wait_action),
+        worker_order=ordered_workers,
     )
     if not rows:
-        return ActionSelection({worker_id: None for worker_id in state.decision_worker_ids}, 0.0, 0, "value_beam_search")
+        return ActionSelection(
+            {worker_id: None for worker_id in state.decision_worker_ids},
+            0.0,
+            0,
+            "value_beam_search",
+            worker_order=ordered_workers,
+        )
     chosen, value = max(rows, key=lambda row: (row[1], str(sorted(row[0].items()))))
-    return ActionSelection(chosen, float(value), len(rows), "value_beam_search")
+    candidate_values = [float(candidate_value) for _, candidate_value in rows]
+    return ActionSelection(
+        chosen,
+        float(value),
+        len(rows),
+        "value_beam_search",
+        worker_order=ordered_workers,
+        candidate_value_entropy=normalized_beam_value_entropy(candidate_values),
+        candidate_value_count=len(candidate_values),
+    )

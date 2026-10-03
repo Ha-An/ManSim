@@ -32,6 +32,12 @@ def machine_lifecycle(env: simpy.Environment, world: ManufacturingWorld, machine
             yield env.timeout(1)
             continue
 
+        # A reserved or active PM owns the machine even when its inputs are ready.
+        # Do not overwrite UNDER_PM with WAIT_INPUT or start a cycle behind its owner.
+        if machine.pm_owner is not None or machine.state == MachineState.UNDER_PM:
+            yield env.timeout(1)
+            continue
+
         if machine.output_intermediate is not None:
             world._set_machine_state(machine, MachineState.DONE_WAIT_UNLOAD, reason="output_waiting_unload")
             yield env.timeout(1)
@@ -52,6 +58,51 @@ def machine_lifecycle(env: simpy.Environment, world: ManufacturingWorld, machine
         process_duration = max(0.0, float(machine.cycle_remaining_process_min))
         start_t = env.now
         machine.active_process = env.active_process
+        if world.machine_failure_time_basis == "active_processing":
+            cycle_elapsed = 0.0
+            interrupted = False
+            try:
+                while cycle_elapsed < process_duration - 1e-9:
+                    remaining = process_duration - cycle_elapsed
+                    segment = world.machine_processing_segment_limit(machine, remaining)
+                    segment_start = env.now
+                    try:
+                        yield env.timeout(segment)
+                    except simpy.Interrupt as intr:
+                        elapsed_min = max(0.0, env.now - segment_start)
+                        world.record_machine_processing_exposure(machine, elapsed_min)
+                        cycle_elapsed += elapsed_min
+                        world.abort_machine_cycle(
+                            machine,
+                            cycle_id,
+                            str(intr.cause),
+                            elapsed_min=cycle_elapsed,
+                        )
+                        interrupted = True
+                        break
+                    world.record_machine_processing_exposure(machine, segment)
+                    cycle_elapsed += segment
+                    if world.machine_failure_threshold_reached(machine):
+                        world.log_machine_failure_processing_threshold(machine)
+                        world.break_machine(
+                            machine,
+                            reason="stochastic_processing_exposure",
+                            interrupt_active_process=False,
+                        )
+                        world.abort_machine_cycle(
+                            machine,
+                            cycle_id,
+                            "machine_breakdown",
+                            elapsed_min=cycle_elapsed,
+                        )
+                        interrupted = True
+                        break
+            finally:
+                machine.active_process = None
+            if interrupted:
+                continue
+            world.complete_machine_cycle(machine, cycle_id)
+            continue
         try:
             yield env.timeout(process_duration)
         except simpy.Interrupt as intr:
@@ -65,6 +116,8 @@ def machine_lifecycle(env: simpy.Environment, world: ManufacturingWorld, machine
 
 def machine_failure_monitor(env: simpy.Environment, world: ManufacturingWorld, machine_id: str):
     machine = world.machines[machine_id]
+    if world.machine_failure_time_basis == "active_processing":
+        return
     while True:
         lam = world.machine_failure_lambda(machine)
         if lam <= 0.0:

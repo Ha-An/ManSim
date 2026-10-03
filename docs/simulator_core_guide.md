@@ -47,7 +47,7 @@ ManSim은 `scenario.type` 값을 registry에서 해석해 scenario plugin을 실
 | Scenario | Purpose |
 | --- | --- |
 | `factory_mfg_basic` | Warehouse -> Station 1 -> Station 2 -> Inspection 제조 공정입니다. 기존 ManSim factory flow와 artifact schema를 유지합니다. |
-| `mfg_flow_shop` | Station 1/2 각각 병렬 설비 2대, 유한 buffer, worker별 전용 충전 도크와 단일 Inspection Desk를 사용하는 flow-shop 제조 공정입니다. PM/handover/battery delivery는 없고 machine repair만 협업합니다. |
+| `mfg_flow_shop` | Station 1/2 각각 병렬 설비 2대, 유한 buffer, worker별 전용 충전 도크와 단일 Inspection Desk를 사용하는 flow-shop 제조 공정입니다. Active-processing 기준 고장·예방정비와 공동수리를 사용하며 handover/battery delivery는 없습니다. |
 | `shipyard_basic` | 중앙 고정 ship hull silhouette의 exterior surface tile별 용접, 표면처리, 도장, 검사를 수행합니다. 핵심 KPI는 `makespan_min`입니다. |
 
 ## HumanoidSim Boundary
@@ -239,15 +239,15 @@ Task 정의와 hierarchy는 HumanoidSim이 소유하지만, ManSim에서 **언�
 | --- | --- |
 | `REPLENISH_MATERIAL` | `factory_mfg_basic`에서는 Station material queue가 configured target보다 적을 때 generic station request로 생성됩니다. `mfg_flow_shop`에는 목표재고가 없고 `material input이 비어 있는 설비 수 - queue item - inbound reservation`만큼 concrete 후보가 생성됩니다. 각 후보는 서로 다른 warehouse material instance, shelf slot과 destination buffer slot을 사용하므로 병렬 설비 수요를 중복 없이 채웁니다. |
 | `TRANSFER` | Station output buffer에 다음 위치로 옮길 item이 있을 때 생성됩니다. Station 1/2 output은 다음 queue로, inspection output은 `completed_product_buffer`로 이동합니다. Battery delivery도 실행 task code는 `TRANSFER`이며 payload의 `transfer_kind=battery_delivery`로 구분합니다. |
-| `MANAGE_ROBOT_POWER` | Worker의 battery remaining이 configured threshold 이하이고, 해당 worker가 battery service owner가 될 수 있을 때 self battery swap 후보로 생성됩니다. Rolling horizon mode에서도 일반 후보와 같은 pool/dispatch 흐름을 탑니다. |
+| `MANAGE_ROBOT_POWER` | Worker의 battery remaining이 configured threshold 이하일 때 battery service 후보로 생성됩니다. `mfg_flow_shop`에서는 자신의 전용 dock로 이동해 충전하며, 추정 battery margin이 음수인 생산 task도 제거하지 않고 충전과 함께 정책 선택지로 노출합니다. |
 | `LOAD_MACHINE` | Machine이 `WAIT_INPUT`이고 broken/processing 상태가 아니며 setup owner가 없고, 필요한 material 또는 intermediate input slot이 비어 있으며 해당 source queue에 item이 있을 때 생성됩니다. 후보에는 load slot과 concrete queue item id가 포함됩니다. |
 | `SETUP_MACHINE` | Machine에 필요한 모든 input이 이미 적재되어 있고 `setup_ready=false`일 때 생성됩니다. Worker는 machine service tile에서 fixture, recipe, program 준비를 수행하며 item을 운반하지 않습니다. |
 | `UNLOAD_MACHINE` | Machine에 `output_intermediate`가 존재하고 unload owner가 없으며 destination output buffer에 점유되지 않았거나 예약되지 않은 slot이 있을 때 생성됩니다. Worker는 해당 slot을 예약한 뒤 machine output을 옮깁니다. |
 | `LOAD_UNLOAD_TRANSFER_INTERFACE (load)` | Inspection desk가 `EMPTY`이고 input queue에 예약되지 않은 product가 있을 때 생성됩니다. 특정 product를 queue에서 집어 단일 desk에 배치합니다. |
 | `INSPECT_PRODUCT` | Desk가 `STAGED_FOR_INSPECTION`이고 아직 판정되지 않은 product가 있을 때만 생성됩니다. Item 운반 없이 desk에서 검사, 판정, 기록만 수행합니다. |
 | `LOAD_UNLOAD_TRANSFER_INTERFACE (unload)` | Desk가 `INSPECTED_WAITING_UNLOAD`이고 PASS/FAIL 결과가 기록되었을 때 생성됩니다. PASS는 inspection output queue, FAIL은 inspection scrap queue로 이동합니다. |
-| `REPAIR_MACHINE` | Machine이 broken이고, 해당 worker가 repair team에 아직 없으며, repair team capacity가 남아 있을 때 생성됩니다. `mfg_flow_shop`에서는 shared/dedicated 여부와 관계없이 모든 worker가 capacity 안에서 공동수리에 참여할 수 있습니다. |
-| `PREVENTIVE_MAINTENANCE` | Machine의 마지막 PM 이후 시간이 `pm_interval_target_min` 이상이고, machine이 broken/processing 상태가 아니며, output이 비어 있고 pm owner가 없을 때 생성됩니다. |
+| `REPAIR_MACHINE` | Machine이 broken이고, 해당 worker가 repair team에 아직 없으며, repair team capacity가 남아 있을 때 생성됩니다. `mfg_flow_shop`에서는 shared/dedicated 여부와 관계없이 모든 worker가 capacity 안에서 공동수리에 참여할 수 있습니다. 후보에는 station 가용 능력, 정지 비율, input/WIP 수요, machine 내 진행 WIP로 계산한 urgency가 포함됩니다. |
+| `PREVENTIVE_MAINTENANCE` | `mfg_flow_shop`에서 마지막 PM 이후 실제 가공시간이 `due_processing_min` 이상이고, machine이 broken/repair/processing 상태가 아니며 output item이 없고 pm owner가 없을 때 생성됩니다. |
 | `HANDOVER_ITEM` | Product 공동 운반 session이 active이고 carrier가 max보다 적으며, 후보 worker가 아직 carrier가 아니고 source carrier와 남은 path가 유효할 때 생성됩니다. ManSim의 task type은 `HANDOVER_ITEM`로 유지되지만 HumanoidSim 실행 task code는 robot-robot protocol인 `HANDOVER_ITEM_TO_ROBOT`에 바인딩됩니다. Dedicated roles mode에서는 협업을 배제하기 위해 pool에 넣지 않습니다. |
 | `COLLECT_WASTE_OR_SCRAP` | Inspection scrap queue에 scrap item이 있고 scrap disposal owner가 없을 때 생성됩니다. Worker는 `quality.scrap_transport.max_carry_count` 이하의 batch를 `scrap_disposal_bin`으로 운반합니다. |
 
@@ -301,9 +301,9 @@ python main.py scenario=mfg_flow_shop scenario.objective.mode=maximize_throughpu
 
 공식 `mfg_flow_shop` 비교 mode는 `immediate_shared`, `immediate_dedicated_roles`, `rolling_horizon_shared`, `rolling_horizon_dedicated_roles` 네 개입니다. 네 mode는 동일한 fixed granular priority를 사용하고, rolling window 적용 여부와 세부 업무의 단일 owner 적용 여부만 다릅니다. Adaptive priority와 aging boost는 사용하지 않습니다.
 
-각 decision YAML의 `mfg_flow_shop_policy.task_rules`는 번호가 부여된 18개 역할을 `task_code`와 payload selector로 구분합니다. 역할 1~16은 일반 생산 업무이고, 이 중 14~16은 inspection desk load, inspection, inspection desk unload입니다. 역할 17은 모든 worker의 자기 충전, 역할 18은 모든 worker가 참여 가능한 공동수리입니다. 예를 들어 `TRANSFER`는 `from_station`에 따라 S1-to-S2, S2-to-Inspection, Inspection-to-CompletedProducts로 나뉘고 `LOAD_MACHINE`은 station과 material/intermediate slot으로 나뉩니다. 역할 번호는 priority가 아니며 후보가 rule과 일치하지 않거나 여러 rule에 겹치면 실행 전에 설정 오류가 발생합니다.
+각 decision YAML의 `mfg_flow_shop_policy.task_rules`는 번호가 부여된 19개 역할을 `task_code`와 payload selector로 구분합니다. 역할 1~16은 일반 생산 업무이고, 이 중 14~16은 inspection desk load, inspection, inspection desk unload입니다. 역할 17은 모든 worker의 자기 충전, 역할 18은 모든 worker가 참여 가능한 공동수리, 역할 19는 예방정비입니다. 예를 들어 `TRANSFER`는 `from_station`에 따라 S1-to-S2, S2-to-Inspection, Inspection-to-CompletedProducts로 나뉘고 `LOAD_MACHINE`은 station과 material/intermediate slot으로 나뉩니다. 역할 번호는 priority가 아니며 후보가 rule과 일치하지 않거나 여러 rule에 겹치면 실행 전에 설정 오류가 발생합니다.
 
-Dedicated mode는 역할 1~16의 objective별 예상 발생 횟수와 scenario timing/map 기반 예상 busy time을 계산한 뒤 deterministic LPT로 `owner: auto` rule을 한 worker에게만 배정합니다. `owner: A2`처럼 고정할 수도 있습니다. 역할 17 `MANAGE_ROBOT_POWER`와 역할 18 `REPAIR_MACHINE`은 LPT 대상이 아니며 모든 worker에게 공통 부여됩니다. 역할표와 예상 부하는 `run_meta.json`과 Pre-Run Diagnostics에 저장됩니다.
+Dedicated mode는 역할 1~16과 19의 objective별 예상 발생 횟수와 scenario timing/map 기반 예상 busy time을 계산한 뒤 deterministic LPT로 `owner: auto` rule을 한 worker에게만 배정합니다. `owner: A2`처럼 고정할 수도 있습니다. 역할 17 `MANAGE_ROBOT_POWER`와 역할 18 `REPAIR_MACHINE`은 LPT 대상이 아니며 모든 worker에게 공통 부여됩니다. 역할표와 예상 부하는 `run_meta.json`과 Pre-Run Diagnostics에 저장됩니다.
 
 정책 비교에서 외생 불확실성이 dispatch 순서에 오염되지 않도록 품질 판정, machine별 고장, worker·incident code별 휴머노이드 incident는 서로 독립된 deterministic random stream을 사용합니다. stream namespace와 base seed는 `run_meta.json`의 `stochastic_streams`에 기록됩니다.
 
@@ -319,13 +319,13 @@ Machine lifecycle은 required input이 모두 있고 `setup_ready=true`일 때�
 
 ### Repair / Preventive Maintenance
 
-Repair에는 여러 worker가 같은 machine에 합류할 수 있습니다. 동시 repair worker 수는 `machine_failure.max_repair_agents`가 제한합니다. `PREVENTIVE_MAINTENANCE`는 idle machine을 대상으로 수행하며, breakdown probability를 낮추는 효과를 가집니다.
+Repair에는 여러 worker가 같은 machine에 합류할 수 있습니다. 동시 repair worker 수는 `machine_failure.max_repair_agents`가 제한합니다. `mfg_flow_shop`의 고장 clock은 달력시간이 아니라 machine이 실제로 가공한 시간만 누적하며, 평균 300 가공분의 지수분포 threshold를 machine별 독립 RNG로 샘플합니다. PM은 240 가공분마다 due가 되고 완료 후 다음 240 가공분의 hazard를 0.5배로 낮춥니다.
 
 ### Battery
 
-Battery swap은 `MANAGE_ROBOT_POWER`로 표현합니다. Rolling horizon mode에서 저전력 threshold를 통과한 battery service는 유일한 strict-periodic 예외로서 현재 task 다음 queue에 즉시 들어갑니다. 실행 중 task를 선점하지 않으며 다음 window의 일반 requeue에서도 보호됩니다.
+Battery swap은 `MANAGE_ROBOT_POWER`로 표현합니다. 기존 factory/shipyard의 저전력 service는 strict-periodic 예외로 설정할 수 있지만, `mfg_flow_shop`은 `assignment_mode=policy_decides`를 사용해 충전을 강제 삽입하지 않습니다. 충전과 battery depletion risk가 있는 생산 task를 함께 후보로 노출하고 정책이 선택합니다.
 
-`mfg_flow_shop`은 swap 대신 direct dock charging을 사용합니다. 내부 opportunity는 `BATTERY_CHARGE`, HumanoidSim binding은 `MANAGE_ROBOT_POWER`이며 args는 `action=dock_charge`, `station=charging_dock_<worker>`, `target_soc=1.0`입니다. Worker는 현재 task를 끝낸 후 자기 도크로 tile 단위 이동하고 정확히 도크 tile에 도착한 뒤 충전합니다. 충전 중 power state는 `CHARGING`, SOC는 선형 증가하며 `BATTERY_CHARGE_STARTED`, `BATTERY_CHARGE_COMPLETED`, `AGENT_RECHARGED`가 기록됩니다.
+`mfg_flow_shop`은 swap 대신 direct dock charging을 사용합니다. 내부 opportunity는 `BATTERY_CHARGE`, HumanoidSim binding은 `MANAGE_ROBOT_POWER`이며 args는 `action=dock_charge`, `station=charging_dock_<worker>`, `target_soc=1.0`입니다. Worker는 자기 도크로 tile 단위 이동하고 정확히 도크 tile에 도착한 뒤 충전합니다. 이동 또는 task 중 SOC가 0이 되면 현재 tile에 item을 내려놓고 resource/reservation을 해제한 뒤 `DISABLED`로 남습니다. 다음 day boundary에 외부 야간 복구를 나타내는 `WORKER_RETURNED_NEXT_DAY` event와 함께 자신의 dock에 SOC 100%로 복귀합니다.
 
 Battery remaining은 worker별 budget으로 정산합니다. 기본 설정에서는 `availability=AVAILABLE`인 동안 `0.5`배 속도로 소모되고, `ASSIGNED`, `EXECUTING`, `WAITING`, `BLOCKED`, `DISABLED` 등 AVAILABLE이 아닌 상태에서는 `1.0`배 속도로 소모됩니다. 따라서 작업/이동/대기 중인 worker는 idle available 상태보다 2배 빠르게 배터리를 사용합니다. 배율은 scenario config의 `worker.battery_drain.available_rate_multiplier`와 `worker.battery_drain.non_available_rate_multiplier`에서 조정합니다.
 
@@ -359,7 +359,7 @@ effective_rank = base_rank - waited_window_count * rank_boost_per_window
 
 낮은 rank가 먼저 dispatch됩니다. `PREVENTIVE_MAINTENANCE`처럼 base rank가 낮은 task도 오래 기다리면 effective rank가 개선되어 영구 starvation을 피합니다.
 
-Window boundary에서는 먼저 아직 실행을 시작하지 않은 queued task를 pool로 회수하고, 전체 상태 스캔으로 event 수집 누락과 stale 후보를 보정한 다음 feasible task를 가능한 한 모두 worker dispatch queue에 배정합니다. 한 worker에게 여러 task가 queue될 수 있으며, worker는 queue의 앞에서부터 FIFO로 실행합니다. 실행 중이거나 battery service 때문에 suspended된 task는 회수·선점·재배정하지 않습니다. Machine failure는 즉시 pool에 보이지만 repair dispatch는 다음 정규 경계에서 수행합니다.
+Window boundary에서는 먼저 아직 실행을 시작하지 않은 queued task를 pool로 회수하고, 전체 상태 스캔으로 event 수집 누락과 stale 후보를 보정한 다음 feasible task를 가능한 한 모두 worker dispatch queue에 배정합니다. 한 worker에게 여러 task가 queue될 수 있으며, worker는 queue의 앞에서부터 FIFO로 실행합니다. 실행 중 task는 회수·선점·재배정하지 않습니다. Machine failure는 즉시 pool에 보이며, `mfg_flow_shop`의 critical repair는 정규 경계 전에도 idle worker queue를 갱신할 수 있습니다. High/normal repair는 다음 경계에서 배정됩니다.
 
 Rolling task는 처음 pool에 들어올 때 stable task id를 받습니다. 예를 들어 `REPLENISH_MATERIAL`은 `MAT-000001`, `TRANSFER`는 `TR-000002`, `REPAIR_MACHINE`은 `RM-000003` 같은 형식입니다. 이 id는 requeue/re-dispatch 이후에도 유지되며 Replay panel의 `Task` 값에도 함께 표시됩니다.
 

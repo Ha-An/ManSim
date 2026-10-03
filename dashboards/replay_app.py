@@ -836,13 +836,19 @@ def _compute_agent_states(
                 states[aid]["zone_enter_t"] = float(row.t)
             states[aid]["zone"] = move_to
             states[aid]["location_mode"] = "zone"
-        elif et == "AGENT_RELOCATED" and aid in states:
-            move_to = _canonical_zone(str(details.get("to", states[aid]["zone"])))
+        elif et in {"AGENT_RELOCATED", "WORKER_RETURNED_NEXT_DAY"} and aid in states:
+            destination = details.get("to_location") if et == "WORKER_RETURNED_NEXT_DAY" else details.get("to")
+            move_to = _canonical_zone(str(destination or states[aid]["zone"]))
+            active_moves.pop(aid, None)
             paused_in_transit.pop(aid, None)
             if _canonical_zone(str(states[aid]["zone"])) != move_to:
                 states[aid]["zone_enter_t"] = float(row.t)
             states[aid]["zone"] = move_to
             states[aid]["location_mode"] = "zone"
+            if et == "WORKER_RETURNED_NEXT_DAY":
+                discharged_agents.pop(aid, None)
+                states[aid]["down_reason"] = ""
+                carrying_now[aid] = "-"
         elif et in {"AGENT_DISCHARGED", "AGENT_FAILED"} and aid in states:
             discharged_agents[aid] = str(details.get("reason", "battery_depleted"))
             active_moves.pop(aid, None)
@@ -2118,5 +2124,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

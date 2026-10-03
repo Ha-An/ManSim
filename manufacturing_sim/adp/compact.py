@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 from .model import require_torch
@@ -23,6 +23,7 @@ class CompactMCBatch:
     targets: Any
     episode_ids: Any
     worker_counts: Any
+    td_data: Any = None
 
     def __len__(self) -> int:
         return int(self.targets.shape[0])
@@ -49,7 +50,9 @@ class CompactMCBatch:
             self.episode_ids,
             self.worker_counts,
         )
-        return int(sum(tensor.numel() * tensor.element_size() for tensor in tensors))
+        return int(sum(tensor.numel() * tensor.element_size() for tensor in tensors)) + (
+            self.td_data.memory_bytes if self.td_data is not None else 0
+        )
 
     def model_batch(self, indices: list[int], device: Any) -> tuple[dict[str, Any], Any]:
         torch = require_torch()
@@ -65,6 +68,55 @@ class CompactMCBatch:
             "selected_assignment_mask": self.selected_assignment_mask.index_select(0, index).to(device),
         }
         return inputs, self.targets.index_select(0, index).to(device)
+
+
+@dataclass
+class CompactPairwiseMCBatch:
+    """Aligned same-state action pairs and their complete Monte Carlo returns."""
+
+    selected: CompactMCBatch
+    alternative: CompactMCBatch
+
+    def __post_init__(self) -> None:
+        if len(self.selected) != len(self.alternative):
+            raise ValueError("Pairwise MC batches must contain aligned sample counts.")
+
+    def __len__(self) -> int:
+        return len(self.selected)
+
+    @property
+    def episode_count(self) -> int:
+        if not len(self):
+            return 0
+        return int(self.selected.episode_ids.unique().numel())
+
+    @property
+    def memory_bytes(self) -> int:
+        return self.selected.memory_bytes + self.alternative.memory_bytes
+
+    def model_batch(
+        self,
+        indices: list[int],
+        device: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any], Any]:
+        selected_inputs, selected_targets = self.selected.model_batch(indices, device)
+        alternative_inputs, alternative_targets = self.alternative.model_batch(indices, device)
+        return selected_inputs, alternative_inputs, selected_targets - alternative_targets
+
+
+def select_compact_samples(batch: CompactMCBatch, indices: list[int]) -> CompactMCBatch:
+    """Select compact samples without retaining simulation-side object references."""
+
+    torch = require_torch()
+    index = torch.as_tensor(indices, dtype=torch.long)
+    return CompactMCBatch(
+        **{
+            field.name: getattr(batch, field.name).index_select(0, index)
+            for field in fields(CompactMCBatch)
+            if field.name != "td_data"
+        },
+        td_data=batch.td_data.select(indices) if batch.td_data is not None else None,
+    )
 
 
 def _mc_targets(transitions: list[dict[str, Any]], gamma: float) -> list[float]:
@@ -186,7 +238,23 @@ def merge_compact_batches(episodes: list[CompactMCBatch]) -> CompactMCBatch:
         merged.episode_ids[offset:end] = episode.episode_ids
         merged.worker_counts[offset:end] = episode.worker_counts
         offset = end
+    td_episodes = [episode.td_data for episode in episodes if len(episode)]
+    if any(data is not None for data in td_episodes):
+        if any(data is None for data in td_episodes):
+            raise ValueError("Cannot merge MC-only and TD replay samples.")
+        from .td import CompactTDData
+
+        merged.td_data = CompactTDData.merge(td_episodes)
     return merged
+
+
+def merge_pairwise_mc_batches(
+    batches: list[CompactPairwiseMCBatch],
+) -> CompactPairwiseMCBatch:
+    return CompactPairwiseMCBatch(
+        selected=merge_compact_batches([batch.selected for batch in batches]),
+        alternative=merge_compact_batches([batch.alternative for batch in batches]),
+    )
 
 
 def stratified_episode_split(

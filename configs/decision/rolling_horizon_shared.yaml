@@ -137,6 +137,13 @@ mfg_flow_shop_policy:
       kind: collaborative
       owner: auto
       match: {priority_key: repair_machine}
+    - role_number: 19
+      id: preventive_maintenance
+      display_name: PREVENTIVE_MAINTENANCE
+      task_code: PREVENTIVE_MAINTENANCE
+      kind: exclusive
+      owner: auto
+      match: {priority_key: preventive_maintenance}
 
   # Fixed and identical across the four policies, so this experiment changes
   # only rolling-window use and dedicated-role enforcement.
@@ -151,6 +158,7 @@ mfg_flow_shop_policy:
     - inspect_product
     - load_inspection_desk
     - transfer_s2_to_inspection
+    - preventive_maintenance
     - load_s2_intermediate
     - load_s2_material
     - setup_s2
@@ -180,6 +188,8 @@ rolling_horizon:
     event_task_codes:
       worker_low_battery:
         - MANAGE_ROBOT_POWER
+      machine_broken_critical:
+        - REPAIR_MACHINE
 
 battery:
   # Charging is still role 17 self-service for every worker.

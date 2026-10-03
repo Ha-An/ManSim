@@ -68,15 +68,13 @@ def _table(rows: list[dict[str, str]], columns: list[str], *, limit: int | None 
 
 
 def _float(row: dict[str, str], key: str) -> float:
-    try:
-        return float(row.get(key, ""))
-    except ValueError:
-        return 0.0
+    return _float_or_none(row, key) or 0.0
 
 
 def _float_or_none(row: dict[str, str], key: str) -> float | None:
     try:
-        return float(row.get(key, ""))
+        value = float(row.get(key, ""))
+        return value if math.isfinite(value) else None
     except (TypeError, ValueError):
         return None
 
@@ -109,7 +107,12 @@ def _format_chart_tick(value: float) -> str:
     return f"{value:.2e}"
 
 
-def _runtime_summary_rows(status_rows: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+def _runtime_summary_rows(
+    status_rows: list[dict[str, str]],
+    *,
+    experiment_wall_sec: float | None = None,
+    parallel_jobs: int = 1,
+) -> tuple[str, list[dict[str, str]]]:
     rows_with_elapsed = [
         row
         for row in status_rows
@@ -132,14 +135,26 @@ def _runtime_summary_rows(status_rows: list[dict[str, str]]) -> tuple[str, list[
         if row.get("status") in {"completed", "skipped_existing"}
     )
     other_elapsed = total_elapsed - successful_elapsed
-    return _format_duration(total_elapsed), [
-        {"metric": "Total run command time", "value": _format_duration(total_elapsed)},
+    wall_sec = experiment_wall_sec if experiment_wall_sec is not None else total_elapsed
+    rows = [
+        {"metric": "Experiment wall time", "value": _format_duration(wall_sec)},
+        {"metric": "Configured parallel jobs", "value": str(max(1, int(parallel_jobs)))},
+        {"metric": "Sum of run command times", "value": _format_duration(total_elapsed)},
         {"metric": "Successful-run command time", "value": _format_duration(successful_elapsed)},
         {"metric": "Failed/other command time", "value": _format_duration(other_elapsed)},
         {"metric": "Average run command time", "value": _format_duration(average_elapsed)},
         {"metric": "Slowest run", "value": slowest_label},
         {"metric": "Runs with elapsed_sec", "value": str(len(rows_with_elapsed))},
     ]
+    if wall_sec > 0:
+        rows.insert(
+            3,
+            {
+                "metric": "Aggregate compute / wall ratio",
+                "value": f"{total_elapsed / wall_sec:.2f}x",
+            },
+        )
+    return _format_duration(wall_sec), rows
 
 
 def _best_run_value(
@@ -201,6 +216,9 @@ def _capacity_dashboard_rows(
                 "expected_attempts_before_quality": f"{float(raw.get('expected_flow_attempts_before_quality', 0.0) or 0.0):.2f}",
                 "expected_operational_cycle_min": f"{float(raw.get('expected_operational_cycle_min', 0.0) or 0.0):.2f}",
                 "machine_availability_pct": f"{100.0 * float(raw.get('machine_availability', 0.0) or 0.0):.2f}%",
+                "effective_processing_mttf_min": f"{float(raw.get('effective_processing_mttf_min', 0.0) or 0.0):.2f}",
+                "pm_due_processing_min": f"{float(raw.get('pm_due_processing_min', 0.0) or 0.0):.2f}",
+                "pm_hazard_multiplier": f"{float(raw.get('pm_hazard_multiplier', 0.0) or 0.0):.3f}",
                 "battery_duty_pct": f"{100.0 * float(raw.get('battery_duty_fraction', 0.0) or 0.0):.2f}%",
                 "quality_yield_pct": f"{100.0 * float(raw.get('quality_yield', 0.0) or 0.0):.2f}%",
                 "best_observed_products": "-" if best_products is None else f"{best_products:g}",
@@ -251,14 +269,34 @@ def _line_chart(
     y_label: str = "지표값",
     description: str = "",
 ) -> str:
-    points_by_mode: dict[str, list[tuple[int, float]]] = {}
+    points_by_mode: dict[str, list[tuple[int, float, float | None, int | None]]] = {}
+    stat_prefix = metric.removesuffix(".mean")
+    marginal = metric.endswith((".marginal_gain", ".marginal_reduction"))
+
+    def bounds(value: float, std: float | None) -> tuple[float, float]:
+        low, high = value - (std or 0.0), value + (std or 0.0)
+        if metric.endswith(".mean"):
+            low = max(0.0, low)
+            if "ratio" in stat_prefix:
+                high = min(1.0, high)
+        return low, high
+
     for row in rows:
         mode = str(row.get("mode", ""))
         worker_count = _float_or_none(row, "worker_count")
         value = _float_or_none(row, metric)
-        if not mode or worker_count is None or value is None:
+        if not mode or worker_count is None or value is None or not math.isfinite(value):
             continue
-        points_by_mode.setdefault(mode, []).append((int(worker_count), value))
+        count = _float_or_none(row, f"{stat_prefix}.count")
+        if count is None and not marginal:
+            count = _float_or_none(row, "comparison_run_count")
+        sample_count = int(count) if count is not None and math.isfinite(count) else None
+        std = _float_or_none(row, f"{stat_prefix}.std")
+        if std is not None and (
+            not math.isfinite(std) or std < 0.0 or (sample_count is not None and sample_count < 2)
+        ):
+            std = None
+        points_by_mode.setdefault(mode, []).append((int(worker_count), value, std, sample_count))
     for points in points_by_mode.values():
         points.sort(key=lambda item: item[0])
     all_points = [point for points in points_by_mode.values() for point in points]
@@ -270,8 +308,8 @@ def _line_chart(
 
     width, height = 840, 330
     left, right, top, bottom = 78, 270, 28, 62
-    xs = sorted({x for x, _value in all_points})
-    y_values = [value for _x, value in all_points]
+    xs = sorted({point[0] for point in all_points})
+    y_values = [limit for _x, value, std, _count in all_points for limit in bounds(value, std)]
     y_min = min(0.0, min(y_values))
     y_max = max(0.0, max(y_values))
     if y_max == y_min:
@@ -299,15 +337,60 @@ def _line_chart(
         x = sx(worker_count)
         grid.append(f"<text x='{x:.1f}' y='{height-22}' class='axis-label' text-anchor='middle'>{worker_count}</text>")
 
+    bands = []
     series = []
     legend = []
     legend_x = width - right + 18
     for index, (mode, points) in enumerate(sorted(points_by_mode.items())):
         color = CHART_COLORS[index % len(CHART_COLORS)]
-        coords = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in points)
+        # Split ribbons at missing SD values rather than interpolating uncertainty.
+        segment: list[tuple[int, float, float]] = []
+        segments: list[list[tuple[int, float, float]]] = []
+        for x, y, std, _count in points:
+            if std is None:
+                if segment:
+                    segments.append(segment)
+                    segment = []
+            else:
+                low, high = bounds(y, std)
+                segment.append((x, low, high))
+        if segment:
+            segments.append(segment)
+        for segment in segments:
+            if len(segment) < 2:
+                continue
+            upper = [f"{sx(x):.1f},{sy(high):.1f}" for x, _low, high in segment]
+            lower = [f"{sx(x):.1f},{sy(low):.1f}" for x, low, _high in reversed(segment)]
+            bands.append(
+                f"<polygon class='sd-band' data-mode='{_esc(mode)}' "
+                f"points='{' '.join(upper + lower)}' fill='{color}' fill-opacity='0.13' "
+                "pointer-events='none' />"
+            )
+        coords = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y, _std, _count in points)
         series.append(f"<polyline points='{coords}' fill='none' stroke='{color}' stroke-width='2.5' />")
-        for x, y in points:
-            series.append(f"<circle cx='{sx(x):.1f}' cy='{sy(y):.1f}' r='3.5' fill='{color}'><title>{_esc(mode)} workers={x}: {y:.4g}</title></circle>")
+        for x, y, std, count in points:
+            tooltip = f"{mode} | workers={x} | 평균={y:.6g}"
+            if std is not None:
+                low, high = bounds(y, std)
+                px, lower_y, upper_y = sx(x), sy(low), sy(high)
+                series.append(
+                    f"<path class='sd-error-bar' stroke='{color}' stroke-width='1.2' opacity='0.7' "
+                    f"d='M {px:.1f} {upper_y:.1f} V {lower_y:.1f} "
+                    f"M {px-4:.1f} {upper_y:.1f} H {px+4:.1f} "
+                    f"M {px-4:.1f} {lower_y:.1f} H {px+4:.1f}' />"
+                )
+                tooltip += f" | SD={std:.6g} | 분산={std * std:.6g}"
+            else:
+                tooltip += " | SD=추정 불가"
+            tooltip += f" | n={count if count is not None else '미기록'}"
+            series.append(
+                f"<circle class='mean-point' cx='{sx(x):.1f}' cy='{sy(y):.1f}' r='4' "
+                f"fill='{color}' tabindex='0' aria-label='{_esc(tooltip)}' "
+                f"data-mode='{_esc(mode)}' data-workers='{x}' "
+                f"data-mean='{y:.12g}' data-sd='{std if std is not None else ''}' "
+                f"data-n='{count if count is not None else ''}'>"
+                f"<title>{_esc(tooltip)}</title></circle>"
+            )
         legend_y = 20 + index * 18
         legend.append(f"<rect x='{legend_x}' y='{legend_y-9}' width='10' height='10' fill='{color}' />")
         legend.append(f"<text x='{legend_x+15}' y='{legend_y}' class='legend'>{_esc(mode)}</text>")
@@ -322,6 +405,7 @@ def _line_chart(
 
     svg = (
         f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{_esc(title)}' "
+        f"data-metric='{_esc(metric)}' data-spread='sample-standard-deviation' "
         f"data-y-min='{y_min:.12g}' data-y-max='{y_max:.12g}' "
         f"data-plot-right='{width-right}' data-legend-left='{legend_x}'>"
         f"<text x='{left}' y='18' class='chart-title'>{_esc(title)}</text>"
@@ -331,13 +415,25 @@ def _line_chart(
         + f"<line x1='{left}' y1='{top}' x2='{left}' y2='{height-bottom}' class='axis' />"
         + f"<text x='{(left + width - right) / 2:.1f}' y='{height-8}' class='axis-label' text-anchor='middle'>휴머노이드 수</text>"
         + f"<text x='16' y='{(top + height - bottom) / 2:.1f}' class='axis-label' text-anchor='middle' transform='rotate(-90 16 {(top + height - bottom) / 2:.1f})'>{_esc(y_label)}</text>"
+        + "".join(bands)
         + "".join(series)
         + "".join(legend)
         + "</svg>"
     )
+    spread_note = (
+        "실선·점은 평균, 음영·오차막대는 seed 간 평균 ±1 표본 표준편차(SD)입니다. "
+        "결과의 변동성을 나타내며 95% 신뢰구간이 아닙니다."
+    )
+    if marginal:
+        spread_note += " 동일 seed의 인원 증가 전후 차이를 worker 1명당으로 환산해 집계합니다."
+    elif metric.endswith(".mean"):
+        spread_note += " 음영은 비음수 지표에서 0 이상, 비율에서는 0~1 범위에 표시합니다."
+    if any(std is None for _x, _y, std, _count in all_points):
+        spread_note += " 표본이 1개이거나 SD가 없는 지점은 변동 구간을 표시하지 않습니다."
     return (
         f"<section class='panel chart-panel'>{svg}"
-        f"<p class='chart-note'><strong>해석:</strong> {_esc(description)}</p></section>"
+        f"<p class='chart-note'><strong>해석:</strong> {_esc(description)}</p>"
+        f"<p class='chart-note'>{_esc(spread_note)}</p></section>"
     )
 
 
@@ -527,8 +623,39 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
     audit_rows = read_csv(output_root / AUDIT_CSV)
     status_rows = read_csv(output_root / STATUS_CSV)
     experiment_plan = read_json(output_root / "experiment_plan.json")
+    validity = read_json(output_root / "result_validity.json")
+    validity_banner = ""
+    if validity.get("status") == "requires_rerun":
+        validity_banner = (
+            '<section role="alert" style="border:2px solid #c74343;padding:16px;margin:16px 0">'
+            '<h2>재실험 필요: 시뮬레이션 동작 오류 발견</h2><p>'
+            + _esc(str(validity.get("message", ""))) + '</p></section>'
+        )
+    experiment_timing = read_json(output_root / "experiment_timing.json")
     plan_scenario = str(experiment_plan.get("scenario", cfg.scenario) or cfg.scenario)
-    total_runtime_label, runtime_rows = _runtime_summary_rows(status_rows)
+    experiment_wall_sec = _float_or_none(
+        {"value": experiment_timing.get("experiment_wall_sec_through_summary", "")},
+        "value",
+    )
+    if experiment_wall_sec is None:
+        try:
+            experiment_wall_sec = max(
+                0.0,
+                (output_root / STATUS_CSV).stat().st_mtime - output_root.stat().st_ctime,
+            )
+        except OSError:
+            experiment_wall_sec = None
+    parallel_jobs = int(
+        experiment_timing.get(
+            "parallel_jobs", experiment_plan.get("parallel_jobs", 1)
+        )
+        or 1
+    )
+    total_runtime_label, runtime_rows = _runtime_summary_rows(
+        status_rows,
+        experiment_wall_sec=experiment_wall_sec,
+        parallel_jobs=parallel_jobs,
+    )
     display_run_rows = _merge_run_status_rows(status_rows, run_rows)
     display_run_rows.sort(
         key=lambda row: (
@@ -559,6 +686,29 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
             rolling_window_values.add(window_min)
     comparison_count = sum(
         1 for row in run_rows if str(row.get("comparison_eligible", "")).lower() == "true"
+    )
+    no_wait_modes = {"random_feasible_dispatch", "simulation_based_adp"}
+    voluntary_wait_violation_count = sum(
+        1
+        for row in run_rows
+        if str(row.get("mode", "")) in no_wait_modes
+        and float(row.get("adp_candidate_available_wait_count", 0) or 0) > 0
+    )
+    adp_entropy_weighted_sum = 0.0
+    adp_entropy_decision_count = 0.0
+    for row in run_rows:
+        if str(row.get("mode", "")) != "simulation_based_adp":
+            continue
+        entropy = _float_or_none(row, "adp_beam_value_entropy_avg")
+        decision_count = _float_or_none(row, "adp_beam_value_entropy_decision_count")
+        if entropy is None or decision_count is None or decision_count <= 0:
+            continue
+        adp_entropy_weighted_sum += entropy * decision_count
+        adp_entropy_decision_count += decision_count
+    adp_entropy_label = (
+        f"{adp_entropy_weighted_sum / adp_entropy_decision_count:.3f}"
+        if adp_entropy_decision_count > 0
+        else "n/a"
     )
     excluded_count = max(0, completed_count - comparison_count)
     def validation_key(row: dict[str, str]) -> tuple[str, ...]:
@@ -613,6 +763,12 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
         *stat_cols("completed_product_lead_time_avg_min"),
         *stat_cols("humanoid_incident_total"),
         *stat_cols("humanoid_blocked_ratio_avg"),
+        *stat_cols("machine_failure_count"),
+        *stat_cols("preventive_maintenance_count"),
+        *stat_cols("battery_risk_assignment_count"),
+        *stat_cols("worker_depleted_during_task_count"),
+        *stat_cols("worker_returned_next_day_count"),
+        *stat_cols("agent_discharged_time_min_total"),
         *stat_cols("otc"),
     ]
     makespan_summary_cols = [
@@ -624,6 +780,12 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
         *stat_cols("initial_batch_yield_ratio"),
         *stat_cols("humanoid_incident_total"),
         *stat_cols("humanoid_blocked_ratio_avg"),
+        *stat_cols("machine_failure_count"),
+        *stat_cols("preventive_maintenance_count"),
+        *stat_cols("battery_risk_assignment_count"),
+        *stat_cols("worker_depleted_during_task_count"),
+        *stat_cols("worker_returned_next_day_count"),
+        *stat_cols("agent_discharged_time_min_total"),
         *stat_cols("otc"),
     ]
     mode_worker_cols = [
@@ -638,6 +800,12 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
         *stat_cols("completed_product_lead_time_avg_min"),
         *stat_cols("humanoid_incident_total"),
         *stat_cols("humanoid_blocked_ratio_avg"),
+        *stat_cols("machine_failure_count"),
+        *stat_cols("preventive_maintenance_count"),
+        *stat_cols("battery_risk_assignment_count"),
+        *stat_cols("worker_depleted_during_task_count"),
+        *stat_cols("worker_returned_next_day_count"),
+        *stat_cols("agent_discharged_time_min_total"),
         *stat_cols("otc"),
     ]
     makespan_worker_cols = [
@@ -652,6 +820,12 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
         *stat_cols("initial_batch_yield_ratio"),
         *stat_cols("humanoid_incident_total"),
         *stat_cols("humanoid_blocked_ratio_avg"),
+        *stat_cols("machine_failure_count"),
+        *stat_cols("preventive_maintenance_count"),
+        *stat_cols("battery_risk_assignment_count"),
+        *stat_cols("worker_depleted_during_task_count"),
+        *stat_cols("worker_returned_next_day_count"),
+        *stat_cols("agent_discharged_time_min_total"),
         *stat_cols("otc"),
     ]
     throughput_rows = [
@@ -677,6 +851,19 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
         experiment_plan.get("objective_modes")
         if isinstance(experiment_plan.get("objective_modes"), list)
         else cfg.objective_modes
+    )
+    policy_contract = (
+        experiment_plan.get("policy_contract", {})
+        if isinstance(experiment_plan.get("policy_contract", {}), dict)
+        else {}
+    )
+    wait_contract_label = (
+        "Disabled"
+        if policy_contract.get("explicit_wait_action_enabled") is False
+        else "Not declared"
+    )
+    beam_order_label = str(
+        policy_contract.get("beam_worker_order_strategy", "Not declared")
     )
     # Older experiment plans stored one mode entry per run. Normalize every
     # dimension so overview counts and fallback expected-run counts stay true.
@@ -735,12 +922,14 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
         statistics_note = (
             f"Across {len(plan_seeds)} seeds, standard deviation is the sample standard deviation."
         )
-    capacity_report = calculate_theoretical_capacity(
-        scenario=plan_scenario,
-        worker_counts=plan_workers,
-        horizon_days=horizon_days,
-        minutes_per_day=minutes_per_day,
-    )
+    capacity_report = read_json(output_root / CAPACITY_REPORT_JSON)
+    if capacity_report.get("source") != "archived_run_config":
+        capacity_report = calculate_theoretical_capacity(
+            scenario=plan_scenario,
+            worker_counts=plan_workers,
+            horizon_days=horizon_days,
+            minutes_per_day=minutes_per_day,
+        )
     (output_root / CAPACITY_REPORT_JSON).write_text(
         json.dumps(capacity_report, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -820,6 +1009,8 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
                 "worker_count", "horizon_min", "theoretical_max_products",
                 "realistic_expected_products", "expected_attempts_before_quality",
                 "expected_operational_cycle_min", "machine_availability_pct",
+                "effective_processing_mttf_min", "pm_due_processing_min",
+                "pm_hazard_multiplier",
                 "battery_duty_pct", "quality_yield_pct",
                 "best_observed_products", "best_vs_expected_pct",
                 "best_capacity_utilization_pct", "binding_bound",
@@ -834,6 +1025,12 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
         {_line_chart(throughput_rows, "humanoid_blocked_ratio_avg.mean", "평균 Worker Blocked 비율", y_label="Blocked 비율", description="worker가 자원·공간·선행조건 때문에 진행하지 못한 시간 비율입니다. 일반적으로 낮을수록 운영 흐름이 원활합니다.")}
         {_line_chart(throughput_rows, "humanoid_incident_total.mean", "평균 Humanoid Incident 수", y_label="Incident 수", description="반복 run에서 발생한 humanoid incident의 평균입니다. 생산량과 함께 보며 낮을수록 안정적인 정책입니다.")}
         {_line_chart(throughput_rows, "otc.mean", "평균 운영 태스크 복잡도(OTC)", y_label="OTC", description="하루 평균 발생한 primitive 가중 복잡도입니다. 정책의 성능 점수가 아니라 정책이 실제로 처리한 운영 부담의 크기입니다.")}
+        {_line_chart(throughput_rows, "machine_failure_count.mean", "평균 설비 고장 수", y_label="고장 수", description="실제 설비 가공 누적시간이 샘플링된 고장 노출 임계치에 도달한 횟수입니다. 정책별 설비 가동 패턴 차이도 함께 반영됩니다.")}
+        {_line_chart(throughput_rows, "preventive_maintenance_count.mean", "평균 예방정비 수", y_label="예방정비 수", description="가공 누적시간 기준 PM 도래 후 실제로 완료된 예방정비 횟수입니다. 생산량과 함께 보아 예방정비의 기회비용과 고장 억제 효과를 판단합니다.")}
+        {_line_chart(throughput_rows, "battery_risk_assignment_count.mean", "평균 배터리 위험 태스크 선택 수", y_label="위험 배정 수", description="예상 태스크 수행시간과 충전 도크 복귀시간을 합하면 잔여 배터리가 부족한데도 정책이 선택한 태스크 수입니다.")}
+        {_line_chart(throughput_rows, "worker_depleted_during_task_count.mean", "평균 작업 중 방전 수", y_label="작업 중 방전 수", description="배터리 위험 선택이 실제 작업 중 SOC 0으로 이어진 횟수입니다. 다음날 복귀와 별개로 당일 생산능력 손실을 나타냅니다.")}
+        {_line_chart(throughput_rows, "worker_returned_next_day_count.mean", "평균 다음날 복귀 수", y_label="복귀 수", description="방전 후 다음날 시작 시 전용 충전 도크에서 완충 상태로 외부 복구된 worker 수입니다.")}
+        {_line_chart(throughput_rows, "agent_discharged_time_min_total.mean", "평균 방전 가동불가 시간", y_label="Worker-min", description="방전 시점부터 다음날 복귀 또는 horizon 종료까지 손실된 worker 시간입니다. 위험 행동의 실제 운영 비용을 직접 보여줍니다.")}
       </section>
       <section class="panel section">
         <h2>Throughput Results by Policy and Worker Count</h2>
@@ -846,11 +1043,11 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
       </section>
       <section class="panel section">
         <h2>Seed-Paired ADP Comparisons</h2>
-        <p>Differences are ADP minus baseline on identical seeds. The 95% interval is a deterministic 10,000-resample paired bootstrap interval.</p>
+        <p>Differences are ADP minus baseline on identical seeds. Registered paper production intervals use the experiment's paired-bootstrap contract and match its CSV. Other intervals use 10,000 deterministic paired resamples. Overall paper intervals resample common seed blocks across fleet sizes; uncertainty from a single trained checkpoint is not estimated.</p>
         {_table(
             [row for row in paired_rows if row.get("objective_mode") == "maximize_throughput"],
             [
-                "baseline_mode", "metric", "paired_seed_count", "mean_difference",
+                "worker_count", "baseline_mode", "metric", "paired_seed_count", "mean_difference",
                 "ci95_low", "ci95_high", "relative_improvement_pct", "win_count",
                 "tie_count", "loss_count", "superiority_demonstrated",
             ],
@@ -910,12 +1107,16 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
         f'<div id="{tab_id}" class="tab-panel{" active" if index == 0 else ""}">{content}</div>'
         for index, (tab_id, _label, content) in enumerate(objective_tabs)
     )
+    primary_candidates = [
+        row for row in paired_rows
+        if str(row.get("primary_comparison", "")).lower() == "true"
+    ]
     primary_row = next(
         (
-            row for row in paired_rows
-            if str(row.get("primary_comparison", "")).lower() == "true"
+            row for row in primary_candidates
+            if str(row.get("worker_count", "")).lower() in {"overall", "2-6"}
         ),
-        None,
+        primary_candidates[0] if len(plan_workers) == 1 and primary_candidates else None,
     )
     primary_card = ""
     if primary_row is not None:
@@ -994,29 +1195,34 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
   <div class="sub">{_esc(duration_summary)} | workers: {_esc(', '.join(worker_counts))} | {_esc(seed_summary)}{_esc(' | ' + rolling_window_summary if rolling_window_summary else '')}</div>
 </header>
 <main>
+  {validity_banner}
   <section class="cards">
     <div class="card"><div class="label">Modes</div><div class="value">{len(plan_modes)}</div></div>
     <div class="card"><div class="label">Objectives</div><div class="value">{len(plan_objectives)}</div></div>
+    <div class="card"><div class="label">Explicit WAIT</div><div class="value">{_esc(wait_contract_label)}</div></div>
+    <div class="card"><div class="label">ADP Beam Order</div><div class="value">{_esc(beam_order_label)}</div></div>
+    <div class="card"><div class="label">ADP Beam Value Entropy</div><div class="value">{_esc(adp_entropy_label)}</div><div>0은 가치 집중, 1은 후보 가치가 유사함을 뜻합니다.</div></div>
+    <div class="card"><div class="label">Voluntary WAIT Violations</div><div class="value">{voluntary_wait_violation_count}</div></div>
     <div class="card"><div class="label">이론적 최대 생산량</div><div class="value">{_esc(upper_bound_label)}</div></div>
     <div class="card"><div class="label">현실적 기대 양품</div><div class="value">{_esc(expected_reference_label)}</div></div>
     <div class="card"><div class="label">Expected Runs</div><div class="value">{expected_runs}</div></div>
     <div class="card"><div class="label">Completed</div><div class="value">{completed_count}</div></div>
-    <div class="card"><div class="label">Valid Comparison Runs</div><div class="value">{comparison_count}</div></div>
+    <div class="card"><div class="label">{'Aggregation-Eligible Historical Runs' if validity_banner else 'Valid Comparison Runs'}</div><div class="value">{comparison_count}</div></div>
     <div class="card"><div class="label">Excluded Completed Runs</div><div class="value">{excluded_count}</div></div>
     <div class="card"><div class="label">Incomplete Runs</div><div class="value">{incomplete_count}</div></div>
-    <div class="card"><div class="label">Run Time</div><div class="value">{_esc(total_runtime_label)}</div></div>
+    <div class="card"><div class="label">Experiment Wall Time</div><div class="value">{_esc(total_runtime_label)}</div></div>
     {f'<div class="card"><div class="label">Rolling Window</div><div class="value">{_esc(rolling_window_summary.removeprefix("Rolling window: ").removeprefix("Rolling windows: "))}</div></div>' if rolling_window_summary else ''}
     <div class="card"><div class="label">Validation-Failed Runs</div><div class="value">{len(validation_issue_keys)}</div></div>
-    {primary_card}
+    {primary_card if not validity_banner else '<div class="card"><div class="label">Policy Superiority</div><div class="value">재실험 전 판단 보류</div></div>'}
   </section>
   <section class="panel section">
     <h2>정책별 핵심 성능 요약</h2>
-    <p>감사와 공정성 검사를 통과한 seed별 run만 사용합니다. 제품 수 표준편차는 반복 seed 간 표본 표준편차이며, 평균 실행비율은 run별 worker 실행비율 평균을 seed에 대해 다시 평균한 값입니다.</p>
+    <p>집계·공정성 검사를 통과한 run의 기술통계입니다. 시뮬레이션 유효성 경고가 있으면 정책 우위를 판단할 수 없습니다. {'이 표는 모든 worker 수의 run을 합칩니다. 표준편차에는 seed 변동뿐 아니라 worker 수에 따른 차이도 포함됩니다. 조건별 분산은 아래 worker별 그래프와 표를 확인하세요.' if len(plan_workers) > 1 else '제품 수 표준편차는 반복 seed 간 표본 표준편차입니다.'} 평균 실행비율은 각 run의 worker 실행비율 평균을 run에 대해 다시 평균한 값이며, 충전 태스크 수행시간도 포함합니다.</p>
     {_table(policy_summary_rows, policy_summary_columns)}
   </section>
   <section class="panel section">
     <h2>Experiment Runtime</h2>
-    <p>Elapsed time is summed from <code>run_status.csv</code> command durations and excludes dashboard/audit post-processing.</p>
+    <p>실제 경과시간은 병렬 실행을 포함한 parent process wall clock입니다. 개별 run 시간의 합은 병렬 계산량을 나타내며 실제 경과시간과 구분합니다.</p>
     {_table(runtime_rows, ["metric", "value"])}
   </section>
   <div class="notice">{_esc(seed_notice)}</div>
@@ -1028,7 +1234,7 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
   {tab_panels}
   <section class="panel section">
     <h2>Fairness Check</h2>
-    <p>Pre-run diagnostics and stochastic prefixes are compared within the same objective, worker-count, and seed group. The Task/Primitive timing fingerprint must match across every run.</p>
+    <p>Pre-run diagnostics and stochastic prefixes are compared within the same objective, worker-count, and seed group. The Task/Primitive timing fingerprint must match across every run. A passing aggregation audit does not override simulation-validity warnings above.</p>
     {_table(fairness_rows, fairness_cols)}
   </section>
   <section class="panel section">

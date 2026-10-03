@@ -21,6 +21,7 @@ from manufacturing_sim.simulation.scenarios.manufacturing.world import (
     resolve_manufacturing_objective,
 )
 from manufacturing_sim.simulation.scenarios.registry import scenario_type
+from manufacturing_sim.simulation.rolling_horizon import strict_periodic_rolling_horizon_loop
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +57,7 @@ EXPECTED_ROLE_DEFINITIONS = [
     ),
     (17, "battery_charge", "MANAGE_ROBOT_POWER", "MANAGE_ROBOT_POWER", "self_service"),
     (18, "repair_machine", "REPAIR_MACHINE", "REPAIR_MACHINE", "collaborative"),
+    (19, "preventive_maintenance", "PREVENTIVE_MAINTENANCE", "PREVENTIVE_MAINTENANCE", "exclusive"),
 ]
 
 
@@ -94,6 +96,172 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
         )
         self.assertEqual(4, cfg["factory"]["buffers"]["station1"]["material_input_capacity"])
         self.assertEqual(2, cfg["factory"]["buffers"]["station2"]["output_capacity"])
+        self.assertEqual("active_processing", cfg["machine_failure"]["time_basis"])
+        self.assertEqual(300, cfg["machine_failure"]["mean_processing_time_to_failure_min"])
+        self.assertEqual(
+            {
+                "enabled": True,
+                "due_processing_min": 240,
+                "protected_processing_min": 240,
+                "hazard_multiplier": 0.5,
+            },
+            cfg["machine_failure"]["preventive_maintenance"],
+        )
+        self.assertEqual("policy_decides", cfg["worker"]["battery_safety"]["assignment_mode"])
+        self.assertEqual("next_day_start", cfg["worker"]["depleted_recovery"]["schedule"])
+
+    def test_active_processing_failure_exposure_respects_pm_hazard(self) -> None:
+        cfg = _load_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(
+                    simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=8)
+                )
+                machine = world.machines["S1M1"]
+                machine.failure_exposure_budget_min = 10.0
+                machine.failure_exposure_used_min = 0.0
+                machine.pm_protected_processing_remaining_min = 4.0
+
+                world.record_machine_processing_exposure(machine, 4.0)
+                self.assertEqual(2.0, machine.failure_exposure_used_min)
+                self.assertEqual(4.0, machine.failure_cycle_processing_min)
+                self.assertEqual(0.0, machine.pm_protected_processing_remaining_min)
+                self.assertEqual(4.0, machine.pm_protected_processing_total_min)
+
+                world.record_machine_processing_exposure(machine, 8.0)
+                self.assertTrue(world.machine_failure_threshold_reached(machine))
+                self.assertEqual(12.0, machine.failure_cycle_processing_min)
+                self.assertEqual(
+                    1,
+                    sum(
+                        event["type"] == "MACHINE_PM_EFFECT_EXPIRED"
+                        for event in logger.events
+                    ),
+                )
+
+                machine.processing_since_maintenance_min = 123.0
+                machine.pm_protected_processing_remaining_min = 17.0
+                world.reset_machine_failure_exposure(machine, reason="repair_completed")
+                self.assertEqual(123.0, machine.processing_since_maintenance_min)
+                self.assertEqual(17.0, machine.pm_protected_processing_remaining_min)
+                self.assertEqual(0.0, machine.failure_exposure_used_min)
+                self.assertEqual(0.0, machine.failure_cycle_processing_min)
+                self.assertGreater(machine.failure_exposure_budget_min, 0.0)
+            finally:
+                logger.close()
+
+    def test_repair_urgency_uses_station_capacity_demand_and_retained_wip(self) -> None:
+        cfg = _load_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(
+                    simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=8)
+                )
+                first = world.machines["S1M1"]
+                second = world.machines["S1M2"]
+                first.broken = True
+                first.state = MachineState.BROKEN
+                first.active_cycle_id = "cycle-with-wip"
+                for index in range(2):
+                    item_id = f"MAT-URGENCY-{index}"
+                    world.items[item_id] = Item(item_id, "material", 0.0)
+                    world.material_queues[1].append(item_id)
+
+                high = world.repair_urgency(first, emit_event=False)
+                self.assertEqual("high", high["repair_urgency_tier"])
+                self.assertAlmostEqual(0.375, high["repair_urgency_score"])
+
+                second.broken = True
+                second.state = MachineState.BROKEN
+                critical = world.repair_urgency(first, emit_event=False)
+                self.assertEqual("critical", critical["repair_urgency_tier"])
+                self.assertEqual(1.0, critical["repair_urgency_score"])
+                self.assertEqual(1.0, critical["repair_urgency_components"]["station_outage"])
+            finally:
+                logger.close()
+
+    def test_critical_repair_bypasses_rolling_boundary_without_preemption(self) -> None:
+        cfg = _load_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(
+                    simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=8)
+                )
+                world.env.process(strict_periodic_rolling_horizon_loop(world.env, world))
+                world.env.run(until=0.000001)
+
+                world.break_machine(world.machines["S1M1"], reason="unit_test_first_loss")
+                self.assertFalse(
+                    any(
+                        entry.get("urgent_dispatch")
+                        for queue in world.rolling_horizon_dispatch_queues.values()
+                        for entry in queue
+                    )
+                )
+
+                world.break_machine(world.machines["S1M2"], reason="unit_test_station_outage")
+                urgent_repairs = [
+                    entry
+                    for queue in world.rolling_horizon_dispatch_queues.values()
+                    for entry in queue
+                    if entry.get("task_code") == "REPAIR_MACHINE"
+                    and entry.get("urgent_dispatch")
+                ]
+                self.assertTrue(urgent_repairs)
+                self.assertTrue(
+                    all(entry.get("repair_urgency_tier") == "critical" for entry in urgent_repairs)
+                )
+                self.assertTrue(
+                    all(entry.get("scheduled_boundary_min") is None for entry in urgent_repairs)
+                )
+                self.assertTrue(
+                    all(float(entry.get("actual_dispatch_min", -1.0)) < 5.0 for entry in urgent_repairs)
+                )
+                self.assertEqual(
+                    0,
+                    sum(
+                        bool(agent.current_task_id)
+                        for agent in world.agents.values()
+                    ),
+                )
+            finally:
+                logger.close()
+
+    def test_policy_decides_keeps_negative_battery_margin_task(self) -> None:
+        cfg = _load_cfg()
+        cfg["decision"] = yaml.safe_load(
+            (ROOT / "configs" / "decision" / "immediate_shared.yaml").read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(
+                    simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=8)
+                )
+                worker = world.agents["A1"]
+                worker.battery_remaining_budget_min = 0.1
+                task = Task(
+                    task_id="RISKY-SETUP",
+                    task_type="SETUP_MACHINE",
+                    priority_key="setup_machine",
+                    priority=1.0,
+                    location="S1M1",
+                    payload={"machine_id": "S1M1", "station": 1},
+                    task_code="SETUP_MACHINE",
+                )
+
+                filtered = world._filter_candidates_for_agent(worker, [task])
+
+                self.assertEqual([task], filtered)
+                risk = task.selection_meta["battery_risk"]
+                self.assertTrue(risk["battery_depletion_risk"])
+                self.assertLess(risk["expected_battery_margin_min"], 0.0)
+                self.assertIsNone(world._select_battery_safety_task([task], worker))
+            finally:
+                logger.close()
 
     def test_parallel_machines_and_finite_buffer_contract(self) -> None:
         cfg = _load_cfg()
@@ -247,7 +415,7 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
                     set(rolling["task_code_priority_order"]).issubset(MFG_FLOW_SHOP_TASK_CODES)
                 )
                 self.assertNotIn("HANDOVER_ITEM", rolling["task_code_priority_order"])
-                self.assertNotIn("PREVENTIVE_MAINTENANCE", rolling["task_code_priority_order"])
+                self.assertIn("PREVENTIVE_MAINTENANCE", rolling["task_code_priority_order"])
             finally:
                 logger.close()
 
@@ -665,7 +833,7 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
             for row in signatures[0][0]
         ]
         self.assertEqual(EXPECTED_ROLE_DEFINITIONS, observed)
-        self.assertEqual(16, sum(1 for row in signatures[0][0] if row.get("kind", "exclusive") == "exclusive"))
+        self.assertEqual(17, sum(1 for row in signatures[0][0] if row.get("kind", "exclusive") == "exclusive"))
 
     def test_role_contract_requires_at_least_two_workers(self) -> None:
         cfg = _load_cfg()
@@ -684,7 +852,7 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             logger = EventLogger(Path(tmp))
             try:
-                with self.assertRaisesRegex(ValueError, "role numbers 1..18 exactly once"):
+                with self.assertRaisesRegex(ValueError, "role numbers 1..19 exactly once"):
                     ManufacturingWorld(simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=8))
             finally:
                 logger.close()
@@ -1036,7 +1204,7 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dedicated charging docks"):
             TileGridMap.from_world_config(cfg, stations=[1, 2], machines_per_station=1)
 
-    def test_world_disables_swap_delivery_pm_and_handover(self) -> None:
+    def test_world_disables_swap_delivery_and_handover_but_enables_pm(self) -> None:
         cfg = _load_cfg()
         with tempfile.TemporaryDirectory() as tmp:
             logger = EventLogger(Path(tmp))
@@ -1050,7 +1218,7 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
                 self.assertTrue(world.battery_direct_charge_enabled)
                 self.assertFalse(world.battery_delivery_enabled)
                 self.assertFalse(world.battery_swap_enabled)
-                self.assertFalse(world.preventive_maintenance_enabled)
+                self.assertTrue(world.preventive_maintenance_enabled)
                 self.assertEqual(MFG_FLOW_SHOP_TASK_CODES, world.enabled_task_codes)
                 self.assertEqual("BatteryStation", world.agents["A1"].location)
                 self.assertEqual(
@@ -1060,6 +1228,7 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
                         "inter_station_transfer",
                         "load_machine",
                         "material_supply",
+                        "preventive_maintenance",
                         "repair_machine",
                         "scrap_disposal",
                         "setup_machine",
@@ -1246,7 +1415,7 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
             finally:
                 logger.close()
 
-    def test_depleted_worker_can_start_charge_only_at_assigned_dock(self) -> None:
+    def test_depleted_worker_waits_until_next_day_recovery(self) -> None:
         cfg = _load_cfg()
         with tempfile.TemporaryDirectory() as tmp:
             logger = EventLogger(Path(tmp))
@@ -1266,12 +1435,8 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
                 worker.battery_accounting_swap_at = worker.last_battery_swap
                 world.discharge_agent(worker, reason="test_depleted", interrupt_process=False)
 
-                charge_task = world.mandatory_task_for_agent(worker)
-                self.assertIsNotNone(charge_task)
-                self.assertEqual("BATTERY_CHARGE", charge_task.task_type)
-                world.start_agent_task(worker, charge_task, 0.0)
-                self.assertEqual("EXECUTING", worker.humanoid_state["availability"])
-                self.assertEqual("DEPLETED", worker.humanoid_state["power"])
+                self.assertIsNone(world.mandatory_task_for_agent(worker))
+                self.assertEqual(2, worker.depleted_recovery_due_day)
 
                 ordinary_task = Task(
                     task_id="LOAD-DISALLOWED",
@@ -1282,6 +1447,34 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(RuntimeError, "only charging"):
                     world.start_agent_task(worker, ordinary_task, 0.0)
+
+                env.run(until=world.minutes_per_day)
+                world.start_day(2, StrategyState(), self._job_plan())
+                self.assertFalse(worker.discharged)
+                self.assertAlmostEqual(world.battery_swap_period_min, world.battery_remaining(worker))
+                self.assertEqual(world.grid_map.initial_worker_tile(worker.agent_id), worker.tile)
+                self.assertEqual("AVAILABLE", worker.humanoid_state["availability"])
+                self.assertEqual("POWER_NORMAL", worker.humanoid_state["power"])
+                self.assertEqual(
+                    1,
+                    sum(1 for event in logger.events if event["type"] == "WORKER_RETURNED_NEXT_DAY"),
+                )
+                event_types = [event["type"] for event in logger.events]
+                returned_index = event_types.index("WORKER_RETURNED_NEXT_DAY")
+                next_state_index = next(
+                    index
+                    for index in range(returned_index + 1, len(logger.events))
+                    if logger.events[index]["type"] == "WORKER_STATE_CHANGED"
+                    and logger.events[index]["entity_id"] == worker.agent_id
+                )
+                self.assertLess(returned_index, next_state_index)
+                returned = logger.events[returned_index]
+                self.assertEqual("scheduled_external_recovery", returned["details"]["relocation_kind"])
+                dock_tile = world.grid_map.initial_worker_tile(worker.agent_id)
+                self.assertEqual(
+                    {"x": dock_tile[0], "y": dock_tile[1]},
+                    returned["details"]["to_tile"],
+                )
             finally:
                 logger.close()
 
@@ -1530,6 +1723,65 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
             finally:
                 logger.close()
 
+    def test_machine_lifecycle_preserves_pm_and_does_not_process_reserved_machine(self) -> None:
+        for loaded in (False, True):
+            with self.subTest(loaded=loaded), tempfile.TemporaryDirectory() as tmp:
+                logger = EventLogger(Path(tmp))
+                try:
+                    env = simpy.Environment()
+                    world = ManufacturingWorld(env, _load_cfg(), logger, SimpleNamespace(worker_queue_limit=8))
+                    machine = world.machines["S1M1"]
+                    machine.state = MachineState.UNDER_PM
+                    machine.pm_owner = "A1"
+                    machine.input_material = "MAT-PM" if loaded else None
+                    machine.setup_ready = loaded
+                    env.process(machine_lifecycle(env, world, machine.machine_id))
+                    env.run(until=2.5)
+                    self.assertEqual(MachineState.UNDER_PM, machine.state)
+                    self.assertFalse(any(e["type"] == "MACHINE_START" for e in logger.events))
+                    self.assertEqual(0.0, machine.total_processing_min)
+                finally:
+                    logger.close()
+
+    def test_interrupted_pm_releases_machine_and_records_partial_downtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                env = simpy.Environment()
+                world = ManufacturingWorld(env, _load_cfg(), logger, SimpleNamespace(worker_queue_limit=8))
+                machine = world.machines["S1M1"]
+                machine.state = MachineState.WAIT_INPUT
+                machine.input_material = "MAT-PM-RETAINED"
+                machine.setup_ready = True
+                worker = world.agents["A1"]
+                def no_movement(*_args, **_kwargs):
+                    yield from ()
+                world.move_agent = no_movement
+                world._dock_agent_at_target = no_movement
+                world._confirm_object_service_tile = lambda *_args: True
+                task = Task(task_id="PM-INTERRUPTED", task_type="PREVENTIVE_MAINTENANCE",
+                            priority_key="preventive_maintenance", priority=1, location="Station1",
+                            payload={"machine_id": "S1M1", "station": 1}, task_code="PREVENTIVE_MAINTENANCE")
+                process = env.process(world._execute_task_domain_action(worker, task))
+                def interrupt():
+                    yield env.timeout(2)
+                    process.interrupt("battery_depleted")
+                env.process(interrupt())
+                with self.assertRaises(simpy.Interrupt):
+                    env.run(until=process)
+                self.assertIsNone(machine.pm_owner)
+                self.assertEqual(MachineState.WAIT_INPUT, machine.state)
+                self.assertEqual("MAT-PM-RETAINED", machine.input_material)
+                self.assertTrue(machine.setup_ready)
+                self.assertEqual(0, machine.pm_count)
+                self.assertEqual(0, machine.pm_protected_processing_remaining_min)
+                self.assertEqual(2, machine.total_pm_min)
+                ends = [event for event in logger.events if event["type"] == "MACHINE_PM_END"]
+                self.assertEqual(1, len(ends))
+                self.assertEqual("interrupted", ends[0]["details"]["outcome"])
+            finally:
+                logger.close()
+
     def test_machine_lifecycle_preserves_under_repair_state(self) -> None:
         cfg = _load_cfg()
         with tempfile.TemporaryDirectory() as tmp:
@@ -1596,7 +1848,7 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
                     exclusive_rules = {
                         row["rule_id"] for row in summary["rules"] if row["kind"] == "exclusive"
                     }
-                    self.assertEqual(16, len(exclusive_rules))
+                    self.assertEqual(17, len(exclusive_rules))
                     self.assertEqual(exclusive_rules, set(policy.exclusive_owner_by_rule))
                     assigned = [
                         rule_id
@@ -1694,7 +1946,7 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
         empty_workers = [
             worker_id for worker_id, rule_ids in policy.worker_exclusive_rules.items() if not rule_ids
         ]
-        self.assertEqual(2, len(empty_workers))
+        self.assertEqual(1, len(empty_workers))
         for worker_id in empty_workers:
             self.assertEqual(
                 {"MANAGE_ROBOT_POWER", "REPAIR_MACHINE"},

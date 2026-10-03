@@ -423,10 +423,24 @@ def audit_run(output_dir: Path) -> tuple[list[str], dict]:
         else (output_dir / "events.jsonl").is_file()
     )
     if not event_log_enabled:
+        daily_product_total = (
+            sum(
+                int(
+                    day.get(
+                        "completed_surface_tile_count",
+                        day.get("completed_section_count", 0),
+                    )
+                    or 0
+                )
+                for day in daily
+            )
+            if scenario_type == "shipyard_basic"
+            else sum(int(day.get("products", 0) or 0) for day in daily)
+        )
         compare_scalar(
             findings,
             "daily_summary total products",
-            sum(int(day.get("products", 0) or 0) for day in daily),
+            daily_product_total,
             int(kpi.get("total_products", 0) or 0),
             0.0,
         )

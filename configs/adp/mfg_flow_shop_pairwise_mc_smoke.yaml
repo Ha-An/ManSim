@@ -1,0 +1,95 @@
+scenario: mfg_flow_shop
+objective_mode: maximize_throughput
+horizon_days: 1
+worker_counts: [3]
+base_seed: 72026
+
+seed_partitions:
+  enforce_disjoint: true
+  screening_validation: [172026]
+  final_selection_validation: [172027]
+  held_out_test: [172028]
+
+diagnostics:
+  value_validation:
+    enabled: false
+  ood_support:
+    enabled: false
+  fixed_action_probe:
+    enabled: false
+
+algorithm:
+  return_estimator: monte_carlo
+  n_step_enabled: false
+  td_bootstrap_enabled: false
+  initial_policy: uniform_random_feasible_no_wait
+  allow_wait_action: false
+  worker_order_strategy: cyclic
+
+policy_update:
+  mode: always_accept
+  enabled: false
+  acceptance_metric: completed_products_mean
+  min_improvement: 0.0
+  rollback_model: false
+  rollback_optimizer: false
+
+training:
+  initial_random_episodes: 2
+  policy_iterations: 1
+  episodes_per_iteration: 2
+  replay_scope: current_iteration
+  replay_window_iterations: 1
+  latest_iteration_weight: 1.0
+  compact_episode_tensors: true
+  release_samples_after_update: true
+  validation_episode_fraction: 0.0
+  epsilon_start: 0.50
+  epsilon_end: 0.10
+  max_review_interval_min: 1.0
+  gamma: 1.0
+  batch_size: 256
+  learning_rate: 0.00005
+  loss_type: mse
+  gradient_clip: 0.5
+  max_epochs_per_iteration: 1
+  early_stopping_patience: 1
+  pairwise_mc_advantage:
+    enabled: true
+    loss_weight: 1.0
+    capture_episode_fraction: 1.0
+    minimum_pairs_per_batch: 2
+    decision_thresholds: [20]
+    candidates_per_state: 3
+
+validation:
+  combined_checkpoint_evaluation: false
+  screening_interval_iterations: 1
+  screening_iterations: [0, 1]
+  screening_include_initial: true
+  screening_seed_count: 1
+  final_candidate_count: 1
+  final_selection_seed_count: 1
+
+model:
+  embedding_dim: 128
+  heads: 4
+  layers: 3
+  beam_width: 64
+
+rollout:
+  parallel: true
+  process_count: 2
+  wave_size: 2
+  device: cpu
+  start_method: spawn
+  torch_threads_per_process: 1
+  deterministic_result_merge: true
+
+runtime:
+  device: cuda:0
+  require_cuda_training: true
+  output_root: outputs/adp_pairwise_mc_smoke
+  auto_open_dashboard: false
+  retain_episode_events: false
+  export_replay_artifacts: false

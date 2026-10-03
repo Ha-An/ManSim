@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from xml.etree import ElementTree
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from dashboards.dashboard import _summary_cards
 from experiments.factory_policy_comparison.audit_experiment import (
     _observed_prefixes_consistent,
     _pre_run_fingerprints,
@@ -24,6 +26,7 @@ from experiments.factory_policy_comparison.common import (
     write_json,
 )
 from experiments.factory_policy_comparison.render_dashboard import (
+    _float_or_none,
     _format_chart_tick,
     _line_chart,
     _worker_ranking_table,
@@ -36,6 +39,7 @@ from experiments.factory_policy_comparison.run_experiment import (
     validate_adp_held_out_seeds,
 )
 from experiments.factory_policy_comparison.summarize_results import (
+    _mode_worker_summary,
     _paired_adp_comparisons,
     _paired_bootstrap_interval,
     summarize_results,
@@ -51,6 +55,25 @@ EXPERIMENT_DIR = ROOT / "experiments" / "factory_policy_comparison"
 
 class FactoryPolicyComparisonTests(unittest.TestCase):
 
+    def test_prefix_audit_checks_longer_observed_tails(self) -> None:
+        self.assertFalse(_observed_prefixes_consistent([[1], [1, 2], [1, 3]]))
+
+    def test_graph_does_not_turn_nonfinite_values_into_svg_coordinates(self) -> None:
+        for value in ("NaN", "inf", "-inf", None):
+            self.assertIsNone(_float_or_none({"x": value}, "x"))
+
+    def test_capacity_can_use_archived_settings_without_reading_current_profiles(self) -> None:
+        import yaml
+        resolved = {
+            "scenario": yaml.safe_load((ROOT / "configs/scenario/mfg_flow_shop.yaml").read_text(encoding="utf-8")),
+            "task_primitive_timing": yaml.safe_load((ROOT / "configs/task_primitive_timing/mfg_flow_shop.yaml").read_text(encoding="utf-8")),
+            "humanoidsim": yaml.safe_load((ROOT / "configs/humanoidsim/default.yaml").read_text(encoding="utf-8")),
+        }
+        with patch("experiments.factory_policy_comparison.theoretical_capacity._load_yaml", side_effect=AssertionError("current config read")):
+            report = calculate_theoretical_capacity(scenario="mfg_flow_shop", worker_counts=[3], horizon_days=5,
+                                                    minutes_per_day=480, resolved_config=resolved)
+        self.assertTrue(report["available"])
+
     def test_mfg_flow_shop_theoretical_capacity_includes_process_movement_and_resources(self) -> None:
         report = calculate_theoretical_capacity(
             scenario="mfg_flow_shop",
@@ -59,7 +82,7 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
             minutes_per_day=480,
         )
         self.assertTrue(report["available"])
-        self.assertEqual(3, report["schema_version"])
+        self.assertEqual(4, report["schema_version"])
         self.assertEqual("triangular_minimum", report["timing_basis"])
         self.assertEqual(
             "triangular_expected_value",
@@ -68,14 +91,18 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
         rows = report["rows"]
         self.assertEqual([3, 4, 5, 6], [row["worker_count"] for row in rows])
         self.assertEqual([75, 75, 75, 75], [row["theoretical_max_products"] for row in rows])
-        self.assertAlmostEqual(40.87, rows[0]["realistic_expected_products"], places=2)
-        self.assertAlmostEqual(45.41, rows[0]["expected_flow_attempts_before_quality"], places=2)
+        self.assertAlmostEqual(37.59, rows[0]["realistic_expected_products"], places=2)
+        self.assertAlmostEqual(41.77, rows[0]["expected_flow_attempts_before_quality"], places=2)
         self.assertLess(
             rows[0]["realistic_expected_products"],
             rows[0]["theoretical_max_products"],
         )
         self.assertEqual(0.9, rows[0]["quality_yield"])
-        self.assertEqual(0.9375, rows[0]["machine_availability"])
+        self.assertAlmostEqual(0.861759, rows[0]["machine_availability"], places=6)
+        self.assertEqual("active_processing", rows[0]["failure_time_basis"])
+        self.assertEqual(600.0, rows[0]["effective_processing_mttf_min"])
+        self.assertEqual(240.0, rows[0]["pm_due_processing_min"])
+        self.assertEqual(0.5, rows[0]["pm_hazard_multiplier"])
         self.assertEqual(2, rows[0]["machines_per_station"])
         self.assertEqual(18.36, rows[0]["station2_cycle_min"])
         self.assertEqual(9.18, rows[0]["station2_parallel_cycle_min"])
@@ -86,15 +113,26 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
         self.assertEqual(15, rows[0]["initial_batch_product_count"])
         self.assertGreater(rows[0]["theoretical_min_makespan_min"], 300.0)
 
-    def test_worker3_adp_profile_has_30_held_out_runs(self) -> None:
+    def test_worker3_adp_profile_has_15_held_out_runs(self) -> None:
         cfg = load_experiment_config(EXPERIMENT_DIR / "config_mfg_flow_shop_worker3_adp.yaml")
         with tempfile.TemporaryDirectory() as tmp:
             specs = build_run_specs(cfg, Path(tmp))
-        self.assertEqual(len(specs), 30)
+        self.assertEqual(len(specs), 15)
         self.assertEqual(cfg.worker_counts, [3])
         self.assertEqual(len(cfg.seeds), 5)
-        self.assertIn("random_feasible_dispatch", cfg.modes)
-        self.assertIn("simulation_based_adp", cfg.modes)
+        self.assertEqual(
+            cfg.modes,
+            [
+                "simulation_based_adp",
+                "immediate_shared",
+                "random_feasible_dispatch",
+            ],
+        )
+
+    def test_default_policy_comparison_locks_longitudinal_benchmark_seeds(self) -> None:
+        cfg = load_experiment_config(EXPERIMENT_DIR / "config.yaml")
+        self.assertEqual(cfg.seeds, [50001, 50002, 50003, 50004, 50005])
+        self.assertTrue(cfg.benchmark_seeds_locked)
 
     def test_paired_bootstrap_interval_is_deterministic(self) -> None:
         first = _paired_bootstrap_interval([1.0, 2.0, 3.0], repetitions=1000)
@@ -152,6 +190,9 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
                     "manifest": {
                         "checkpoint_id": "fixture",
                         "worker_count_range": [3, 3],
+                        "supported_worker_counts": [3],
+                        "wait_action_enabled": False,
+                        "worker_order_strategy": "cyclic",
                         "seed_partitions": {
                             "training": {"values": [2026, 2027]},
                             "screening_validation": {"values": [102626]},
@@ -169,11 +210,39 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
                 validate_adp_held_out_seeds(path, [2026])
             with self.assertRaisesRegex(RuntimeError, "not declared"):
                 validate_adp_held_out_seeds(path, [59999])
+            override = validate_adp_held_out_seeds(path, [59999], allow_undeclared=True)
+            self.assertEqual(override["undeclared_held_out_seeds"], [59999])
+            self.assertFalse(override["held_out_declaration_enforced"])
+            with self.assertRaisesRegex(RuntimeError, "overlap"):
+                validate_adp_held_out_seeds(path, [2026], allow_undeclared=True)
+
+            torch.save(
+                {
+                    "manifest": {
+                        "checkpoint_id": "td-fixture",
+                        "worker_count_range": [3, 3],
+                        "supported_worker_counts": [3],
+                        "wait_action_enabled": False,
+                        "worker_order_strategy": "cyclic",
+                        "seed_partitions": {
+                            "training": [2026, 2027],
+                            "screening_validation": [102626],
+                            "final_selection_validation": [102636],
+                            "held_out_test": [50001, 50002],
+                        },
+                    }
+                },
+                path,
+            )
+            result = validate_adp_held_out_seeds(path, [50001, 50002])
+            self.assertEqual(result["declared_held_out_seed_count"], 2)
 
             torch.save(
                 {
                     "manifest": {
                         "worker_count_range": [3, 6],
+                        "wait_action_enabled": False,
+                        "worker_order_strategy": "cyclic",
                         "seed_partitions": {
                             "training": {"values": [2026]},
                             "screening_validation": {"values": [102626]},
@@ -185,8 +254,21 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
                 },
                 path,
             )
-            with self.assertRaisesRegex(RuntimeError, "worker_count_range"):
+            with self.assertRaisesRegex(RuntimeError, "supported_worker_counts"):
                 validate_adp_held_out_seeds(path, [50001])
+
+    def test_worker3_worker5_adp_profile_has_60_held_out_runs(self) -> None:
+        cfg = load_experiment_config(
+            EXPERIMENT_DIR / "config_mfg_flow_shop_adp_workers_3_5.yaml"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            specs = build_run_specs(cfg, Path(tmp))
+        self.assertEqual(len(specs), 60)
+        self.assertEqual(cfg.worker_counts, [3, 5])
+        self.assertEqual(len(cfg.seeds), 5)
+        self.assertEqual(len(cfg.modes), 6)
+        self.assertIn("random_feasible_dispatch", cfg.modes)
+        self.assertIn("simulation_based_adp", cfg.modes)
 
     def _cfg(
         self,
@@ -388,21 +470,30 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
             self.assertFalse(result.events_available)
             self.assertTrue(any("event-level" in warning for warning in result.warnings))
 
-    def test_default_config_is_32_run_flow_shop_experiment(self) -> None:
+    def test_default_config_is_worker3_three_policy_adp_comparison(self) -> None:
         cfg = load_experiment_config()
+        self.assertEqual("mfg_flow_shop", cfg.scenario)
+        self.assertEqual(["maximize_throughput"], cfg.objective_modes)
+        self.assertEqual([50001, 50002, 50003, 50004, 50005], cfg.seeds)
+        self.assertEqual([3], cfg.worker_counts)
+        self.assertEqual(
+            [
+                "simulation_based_adp",
+                "immediate_shared",
+                "random_feasible_dispatch",
+            ],
+            cfg.modes,
+        )
+        self.assertEqual(15, len(build_run_specs(cfg, Path("result"))))
+
+    def test_four_policy_two_objective_profile_is_preserved(self) -> None:
+        cfg = load_experiment_config(
+            EXPERIMENT_DIR / "config_mfg_flow_shop_4policy_objectives.yaml"
+        )
         self.assertEqual("mfg_flow_shop", cfg.scenario)
         self.assertEqual(["maximize_throughput", "minimize_makespan"], cfg.objective_modes)
         self.assertEqual([2026], cfg.seeds)
         self.assertEqual([3, 4, 5, 6], cfg.worker_counts)
-        self.assertEqual(
-            [
-                "immediate_shared",
-                "immediate_dedicated_roles",
-                "rolling_horizon_shared",
-                "rolling_horizon_dedicated_roles",
-            ],
-            cfg.modes,
-        )
         self.assertEqual(32, len(build_run_specs(cfg, Path("result"))))
 
     def test_legacy_factory_profile_is_preserved(self) -> None:
@@ -421,7 +512,9 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
             self.assertIn(package, optional_requirements)
 
     def test_run_specs_and_commands_include_objective_axis(self) -> None:
-        cfg = load_experiment_config()
+        cfg = load_experiment_config(
+            EXPERIMENT_DIR / "config_mfg_flow_shop_4policy_objectives.yaml"
+        )
         with tempfile.TemporaryDirectory() as tmp:
             specs = build_run_specs(cfg, Path(tmp))
             self.assertEqual(32, len({spec.run_id for spec in specs}))
@@ -441,7 +534,9 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
             self.assertNotIn("scenario_worker_task_priority.factory_mfg_basic", makespan_command)
 
     def test_rolling_window_override_applies_only_to_rolling_modes(self) -> None:
-        cfg = load_experiment_config()
+        cfg = load_experiment_config(
+            EXPERIMENT_DIR / "config_mfg_flow_shop_4policy_objectives.yaml"
+        )
         with tempfile.TemporaryDirectory() as tmp:
             specs = build_run_specs(cfg, Path(tmp))
             immediate = next(spec for spec in specs if spec.mode == "immediate_shared")
@@ -669,6 +764,70 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
             self.assertEqual("0", invalid_mode["comparison_run_count"])
             self.assertEqual("", invalid_mode["throughput_per_sim_hour.mean"])
 
+    def test_summary_excludes_unobserved_failure_mttf_sentinel(self) -> None:
+        cfg = self._cfg(
+            objectives=["maximize_throughput"],
+            modes=["immediate_shared"],
+            worker_counts=[3],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._write_run(
+                root,
+                objective_mode="maximize_throughput",
+                mode="immediate_shared",
+                worker_count=3,
+                products=10,
+            )
+            first_kpi = json.loads((first / "kpi.json").read_text(encoding="utf-8"))
+            first_kpi.update(
+                {
+                    "machine_failure_count": 0,
+                    "machine_failure_observed_processing_mttf_min": 0.0,
+                }
+            )
+            write_json(first / "kpi.json", first_kpi)
+
+            second = root / "runs" / "maximize_throughput" / "immediate_shared" / "workers_3" / "seed_2027"
+            second.mkdir(parents=True)
+            second_meta = json.loads((first / "run_meta.json").read_text(encoding="utf-8"))
+            second_meta["seed"] = 2027
+            write_json(second / "run_meta.json", second_meta)
+            second_kpi = dict(first_kpi)
+            second_kpi.update(
+                {
+                    "machine_failure_count": 2,
+                    "machine_failure_observed_processing_mttf_min": 120.0,
+                }
+            )
+            write_json(second / "kpi.json", second_kpi)
+            write_json(second / "artifact_status.json", {"errors": {}})
+
+            payload = summarize_results(root, cfg)
+            self.assertEqual("", payload["runs"][0]["machine_failure_observed_processing_mttf_min"])
+            self.assertEqual(
+                120.0,
+                payload["modes"][0]["machine_failure_observed_processing_mttf_min.mean"],
+            )
+
+    def test_kpi_dashboard_marks_unobserved_failure_mttf(self) -> None:
+        cards = _summary_cards(
+            {
+                "machine_failure_count": 0,
+                "machine_failure_observed_processing_mttf_min": 0.0,
+                "repair_response_time_avg_min": 0.0,
+                "battery_risk_assignment_count": 0,
+                "battery_risk_expected_margin_avg_min": 0.0,
+            },
+            [
+                "machine_failure_observed_processing_mttf_min",
+                "repair_response_time_avg_min",
+                "battery_risk_expected_margin_avg_min",
+            ],
+        )
+        self.assertEqual(3, cards.count("not observed"))
+        self.assertNotIn("0.0m", cards)
+
     def test_marginals_are_normalized_per_added_worker(self) -> None:
         cfg = self._cfg(modes=["immediate_shared"], worker_counts=[3, 5])
         with tempfile.TemporaryDirectory() as tmp:
@@ -730,6 +889,7 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
             self.assertIn("results_dashboard.html", html)
             self.assertIn("정책별 핵심 성능 요약", html)
             self.assertIn("평균 제품 수", html)
+            self.assertIn("ADP Beam Value Entropy", html)
             self.assertIn("75.00%", html)
             self.assertIn("Individual Run Artifacts", html)
             self.assertIn("Run Gantt", html)
@@ -745,7 +905,11 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
             self.assertIn("현실적 기대 생산량 산정", html)
             self.assertIn("realistic_expected_products", html)
             self.assertIn("Theoretical Minimum Batch Makespan by Worker Count", html)
-            self.assertIn("parallel_resource_finite_buffer_shortest_path_bound_v2", html)
+            self.assertIn("parallel_resource_finite_buffer_shortest_path_bound_v3", html)
+            self.assertIn("effective_processing_mttf_min", html)
+            self.assertIn("machine_failure_count.mean", html)
+            self.assertIn("preventive_maintenance_count.mean", html)
+            self.assertIn("battery_risk_assignment_count.mean", html)
             self.assertTrue((root / "theoretical_capacity.json").exists())
             self.assertIn("With one seed, standard deviation is left blank", html)
             self.assertNotIn('<div class="label">Rolling Window</div>', html)
@@ -776,6 +940,84 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
         self.assertIn(">휴머노이드 수</text>", chart)
         self.assertEqual("112", _format_chart_tick(112.0))
         self.assertEqual("0.025", _format_chart_tick(0.025))
+
+    def test_line_chart_sd_bounds_counts_and_single_seed(self) -> None:
+        chart = _line_chart(
+            [
+                {"mode": "a", "worker_count": "3", "products.mean": "10",
+                 "products.std": "4", "products.count": "20"},
+                {"mode": "a", "worker_count": "4", "products.mean": "20",
+                 "products.std": "8", "products.count": "20"},
+                {"mode": "b", "worker_count": "3", "products.mean": "3",
+                 "products.std": "0", "products.count": "1"},
+            ], "products.mean", "Products",
+        )
+        svg = ElementTree.fromstring(chart[chart.index("<svg"):chart.index("</svg>") + 6])
+        self.assertEqual("28", svg.get("data-y-max"))
+        self.assertEqual(1, len(svg.findall("polygon[@class='sd-band']")))
+        self.assertEqual(2, len(svg.findall("path[@class='sd-error-bar']")))
+        points = svg.findall("circle[@class='mean-point']")
+        self.assertEqual("20", points[0].get("data-n"))
+        self.assertIn("분산=16", points[0].findtext("title"))
+        self.assertEqual("", points[2].get("data-sd"))
+        self.assertIn("SD=추정 불가", points[2].findtext("title"))
+        self.assertIn("95% 신뢰구간이 아닙니다", chart)
+
+    def test_line_chart_ratio_clipping_and_missing_spread(self) -> None:
+        chart = _line_chart(
+            [
+                {"mode": "a", "worker_count": "3", "yield_ratio.mean": "0.1",
+                 "yield_ratio.std": "0.2", "yield_ratio.count": "20"},
+                {"mode": "a", "worker_count": "4", "yield_ratio.mean": "0.5",
+                 "yield_ratio.std": "nan", "yield_ratio.count": "20"},
+                {"mode": "a", "worker_count": "5", "yield_ratio.mean": "0.9",
+                 "yield_ratio.std": "0.2", "yield_ratio.count": "20"},
+            ], "yield_ratio.mean", "Yield",
+        )
+        self.assertIn("data-y-min='0'", chart)
+        self.assertIn("data-y-max='1'", chart)
+        self.assertNotIn("class='sd-band'", chart)
+        self.assertEqual(2, chart.count("class='sd-error-bar'"))
+
+    def test_marginal_sd_uses_seed_paired_differences(self) -> None:
+        for objective, metric, suffix, old, new, expected in (
+            ("maximize_throughput", "throughput_per_sim_hour", "marginal_gain",
+             [10, 20, 30], [14, 24, 34], 2.0),
+            ("minimize_makespan", "makespan_min", "marginal_reduction",
+             [120, 100, 80], [100, 80, 60], 10.0),
+        ):
+            with self.subTest(objective=objective):
+                runs = [
+                    {"objective_mode": objective, "mode": "a", "worker_count": workers,
+                     "seed": seed, "status": "completed", "comparison_eligible": True,
+                     metric: value}
+                    for workers, values in ((3, old), (5, new))
+                    for seed, value in enumerate(values, 1)
+                ]
+                rows = _mode_worker_summary(runs, [metric])
+                key = f"{metric}.{suffix}"
+                self.assertEqual("", rows[0][key])
+                self.assertGreater(rows[1][f"{metric}.std"], 0.0)
+                self.assertEqual(expected, rows[1][key])
+                self.assertEqual(0.0, rows[1][f"{key}.std"])
+                self.assertEqual(3, rows[1][f"{key}.count"])
+
+    def test_marginal_sd_uses_only_common_valid_seeds(self) -> None:
+        metric = "throughput_per_sim_hour"
+        runs = [
+            {"objective_mode": "maximize_throughput", "mode": "a",
+             "worker_count": workers, "seed": seed, "status": "completed",
+             "comparison_eligible": eligible, metric: value}
+            for workers, seed, value, eligible in (
+                (3, 1, 10, True), (3, 2, 20, True), (3, 3, 30, True),
+                (5, 1, 14, True), (5, 2, 24, False), (5, 4, 100, True),
+            )
+        ]
+        row = _mode_worker_summary(runs, [metric])[1]
+        self.assertEqual(2, row[f"{metric}.count"])
+        self.assertEqual(2.0, row[f"{metric}.marginal_gain"])
+        self.assertEqual(1, row[f"{metric}.marginal_gain.count"])
+        self.assertEqual("", row[f"{metric}.marginal_gain.std"])
 
     def test_dashboard_uses_competition_rank_for_equal_policy_values(self) -> None:
         metric = "throughput_per_sim_hour.mean"

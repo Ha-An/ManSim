@@ -83,17 +83,21 @@ Hydra 출력 경로를 고정할 수 있습니다.
 
 ## 기본 정책 비교 실험
 
-기본 profile은 `mfg_flow_shop`의 두 목적함수, 4개 rule-based 정책, worker 3~6명과 seed 2026을
-조합한 32개 run입니다. 완료 후 audit과 집계를 수행하고 `comparison_dashboard.html`을 자동으로
-엽니다.
+기본 profile은 `mfg_flow_shop`, 5일 throughput, worker 3명과 held-out seed 5개에서
+`simulation_based_adp`, `immediate_shared`, `random_feasible_dispatch`를 비교하는 15개 run입니다.
+ADP checkpoint를 명시해야 하며, 완료 후 audit과 집계를 수행하고
+`comparison_dashboard.html`을 자동으로 엽니다.
 
 ~~~powershell
-.\.venv\Scripts\python.exe experiments/factory_policy_comparison/run_experiment.py --dry-run
-.\.venv\Scripts\python.exe experiments/factory_policy_comparison/run_experiment.py
+.\.venv\Scripts\python.exe experiments/factory_policy_comparison/run_experiment.py --adp-checkpoint C:/path/to/best.pt --dry-run
+.\.venv\Scripts\python.exe experiments/factory_policy_comparison/run_experiment.py --adp-checkpoint C:/path/to/best.pt --jobs 5
 ~~~
 
 브라우저를 열 수 없는 환경에서는 `--no-open-dashboard`를 추가합니다. 자세한 실행 옵션과 결과
 구조는 [Factory Policy Comparison](experiments/factory_policy_comparison/README.md)을 참고합니다.
+
+이전의 두 목적함수, 4개 rule-based 정책, worker 3~6명, seed 2026 조합 32-run 실험은
+`config_mfg_flow_shop_4policy_objectives.yaml`로 보존합니다.
 
 ## Legacy Factory 6-Policy 비교 실험
 
@@ -132,6 +136,11 @@ item은 machine 안에 남고 해당 machine은 공간이 확보될 때까지 �
 Material 보충량은 고정 목표 재고가 아니라 미충족 machine 수요에서 queue와 inbound 재고를 뺀
 값으로 계산합니다.
 
+Machine 고장은 달력시간이 아니라 실제 가공 누적시간을 기준으로 평균 300분의
+지수분포 threshold를 사용합니다. 240 가공분마다 예방정비가 due가 되며, 정비 후
+다음 240 가공분은 고장 hazard가 0.5배로 낮아집니다. Repair urgency는 station의
+가용 설비, 정지 비율, 처리 수요와 machine 내 WIP를 반영합니다.
+
 Inspection은 세 개의 독립 task로 실행됩니다.
 
 ~~~text
@@ -141,7 +150,9 @@ LOAD_UNLOAD_TRANSFER_INTERFACE (desk load)
 ~~~
 
 Battery item 교환이나 전달은 사용하지 않습니다. Worker는 자신의 charging dock로 이동해 직접
-충전하며, dock tile에 도착한 뒤에만 SOC가 증가합니다.
+충전하며, dock tile에 도착한 뒤에만 SOC가 증가합니다. Battery margin이 음수인 작업도
+후보에서 제거하지 않아 정책이 위험을 판단합니다. 방전되면 현재 tile에 item을 내려놓고
+`DISABLED`로 대기한 뒤, 다음 day boundary에 전용 dock에서 SOC 100%로 복귀합니다.
 
 ### 목적함수
 
@@ -169,20 +180,17 @@ accepted product 또는 ScrapDisposal에 도착한 scrap으로 모두 종결되�
 
 Rolling Horizon은 worker polling이 아니라 독립 SimPy coordinator가 정확한
 <code>t = window, 2*window, ...</code> 시각에 미시작 queue를 회수하고 전체 재할당합니다. 실행 중
-task는 선점하지 않으며 low-battery self-charge만 현재 task 다음에 긴급 삽입됩니다.
+task는 선점하지 않으며, <code>mfg_flow_shop</code>의 critical repair는 idle worker queue를 즉시 갱신할 수 있습니다. Battery charge는 강제 삽입되지 않고 생산 task와 함께 정책이 선택합니다.
 
-### Worker 3 정책 비교
+### Worker 3 기본 정책 비교
 
 ADP 실험에서는 동일한 `mfg_flow_shop`, 5일 throughput 목적, worker 3명과 held-out seed를 사용해
-다음 여섯 정책을 비교합니다.
+다음 세 정책을 비교합니다.
 
 | Decision mode | 선택 방식 | 비교 역할 |
 | --- | --- | --- |
-| <code>random_feasible_dispatch</code> | WAIT와 충돌 없는 feasible task를 균등 무작위 선택 | 학습 없는 무작위 기준선 |
+| <code>random_feasible_dispatch</code> | 충돌 없는 feasible task를 균등 무작위 선택 | 학습 없는 무작위 기준선 |
 | <code>immediate_shared</code> | idle event마다 고정 priority로 즉시 선택 | 반응형 shared rule 기준선 |
-| <code>immediate_dedicated_roles</code> | idle event마다 전담 역할 안에서 즉시 선택 | 반응형 역할 분리 기준선 |
-| <code>rolling_horizon_shared</code> | strict periodic window마다 전체 재할당 | 주기형 shared 기준선 |
-| <code>rolling_horizon_dedicated_roles</code> | strict periodic window마다 역할 제약 하에 재할당 | 주기형 역할 분리 기준선 |
 | <code>simulation_based_adp</code> | 가치망과 beam search로 joint assignment 선택 | 학습 기반 정책 |
 
 정책 비교 dashboard는 평균 제품 수, 표준편차, 95% CI, worker 실행비율과 seed별 paired
@@ -244,6 +252,12 @@ inspection lifecycle와 이동 연속성을 확인합니다.
 
 ## 문서
 
+2026-09-26 기준 점검 내용은 [정책 실험 감사](docs/audits/2026-09-26_policy_study_audit.md)와
+[ADP 효율성 검토](docs/audits/2026-09-26_adp_efficiency_review.md)에 기록했습니다.
+설비 PM과 processing의 중첩을 수정했으므로 수정 전 결과를 새 환경의 성능으로 해석해서는
+안 됩니다. 기존 결과와 checkpoint는 로컬에 보존하며 Git에는 대용량 실험 산출물을 포함하지
+않습니다. 효율 개선 전 복구 기준은 [최적화 기준점](docs/adp_efficiency.md)을 참고하세요.
+
 - [Documentation Index](docs/README.md)
 - [Installation Guide](docs/installation.md)
 - [Simulator Core Guide](docs/simulator_core_guide.md)
@@ -256,56 +270,123 @@ inspection lifecycle와 이동 연속성을 확인합니다.
 
 ## Simulation-Based ADP (Optional)
 
-<code>simulation_based_adp</code>는 <code>mfg_flow_shop / maximize_throughput / worker 3</code> 전용
-event-driven joint assignment 정책입니다.
+<code>simulation_based_adp</code>는 <code>mfg_flow_shop / maximize_throughput / worker 3</code>용
+event-driven joint assignment 정책입니다. 기본 학습은
+<code>configs/adp/mfg_flow_shop_throughput.yaml</code>의 n-step TD profile을 사용합니다.
 
-표준 profile은 초기 Random Feasible 20 episode와 10회의 policy update별 100 episode를 사용해
-총 1,020 training episode를 생성합니다. WAIT는 일반 action으로 포함되며, mandatory charging을
-먼저 처리한 뒤 각 worker가 WAIT 또는 conflict-free feasible task를 선택합니다. 전원 WAIT
-afterstate에는 다음 1분 재검토까지의 시간 경과가 반영됩니다.
+기본 비교 계약에서는 명시적 WAIT를 사용하지 않습니다. 현재 mfg_flow_shop의 충전은
+일반 정책 선택 대상이며, idle worker는 conflict-free feasible task가 있으면 하나를 선택합니다. 수행할 수
+있는 task가 없는 강제 유휴는 WAIT 행동으로 집계하지 않습니다. WAIT 구현은 ablation을 위해
+보존되어 있으며 설정에서 명시적으로 다시 켤 수 있습니다.
 
-학습 target은 다음 decision epoch까지 증가한 completed product 수의 complete Monte Carlo
-return입니다. Potential shaping, TD, bootstrapping과 n-step target은 사용하지 않고
-post-decision value network를 MSE로 학습합니다. Raw transition은 episode 종료 직후 CPU compact
-tensor로 바뀌고 해당 100-episode update가 끝나면 폐기됩니다.
+초기 random 데이터부터 n-step TD(`n=30`)와 MSE로 학습합니다. 실제 완료 제품 보상과
+target value network의 bootstrap을 사용하며 gamma는 1, episode 종료 bootstrap은 0입니다.
+중간 행동이 업데이트 시작 시 고정한 greedy 정책과 다르면 그 행동 전에 target을 끊습니다.
+최근 100 episode의 CPU compact transition을 bounded replay로 유지하고 만료된 episode는 폐기합니다.
+정책 업데이트에는 현재 wave 10 episode를 모두 포함하고, 과거 replay에서 episode 20개를
+균등 추출해 총 30개의 완전한 episode를 사용합니다.
+Target network는 SGD step마다 tau=0.03으로 갱신합니다. Conservative gate, WAIT, potential
+shaping과 pairwise MC loss는 기본 비활성화입니다.
 
-Rollout은 CPU process 20개가 wave당 20 episode를 생성합니다. Main process만 <code>cuda:0</code>에서
-network를 업데이트합니다. 초기 random 1 wave, policy rollout 50 wave, checkpoint 0~10
-diagnostic 11 wave와 final selection 3 wave를 실행합니다.
+Rollout은 CPU process 10개가 wave당 10 episode를 생성합니다. Main process만 <code>cuda:0</code>에서
+network를 업데이트합니다. 초기 random 50 episode를 5 wave로 수집해 전체 50 episode로
+1 epoch 초기 학습하고, 이후 매 10-episode wave마다 75번 업데이트합니다. 정책 업데이트는
+현재 10 episode와 과거 replay에서 추출한 20 episode를 2 epoch 학습합니다. 총 800 training
+episode와 76번의 가치망 업데이트를 수행합니다.
+Epsilon은 iteration <code>0/25/50/75</code>에서 <code>0.50/0.15/0.08/0.05</code>, learning rate는
+iteration <code>0/20/30/60/75</code>에서 <code>5e-5/5e-5/2e-5/2e-5/1e-5</code>가 되도록 구간별
+선형 감소합니다. Validation은 checkpoint <code>0, 5, 10, ..., 75</code>에서 표시하며, screening
+상위 3개 checkpoint를 각각 별도 seed 20개로 평가해 최종 checkpoint를 정합니다. Beam search는
+의사결정마다 첫 worker를 순환해 고정된 worker 순서의 선점 편향을 줄입니다.
 
 ~~~powershell
-.\.venv\Scripts\python.exe -m manufacturing_sim.adp.train --config configs/adp/mfg_flow_shop_throughput_10x100.yaml
+.\.venv\Scripts\python.exe -m manufacturing_sim.adp.train --background
 ~~~
 
-결과는 <code>outputs/adp_training/&lt;timestamp&gt;/</code>에 저장됩니다.
+결과는 <code>outputs/adp_training_worker3_n_step_td/&lt;timestamp&gt;/</code>에 저장됩니다.
+
+`--background`는 학습을 독립 프로세스로 실행하고 즉시 명령을 반환합니다. 학습 중에도 Codex에서
+다른 작업을 할 수 있습니다. Chrome으로 열리는 `background_job/live_training.html`은 5초마다
+현재 단계, iteration, wave별 완료 episode, 전체 진행률, 경과시간, CPU process 수, GPU 장치와
+최근 로그를 갱신합니다. 기존 학습 그래프도 같은 화면에서 확인할 수 있으며 wave/iteration 완료 시 갱신됩니다.
+`--no-open-dashboard`를 함께 주면 브라우저 자동 열기만 끕니다. 기존 동기 실행은 `--background`를 빼면 됩니다.
+상태 확인과 중단 명령, worker별 연속 학습은 [백그라운드 학습](docs/adp_background_training.md)을 참고하세요.
+
+백그라운드 실행은 재부팅 후 자동 재개를 의미하지 않습니다. 절전·종료·재부팅은 피하고, 학습 도중
+다른 작업을 하더라도 해당 학습의 코드와 설정은 수정하지 않는 것을 권장합니다.
 
 - <code>best.pt</code>, <code>last.pt</code>, <code>checkpoints/iteration_*.pt</code>
 - <code>episode_metrics.csv</code>, <code>wave_metrics.csv</code>, <code>iteration_metrics.csv</code>
 - <code>checkpoint_selection.csv</code>, <code>training_summary.json</code>
-- <code>fixed_action_probe.json</code>
 - <code>training_dashboard.html</code>
+- <code>resolved_config.yaml</code>, <code>checkpoint_manifest.json</code>
 
-학습 dashboard는 checkpoint별 training/validation 생산량, post-decision value MSE/MAE/RMSE,
-WAIT 행동, 병렬 rollout 시간과 메모리를 표시합니다. 행동 선택 품질은 고정 반사실 MC probe의
-행동가치 순위 상관계수, 후보집합 Top-1 일치율과 선택 행동 regret으로 진단합니다. OOD 선택률과
+이전 MC 실험은 `mfg_flow_shop_throughput_worker3_wave_updates.yaml`에 보존합니다.
+이 legacy MC profile에서 `training.pairwise_mc_advantage.enabled=true`를 지정하면 동일한 상태에서 선택 행동과
+하나의 feasible 대안 행동을 공통 seed로 끝까지 재실행하고,
+`V(Sx_selected)-V(Sx_alternative)`가 실제 생산량 return 차이를 따르도록 추가 학습합니다. 이때
+학습 대시보드에는 pair 수, branch 시간, 업데이트 전후 pair MSE와 return 차이 부호 정확도가
+기록됩니다.
+
+기본 TD dashboard는 checkpoint별 rollout/validation 생산량, TD train/holdout MSE,
+미사용 greedy validation의 가치망 평균 예측과 실제 MC 평균 잔여 생산량, MC RMSE·편향,
+실제 n과 target 종료 사유,
+WAIT 계약, 지원 worker 수, beam worker 순서, 병렬 rollout 시간과 메모리를 표시합니다. 가치망은
+Station별 buffer 점유·예약·잔여 용량, 설비의 idle/processing/blocked/broken 비율과 평균 잔여시간,
+선택 edge의 이동·수행시간, battery margin, downstream progress, blockage 해소 여부 및 목적지
+가용 용량을 입력으로 사용합니다. OOD 선택률과
 OOD 과대평가 초과값은 현재 greedy 행동이 직전 on-policy batch의 지지영역을 벗어나는지 보여줍니다.
-Probe와 OOD 값은 경험적 진단이며 전역 최적해를 뜻하지 않습니다. 모든 그래프 하단에는 한국어
-해석을 함께 표시합니다.
+OOD 값은 경험적 진단이며 전역 최적해를 뜻하지 않습니다. 모든 그래프 하단에는 한국어
+해석을 함께 표시합니다. `Beam 후보 가치 엔트로피`는 0에 가까울수록 소수 행동에 가치가
+집중되고 1에 가까울수록 후보 행동의 예측 가치가 비슷함을 뜻하며, 생산량 추세와 함께
+정책의 건전한 집중 또는 잘못된 과신을 진단합니다.
+TD replay는 iteration 수가 아닌 최근 100 episode로 제한합니다. Episode ID가 10의 배수인
+표본은 고정 holdout이며 경사 학습에 쓰지 않습니다. TD 오차와 실제 greedy 미래 생산량
+예측 오차를 구분해야 합니다. 자세한 target 정의와 소형 검증 명령은
+[n-step TD 학습](docs/adp_n_step_td.md)에 정리했습니다.
 
-Checkpoint fingerprint에는 scenario, objective, worker 범위, timing profile, feature schema,
+별도 반사실 행동 검증은 기본 TD 학습에 추가하지 않습니다. 기존 MC profile에서는
+`diagnostics.value_validation.enabled: true`로 학습·checkpoint 선정 종료 후 실행할 수 있습니다.
+학습에 미사용한 seed의 RMSE·평균 편향·시간 기준 오차와, 동일 상태에서 반복 실행한 후보들의
+생산량 차이를 대시보드에 표시합니다. Worker 3에서 최대 40개의 진단 episode가 추가되며 기존
+`1/50/12/1` wave와 별도로 시간을 기록합니다. 기존 결과에도 재학습 없이 적용할 수 있으며
+실행법과 해석 범위는
+[ADP 가치함수 독립 검증](docs/adp_value_validation.md)에 정리했습니다.
+
+Checkpoint fingerprint에는 scenario, objective, 정확한 지원 worker 집합, worker 수별 환경,
+timing profile, feature schema,
 설비 ID와 수, processing distribution, finite-buffer capacity, inspection capacity와 지도 구조가
 포함됩니다. 하나라도 현재 환경과 다르면 fallback 없이 오류로 종료합니다.
+현재 feature schema는 <code>mfg_flow_shop_adp_v9</code>이며 terminal output까지의 예상 잔여시간을
+task feature로 포함합니다. 이전 schema의 checkpoint는
+명확한 불일치 오류로 거부됩니다.
 
 ~~~powershell
 .\.venv\Scripts\python.exe main.py scenario=mfg_flow_shop decision=simulation_based_adp decision.adp.checkpoint_path=C:/path/to/best.pt
 ~~~
 
-최종 비교는 학습과 checkpoint 선택에 사용하지 않은 seed <code>50001~50005</code>에서 Random
-Feasible, 네 rule-based 정책과 ADP를 총 30회 실행합니다.
+최종 기본 비교는 학습과 checkpoint 선택에 사용하지 않은 seed <code>50001~50005</code>에서 worker
+3명에 대해 ADP, Immediate Shared와 Random Feasible을 총 15회 실행합니다.
 
 ~~~powershell
-.\.venv\Scripts\python.exe experiments/factory_policy_comparison/run_experiment.py --config experiments/factory_policy_comparison/config_mfg_flow_shop_worker3_adp.yaml --adp-checkpoint C:/path/to/best.pt
+.\.venv\Scripts\python.exe experiments/factory_policy_comparison/run_experiment.py --adp-checkpoint C:/path/to/best.pt --jobs 5
 ~~~
 
 비교 dashboard는 평균, 표준편차, 95% CI, paired bootstrap CI, win/tie/loss와
 <code>ADP - Immediate Shared</code> 판정을 표시합니다.
+
+### 논문용 worker 2~6 확증 실험
+
+개발용 비교와 별도로 `experiments/mfg_flow_shop_paper/`에는 worker 2~6에 대해 ADP,
+Immediate Shared, Random Feasible을 비교하는 축소 확증 실험이 준비되어 있습니다. Worker별
+ADP를 한 번씩 총 5회 학습하고, 20개 공통 환경 seed로 총 300회 평가합니다. 학습 checkpoint는
+worker별로 보존되어 나머지 휴리스틱 정책을 나중에 추가할 때 재사용할 수 있습니다.
+
+~~~powershell
+.\.venv\Scripts\python.exe experiments/mfg_flow_shop_paper/prepare_experiment.py
+.\.venv\Scripts\python.exe experiments/mfg_flow_shop_paper/run_training.py --background
+.\.venv\Scripts\python.exe experiments/mfg_flow_shop_paper/run_evaluation.py --jobs 5
+~~~
+
+세부 seed 계약, 예상 시간·용량과 통계 분석 단위는
+[Confirmatory Policy Experiment](experiments/mfg_flow_shop_paper/README.md)을 참고하세요.

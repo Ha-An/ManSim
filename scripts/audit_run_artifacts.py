@@ -76,6 +76,28 @@ MFG_FLOW_SHOP_KPI_KEYS = [
     "machine_blocked_after_service_min",
     "candidate_count_avg",
     "candidate_count_max",
+    "machine_failure_time_basis",
+    "machine_failure_configured_mean_processing_min",
+    "machine_failure_count",
+    "machine_failure_count_by_machine",
+    "machine_failure_observed_processing_mttf_min",
+    "machine_processing_exposure_by_machine",
+    "machine_failure_threshold_by_machine",
+    "repair_count_by_urgency_tier",
+    "repair_response_time_avg_min",
+    "repair_response_time_avg_min_by_urgency_tier",
+    "preventive_maintenance_count",
+    "preventive_maintenance_protected_processing_min",
+    "preventive_maintenance_failure_count",
+    "battery_assignment_mode",
+    "battery_risk_assignment_count",
+    "battery_risk_expected_margin_avg_min",
+    "worker_depleted_during_task_count",
+    "worker_depleted_during_move_count",
+    "worker_recovery_scheduled_count",
+    "worker_returned_next_day_count",
+    "worker_task_interrupted_by_depletion_count",
+    "worker_item_dropped_by_depletion_count",
 ]
 SHIPYARD_KPI_KEYS = [
     "makespan_min",
@@ -650,7 +672,7 @@ def check_kpi(run_dir: Path, audit: Audit) -> None:
                 audit.error(f"mfg_flow_shop kpi.json missing key: {key}")
         if str(kpi.get("battery_service_mode", "")).strip().lower() != "dock_charge":
             audit.error("mfg_flow_shop battery_service_mode must be dock_charge")
-        for key in ("battery_swap_count", "battery_delivery_count", "preventive_maintenance_task_count", "handover_item_count"):
+        for key in ("battery_swap_count", "battery_delivery_count", "handover_item_count"):
             if int(kpi.get(key, 0) or 0) != 0:
                 audit.error(f"mfg_flow_shop {key} must be zero, got {kpi.get(key)}")
         for key in (
@@ -756,6 +778,16 @@ def check_gantt(run_dir: Path, events: list[dict[str, Any]], audit: Audit, scena
     invalid_worker_statuses = worker_statuses - AVAILABILITY_STATES - {"UNKNOWN", "CHARGING"}
     if invalid_worker_statuses:
         audit.error(f"gantt has non-availability worker statuses: {sorted(invalid_worker_statuses)}")
+    machine_lanes: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row.get("entity_group") == "Machine":
+            machine_lanes[str(row.get("lane", ""))].append(row)
+    for lane, segments in machine_lanes.items():
+        previous_end = 0.0
+        for segment in sorted(segments, key=lambda row: float(row["start"])):
+            if float(segment["start"]) < previous_end - 0.002:
+                audit.error(f"gantt machine intervals overlap: {lane} at {segment['start']}")
+            previous_end = max(previous_end, float(segment["end"]))
     # A positive-duration availability state in events must be represented in
     # the Gantt data; zero-duration ASSIGNED/WAITING transitions may only appear
     # in the legend and are intentionally ignored here.
@@ -1089,8 +1121,6 @@ def check_mfg_flow_shop_contract(run_dir: Path, events: list[dict[str, Any]], au
     forbidden_event_types = {
         "BATTERY_SWAP",
         "BATTERY_DELIVERED",
-        "MACHINE_PM_START",
-        "MACHINE_PM_END",
         "ITEM_HANDOFF_STARTED",
         "ITEM_HANDOFF_COMPLETED",
     }
@@ -1108,9 +1138,9 @@ def check_mfg_flow_shop_contract(run_dir: Path, events: list[dict[str, Any]], au
         details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
         task_type = str(details.get("task_type", "")).strip().upper()
         task_code = str(details.get("task_code", details.get("humanoid_task_code", ""))).strip().upper()
-        if task_type in {"PREVENTIVE_MAINTENANCE", "HANDOVER_ITEM", "BATTERY_SWAP"}:
+        if task_type in {"HANDOVER_ITEM", "BATTERY_SWAP"}:
             forbidden_tasks[task_type] += 1
-        if task_code in {"PREVENTIVE_MAINTENANCE", "HANDOVER_ITEM_TO_ROBOT"}:
+        if task_code == "HANDOVER_ITEM_TO_ROBOT":
             forbidden_tasks[task_code] += 1
     if forbidden_tasks:
         audit.error(f"mfg_flow_shop executed forbidden tasks: {dict(forbidden_tasks)}")
@@ -1185,12 +1215,18 @@ def check_mfg_flow_shop_contract(run_dir: Path, events: list[dict[str, Any]], au
         ),
         17: ("battery_charge", "MANAGE_ROBOT_POWER", "MANAGE_ROBOT_POWER", "self_service"),
         18: ("repair_machine", "REPAIR_MACHINE", "REPAIR_MACHINE", "collaborative"),
+        19: (
+            "preventive_maintenance",
+            "PREVENTIVE_MAINTENANCE",
+            "PREVENTIVE_MAINTENANCE",
+            "exclusive",
+        ),
     }
     rules_by_number = {
         int(row.get("role_number", 0) or 0): row for row in rules if isinstance(row, dict)
     }
-    if set(rules_by_number) != set(expected_roles) or len(rules) != 18:
-        audit.error(f"mfg_flow_shop role numbers must be exactly 1..18, got {sorted(rules_by_number)}")
+    if set(rules_by_number) != set(expected_roles) or len(rules) != 19:
+        audit.error(f"mfg_flow_shop role numbers must be exactly 1..19, got {sorted(rules_by_number)}")
     else:
         mismatched_roles = []
         for role_number, expected in expected_roles.items():
@@ -1210,8 +1246,8 @@ def check_mfg_flow_shop_contract(run_dir: Path, events: list[dict[str, Any]], au
         for row in rules
         if isinstance(row, dict) and str(row.get("kind", "exclusive")).strip() == "exclusive"
     }
-    if len(exclusive_rules) != 16:
-        audit.error(f"mfg_flow_shop expected 16 exclusive task rules, got {len(exclusive_rules)}")
+    if len(exclusive_rules) != 17:
+        audit.error(f"mfg_flow_shop expected 17 exclusive task rules, got {len(exclusive_rules)}")
     owner_by_rule = policy.get("owner_by_rule", {}) if isinstance(policy.get("owner_by_rule", {}), dict) else {}
     dedicated = bool(policy.get("dedicated_roles", False))
     workers = policy.get("workers", {}) if isinstance(policy.get("workers", {}), dict) else {}
@@ -1222,8 +1258,8 @@ def check_mfg_flow_shop_contract(run_dir: Path, events: list[dict[str, Any]], au
         role_numbers = set(int(number) for number in payload.get("role_numbers", []))
         if not {"battery_charge", "repair_machine"}.issubset(assigned) or not {17, 18}.issubset(role_numbers):
             audit.error(f"mfg_flow_shop worker {worker_id} is missing common roles 17/18")
-        if not dedicated and (len(assigned) != 18 or role_numbers != set(range(1, 19))):
-            audit.error(f"mfg_flow_shop shared worker {worker_id} does not own all 18 roles")
+        if not dedicated and (len(assigned) != 19 or role_numbers != set(range(1, 20))):
+            audit.error(f"mfg_flow_shop shared worker {worker_id} does not own all 19 roles")
     if owner_by_rule.get("battery_charge") != "self":
         audit.error("mfg_flow_shop role 17 owner must be self")
     if owner_by_rule.get("repair_machine") != worker_ids:
@@ -1320,6 +1356,113 @@ def check_mfg_flow_shop_contract(run_dir: Path, events: list[dict[str, Any]], au
             role_violations.append(f"task end t={event.get('t')} nested/direct rule metadata mismatch")
     if role_violations:
         audit.error(f"mfg_flow_shop role violations: {role_violations[:10]}")
+
+    kpi = _load_json(run_dir / "kpi.json", audit)
+    if isinstance(kpi, dict):
+        if str(kpi.get("machine_failure_time_basis", "")).strip().lower() != "active_processing":
+            audit.error("mfg_flow_shop machine failure clock is not active_processing")
+        if str(kpi.get("battery_assignment_mode", "")).strip().lower() != "policy_decides":
+            audit.error("mfg_flow_shop battery assignment mode is not policy_decides")
+
+    threshold_keys = Counter(
+        (str(event.get("entity_id", "")), round(float(event.get("t", 0.0) or 0.0), 6))
+        for event in events
+        if str(event.get("type", "")).strip().upper()
+        == "MACHINE_FAILURE_PROCESSING_THRESHOLD_REACHED"
+    )
+    processing_failure_keys = Counter()
+    for event in events:
+        if str(event.get("type", "")).strip().upper() != "MACHINE_BROKEN":
+            continue
+        details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+        if str(details.get("reason", "")).strip().lower() != "stochastic_processing_exposure":
+            continue
+        processing_failure_keys[
+            (str(event.get("entity_id", "")), round(float(event.get("t", 0.0) or 0.0), 6))
+        ] += 1
+    if threshold_keys != processing_failure_keys:
+        audit.error(
+            "active-processing failure threshold/break events do not match: "
+            f"threshold_only={list((threshold_keys - processing_failure_keys).elements())[:10]} "
+            f"break_only={list((processing_failure_keys - threshold_keys).elements())[:10]}"
+        )
+
+    pm_starts = Counter(
+        str(event.get("entity_id", ""))
+        for event in events
+        if str(event.get("type", "")).strip().upper() == "MACHINE_PM_START"
+    )
+    pm_ends = Counter(
+        str(event.get("entity_id", ""))
+        for event in events
+        if str(event.get("type", "")).strip().upper() == "MACHINE_PM_END"
+    )
+    excess_pm_ends = pm_ends - pm_starts
+    if excess_pm_ends:
+        audit.error(f"preventive-maintenance end without start: {dict(excess_pm_ends)}")
+    open_pm = pm_starts - pm_ends
+    if open_pm:
+        audit.note(f"preventive maintenance remained active at the run horizon: {dict(open_pm)}")
+    protected_budget = sum(
+        float(
+            (event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}).get(
+                "protected_processing_min", 0.0
+            )
+            or 0.0
+        )
+        for event in events
+        if str(event.get("type", "")).strip().upper() == "MACHINE_PM_EFFECT_STARTED"
+    )
+    if isinstance(kpi, dict) and float(
+        kpi.get("preventive_maintenance_protected_processing_min", 0.0) or 0.0
+    ) > protected_budget + 1e-6:
+        audit.error("recorded PM-protected processing exceeds the granted processing-time budget")
+
+    recovery_schedule: dict[str, list[float]] = defaultdict(list)
+    returned_events: list[dict[str, Any]] = []
+    risk_start_count = 0
+    for event in events:
+        event_type = str(event.get("type", "")).strip().upper()
+        worker_id = str(event.get("entity_id", "")).strip()
+        details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+        if event_type == "WORKER_RECOVERY_SCHEDULED":
+            recovery_schedule[worker_id].append(float(details.get("recovery_at_min", -1.0) or -1.0))
+        elif event_type == "WORKER_RETURNED_NEXT_DAY":
+            returned_events.append(event)
+        elif event_type == "AGENT_TASK_START":
+            selection = details.get("selection", {}) if isinstance(details.get("selection", {}), dict) else {}
+            risk = selection.get("battery_risk", {}) if isinstance(selection.get("battery_risk", {}), dict) else {}
+            payload = details.get("payload", {}) if isinstance(details.get("payload", {}), dict) else {}
+            source = risk or payload
+            if bool(source.get("battery_depletion_risk", False)):
+                risk_start_count += 1
+
+    for event in returned_events:
+        worker_id = str(event.get("entity_id", "")).strip()
+        event_time = float(event.get("t", 0.0) or 0.0)
+        details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
+        scheduled = recovery_schedule.get(worker_id, [])
+        if not any(abs(value - event_time) <= 1e-6 for value in scheduled):
+            audit.error(f"{worker_id} returned at t={event_time:g} without a matching recovery schedule")
+        if str(details.get("relocation_kind", "")).strip() != "scheduled_external_recovery":
+            audit.error(f"{worker_id} recovery relocation is not marked as scheduled_external_recovery")
+        minutes_per_day = float(run_meta.get("minutes_per_day", 0.0) or 0.0)
+        if minutes_per_day > 0.0 and abs(event_time / minutes_per_day - round(event_time / minutes_per_day)) > 1e-7:
+            audit.error(f"{worker_id} returned off a day boundary at t={event_time:g}")
+        if not str(details.get("charging_dock_id", "")).strip() or not details.get("to_tile"):
+            audit.error(f"{worker_id} recovery is missing charging dock/tile metadata")
+
+    if isinstance(kpi, dict):
+        if int(kpi.get("worker_recovery_scheduled_count", 0) or 0) != sum(
+            len(values) for values in recovery_schedule.values()
+        ):
+            audit.error("worker recovery schedule KPI does not match events")
+        if int(kpi.get("worker_returned_next_day_count", 0) or 0) != len(returned_events):
+            audit.error("worker next-day return KPI does not match events")
+        if int(kpi.get("battery_risk_assignment_count", 0) or 0) != risk_start_count:
+            audit.error("battery-risk assignment KPI does not match task-start events")
+        if str(kpi.get("termination_reason", "")).strip() == "all_agents_discharged":
+            audit.error("mfg_flow_shop terminated despite next-day depleted-worker recovery")
 
 
 
@@ -1499,12 +1642,23 @@ def check_strict_periodic_rolling_horizon(
         details = event.get("details", {}) if isinstance(event.get("details", {}), dict) else {}
         trigger = str(details.get("collection_trigger", "")).strip().lower()
         task_code = str(details.get("task_code", "")).strip().upper()
-        if trigger != "worker_low_battery" or task_code not in {"MANAGE_ROBOT_POWER", "TRANSFER"}:
+        allowed_battery_bypass = (
+            trigger == "worker_low_battery"
+            and task_code in {"MANAGE_ROBOT_POWER", "TRANSFER"}
+        )
+        allowed_critical_repair_bypass = (
+            trigger == "machine_broken_critical"
+            and task_code == "REPAIR_MACHINE"
+        )
+        if not (allowed_battery_bypass or allowed_critical_repair_bypass):
             invalid_immediate.append(
                 f"t={event.get('t')} trigger={trigger or '-'} task={task_code or '-'}"
             )
     if invalid_immediate:
-        audit.error(f"non-battery task bypassed strict rolling boundaries: {invalid_immediate[:10]}")
+        audit.error(
+            "task bypassed strict rolling boundaries without an allowed battery/critical-repair trigger: "
+            f"{invalid_immediate[:10]}"
+        )
 
     run_meta_path = run_dir / "run_meta.json"
     if run_meta_path.exists():
@@ -1553,9 +1707,10 @@ def audit_run(run_dir: Path, *, require_replay_log: bool = True) -> Audit:
     if not event_log_enabled:
         check_kpi(run_dir, audit)
         check_layout(run_dir, audit, _scenario_type(run_dir))
+        check_gantt(run_dir, [], audit, _scenario_type(run_dir))
         audit.note(
             "event log audit skipped because runtime.artifacts.export_events=false; "
-            "KPI and compact layout contracts were checked"
+            "KPI, Gantt intervals and compact layout contracts were checked"
         )
         return audit
     events = _iter_events(run_dir / "events.jsonl", audit)

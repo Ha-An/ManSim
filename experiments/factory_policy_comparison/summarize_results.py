@@ -69,6 +69,18 @@ DASHBOARD_REQUIRED_METRICS = [
     "humanoid_execution_ratio_avg",
     "humanoid_blocked_ratio_avg",
     "otc",
+    "machine_failure_count",
+    "machine_failure_observed_processing_mttf_min",
+    "repair_response_time_avg_min",
+    "preventive_maintenance_count",
+    "preventive_maintenance_protected_processing_min",
+    "preventive_maintenance_failure_count",
+    "battery_risk_assignment_count",
+    "battery_risk_expected_margin_avg_min",
+    "worker_depleted_during_task_count",
+    "worker_depleted_during_move_count",
+    "worker_returned_next_day_count",
+    "agent_discharged_time_min_total",
     "makespan_min",
     "initial_batch_progress_ratio",
     "initial_batch_yield_ratio",
@@ -133,7 +145,18 @@ def _run_row(
         ),
     }
     for metric in metrics:
-        row[metric] = nested_get(kpi, metric, "")
+        value = nested_get(kpi, metric, "")
+        # Older artifacts encoded observation-conditioned averages as zero
+        # when no matching event occurred. Exclude those sentinels so zero is
+        # not mistaken for an observed duration or margin.
+        observation_count_key = {
+            "machine_failure_observed_processing_mttf_min": "machine_failure_count",
+            "repair_response_time_avg_min": "machine_failure_count",
+            "battery_risk_expected_margin_avg_min": "battery_risk_assignment_count",
+        }.get(metric)
+        if observation_count_key and int(kpi.get(observation_count_key, 0) or 0) == 0:
+            value = ""
+        row[metric] = value
     return row
 
 
@@ -164,6 +187,7 @@ def _mode_summary(run_rows: list[dict[str, object]], metrics: list[str]) -> list
         for metric in metrics:
             values = [value for value in (as_float(row.get(metric)) for row in mode_rows) if value is not None]
             summary[f"{metric}.mean"] = round(mean(values), 6) if values else ""
+            summary[f"{metric}.count"] = len(values)
             # A sample standard deviation is undefined for a single run. Keep
             # the cell empty instead of presenting false zero uncertainty.
             summary[f"{metric}.std"] = round(sample_std(values), 6) if len(values) > 1 else ""
@@ -187,6 +211,7 @@ def _mode_worker_summary(run_rows: list[dict[str, object]], metrics: list[str]) 
         key=lambda item: (item[0], item[1], item[2]),
     )
     rows: list[dict[str, object]] = []
+    seed_values: dict[tuple[str, str, int, str], dict[int, float]] = {}
     for objective_mode, mode, worker_count in keys:
         completed_rows = [
             row
@@ -207,41 +232,47 @@ def _mode_worker_summary(run_rows: list[dict[str, object]], metrics: list[str]) 
         for metric in metrics:
             values = [value for value in (as_float(row.get(metric)) for row in group_rows) if value is not None]
             summary[f"{metric}.mean"] = round(mean(values), 6) if values else ""
+            summary[f"{metric}.count"] = len(values)
             summary[f"{metric}.std"] = round(sample_std(values), 6) if len(values) > 1 else ""
             summary[f"{metric}.min"] = round(min(values), 6) if values else ""
             summary[f"{metric}.max"] = round(max(values), 6) if values else ""
+            if metric in {"throughput_per_sim_hour", "makespan_min"}:
+                seed_values[(objective_mode, mode, worker_count, metric)] = {
+                    int(row["seed"]): value
+                    for row in group_rows
+                    if row.get("seed") is not None
+                    and (value := as_float(row.get(metric))) is not None
+                }
         rows.append(summary)
 
-    previous_throughput: dict[tuple[str, str], tuple[int, float]] = {}
-    previous_makespan: dict[tuple[str, str], tuple[int, float]] = {}
+    previous_workers: dict[tuple[str, str, str], int] = {}
     for row in rows:
         objective_mode = str(row.get("objective_mode", "scenario_default"))
         mode = str(row.get("mode", ""))
         current_worker_count = int(row.get("worker_count", 0) or 0)
-        group_key = (objective_mode, mode)
-        throughput = as_float(row.get("throughput_per_sim_hour.mean"))
-        if objective_mode != "maximize_throughput" or throughput is None:
-            row["throughput_per_sim_hour.marginal_gain"] = ""
-        else:
-            previous = previous_throughput.get(group_key)
-            row["throughput_per_sim_hour.marginal_gain"] = (
-                ""
-                if previous is None
-                else round((throughput - previous[1]) / max(1, current_worker_count - previous[0]), 6)
-            )
-            previous_throughput[group_key] = (current_worker_count, throughput)
-
-        makespan = as_float(row.get("makespan_min.mean"))
-        if objective_mode != "minimize_makespan" or makespan is None:
-            row["makespan_min.marginal_reduction"] = ""
-        else:
-            previous = previous_makespan.get(group_key)
-            row["makespan_min.marginal_reduction"] = (
-                ""
-                if previous is None
-                else round((previous[1] - makespan) / max(1, current_worker_count - previous[0]), 6)
-            )
-            previous_makespan[group_key] = (current_worker_count, makespan)
+        for objective, metric, suffix, direction in (
+            ("maximize_throughput", "throughput_per_sim_hour", "marginal_gain", 1.0),
+            ("minimize_makespan", "makespan_min", "marginal_reduction", -1.0),
+        ):
+            key = f"{metric}.{suffix}"
+            row[key], row[f"{key}.std"], row[f"{key}.count"] = "", "", 0
+            current = seed_values.get((objective_mode, mode, current_worker_count, metric), {})
+            if objective_mode != objective or not current:
+                continue
+            group_key = (objective_mode, mode, metric)
+            previous_worker = previous_workers.get(group_key)
+            if previous_worker is not None:
+                previous = seed_values[(objective_mode, mode, previous_worker, metric)]
+                gap = current_worker_count - previous_worker
+                # Paired differences preserve covariance between common seeds.
+                differences = [
+                    direction * (current[seed] - previous[seed]) / gap
+                    for seed in sorted(current.keys() & previous.keys())
+                ]
+                row[key] = round(mean(differences), 6) if differences else ""
+                row[f"{key}.std"] = round(sample_std(differences), 6) if len(differences) > 1 else ""
+                row[f"{key}.count"] = len(differences)
+            previous_workers[group_key] = current_worker_count
     return rows
 
 

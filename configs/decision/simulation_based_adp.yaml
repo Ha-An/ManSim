@@ -12,9 +12,11 @@ adp:
   device: auto
   training: false
   force_random_policy: false
-  # WAIT is a regular action. An all-WAIT afterstate advances the encoded
-  # clock by max_review_interval_min so waiting is not treated as cost-free.
-  allow_wait_action: true
+  # Explicit WAIT is disabled for fair work-conserving policy comparisons.
+  # Set true only for a dedicated WAIT ablation experiment.
+  allow_wait_action: false
+  # Rotate the first worker expanded by beam search at every joint decision.
+  worker_order_strategy: cyclic
   beam_width: 64
   max_review_interval_min: 1.0
   exploration_epsilon: 0.0

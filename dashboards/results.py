@@ -219,6 +219,39 @@ def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) 
                     "Total simulated time spent charging; travel to the dock is excluded.",
                 ),
                 (
+                    "Active-Processing Failures",
+                    _format_value(_safe_float(kpi.get("machine_failure_count", 0)), "count"),
+                    "Failures triggered by accumulated machine processing, not elapsed calendar time.",
+                ),
+                (
+                    "Preventive Maintenance",
+                    _format_value(_safe_float(kpi.get("preventive_maintenance_count", 0)), "count"),
+                    "Completed PM tasks; each grants a lower-hazard active-processing interval.",
+                ),
+                (
+                    "PM-Protected Processing",
+                    _format_value(
+                        _safe_float(kpi.get("preventive_maintenance_protected_processing_min", 0.0)),
+                        "minutes",
+                    ),
+                    "Actual processing minutes completed while the PM hazard multiplier was active.",
+                ),
+                (
+                    "Battery-Risk Assignments",
+                    _format_value(_safe_float(kpi.get("battery_risk_assignment_count", 0)), "count"),
+                    "Selected tasks with a negative expected battery margin after dock return time.",
+                ),
+                (
+                    "Next-Day Returns",
+                    _format_value(_safe_float(kpi.get("worker_returned_next_day_count", 0)), "count"),
+                    "Depleted workers externally restored at their assigned dock on a day boundary.",
+                ),
+                (
+                    "Depleted Unavailable Time",
+                    _format_value(_safe_float(kpi.get("agent_discharged_time_min_total", 0.0)), "minutes"),
+                    "Total worker-minutes lost between depletion and next-day recovery or horizon end.",
+                ),
+                (
                     "Finite Buffer Safety",
                     "PASS"
                     if _safe_int(kpi.get("buffer_overflow_attempt_count", 0)) == 0
@@ -307,7 +340,7 @@ def _summary_cards(kpi: dict[str, Any], run_meta: dict[str, Any] | None = None) 
                 (
                     "Rolling Scheduler",
                     f"{scheduler_mode.replace('_', ' ').title()} / {window_min:g} min",
-                    "Worker-independent periodic dispatch; low-battery service is the only immediate exception.",
+                    "Worker-independent periodic dispatch; configured battery service and critical repair may bypass the boundary.",
                 ),
                 (
                     "Boundary Timing",

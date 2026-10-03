@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 import os
 import shutil
 import subprocess
@@ -64,6 +65,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds", nargs="*", type=int, default=None, help="Optional subset of seeds.")
     parser.add_argument("--worker-counts", nargs="*", type=int, default=None, help="Optional subset of worker counts.")
     parser.add_argument("--adp-checkpoint", type=Path, default=None, help="Checkpoint for simulation_based_adp runs.")
+    parser.add_argument(
+        "--allow-undeclared-held-out-seeds",
+        action="store_true",
+        help=(
+            "Allow comparison seeds not listed in the checkpoint held-out partition. "
+            "Training/validation overlap is still rejected and undeclared seeds are recorded in experiment_plan.json."
+        ),
+    )
     parser.add_argument("--days", type=int, default=None, help="Override horizon days.")
     parser.add_argument("--makespan-max-days", type=int, default=None, help="Override the makespan safety limit.")
     parser.add_argument(
@@ -140,7 +149,22 @@ def experiment_audit_failed(summary: dict[str, object]) -> bool:
     )
 
 
-def validate_adp_held_out_seeds(checkpoint_path: Path, held_out_seeds: list[int]) -> dict[str, object]:
+def validate_adp_held_out_seeds(
+    checkpoint_path: Path,
+    held_out_seeds: list[int],
+    worker_counts: list[int] | None = None,
+    *,
+    allow_undeclared: bool = False,
+) -> dict[str, object]:
+    def partition_values(value: object) -> list[int]:
+        if isinstance(value, dict):
+            raw_values = value.get("values", [])
+        elif isinstance(value, list):
+            raw_values = value
+        else:
+            raw_values = []
+        return [int(item) for item in raw_values if str(item).strip()]
+
     try:
         import torch
     except ModuleNotFoundError as exc:
@@ -157,26 +181,52 @@ def validate_adp_held_out_seeds(checkpoint_path: Path, held_out_seeds: list[int]
         raise RuntimeError("ADP checkpoint reports overlapping seed partitions")
     used: set[int] = set()
     for name in ("training", "screening_validation", "final_selection_validation"):
-        row = partitions.get(name, {}) if isinstance(partitions.get(name, {}), dict) else {}
-        used.update(int(value) for value in row.get("values", []) if str(value).strip())
+        used.update(partition_values(partitions.get(name)))
     overlap = sorted(used & {int(seed) for seed in held_out_seeds})
     if overlap:
         raise RuntimeError(f"held-out experiment seeds overlap ADP training/validation seeds: {overlap}")
-    held_out_row = (
-        partitions.get("held_out_test", {})
-        if isinstance(partitions.get("held_out_test", {}), dict)
-        else {}
-    )
-    declared_held_out = {int(value) for value in held_out_row.get("values", [])}
+    declared_held_out = set(partition_values(partitions.get("held_out_test")))
     requested_held_out = {int(seed) for seed in held_out_seeds}
     undeclared = sorted(requested_held_out - declared_held_out)
-    if undeclared:
+    if undeclared and not allow_undeclared:
         raise RuntimeError(
             f"experiment seeds are not declared in the checkpoint held-out partition: {undeclared}"
         )
-    worker_range = manifest.get("worker_count_range", [])
-    if worker_range != [3, 3]:
-        raise RuntimeError(f"worker-3 ADP comparison requires worker_count_range=[3, 3], got {worker_range}")
+    requested_worker_counts = sorted({int(value) for value in (worker_counts or [3])})
+    supported_worker_counts = manifest.get("supported_worker_counts")
+    if isinstance(supported_worker_counts, list) and supported_worker_counts:
+        supported = sorted({int(value) for value in supported_worker_counts})
+    else:
+        worker_range = manifest.get("worker_count_range", [])
+        if not isinstance(worker_range, list) or len(worker_range) != 2 or worker_range[0] != worker_range[1]:
+            raise RuntimeError(
+                "ADP checkpoint must declare exact supported_worker_counts for a multi-fleet comparison; "
+                f"got worker_count_range={worker_range}"
+            )
+        supported = [int(worker_range[0])]
+    unsupported = sorted(set(requested_worker_counts) - set(supported))
+    if unsupported:
+        raise RuntimeError(
+            "ADP checkpoint does not support requested worker counts: "
+            f"unsupported={unsupported}, supported={supported}"
+        )
+    environment_by_worker = manifest.get("environment_fingerprints_by_worker_count", {})
+    if len(requested_worker_counts) > 1:
+        missing_environment = [
+            worker_count
+            for worker_count in requested_worker_counts
+            if not isinstance(environment_by_worker, dict)
+            or not str(environment_by_worker.get(str(worker_count), ""))
+        ]
+        if missing_environment:
+            raise RuntimeError(
+                "ADP checkpoint is missing worker-specific environment fingerprints: "
+                f"{missing_environment}"
+            )
+    if bool(manifest.get("wait_action_enabled", False)):
+        raise RuntimeError("Fair policy comparison requires an ADP checkpoint with WAIT disabled")
+    if str(manifest.get("worker_order_strategy", "")) != "cyclic":
+        raise RuntimeError("Fair policy comparison requires worker_order_strategy=cyclic")
     return {
         "checkpoint": str(path),
         "checkpoint_id": str(manifest.get("checkpoint_id", "")),
@@ -184,6 +234,21 @@ def validate_adp_held_out_seeds(checkpoint_path: Path, held_out_seeds: list[int]
         "overlap": overlap,
         "seed_partitions_present": True,
         "declared_held_out_seed_count": len(declared_held_out),
+        "undeclared_held_out_seeds": undeclared,
+        "held_out_declaration_enforced": not allow_undeclared,
+        "supported_worker_counts": supported,
+        "requested_worker_counts": requested_worker_counts,
+        "wait_action_enabled": False,
+        "worker_order_strategy": "cyclic",
+        "return_estimator": str(manifest.get("return_estimator", "")),
+        "horizon_days": int(manifest.get("horizon_days", 0) or 0),
+        "feature_schema_version": str(manifest.get("feature_schema_version", "")),
+        "environment_fingerprints_by_worker_count": {
+            str(worker_count): str(environment_by_worker.get(str(worker_count), ""))
+            for worker_count in requested_worker_counts
+        },
+        "n_step": int((manifest.get("training", {}) or {}).get("n_step", 0) or 0),
+        "target_tau": float((manifest.get("training", {}) or {}).get("target_tau", 0.0) or 0.0),
     }
 
 
@@ -192,6 +257,13 @@ def main() -> int:
     if args.jobs < 1:
         raise ValueError("jobs must be at least 1")
     cfg = load_experiment_config(args.config)
+    if cfg.benchmark_seeds_locked and args.seeds is not None:
+        requested_seeds = [int(seed) for seed in args.seeds]
+        if requested_seeds != cfg.seeds:
+            raise ValueError(
+                "benchmark seeds are locked by the experiment config: "
+                f"expected={cfg.seeds}, requested={requested_seeds}"
+            )
     effective_cfg = replace(
         cfg,
         horizon_days=int(args.days if args.days is not None else cfg.horizon_days),
@@ -237,6 +309,11 @@ def main() -> int:
         adp_preflight = validate_adp_held_out_seeds(
             Path(next(iter(checkpoint_values))),
             sorted({spec.seed for spec in specs}),
+            sorted({spec.worker_count for spec in adp_specs}),
+            allow_undeclared=(
+                bool(args.allow_undeclared_held_out_seeds)
+                or bool(cfg.benchmark_seeds_locked)
+            ),
         )
 
     if args.dry_run:
@@ -249,6 +326,8 @@ def main() -> int:
             print(" ".join(command))
         return 0
 
+    experiment_started_perf = time.perf_counter()
+    experiment_started_at = datetime.now(timezone.utc).isoformat()
     output_root.mkdir(parents=True, exist_ok=True)
     shutil.copy2(args.config, output_root / "experiment_config.yaml")
     write_json(
@@ -262,9 +341,16 @@ def main() -> int:
             "modes": list(dict.fromkeys(spec.mode for spec in specs)),
             "worker_counts": sorted({spec.worker_count for spec in specs}),
             "seeds": sorted({spec.seed for spec in specs}),
+            "benchmark_seeds_locked": bool(cfg.benchmark_seeds_locked),
             "run_count": len(specs),
+            "parallel_jobs": int(args.jobs),
             "rolling_window_min": args.rolling_window_min,
             "adp_preflight": adp_preflight,
+            "policy_contract": {
+                "explicit_wait_action_enabled": False,
+                "forced_idle_without_feasible_task_allowed": True,
+                "beam_worker_order_strategy": "cyclic",
+            },
         },
     )
 
@@ -382,17 +468,44 @@ def main() -> int:
                     f"elapsed_sec={row['elapsed_sec']}"
                 )
 
+    run_phase_wall_sec = time.perf_counter() - experiment_started_perf
+
     postprocess_failed = False
     if not args.no_postprocess:
         audit_summary = audit_experiment(output_root, effective_cfg)
         postprocess_failed = experiment_audit_failed(audit_summary)
         summarize_results(output_root, effective_cfg)
+        write_json(
+            output_root / "experiment_timing.json",
+            {
+                "started_at_utc": experiment_started_at,
+                "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                "parallel_jobs": int(args.jobs),
+                "run_phase_wall_sec": round(run_phase_wall_sec, 3),
+                "experiment_wall_sec_through_summary": round(
+                    time.perf_counter() - experiment_started_perf, 3
+                ),
+                "measurement": "monotonic_parent_process_wall_clock",
+            },
+        )
         dashboard_path = render_dashboard(output_root, effective_cfg)
         print(f"dashboard: {dashboard_path.resolve()}")
         if not args.no_open_dashboard:
             opened = open_experiment_dashboard(dashboard_path)
             print(f"dashboard_opened: {str(opened).lower()}")
         print(f"experiment_audit_passed: {str(not postprocess_failed).lower()}")
+    else:
+        write_json(
+            output_root / "experiment_timing.json",
+            {
+                "started_at_utc": experiment_started_at,
+                "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                "parallel_jobs": int(args.jobs),
+                "run_phase_wall_sec": round(run_phase_wall_sec, 3),
+                "experiment_wall_sec_through_summary": round(run_phase_wall_sec, 3),
+                "measurement": "monotonic_parent_process_wall_clock",
+            },
+        )
 
     return 1 if postprocess_failed else 0
 

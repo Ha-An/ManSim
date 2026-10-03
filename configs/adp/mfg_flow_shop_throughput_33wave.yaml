@@ -16,6 +16,7 @@ algorithm:
   td_bootstrap_enabled: false
   initial_policy: uniform_random_feasible_no_wait
   allow_wait_action: false
+  worker_order_strategy: cyclic
 
 training:
   # 1 initial wave plus 30 policy waves (15 updates x 2 waves).

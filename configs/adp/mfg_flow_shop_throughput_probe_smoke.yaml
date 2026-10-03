@@ -22,14 +22,17 @@ algorithm:
   return_estimator: monte_carlo
   n_step_enabled: false
   td_bootstrap_enabled: false
-  initial_policy: uniform_random_feasible_with_wait
-  allow_wait_action: true
+  initial_policy: uniform_random_feasible_no_wait
+  allow_wait_action: false
+  worker_order_strategy: cyclic
 
 training:
   initial_random_episodes: 2
   policy_iterations: 1
   episodes_per_iteration: 2
-  replay_scope: current_iteration
+  replay_scope: recent_window
+  replay_window_iterations: 5
+  latest_iteration_weight: 2.0
   compact_episode_tensors: true
   release_samples_after_update: true
   validation_episode_fraction: 0.5

@@ -1,0 +1,111 @@
+scenario: mfg_flow_shop
+objective_mode: maximize_throughput
+horizon_days: 5
+worker_counts: [3]
+base_seed: 2026
+
+seed_partitions:
+  enforce_disjoint: true
+  screening_validation: [102626, 102627, 102628, 102629, 102630, 102631, 102632, 102633, 102634, 102635]
+  final_selection_validation: [102646, 102647, 102648, 102649, 102650, 102651, 102652, 102653, 102654, 102655]
+  held_out_test: [50001, 50002, 50003, 50004, 50005]
+
+diagnostics:
+  value_validation:
+    enabled: false
+    checkpoints: [initial, best, last]
+    mc_seeds: [942001, 942002, 942003]
+    action_checkpoints: [best]
+    action_seeds: [943001]
+    decision_thresholds: [20, 100]
+    candidates_per_state: 3
+    future_seeds: [944001, 944002, 944003, 944004, 944005]
+    process_count: 10
+  ood_support:
+    enabled: true
+    reference_samples: 1024
+    calibration_samples: 1024
+    evaluation_samples: 4096
+    quantile: 0.95
+  fixed_action_probe:
+    enabled: false
+
+algorithm:
+  return_estimator: n_step_td
+  n_step_enabled: true
+  n_step: 30
+  td_bootstrap_enabled: true
+  off_policy_correction: truncate_on_greedy_mismatch
+  initial_policy: uniform_random_feasible_no_wait
+  allow_wait_action: false
+  worker_order_strategy: cyclic
+
+policy_update:
+  mode: always_accept
+  enabled: false
+  acceptance_metric: completed_products_mean
+  min_improvement: 0.0
+  rollback_model: false
+  rollback_optimizer: false
+
+training:
+  # Match the v8 baseline budget exactly: 50 initial episodes and 50 updates.
+  initial_random_episodes: 50
+  policy_iterations: 50
+  episodes_per_iteration: 10
+  replay_scope: recent_episodes
+  replay_capacity_episodes: 50
+  replay_sample_episodes_per_update: 20
+  initial_update_epochs: 1
+  target_tau: 0.03
+  compact_episode_tensors: true
+  release_samples_after_update: true
+  validation_episode_fraction: 0.10
+  epsilon_start: 0.50
+  epsilon_end: 0.10
+  max_review_interval_min: 1.0
+  gamma: 1.0
+  batch_size: 512
+  learning_rate: 0.00005
+  loss_type: mse
+  gradient_clip: 0.5
+  max_epochs_per_iteration: 2
+  pairwise_mc_advantage:
+    enabled: false
+    loss_weight: 1.0
+    capture_episode_fraction: 0.20
+    minimum_pairs_per_batch: 2
+    decision_thresholds: [20, 100, 300]
+    candidates_per_state: 3
+
+validation:
+  combined_checkpoint_evaluation: false
+  screening_interval_iterations: 5
+  screening_iterations: [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+  screening_include_initial: true
+  screening_seed_count: 10
+  final_candidate_count: 1
+  final_selection_seed_count: 10
+
+model:
+  embedding_dim: 128
+  heads: 4
+  layers: 3
+  beam_width: 64
+
+rollout:
+  parallel: true
+  process_count: 10
+  wave_size: 10
+  device: cpu
+  start_method: spawn
+  torch_threads_per_process: 1
+  deterministic_result_merge: true
+
+runtime:
+  device: cuda:0
+  require_cuda_training: true
+  output_root: outputs/adp_training_worker3_n_step_td_terminal_feature
+  auto_open_dashboard: false
+  retain_episode_events: false
+  export_replay_artifacts: false

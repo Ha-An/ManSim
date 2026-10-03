@@ -113,10 +113,23 @@ def _reconstruct_iteration_rows(
 ) -> list[dict[str, Any]]:
     training_cfg = cfg["training"]
     policy_iterations = int(training_cfg["policy_iterations"])
+    replay_scope = str(training_cfg.get("replay_scope", "current_iteration")).strip().lower()
+    replay_window_iterations = int(training_cfg.get("replay_window_iterations", 1))
+    latest_iteration_weight = float(training_cfg.get("latest_iteration_weight", 1.0))
+    if replay_scope == "current_iteration":
+        replay_window_iterations = 1
+        latest_iteration_weight = 1.0
+    worker_counts = sorted({int(value) for value in cfg["worker_counts"]})
     screening_by_iteration: dict[int, list[float]] = defaultdict(list)
+    screening_by_iteration_worker: dict[tuple[int, int], list[float]] = defaultdict(list)
     for row in episode_rows:
         if str(row.get("phase", "")) == "screening_validation":
-            screening_by_iteration[int(float(row["iteration"]))].append(float(row["products"]))
+            iteration = int(float(row["iteration"]))
+            worker_count = int(float(row["worker_count"]))
+            screening_by_iteration[iteration].append(float(row["products"]))
+            screening_by_iteration_worker[(iteration, worker_count)].append(
+                float(row["products"])
+            )
     rows: list[dict[str, Any]] = []
     for iteration in range(policy_iterations + 1):
         phase = "initial_random" if iteration == 0 else f"policy_iteration_{iteration}"
@@ -132,6 +145,22 @@ def _reconstruct_iteration_rows(
         validation_mean, validation_std = _mean_and_std(validation_values)
         validation_performed = bool(validation_values)
         compact_mib = sum(float(row.get("compact_memory_mib", 0.0)) for row in episode_group)
+        replay_oldest_iteration = max(0, iteration - replay_window_iterations + 1)
+        replay_groups = [
+            item
+            for item in episode_rows
+            if replay_oldest_iteration <= int(float(item.get("iteration", 0))) <= iteration
+            and str(item.get("phase", "")).startswith(("initial_random", "policy_iteration"))
+        ]
+        replay_sample_count = sum(
+            int(float(item.get("compact_sample_count", 0))) for item in replay_groups
+        )
+        current_sample_count = sum(
+            int(float(item.get("compact_sample_count", 0))) for item in episode_group
+        )
+        replay_compact_mib = sum(
+            float(item.get("compact_memory_mib", 0.0)) for item in replay_groups
+        )
         row = {
             "iteration": iteration,
             "phase": phase,
@@ -147,6 +176,19 @@ def _reconstruct_iteration_rows(
                 int(float(item.get("compact_sample_count", 0))) for item in episode_group
             ),
             "compact_batch_mib": compact_mib,
+            "replay_scope": replay_scope,
+            "replay_iteration_count": iteration - replay_oldest_iteration + 1,
+            "replay_oldest_iteration": replay_oldest_iteration,
+            "replay_newest_iteration": iteration,
+            "replay_episode_count": len(replay_groups),
+            "replay_sample_count": replay_sample_count,
+            "replay_effective_sample_count": (
+                replay_sample_count
+                + (latest_iteration_weight - 1.0) * current_sample_count
+            ),
+            "replay_compact_mib": replay_compact_mib,
+            "replay_buffer_mib": replay_compact_mib,
+            "latest_iteration_weight": latest_iteration_weight,
             "process_rss_mib": 0.0,
             "epsilon": 1.0
             if iteration == 0
@@ -194,8 +236,19 @@ def _reconstruct_iteration_rows(
                 else ""
             ),
             "validation_stage": "screening" if validation_performed else "",
-            "validation_products_avg_workers_3": validation_mean if validation_performed else "",
         }
+        row.update(
+            {
+                f"validation_products_avg_workers_{worker_count}": (
+                    _mean_and_std(
+                        screening_by_iteration_worker.get((iteration, worker_count), [])
+                    )[0]
+                    if validation_performed
+                    else ""
+                )
+                for worker_count in worker_counts
+            }
+        )
         rows.append(row)
     return rows
 
@@ -226,7 +279,11 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
     )
     model_cfg = cfg["model"]
     rollout_cfg = cfg["rollout"]
+    worker_counts = sorted({int(value) for value in cfg["worker_counts"]})
     allow_wait_action = bool(cfg.get("algorithm", {}).get("allow_wait_action", False))
+    worker_order_strategy = str(
+        cfg.get("algorithm", {}).get("worker_order_strategy", "cyclic")
+    ).strip().lower()
     random_policy_name = (
         "uniform_random_feasible_with_wait"
         if allow_wait_action
@@ -236,6 +293,7 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
         "beam_width": int(model_cfg["beam_width"]),
         "max_review_interval_min": float(cfg["training"].get("max_review_interval_min", 1.0)),
         "allow_wait_action": allow_wait_action,
+        "worker_order_strategy": worker_order_strategy,
     }
     next_episode = max((int(float(row.get("episode", 0))) for row in episode_rows), default=1_000_000) + 1
     selection_payloads: dict[int, dict[str, Any]] = {}
@@ -246,12 +304,17 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
         selection_payloads[iteration] = payload
         existing = {
-            int(float(row["seed"]))
+            (int(float(row["worker_count"])), int(float(row["seed"])))
             for row in episode_rows
             if str(row.get("phase", "")) == "final_selection_validation"
             and int(float(row.get("iteration", -1))) == iteration
         }
-        missing = [seed for seed in final_seeds if seed not in existing]
+        expected = [
+            (worker_count, seed)
+            for worker_count in worker_counts
+            for seed in final_seeds
+        ]
+        missing = [pair for pair in expected if pair not in existing]
         if missing:
             model = build_value_network(
                 embedding_dim=int(model_cfg["embedding_dim"]),
@@ -262,13 +325,13 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
             model.eval()
             model_state, snapshot_hash = _snapshot_state_dict(model)
             jobs: list[RolloutJob] = []
-            for index, seed in enumerate(missing):
+            for index, (worker_count, seed) in enumerate(missing):
                 jobs.append(
                     RolloutJob(
                         episode=next_episode + index,
                         phase="final_selection_validation",
                         iteration=iteration,
-                        worker_count=3,
+                        worker_count=worker_count,
                         seed=seed,
                         days=int(cfg["horizon_days"]),
                         epsilon=0.0,
@@ -304,25 +367,47 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
             if str(row.get("phase", "")) == "final_selection_validation"
             and int(float(row.get("iteration", -1))) == iteration
             and int(float(row["seed"])) in set(final_seeds)
+            and int(float(row["worker_count"])) in set(worker_counts)
         ]
-        if len(final_values) != len(final_seeds):
+        expected_sample_count = len(final_seeds) * len(worker_counts)
+        if len(final_values) != expected_sample_count:
             raise RuntimeError(
                 f"Iteration {iteration} final selection is incomplete: "
-                f"{len(final_values)}/{len(final_seeds)} seeds."
+                f"{len(final_values)}/{expected_sample_count} worker-seed samples."
             )
         final_mean, final_std = _mean_and_std(final_values)
+        final_mean_by_worker = {
+            worker_count: _mean_and_std(
+                [
+                    float(row["products"])
+                    for row in episode_rows
+                    if str(row.get("phase", "")) == "final_selection_validation"
+                    and int(float(row.get("iteration", -1))) == iteration
+                    and int(float(row["seed"])) in set(final_seeds)
+                    and int(float(row["worker_count"])) == worker_count
+                ]
+            )[0]
+            for worker_count in worker_counts
+        }
         selection_rows.append(
             {
                 **screening,
                 "screening_rank": rank,
                 "final_mean_products": round(final_mean, 6),
                 "final_std_products": round(final_std, 6),
-                "final_seed_count": len(final_values),
+                "final_seed_count": len(final_seeds),
+                "final_sample_count": expected_sample_count,
+                **{
+                    f"final_mean_products_workers_{worker_count}": round(
+                        final_mean_by_worker[worker_count], 6
+                    )
+                    for worker_count in worker_counts
+                },
                 "final_ci95_low": round(
-                    final_mean - 1.96 * final_std / math.sqrt(len(final_values)), 6
+                    final_mean - 1.96 * final_std / math.sqrt(expected_sample_count), 6
                 ),
                 "final_ci95_high": round(
-                    final_mean + 1.96 * final_std / math.sqrt(len(final_values)), 6
+                    final_mean + 1.96 * final_std / math.sqrt(expected_sample_count), 6
                 ),
                 "final_validation_wall_sec": sum(
                     float(row.get("wall_sec", 0.0))
@@ -345,6 +430,10 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
     best_manifest = dict(best_payload["manifest"])
     best_manifest["validation_completed_products_avg"] = float(winner["final_mean_products"])
     best_manifest["validation_completed_products_std"] = float(winner["final_std_products"])
+    best_manifest["validation_completed_products_avg_by_worker_count"] = {
+        str(worker_count): float(winner[f"final_mean_products_workers_{worker_count}"])
+        for worker_count in worker_counts
+    }
     best_manifest["checkpoint_selection"] = {
         "stage": "final_selection",
         "screening_rank": int(winner["screening_rank"]),
@@ -373,6 +462,17 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
             + int(cfg["training"]["policy_iterations"])
             * int(cfg["training"]["episodes_per_iteration"]),
             "best_iteration": best_iteration,
+            "replay_scope": str(
+                cfg["training"].get("replay_scope", "current_iteration")
+            ),
+            "replay_window_iterations": int(
+                cfg["training"].get("replay_window_iterations", 1)
+            ),
+            "latest_iteration_weight": float(
+                cfg["training"].get("latest_iteration_weight", 1.0)
+            ),
+            "replay_target_contract": "complete_mc_return_under_collection_policy",
+            "target_network": False,
             "phase_wave_counts": phase_wave_counts,
             "recovered_after_interruption": True,
         }
@@ -417,6 +517,10 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
         (float(row.get("compact_batch_mib", 0.0)) for row in iteration_rows),
         default=0.0,
     )
+    peak_replay_buffer_mib = max(
+        (float(row.get("replay_buffer_mib", 0.0)) for row in iteration_rows),
+        default=0.0,
+    )
     peak_child_rss_mib = max(
         (float(row.get("child_peak_rss_mib", 0.0)) for row in episode_rows),
         default=0.0,
@@ -439,7 +543,12 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
             for row in episode_rows
             if str(row.get("phase", "")) == "final_selection_validation"
         ),
-        "worker_counts": [3],
+        "worker_counts": worker_counts,
+        "supported_worker_counts": worker_counts,
+        "environment_fingerprints_by_worker_count": best_manifest.get(
+            "environment_fingerprints_by_worker_count", {}
+        ),
+        "worker_order_strategy": worker_order_strategy,
         "horizon_days": int(cfg["horizon_days"]),
         "policy_iterations": int(cfg["training"]["policy_iterations"]),
         "episodes_per_iteration": int(cfg["training"]["episodes_per_iteration"]),
@@ -462,6 +571,11 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
         "best_validation_completed_products_std": float(winner["final_std_products"]),
         "best_checkpoint": str((output_dir / "best.pt").resolve()),
         "last_checkpoint": str((output_dir / "last.pt").resolve()),
+        "replay_scope": training_meta.get("replay_scope", "current_iteration"),
+        "replay_window_iterations": int(training_meta.get("replay_window_iterations", 1)),
+        "latest_iteration_weight": float(training_meta.get("latest_iteration_weight", 1.0)),
+        "replay_target_contract": "complete_mc_return_under_collection_policy",
+        "target_network": False,
         "checkpoint_selection_file": str((output_dir / "checkpoint_selection.csv").resolve()),
         "configured_process_count": process_count,
         "actual_process_count_max": max(
@@ -480,6 +594,8 @@ def finalize(config_path: Path, output_dir: Path, *, open_dashboard: bool) -> Pa
         "phase_wave_counts": phase_wave_counts,
         "seed_partitions": seed_partition_meta,
         "peak_compact_batch_mib": peak_compact_batch_mib,
+        "peak_replay_buffer_mib": peak_replay_buffer_mib,
+        "peak_replay_training_batch_mib": peak_replay_buffer_mib,
         "observed_peak_process_rss_mib": 0.0,
         "peak_child_rss_mib": peak_child_rss_mib,
         "training_rollout_sec": sum(

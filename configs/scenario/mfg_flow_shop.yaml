@@ -54,6 +54,7 @@ factory:
     - LOAD_UNLOAD_TRANSFER_INTERFACE
     - INSPECT_PRODUCT
     - REPAIR_MACHINE
+    - PREVENTIVE_MAINTENANCE
     - MANAGE_ROBOT_POWER
     - COLLECT_WASTE_OR_SCRAP
 
@@ -119,14 +120,15 @@ warehouse:
     initial_fill: 30
 
 machine_failure:
-  mean_time_to_fail_min: 300
+  distribution: exponential
+  time_basis: active_processing
+  mean_processing_time_to_failure_min: 300
   max_repair_agents: 3
   preventive_maintenance:
-    enabled: false
-  # Legacy PM fields remain readable by the shared factory engine but are inert.
-  pm_effect_duration_min: 720
-  pm_lambda_multiplier: 0.5
-  pm_interval_target_min: 480
+    enabled: true
+    due_processing_min: 240
+    protected_processing_min: 240
+    hazard_multiplier: 0.5
 
 worker:
   battery_capacity_min: 200
@@ -141,6 +143,16 @@ worker:
     allow_battery_delivery: false
     allow_battery_swap: false
     finish_current_task_before_charge: true
+  # Production work with a negative expected return-to-dock margin remains a
+  # selectable action. Physical task, item, resource and buffer constraints do not.
+  battery_safety:
+    assignment_mode: policy_decides
+    expose_risk_metadata: true
+  depleted_recovery:
+    enabled: true
+    schedule: next_day_start
+    restart_location: assigned_charging_dock
+    restart_soc: 1.0
 
 initial_inventory:
   material:

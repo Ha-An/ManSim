@@ -136,6 +136,13 @@ mfg_flow_shop_policy:
       kind: collaborative
       owner: auto
       match: {priority_key: repair_machine}
+    - role_number: 19
+      id: preventive_maintenance
+      display_name: PREVENTIVE_MAINTENANCE
+      task_code: PREVENTIVE_MAINTENANCE
+      kind: exclusive
+      owner: auto
+      match: {priority_key: preventive_maintenance}
 
   # This fixed order is identical to the other three policies. It resolves
   # priority only among tasks that the requesting worker is allowed to execute.
@@ -150,6 +157,7 @@ mfg_flow_shop_policy:
     - inspect_product
     - load_inspection_desk
     - transfer_s2_to_inspection
+    - preventive_maintenance
     - load_s2_intermediate
     - load_s2_material
     - setup_s2

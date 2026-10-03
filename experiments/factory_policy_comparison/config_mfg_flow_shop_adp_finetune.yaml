@@ -1,0 +1,25 @@
+# Held-out comparison for the warm-start fine-tuned ADP checkpoint.
+adp_checkpoint_path: ""
+scenario: mfg_flow_shop
+horizon_days: 5
+makespan_max_sim_days: 30
+minutes_per_day: 480
+objective_modes: [maximize_throughput]
+seeds: [50001, 50002, 50003, 50004, 50005]
+worker_counts: [3]
+modes:
+  - simulation_based_adp
+  - immediate_shared
+  - random_feasible_dispatch
+common_overrides:
+  - runtime.ui.auto_open_results=false
+  - runtime.ui.auto_start_replay_studio_3d=false
+  - runtime.ui.export_replay_artifacts=false
+  - runtime.artifacts.export_events=false
+metrics:
+  productivity: [total_products, throughput_per_sim_hour, avg_daily_products]
+  robot: [humanoid_execution_ratio_avg, humanoid_blocked_ratio_avg, humanoid_unavailable_ratio_avg, agent_discharged_ratio]
+  flow: [buffer_overflow_attempt_count, buffer_reservation_failure_count, buffer_reservation_leak_count, machine_blocked_after_service_min, candidate_count_avg, candidate_count_max]
+  reliability: [machine_failure_count, machine_failure_observed_processing_mttf_min, repair_response_time_avg_min, preventive_maintenance_count, preventive_maintenance_protected_processing_min]
+  battery_risk: [battery_risk_assignment_count, battery_risk_expected_margin_avg_min, worker_depleted_during_task_count, worker_depleted_during_move_count, worker_returned_next_day_count, agent_discharged_time_min_total]
+  adp: [adp_decision_count, adp_wait_count, adp_candidate_available_wait_count, adp_no_candidate_unassigned_count, adp_candidate_available_wait_ratio, adp_no_candidate_unassigned_ratio, adp_avg_candidate_count, adp_beam_value_entropy_avg, adp_beam_value_entropy_decision_count, adp_inference_latency_ms_avg]

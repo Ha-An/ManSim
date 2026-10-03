@@ -38,6 +38,13 @@ class ADPDecisionCoordinator:
             raise ValueError("decision.adp.potential_shaping was removed; ADP now uses raw completed-product rewards.")
         self.max_review_interval_min = max(0.1, float(self.cfg.get("max_review_interval_min", 5.0) or 5.0))
         self.beam_width = max(1, int(self.cfg.get("beam_width", 64) or 64))
+        self.worker_order_strategy = str(
+            self.cfg.get("worker_order_strategy", "cyclic") or "cyclic"
+        ).strip().lower()
+        if self.worker_order_strategy not in {"cyclic", "fixed"}:
+            raise ValueError(
+                "decision.adp.worker_order_strategy must be 'cyclic' or 'fixed'."
+            )
         self.exploration_epsilon = min(1.0, max(0.0, float(self.cfg.get("exploration_epsilon", 0.0) or 0.0)))
         self.allow_wait_action = bool(self.cfg.get("allow_wait_action", False))
         self.rng = random.Random(int(world.seed) ^ 0xAD92026)
@@ -98,6 +105,8 @@ class ADPDecisionCoordinator:
             "candidate_total": 0,
             "feasible_pair_total": 0,
             "candidate_matching_total": 0,
+            "beam_value_entropy_sum": 0.0,
+            "beam_value_entropy_decision_count": 0,
             "inference_latency_ms_total": 0.0,
             "inference_latency_ms_max": 0.0,
         }
@@ -116,6 +125,7 @@ class ADPDecisionCoordinator:
             world=self.world,
             device=self.device,
             wait_action_enabled=self.allow_wait_action,
+            worker_order_strategy=self.worker_order_strategy,
         )
         training_meta = self.checkpoint_manifest.get("training", {})
         trained_review = float(training_meta.get("max_review_interval_min", self.max_review_interval_min))
@@ -252,6 +262,7 @@ class ADPDecisionCoordinator:
                 repair_capacity=self.world.max_repair_agents,
                 allow_wait_action=self.allow_wait_action,
             )
+        worker_order = self._beam_worker_order(state)
         return greedy_beam_matching(
             state,
             model=self.model,
@@ -259,7 +270,17 @@ class ADPDecisionCoordinator:
             beam_width=self.beam_width,
             repair_capacity=self.world.max_repair_agents,
             allow_wait_action=self.allow_wait_action,
+            worker_order=worker_order,
         )
+
+    def _beam_worker_order(self, state: EncodedDecisionState) -> list[str]:
+        decision_workers = set(state.decision_worker_ids)
+        fleet_order = list(state.worker_ids)
+        if self.worker_order_strategy == "fixed" or not fleet_order:
+            return [worker_id for worker_id in fleet_order if worker_id in decision_workers]
+        offset = int(self.metrics["decision_count"]) % len(fleet_order)
+        circular = fleet_order[offset:] + fleet_order[:offset]
+        return [worker_id for worker_id in circular if worker_id in decision_workers]
 
     def _forced_probe_selection(
         self,
@@ -292,6 +313,7 @@ class ADPDecisionCoordinator:
             predicted_value=0.0,
             candidate_matching_count=1,
             policy="fixed_counterfactual_probe_replay",
+            worker_order=list(state.decision_worker_ids),
         )
 
     def _capture_probe_state(
@@ -355,16 +377,40 @@ class ADPDecisionCoordinator:
         )
         if decision_number == self._probe_target_decision_number:
             self.probe_target_product_count = int(self.world.product_count)
+            expected = self.cfg.get("_probe_expected_pre_state")
+            if expected is not None and serialize_state(state) != expected:
+                raise RuntimeError("ADP counterfactual replay pre-state mismatch.")
         started = perf_counter()
         selection = self._forced_probe_selection(
             state,
             mandatory,
             decision_number,
         ) or self._select(state)
+        if decision_number == self._probe_target_decision_number:
+            rng_state = self.cfg.get("_probe_policy_rng_state_after_selection")
+            if rng_state is not None:
+                # Prefix replay bypasses policy sampling; restore the captured continuation.
+                self.rng.setstate((int(rng_state[0]), tuple(rng_state[1]), rng_state[2]))
+            expected_post = self.cfg.get("_probe_expected_post_state")
+            if expected_post is not None and serialize_state(state.post_decision(selection.assignment)) != expected_post:
+                raise RuntimeError("ADP counterfactual replay post-state mismatch.")
+            if "_probe_future_seed" in self.cfg:
+                from .value_validation import reseed_future_draws
+
+                reseed_future_draws(self.world, int(self.cfg["_probe_future_seed"]))
         value_policy_selected = selection.policy == "value_beam_search" and not mandatory
         for worker_id, task in mandatory.items():
             if task is not None:
                 selection.assignment[worker_id] = "__MANDATORY__"
+        if self.probe_records and self.probe_records[-1]["decision_number"] == decision_number:
+            self.probe_records[-1].update(
+                {
+                    "pre_state": serialize_state(state),
+                    "selected_assignment": dict(selection.assignment),
+                    "selected_post_state": serialize_state(state.post_decision(selection.assignment)),
+                    "policy_rng_state_after_selection": self.rng.getstate(),
+                }
+            )
         latency_ms = (perf_counter() - started) * 1000.0
         assigned: dict[str, str] = {}
         for worker in workers:
@@ -400,6 +446,15 @@ class ADPDecisionCoordinator:
         self.metrics["candidate_total"] += len(state.opportunity_ids)
         self.metrics["feasible_pair_total"] += int(state.feasibility.sum())
         self.metrics["candidate_matching_total"] += int(selection.candidate_matching_count)
+        if (
+            value_policy_selected
+            and selection.candidate_value_entropy is not None
+            and int(selection.candidate_value_count) >= 2
+        ):
+            self.metrics["beam_value_entropy_sum"] += float(
+                selection.candidate_value_entropy
+            )
+            self.metrics["beam_value_entropy_decision_count"] += 1
         self.metrics["inference_latency_ms_total"] += latency_ms
         self.metrics["inference_latency_ms_max"] = max(float(self.metrics["inference_latency_ms_max"]), latency_ms)
         unassigned_workers = [
@@ -468,8 +523,19 @@ class ADPDecisionCoordinator:
                 "all_wait_without_candidate": all_wait_without_candidate,
                 "wait_action_enabled": self.allow_wait_action,
                 "predicted_value": round(float(selection.predicted_value), 6),
+                "beam_value_entropy": (
+                    round(float(selection.candidate_value_entropy), 6)
+                    if selection.candidate_value_entropy is not None
+                    else None
+                ),
+                "beam_value_candidate_count": int(selection.candidate_value_count),
                 "inference_latency_ms": round(latency_ms, 6),
                 "policy": selection.policy,
+                "worker_order_strategy": self.worker_order_strategy,
+                "worker_order": list(selection.worker_order),
+                "worker_order_start": (
+                    selection.worker_order[0] if selection.worker_order else ""
+                ),
             },
         )
         self.previous_pre_state = state
@@ -497,7 +563,13 @@ class ADPDecisionCoordinator:
             "checkpoint_id": str(self.checkpoint_manifest.get("checkpoint_id", "training" if self.training else "")),
             "checkpoint_path": str(self.checkpoint_manifest.get("checkpoint_path", "")),
             "validation_completed_products_avg": float(self.checkpoint_manifest.get("validation_completed_products_avg", 0.0) or 0.0),
-            "reward_mode": "completed_product_mc",
+            "reward_mode": self.checkpoint_manifest.get(
+                "reward_mode", "completed_product_td" if self.cfg.get("_collect_td_replay") else "completed_product_mc"
+            ),
+            "return_estimator": self.checkpoint_manifest.get(
+                "return_estimator", "n_step_td" if self.cfg.get("_collect_td_replay") else "monte_carlo"
+            ),
+            "worker_order_strategy": self.worker_order_strategy,
             "wait_action_enabled": self.allow_wait_action,
             "decision_count": int(self.metrics["decision_count"]),
             "wait_count": int(self.metrics["wait_count"]),
@@ -545,6 +617,11 @@ class ADPDecisionCoordinator:
             "avg_candidate_count": float(self.metrics["candidate_total"]) / decisions,
             "avg_feasible_pair_count": float(self.metrics["feasible_pair_total"]) / decisions,
             "avg_candidate_matching_count": float(self.metrics["candidate_matching_total"]) / decisions,
+            "beam_value_entropy_avg": float(self.metrics["beam_value_entropy_sum"])
+            / max(1, int(self.metrics["beam_value_entropy_decision_count"])),
+            "beam_value_entropy_decision_count": int(
+                self.metrics["beam_value_entropy_decision_count"]
+            ),
             "inference_latency_ms_avg": float(self.metrics["inference_latency_ms_total"]) / decisions,
             "inference_latency_ms_max": float(self.metrics["inference_latency_ms_max"]),
         }

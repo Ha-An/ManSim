@@ -22,6 +22,11 @@ PRIMARY_METRICS = [
     ("Machine Utilization", "machine_utilization", "ratio", True, "Processing minutes divided by total machine-minutes."),
     ("Machine Broken Ratio", "machine_broken_ratio", "ratio", False, "Broken minutes divided by total machine-minutes."),
     ("Machine PM Ratio", "machine_pm_ratio", "ratio", False, "Preventive-maintenance minutes divided by total machine-minutes."),
+    ("Machine Failures", "machine_failure_count", "count", False, "Failures triggered by cumulative active machine-processing exposure."),
+    ("Observed Processing MTTF", "machine_failure_observed_processing_mttf_min", "minutes", True, "Average active processing completed between repairs and failures."),
+    ("Repair Response", "repair_response_time_avg_min", "minutes", False, "Average delay from machine failure to the first repair worker joining."),
+    ("Preventive Maintenance", "preventive_maintenance_count", "count", True, "Completed preventive-maintenance tasks."),
+    ("PM-Protected Processing", "preventive_maintenance_protected_processing_min", "minutes", True, "Actual active processing performed under reduced failure hazard."),
     ("Humanoid Executing Ratio", "humanoid_execution_ratio_avg", "ratio", True, "Average share of worker-minutes with availability=EXECUTING."),
     ("Humanoid Blocked Ratio", "humanoid_blocked_ratio_avg", "ratio", False, "Average share of worker-minutes with availability=BLOCKED."),
     ("Humanoid Unavailable Ratio", "humanoid_unavailable_ratio_avg", "ratio", False, "Average share of worker-minutes with availability=DISABLED or OFFLINE."),
@@ -39,6 +44,11 @@ PRIMARY_METRICS = [
     ("Worker Discharged Ratio", "agent_discharged_ratio", "ratio", False, "Battery-depletion event time ratio."),
     ("Battery Charges", "battery_charge_count", "count", True, "Completed worker charging sessions at assigned charging docks."),
     ("Battery Charge Time", "battery_charge_time_min", "minutes", False, "Total simulated minutes spent charging at assigned docks."),
+    ("Battery-Risk Assignments", "battery_risk_assignment_count", "count", False, "Selected tasks whose expected task and dock-return time exceeded remaining battery."),
+    ("Risk Assignment Margin", "battery_risk_expected_margin_avg_min", "minutes", True, "Average expected battery margin among selected depletion-risk tasks; negative means a shortfall."),
+    ("Depleted During Task", "worker_depleted_during_task_count", "count", False, "Workers that reached zero battery while a task was active."),
+    ("Next-Day Returns", "worker_returned_next_day_count", "count", True, "Depleted workers restored at their assigned charging dock on the next day boundary."),
+    ("Depleted Unavailable Time", "agent_discharged_time_min_total", "minutes", False, "Total worker-minutes unavailable between depletion and next-day recovery or horizon end."),
     ("Traffic Collisions", "collision_count", "count", False, "Tile/edge traffic conflicts with overlapping movement windows."),
     ("Traffic Near Misses", "near_miss_count", "count", False, "Movement conflicts closer than the configured traffic headway."),
     ("Edge Conflicts", "edge_conflict_count", "count", False, "Workers crossing the same edge in opposite directions during overlapping windows."),
@@ -86,6 +96,18 @@ METRIC_GROUPS = {
     "flow_makespan": ["makespan_min", "initial_batch_progress_ratio", "initial_batch_material_count", "initial_batch_terminal_material_count", "initial_batch_accepted_product_count", "initial_batch_disposed_scrap_count", "initial_batch_yield_ratio"],
     "flow_throughput": ["total_products", "throughput_per_sim_hour", "avg_daily_products", "warehouse_material_restock_count", "disposed_scrap_count", "downstream_closure_ratio"],
     "machine": ["machine_utilization", "machine_broken_ratio", "machine_pm_ratio", "wall_clock_sec"],
+    "reliability": [
+        "machine_failure_count",
+        "machine_failure_observed_processing_mttf_min",
+        "repair_response_time_avg_min",
+        "preventive_maintenance_count",
+        "preventive_maintenance_protected_processing_min",
+        "battery_risk_assignment_count",
+        "battery_risk_expected_margin_avg_min",
+        "worker_depleted_during_task_count",
+        "worker_returned_next_day_count",
+        "agent_discharged_time_min_total",
+    ],
     "buffer": [
         "buffer_overflow_attempt_count",
         "buffer_reservation_failure_count",
@@ -299,8 +321,23 @@ def _summary_cards(kpi: dict[str, Any], metric_keys: list[str] | None = None) ->
             continue
         label, key, kind, _higher_is_better, description = metric
         raw_value = kpi.get(key)
+        observation_count_key = {
+            "machine_failure_observed_processing_mttf_min": "machine_failure_count",
+            "repair_response_time_avg_min": "machine_failure_count",
+            "battery_risk_expected_margin_avg_min": "battery_risk_assignment_count",
+        }.get(key)
+        display_value = (
+            "not observed"
+            if observation_count_key
+            and (
+                raw_value is None
+                or raw_value == ""
+                or int(kpi.get(observation_count_key, 0) or 0) == 0
+            )
+            else _format_metric_value(raw_value, kind)
+        )
         cards.append(
-            f"<div class='card'><div class='label'>{html.escape(label)}</div><div class='value'>{html.escape(_format_metric_value(raw_value, kind))}</div><div class='sub'>{html.escape(description)}</div></div>"
+            f"<div class='card'><div class='label'>{html.escape(label)}</div><div class='value'>{html.escape(display_value)}</div><div class='sub'>{html.escape(description)}</div></div>"
         )
     return "<div class='grid cards-4'>" + "".join(cards) + "</div>"
 
@@ -509,6 +546,78 @@ def _finite_buffer_table(kpi: dict[str, Any]) -> str:
     )
 
 
+def _reliability_table(kpi: dict[str, Any]) -> str:
+    failure_counts = (
+        kpi.get("machine_failure_count_by_machine", {})
+        if isinstance(kpi.get("machine_failure_count_by_machine", {}), dict)
+        else {}
+    )
+    exposures = (
+        kpi.get("machine_processing_exposure_by_machine", {})
+        if isinstance(kpi.get("machine_processing_exposure_by_machine", {}), dict)
+        else {}
+    )
+    thresholds = (
+        kpi.get("machine_failure_threshold_by_machine", {})
+        if isinstance(kpi.get("machine_failure_threshold_by_machine", {}), dict)
+        else {}
+    )
+    machine_ids = sorted(set(failure_counts) | set(exposures) | set(thresholds), key=_machine_sort_key)
+    machine_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(machine_id)}</td>"
+        f"<td>{_safe_int(failure_counts.get(machine_id))}</td>"
+        f"<td>{_safe_float(exposures.get(machine_id)):.2f}</td>"
+        f"<td>{_safe_float(thresholds.get(machine_id)):.2f}</td>"
+        "</tr>"
+        for machine_id in machine_ids
+    )
+    if not machine_rows:
+        machine_rows = "<tr><td colspan='4'>No machine reliability data.</td></tr>"
+
+    repair_counts = (
+        kpi.get("repair_count_by_urgency_tier", {})
+        if isinstance(kpi.get("repair_count_by_urgency_tier", {}), dict)
+        else {}
+    )
+    response_times = (
+        kpi.get("repair_response_time_avg_min_by_urgency_tier", {})
+        if isinstance(kpi.get("repair_response_time_avg_min_by_urgency_tier", {}), dict)
+        else {}
+    )
+    tier_rows = ""
+    for tier in ("critical", "high", "normal"):
+        repair_count = _safe_int(repair_counts.get(tier))
+        response_value = response_times.get(tier)
+        response_label = (
+            f"{_safe_float(response_value):.2f}"
+            if repair_count > 0 and response_value not in {None, ""}
+            else "not observed"
+        )
+        tier_rows += (
+            "<tr>"
+            f"<td>{tier.title()}</td>"
+            f"<td>{repair_count}</td>"
+            f"<td>{response_label}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='panel'><h2>Active-Processing Failure Clock</h2>"
+        f"<p class='muted'>Basis: {html.escape(str(kpi.get('machine_failure_time_basis', '-')))}; "
+        f"configured exponential mean: {_safe_float(kpi.get('machine_failure_configured_mean_processing_min')):.1f} processing min.</p>"
+        "<table><thead><tr><th>Machine</th><th>Failures</th><th>Current Cycle Processing</th>"
+        "<th>Sampled Exposure Threshold</th></tr></thead><tbody>"
+        + machine_rows
+        + "</tbody></table></div>"
+        "<div class='panel'><h2>Repair Urgency</h2>"
+        "<p class='muted'>Tier is recalculated from station outage, loss ratio, available demand, and retained WIP when repair starts.</p>"
+        "<table><thead><tr><th>Tier</th><th>Repairs Started</th><th>Average Response (min)</th>"
+        "</tr></thead><tbody>"
+        + tier_rows
+        + "</tbody></table></div>"
+    )
+
+
 def _rolling_horizon_table(kpi: dict[str, Any]) -> str:
     payload = kpi.get("rolling_horizon", {}) if isinstance(kpi.get("rolling_horizon", {}), dict) else {}
     dedicated_summary = (
@@ -542,7 +651,7 @@ def _rolling_horizon_table(kpi: dict[str, Any]) -> str:
         ("A1 Battery Deliveries", str(_safe_int(dedicated_summary.get("battery_delivery_from_provider_count")))),
     ]
     body = "".join(f"<tr><td>{html.escape(label)}</td><td>{html.escape(value)}</td></tr>" for label, value in rows)
-    return "<div class='panel'><h2>Rolling Horizon Dispatch</h2><p class='muted'>Strict-periodic modes dispatch independently at exact window boundaries; low-battery service is the only immediate queue exception.</p><table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>" + body + "</tbody></table></div>"
+    return "<div class='panel'><h2>Rolling Horizon Dispatch</h2><p class='muted'>Strict-periodic modes dispatch independently at exact window boundaries; configured battery service and critical repair may bypass the boundary.</p><table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>" + body + "</tbody></table></div>"
 
 
 def _operational_complexity_table(kpi: dict[str, Any]) -> str:
@@ -1315,6 +1424,16 @@ def export_kpi_dashboard(
         if scenario_type == "mfg_flow_shop"
         else ""
     )
+    reliability_section = (
+        _group_section(
+            "Reliability, Maintenance, and Battery Risk",
+            "Active-processing failure exposure, urgency-aware repair, preventive maintenance, policy-visible battery risk, and next-day depleted-worker recovery.",
+            _summary_cards(kpi, METRIC_GROUPS["reliability"]),
+            "<div class='grid cards-2'>" + _reliability_table(kpi) + "</div>",
+        )
+        if scenario_type == "mfg_flow_shop"
+        else ""
+    )
     worker_section = _group_section(
         "Worker Metrics",
         "HumanoidSim state axes, task taxonomy, primitive execution, and local response activity.",
@@ -1389,6 +1508,7 @@ def export_kpi_dashboard(
         + item_section
         + buffer_section
         + machine_section
+        + reliability_section
         + worker_section
         + complexity_section
         + decision_section

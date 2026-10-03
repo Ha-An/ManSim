@@ -482,6 +482,80 @@ class HumanoidRuntimeContractTests(unittest.TestCase):
             )
         )
 
+    def test_battery_depletion_interrupt_skips_incident_recovery(self) -> None:
+        env = simpy.Environment()
+        events: list[dict] = []
+        worker = Worker(worker_id="A1")
+        runtime_holder: dict[str, HumanoidTaskRuntime] = {}
+
+        def depleted_domain_action(agent: Worker, _task: Task):
+            agent.pending_recovery_incident = {
+                "incident_code": "ITEM_DROPPED",
+                "recovery_protocol": [
+                    {"kind": "primitive", "code": "LOCALIZE_OBJECT"}
+                ],
+            }
+            agent.discharged = True
+            runtime_holder["runtime"].set_disabled_state(
+                agent, reason="battery_depleted"
+            )
+            if False:
+                yield env.timeout(0)
+            raise simpy.Interrupt("battery_depleted")
+
+        world = SimpleNamespace(
+            env=env,
+            agents={"A1": worker},
+            logger=SimpleNamespace(log=lambda **payload: events.append(payload)),
+            battery_remaining=lambda _worker: 0.0,
+            day_for_time=lambda _t: 1,
+            agent_display_location=lambda agent: agent.location,
+            _task_priority_key=lambda task: task.priority_key,
+            _execute_task_domain_action=depleted_domain_action,
+        )
+        runtime = HumanoidTaskRuntime(
+            world,
+            {
+                "humanoidsim": {
+                    "enabled": True,
+                    "recovery_protocol": {
+                        "enabled": True,
+                        "unit": "min",
+                        "default_step_min": 0.1,
+                        "minimum_step_min": 0.1,
+                    },
+                }
+            },
+        )
+        runtime_holder["runtime"] = runtime
+        task = Task(
+            task_id="TASK-DEPLETION",
+            task_type="TRANSFER",
+            priority_key="inter_station_transfer",
+            priority=1.0,
+            location="Warehouse",
+            task_code="TRANSFER",
+            instance_id="TASK-DEPLETION:TRANSFER",
+            assigned_robot_id="A1",
+        )
+        interrupted: dict[str, str] = {}
+
+        def run_task():
+            try:
+                yield from runtime.execute(worker, task)
+            except simpy.Interrupt as intr:
+                interrupted["reason"] = str(intr.cause)
+
+        env.process(run_task())
+        env.run()
+
+        self.assertEqual("battery_depleted", interrupted["reason"])
+        self.assertEqual("DISABLED", worker.humanoid_state["availability"])
+        self.assertIsNone(worker.pending_recovery_incident)
+        self.assertFalse(
+            any(event["event_type"] == "HUMANOID_RECOVERY_START" for event in events)
+        )
+
     def test_domain_failure_reason_is_converted_to_recovery_timeline(self) -> None:
         env = simpy.Environment()
         events: list[dict] = []

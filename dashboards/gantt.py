@@ -87,6 +87,8 @@ def _pair_intervals(
     status_label: str,
     interval_type_fn: Any,
     entity_group: str,
+    *,
+    close_at_horizon: bool = False,
 ) -> list[dict[str, Any]]:
     end_type_set = {end_types} if isinstance(end_types, str) else set(end_types)
     active: dict[tuple[str, str], dict[str, Any]] = {}
@@ -125,6 +127,18 @@ def _pair_intervals(
             }
         )
 
+    if close_at_horizon:
+        sim_end = max((float(event.get("t", 0.0)) for event in events), default=0.0)
+        for start_event in active.values():
+            start_t = float(start_event.get("t", 0.0))
+            if sim_end > start_t:
+                end_event = {"t": sim_end, "type": "INTERVAL_HORIZON_END", "details": {"reason": "horizon_reached"}}
+                intervals.append({
+                    "lane": str(start_event.get("entity_id", "")), "entity_group": entity_group,
+                    "status": status_label, "start": start_t, "end": sim_end,
+                    "duration": sim_end - start_t, "interval_type": str(interval_type_fn(start_event, end_event)),
+                    "start_event": start_event, "end_event": end_event,
+                })
     return intervals
 
 
@@ -514,6 +528,7 @@ def export_gantt(
         "DOWN",
         lambda _s, _e: "MACHINE_BROKEN",
         "Machine",
+        close_at_horizon=True,
     )
     machine_down_pm = _pair_intervals(
         events,
@@ -523,6 +538,7 @@ def export_gantt(
         "DOWN",
         lambda _s, _e: "PREVENTIVE_MAINTENANCE",
         "Machine",
+        close_at_horizon=True,
     )
     machine_wait_unload = _build_finished_wait_unload(events)
     ship_sections = _build_ship_surface_intervals(events)

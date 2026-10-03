@@ -48,6 +48,19 @@ def _state_event(
 
 
 class GanttExportTests(unittest.TestCase):
+    def test_open_machine_downtime_is_retained_at_horizon(self) -> None:
+        events = [
+            {"t": 2, "type": "MACHINE_PM_START", "entity_id": "S1M1", "details": {}},
+            {"t": 3, "type": "MACHINE_BROKEN", "entity_id": "S2M1", "details": {}},
+            {"t": 5, "type": "RUN_END", "entity_id": "system", "details": {}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            export_gantt(events, Path(directory))
+            with (Path(directory) / "gantt_segments.csv").open() as handle:
+                rows = list(csv.DictReader(handle))
+        self.assertEqual({("S1M1", 2.0, 5.0), ("S2M1", 3.0, 5.0)},
+                         {(r["lane"], float(r["start"]), float(r["end"])) for r in rows})
+
     def test_worker_rows_use_humanoidsim_availability_axis(self) -> None:
         events = [
             _state_event(0.0, "A1", "ASSIGNED", task_code="TRANSFER"),

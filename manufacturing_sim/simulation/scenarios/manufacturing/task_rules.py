@@ -82,6 +82,13 @@ DEFAULT_CANDIDATE_CONTEXTS: tuple[dict[str, Any], ...] = (
         "machine_id": "S2M1",
     },
     {
+        "task_code": "PREVENTIVE_MAINTENANCE",
+        "task_type": "PREVENTIVE_MAINTENANCE",
+        "priority_key": "preventive_maintenance",
+        "station": 1,
+        "machine_id": "S1M1",
+    },
+    {
         "task_code": "REPLENISH_MATERIAL",
         "task_type": "TRANSFER",
         "priority_key": "material_supply",
@@ -313,14 +320,14 @@ class MfgFlowShopTaskPolicy:
         return parsed
 
     def _validate_role_contract(self) -> None:
-        expected_numbers = set(range(1, 19))
+        expected_numbers = set(range(1, 20))
         observed_numbers = [rule.role_number for rule in self.rules]
         missing = sorted(expected_numbers - set(observed_numbers))
         duplicates = sorted({number for number in observed_numbers if observed_numbers.count(number) > 1})
         extras = sorted(set(observed_numbers) - expected_numbers)
-        if len(self.rules) != 18 or missing or duplicates or extras:
+        if len(self.rules) != 19 or missing or duplicates or extras:
             raise TaskRuleConfigError(
-                "mfg_flow_shop must define role numbers 1..18 exactly once; "
+                "mfg_flow_shop must define role numbers 1..19 exactly once; "
                 f"count={len(self.rules)}, missing={missing}, duplicates={duplicates}, extras={extras}."
             )
         invalid_exclusive = [
@@ -328,12 +335,15 @@ class MfgFlowShopTaskPolicy:
         ]
         role_17 = self.rules_by_number[17]
         role_18 = self.rules_by_number[18]
+        role_19 = self.rules_by_number[19]
         if invalid_exclusive:
             raise TaskRuleConfigError(f"mfg_flow_shop roles 1..16 must be exclusive: {invalid_exclusive}.")
         if role_17.task_code != "MANAGE_ROBOT_POWER" or role_17.kind != "self_service":
             raise TaskRuleConfigError("mfg_flow_shop role 17 must be MANAGE_ROBOT_POWER/self_service.")
         if role_18.task_code != "REPAIR_MACHINE" or role_18.kind != "collaborative":
             raise TaskRuleConfigError("mfg_flow_shop role 18 must be REPAIR_MACHINE/collaborative.")
+        if role_19.task_code != "PREVENTIVE_MAINTENANCE" or role_19.kind != "exclusive":
+            raise TaskRuleConfigError("mfg_flow_shop role 19 must be PREVENTIVE_MAINTENANCE/exclusive.")
         if len(self.worker_ids) < 2:
             raise TaskRuleConfigError("mfg_flow_shop requires at least two workers for collaborative repair.")
         if int(getattr(self.world, "max_repair_agents", 3) or 3) < 2:
@@ -413,7 +423,9 @@ class MfgFlowShopTaskPolicy:
             material_count += float(restock_events * int(getattr(self.world, "throughput_restock_target_fill", 0) or 0))
             horizon_min = float(days * int(getattr(self.world, "minutes_per_day", 240) or 240))
             station_caps = [
-                horizon_min / max(0.1, float(value))
+                horizon_min
+                * max(1, int(getattr(self.world, "machines_per_station", 1) or 1))
+                / max(0.1, float(value))
                 for value in getattr(self.world, "processing_time_min", {}).values()
             ]
             process_capacity = min(station_caps) if station_caps else material_count / 2.0
@@ -432,6 +444,15 @@ class MfgFlowShopTaskPolicy:
         if rule.kind != "exclusive":
             return 0.0
         products = float(self.expected_product_count)
+        if rule.task_code == "PREVENTIVE_MAINTENANCE":
+            due_processing_min = float(getattr(self.world, "pm_interval_target_min", math.inf))
+            if not math.isfinite(due_processing_min) or due_processing_min <= 0.0:
+                return 0.0
+            processing_per_product = sum(
+                max(0.0, float(value))
+                for value in getattr(self.world, "processing_time_min", {}).values()
+            )
+            return max(0.0, products * processing_per_product / due_processing_min)
         defect_prob = max(0.0, min(1.0, float(getattr(self.world, "quality_cfg", {}).get("defect_prob", 0.0) or 0.0)))
         if rule.task_code == "TRANSFER" and int(rule.match.get("from_station", 0) or 0) == 4:
             return products * (1.0 - defect_prob)
@@ -485,7 +506,14 @@ class MfgFlowShopTaskPolicy:
         service_min = float(self.world.timing.expected_task_duration(rule.task_code))
         start, segments = self._task_route(rule)
         dock_ids = [f"charging_dock_{worker_id}" for worker_id in self.worker_ids]
-        access_values = [float(self.world.travel_time(dock_id, start)) for dock_id in dock_ids]
+        if rule.task_code == "PREVENTIVE_MAINTENANCE":
+            access_values = [
+                float(self.world.travel_time(dock_id, machine_id))
+                for dock_id in dock_ids
+                for machine_id in sorted(getattr(self.world, "machines", {}))
+            ]
+        else:
+            access_values = [float(self.world.travel_time(dock_id, start)) for dock_id in dock_ids]
         access_min = mean(access_values) if access_values else 0.0
         route_min = 0.0
         for source, destination, item_type in segments:
@@ -653,7 +681,7 @@ class MfgFlowShopTaskPolicy:
             },
             "validation": {
                 "role_count": len(self.rules),
-                "role_numbers_complete": sorted(rule.role_number for rule in self.rules) == list(range(1, 19)),
+                "role_numbers_complete": sorted(rule.role_number for rule in self.rules) == list(range(1, 20)),
                 "exclusive_rule_count": sum(1 for rule in self.rules if rule.kind == "exclusive"),
                 "exclusive_owned_rule_count": len(self.exclusive_owner_by_rule) if self.dedicated else 0,
                 "duplicate_exclusive_owner_count": 0,

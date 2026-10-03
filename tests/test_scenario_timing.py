@@ -48,13 +48,13 @@ class ScenarioTimingTests(unittest.TestCase):
 
     def test_profiles_have_strict_humanoidsim_coverage(self) -> None:
         self.assertEqual(12, len(self._factory().task_steps))
-        self.assertEqual(10, len(self._mfg_flow_shop().task_steps))
+        self.assertEqual(11, len(self._mfg_flow_shop().task_steps))
         self.assertEqual(8, len(self._shipyard().task_steps))
 
-    def test_mfg_flow_shop_profile_excludes_pm_and_handover(self) -> None:
+    def test_mfg_flow_shop_profile_includes_pm_and_excludes_handover(self) -> None:
         task_codes = set(self._mfg_flow_shop().task_steps)
         self.assertEqual(MFG_FLOW_SHOP_TASK_CODES, task_codes)
-        self.assertNotIn("PREVENTIVE_MAINTENANCE", task_codes)
+        self.assertIn("PREVENTIVE_MAINTENANCE", task_codes)
         self.assertNotIn("HANDOVER_ITEM", task_codes)
 
     def test_primitive_sampling_is_reproducible_and_bounded(self) -> None:

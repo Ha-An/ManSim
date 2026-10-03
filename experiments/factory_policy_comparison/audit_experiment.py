@@ -146,8 +146,8 @@ def _stochastic_signature(run_dir: Path) -> dict[str, object]:
 def _common_prefix_equal(sequences: list[list[object]]) -> bool:
     if not sequences or any(not sequence for sequence in sequences):
         return False
-    prefix_length = min(len(sequence) for sequence in sequences)
-    return len({tuple(sequence[:prefix_length]) for sequence in sequences}) == 1
+    longest = max(sequences, key=len)
+    return all(sequence == longest[:len(sequence)] for sequence in sequences)
 
 
 def _observed_prefixes_consistent(sequences: list[list[object]]) -> bool:

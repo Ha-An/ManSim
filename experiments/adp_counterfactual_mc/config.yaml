@@ -1,0 +1,18 @@
+checkpoint: outputs/adp_training_reliability_v8_full/20260911_214109/checkpoints/iteration_005.pt
+worker_count: 3
+horizon_days: 5
+training_seeds: [620001, 620002, 620003, 620004, 620005, 620006, 620007, 620008, 620009, 620010]
+evaluation_seeds: [720001, 720002, 720003, 720004, 720005]
+capture_decisions: [100, 250, 400]
+candidate_limit: 3
+epsilon: 0.5
+process_count: 10
+training:
+  seed: 2026
+  learning_rate: 0.00005
+  batch_size: 512
+  epochs: 3
+  gradient_clip: 0.5
+  holdout_fraction: 0.2
+  counterfactual_fraction: 0.1
+output_root: experiments/adp_counterfactual_mc/results

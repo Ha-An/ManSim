@@ -1,0 +1,69 @@
+# Legacy mfg_flow_shop policy, fleet-size, and objective comparison experiment.
+scenario: mfg_flow_shop
+horizon_days: 5
+makespan_max_sim_days: 30
+minutes_per_day: 480
+
+objective_modes:
+  - maximize_throughput
+  - minimize_makespan
+
+seeds: [2026]
+worker_counts: [3, 4, 5, 6]
+
+modes:
+  - immediate_shared
+  - immediate_dedicated_roles
+  - rolling_horizon_shared
+  - rolling_horizon_dedicated_roles
+
+common_overrides:
+  - runtime.ui.auto_open_results=false
+  - runtime.ui.auto_start_replay_studio_3d=false
+
+metrics:
+  objective:
+    - objective_status
+    - total_products
+    - throughput_per_sim_hour
+    - avg_daily_products
+    - warehouse_material_restock_count
+    - makespan_min
+    - makespan_status
+    - initial_batch_material_count
+    - initial_batch_terminal_material_count
+    - initial_batch_progress_ratio
+    - initial_batch_accepted_product_count
+    - initial_batch_disposed_scrap_count
+    - initial_batch_yield_ratio
+  flow:
+    - completed_product_lead_time_avg_min
+    - downstream_closure_ratio
+    - avg_wip_material
+    - avg_wip_intermediate
+    - avg_wip_output
+    - buffer_wait_avg_min.material_input
+    - buffer_wait_avg_min.intermediate_input
+    - buffer_wait_avg_min.product_input
+  robot:
+    - humanoid_execution_ratio_avg
+    - humanoid_blocked_ratio_avg
+    - humanoid_unavailable_ratio_avg
+    - agent_discharged_time_min_total
+    - agent_discharged_ratio
+  safety:
+    - humanoid_incident_total
+    - physical_incident_total
+    - coordination_incident_total
+    - traffic_conflicts_by_type.TRAFFIC_WAIT
+    - near_miss_count
+    - collision_count
+  complexity:
+    - otc
+    - cumulative_operational_complexity_over_n_days
+  policy:
+    - rolling_horizon_window_count
+    - rolling_horizon_dispatched_task_count
+    - rolling_horizon_stale_skipped_task_count
+    - rolling_horizon_requeued_task_count
+    - rolling_horizon_max_worker_queue_length

@@ -919,7 +919,20 @@ class HumanoidTaskRuntime:
                 )
             active_step = None
             active_context_task = None
-            if getattr(agent, "pending_recovery_incident", None) is not None:
+            current_availability = str(
+                (agent.humanoid_state or {}).get("availability", "")
+            ).strip().upper()
+            battery_depleted = (
+                str(intr.cause or "").strip().lower() == "battery_depleted"
+                or bool(agent.discharged)
+                or current_availability == "DISABLED"
+            )
+            if battery_depleted:
+                # Depletion recovery is a next-day world lifecycle. Running an
+                # incident protocol here would attempt DISABLED -> BLOCKED and
+                # conflict with HumanoidSim's state contract.
+                agent.pending_recovery_incident = None
+            elif getattr(agent, "pending_recovery_incident", None) is not None:
                 yield from self._execute_pending_recovery_protocol(agent, task)
             self._log_task_event("HUMANOID_TASK_END", agent, task, status="interrupted")
             end_logged = True

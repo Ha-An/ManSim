@@ -1,17 +1,17 @@
 # Manufacturing Policy Comparison Experiment Suite
 
-This folder runs the default `mfg_flow_shop` policy comparison across two objectives, four fleet sizes, and four decision modes.
+The default profile compares the trained ADP policy with its two primary baselines.
 
-- Objectives: `maximize_throughput`, `minimize_makespan`
-- Modes: `immediate_shared`, `immediate_dedicated_roles`, `rolling_horizon_shared`, `rolling_horizon_dedicated_roles`
-- Worker counts: `3, 4, 5, 6`
-- Seed: `2026`
-- Throughput horizon: 5 days
-- Shift length: 8 hours (`480` simulation minutes per day)
-- Makespan safety limit: 30 days
-- Total: `2 x 4 x 4 x 1 = 32` runs
+- Scenario/objective: `mfg_flow_shop / maximize_throughput`
+- Modes: `simulation_based_adp`, `immediate_shared`, `random_feasible_dispatch`
+- Worker count: `3`
+- Held-out seeds: `50001, 50002, 50003, 50004, 50005`
+- This seed set is the locked longitudinal benchmark. Default policy comparisons must not substitute another seed set.
+- Horizon: 5 days, 8 hours per day
+- Total: `3 x 1 x 5 = 15` runs
 
-The single-seed result is a deterministic descriptive comparison. It does not estimate statistical uncertainty.
+The ADP checkpoint is required. All three policies use the same scenario, worker count, timing profile,
+finite buffers, stochastic seed, no-WAIT contract, and horizon.
 
 ## Installation
 
@@ -31,66 +31,69 @@ The complete setup procedure is in the [root README](../../README.md#installatio
 
 ## Run The Experiment
 
-Inspect all 32 commands without creating results:
+Inspect all 15 commands without creating results:
 
 ```powershell
-.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --dry-run
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py `
+  --adp-checkpoint C:\path\to\best.pt --dry-run
 ```
 
-Run an 8-run smoke comparison using three workers:
+Run a three-policy smoke comparison on one held-out seed:
 
 ```powershell
-.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --worker-counts 3
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py `
+  --adp-checkpoint C:\path\to\best.pt --limit 3
 ```
 
-Run all 32 combinations:
+Run all 15 combinations:
 
 ```powershell
-.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py `
+  --adp-checkpoint C:\path\to\best.pt --jobs 5
 ```
 
-Run only one objective or override its limit:
+The runner audits and summarizes the results, creates `comparison_dashboard.html`, and opens it in the
+default browser. Use `--no-open-dashboard` in a headless environment.
+
+## Preserved Rule-Based Profile
+
+The former 32-run experiment remains available as
+`config_mfg_flow_shop_4policy_objectives.yaml`. It compares two objectives, worker counts 3 through 6,
+one seed, and the four immediate/rolling shared/dedicated rule policies.
 
 ```powershell
-.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --objectives maximize_throughput --days 5
-.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py --objectives minimize_makespan --makespan-max-days 30
+.\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py `
+  --config experiments\factory_policy_comparison\config_mfg_flow_shop_4policy_objectives.yaml
 ```
 
-After all runs finish, the runner audits and summarizes the results, creates `comparison_dashboard.html`, and opens it in the default browser. Use `--no-open-dashboard` in a headless environment.
+## Default Held-Out Comparison
 
-## Worker-3 ADP Held-Out Comparison
-
-The four rule-based modes remain available without PyTorch. The ADP research profile compares a
-worker-3 checkpoint against a random feasible baseline and the four rule-based modes on five held-out
-seeds. Training, screening, final checkpoint selection, and held-out test seeds are disjoint.
+Training, checkpoint diagnostics, final checkpoint selection, and held-out test seeds are disjoint.
 
 | Mode | Dispatch contract | Comparison role |
 | --- | --- | --- |
-| `random_feasible_dispatch` | Uniform choice among WAIT and conflict-free feasible tasks | Untrained stochastic baseline |
+| `random_feasible_dispatch` | Uniform choice among conflict-free feasible tasks; no explicit WAIT | Untrained stochastic baseline |
 | `immediate_shared` | Fixed-priority choice whenever a worker becomes idle | Primary reactive rule baseline |
-| `immediate_dedicated_roles` | Immediate choice constrained by exclusive task-rule ownership | Reactive specialization baseline |
-| `rolling_horizon_shared` | Strict-periodic global reallocation with shared roles | Periodic planning baseline |
-| `rolling_horizon_dedicated_roles` | Strict-periodic reallocation under fixed LPT roles | Periodic specialization baseline |
-| `simulation_based_adp` | Attention post-decision value and beam-search joint matching | Learned policy |
+| `simulation_based_adp` | Attention post-decision value and cyclic-order beam-search joint matching | Learned policy |
 
-All six modes use the same scenario, worker count, timing profile, finite buffers, stochastic seed, and
-five-day horizon. The primary test is the paired completed-product difference between ADP and Immediate
+The primary test is the paired completed-product difference between ADP and Immediate
 Shared. A positive mean alone is not reported as superiority; the paired bootstrap 95% interval must
 also have a lower bound above zero. Results therefore describe this experiment contract rather than a
 universal ordering of dispatch policies.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-adp.txt
-.\.venv\Scripts\python.exe -m manufacturing_sim.adp.train `
-  --config configs/adp/mfg_flow_shop_throughput_10x100.yaml
+.\.venv\Scripts\python.exe -m manufacturing_sim.adp.train
 .\.venv\Scripts\python.exe experiments\factory_policy_comparison\run_experiment.py `
-  --config experiments/factory_policy_comparison/config_mfg_flow_shop_worker3_adp.yaml `
-  --adp-checkpoint outputs/adp_training/<timestamp>/best.pt
+  --adp-checkpoint outputs/adp_training/<timestamp>/best.pt --jobs 5
 ```
 
-This profile runs 30 simulations: six modes, five seeds, worker count 3, and the same 5-day
-`maximize_throughput` objective. An absent checkpoint, held-out seed overlap, or a scenario,
-objective, timing, feature-schema, review-interval, or worker-range
+The default trainer uses 10 CPU rollout processes, updates after every 10-episode wave, performs one
+initial plus 50 policy updates, and keeps the existing checkpoint graph at iterations
+`0, 1, 5, 10, ..., 50`.
+
+This profile runs 15 simulations. An absent checkpoint, held-out seed overlap, or a scenario,
+objective, timing, feature-schema, review-interval, cyclic worker-order, exact worker support, or worker-specific environment
 mismatch stops the ADP run; it never falls back to a rule-based policy. Tiny smoke checkpoints only
 validate the execution contract and are not meaningful performance baselines.
 
@@ -126,7 +129,14 @@ Key outputs:
 - `theoretical_capacity.json`: worker-count-specific ideal upper bound, realistic expected production reference, and calculation components
 - `comparison_dashboard.html`: integrated Throughput and Makespan tabs with run links
 
-The dashboard links each run's Hub, KPI dashboard, and Gantt. Policy experiments do not persist the large `events.jsonl` or heavy Replay JSON/HTML artifacts by default. KPI and Gantt artifacts are still generated from in-memory events, while fairness checks use the compact stochastic signature stored in `run_meta.json`. With one seed, the displayed mean equals the observed run value and standard deviation is zero.
+The dashboard links each run's Hub, KPI dashboard, and Gantt. Policy experiments do not persist the large `events.jsonl` or heavy Replay JSON/HTML artifacts by default. KPI and Gantt artifacts are still generated from in-memory events, while fairness checks use the compact stochastic signature stored in `run_meta.json`. With one seed, the displayed mean equals the observed run value and sample standard deviation is not estimable.
+
+All fleet-size line charts show the mean with a shaded +/-1 sample-standard-deviation band and error bars.
+This describes variation across seeds, not a confidence interval for the mean. Nonnegative metrics clip the
+displayed band at zero; ratios clip it to [0, 1]. Point tooltips retain the original mean, SD, variance and
+sample count. Single-seed or missing-SD points have no band. Marginal throughput gains and makespan reductions
+use the mean and SD of differences between matching valid seeds, divided by the number of added workers.
+The first worker count has no marginal value. With incomplete seed sets, only common seeds contribute.
 
 For `mfg_flow_shop`, the dashboard also reports a theoretical maximum production count and a theoretical minimum initial-batch makespan. This ideal deterministic bound uses triangular minimum times, all mandatory production tasks, shortest-path item movement with load multipliers, two parallel machines at each processing station, configured finite-buffer capacities, the single Inspection resource, pooled worker workload, charging duty cycle, startup lead time, and material availability. Failures, defects, incidents, dynamic traffic waits, and avoidable deadhead travel are relaxed, so the value is an optimistic capacity ceiling rather than an expected result.
 
