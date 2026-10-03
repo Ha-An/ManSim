@@ -239,8 +239,8 @@ def _build_worker_availability(events: list[dict[str, Any]]) -> list[dict[str, A
     """Build non-overlapping worker Gantt rows from HumanoidSim availability state.
 
     Worker state is now a multi-axis HumanoidStateSnapshot.  The Gantt lane uses
-    only the availability axis for color/status and keeps task/primitive context
-    in hover metadata.
+    the availability axis with a charging overlay for color/status, and keeps
+    the underlying availability and task/primitive context in hover metadata.
     """
 
     sim_end = max((float(event.get("t", 0.0) or 0.0) for event in events), default=0.0)
@@ -300,6 +300,8 @@ def _build_worker_availability(events: list[dict[str, Any]]) -> list[dict[str, A
                 "end": float(end_t),
                 "duration": duration,
                 "interval_type": display_status,
+                "availability": availability,
+                "charging": power == "CHARGING",
                 "start_event": start_event,
                 "end_event": end_event,
             }
@@ -565,6 +567,8 @@ def export_gantt(
                 "end",
                 "duration",
                 "interval_type",
+                "availability",
+                "charging",
             ],
         )
         writer.writeheader()
@@ -578,6 +582,8 @@ def export_gantt(
                     "end": row["end"],
                     "duration": round(row["duration"], 3),
                     "interval_type": row["interval_type"],
+                    "availability": row.get("availability", ""),
+                    "charging": row.get("charging", ""),
                 }
             )
 
@@ -672,6 +678,7 @@ def export_gantt(
             f"<br>Status={html.escape(str(row['status']))}",
         ]
         if row["entity_group"] == "Worker":
+            lines.append(_hover_line("Availability", row.get("availability", "")))
             lines.append(_hover_line("Task", row.get("task_code", "")))
             lines.append(_hover_line("Primitive", row.get("primitive_call_code", "")))
             lines.append(_hover_line("Mobility", row.get("mobility", "")))
@@ -719,6 +726,7 @@ def export_gantt(
         "REWORK_REQUIRED": "#e74c3c",
     }
     status_order = AVAILABILITY_STATES + [
+        "CHARGING",
         "UNKNOWN",
         "RUNNING",
         "DOWN",
@@ -760,7 +768,7 @@ def export_gantt(
             )
         )
 
-    worker_statuses = set(AVAILABILITY_STATES) | {"UNKNOWN"}
+    worker_statuses = set(AVAILABILITY_STATES) | {"UNKNOWN", "CHARGING"}
     machine_statuses = {"RUNNING", "DOWN", "FINISHED-WAIT-UNLOAD"}
     section_statuses = {"WAIT_WELD", "WELDED", "SURFACE_PREPARED", "PAINTED", "VERIFIED", "COMPLETE", "REWORK_REQUIRED"}
     seen_worker_group = False
@@ -808,7 +816,7 @@ def export_gantt(
         current_artifact="gantt.html",
         current_run_id=current_run_id,
         page_title="Gantt",
-        page_subtitle="Timeline view of worker Availability State, machine states, and wait-unload windows.",
+        page_subtitle="Worker availability with a charging overlay, machine states, and wait-unload windows. Charging can overlap blocked time; execution ratios use the underlying availability state.",
         body_html=f"<section class='section'><div class='panel'>{fig.to_html(full_html=False, include_plotlyjs=True)}</div></section>",
     )
     gantt_path.write_text(html_text, encoding="utf-8")

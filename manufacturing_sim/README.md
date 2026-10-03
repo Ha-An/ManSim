@@ -95,7 +95,8 @@ WAIT를 비활성화하고 Random rollout은 conflict-free feasible task를 균�
 진단은 greedy 선택이 직전 on-policy compact batch의 95% 지지영역을 벗어나는 비율과 그 선택의
 상대적인 가치 과대평가 오차를 기록합니다. 신뢰하기 어려운 고정 probe MSE와 미선택 행동 MSE는
 계산하지 않습니다.
-Feature schema v9은 Station별 finite-buffer 및 machine 상태 집계, repair urgency, battery risk, terminal output까지의 예상 잔여시간과 선택 edge의 downstream progress,
+Feature schema v10은 중복 global 입력 5개를 제거한 30차원이며, 실제 창고 재고와 실시간 설비 잔여시간을 사용합니다.
+Station별 finite-buffer 및 machine 상태 집계, repair urgency, battery risk, terminal output까지의 예상 잔여시간과 선택 edge의 downstream progress,
 blockage 해소 여부, 목적지 가용 용량을 포함합니다. Beam 후보 가치 엔트로피는 greedy 최종 후보
 가치의 집중도를 기록하며 생산량과 함께 정책의 확신 또는 과신을 진단합니다.
 기존 worker 3~6 profile은 `configs/adp/mfg_flow_shop_throughput_multifleet.yaml`에 보존되며,

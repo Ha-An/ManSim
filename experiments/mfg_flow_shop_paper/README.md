@@ -2,6 +2,36 @@
 
 This suite prepares the pre-registered paper experiment separately from development and pilot results.
 
+## Material Supply Sensitivity (20 vs 40)
+
+`inventory_study.py` reuses the existing evaluator, live monitor and comparison dashboard.
+It compares Immediate Shared and Random Feasible at workers 2--6, seeds 910001--910100,
+over five 480-minute days: 1,000 runs per condition, 2,000 total. No ADP training is performed.
+Both conditions use 40 physical shelf slots in a 26-by-15-tile Warehouse, with four rows of
+ten slots and the bottom doorway at y=18. Only initial fill and daily top-up target differ.
+Daily top-up fills the shelf to 20 or 40; it does not add that many materials unconditionally.
+The ordinary 30-slot scenario is unchanged. Compare these two new conditions to each other;
+old results used a different Warehouse doorway and are not a layout-controlled comparison.
+
+```powershell
+# Qualification: eight five-day runs with events for movement/item audits.
+.\.venv\Scripts\python.exe experiments/mfg_flow_shop_paper/inventory_study.py `
+  --output <new_smoke_directory> --smoke --run --no-open-dashboard
+# Full study: ten processes total; the two conditions run sequentially.
+.\.venv\Scripts\python.exe experiments/mfg_flow_shop_paper/inventory_study.py `
+  --output <new_study_directory> --run
+# After interruption, skip only completed runs whose settings and audits match.
+.\.venv\Scripts\python.exe experiments/mfg_flow_shop_paper/inventory_study.py `
+  --output <existing_study_directory> --resume --run
+```
+
+Each `materials_20/` or `materials_40/` directory contains `live_evaluation.html` and,
+after all runs and fairness checks pass, `policy_comparison_dashboard/comparison_dashboard.html`.
+Final dashboards open automatically. Detailed events and Replay exports are disabled in the
+2,000-run study; event-level movement audits are limited to the separate qualification runs.
+For detached Windows execution, launch the same command with `Start-Process -WindowStyle Hidden`
+and redirected stdout/stderr. This does not change the simulation or statistical protocol.
+
 ## Confirmatory Design
 
 - Worker counts: 2, 3, 4, 5 and 6.
@@ -78,6 +108,33 @@ estimate variation caused by neural-network initialization or training seeds.
 
 ## Analysis Contract
 
+### Evaluate Existing Fleet-Specific Checkpoints
+
+Completed external training directories can be evaluated without retraining or modifying their checkpoints:
+
+```powershell
+.\.venv\Scripts\python.exe experiments/mfg_flow_shop_paper/prepare_saved_checkpoints.py `
+  --training-roots <worker2_training> <worker3_training> <worker4_training> <worker5_training> <worker6_training> `
+  --output <new_result_directory> --previous-result <old_result_directory> `
+  --allow-undeclared-held-out-seeds
+.\.venv\Scripts\python.exe experiments/mfg_flow_shop_paper/run_evaluation.py `
+  --prepared <new_result_directory> --jobs 10 --allow-undeclared-held-out-seeds
+```
+
+The preparation audits all five training outputs, validates checkpoint compatibility against the current
+runtime, and records source paths, SHA-256 digests, actual training budgets and validation configurations.
+The default evaluates three policies (300 runs); add `--six-policies` during preparation for all six (600).
+It does not launch training or overwrite existing result directories.
+
+The explicit seed-extension flag is needed only when the old checkpoint declared development seeds rather
+than the established paper seeds 910001--910020. Overlap with training or validation remains an error.
+The original checkpoint is unchanged and the declaration extension is recorded in preflight JSON; this is
+not a claim that the new seed set was embedded in that checkpoint before training.
+
+Previous results marked `requires_rerun` are never imported into the new comparison. In particular, the
+September 19 results used the pre-fix PM lifecycle and cannot serve as baselines for `exclusive_pm_v1` models.
+The new evaluation directory preserves that reuse assessment independently of the old results.
+
 ### Extend A Completed Three-Policy Comparison
 
 The optional extension adds Immediate Dedicated Roles, Rolling Horizon Shared and Rolling Horizon Dedicated
@@ -118,6 +175,56 @@ Do not use the repeatedly inspected development seeds 50001 through 50005 for co
 Any behavior-changing fix after final runs begin invalidates the complete affected experiment block.
 
 ## Expected Runtime And Storage
+
+### Extend To 100 Seeds With Live Progress
+
+Keep the completed, audited 20-seed runs and append the same 80 new seeds to every policy and fleet size:
+
+```powershell
+.\.venv\Scripts\python.exe experiments/mfg_flow_shop_paper/extend_seeds.py `
+  --prepared <result_directory> --first-seed 910001 --seed-count 100 `
+  --allow-undeclared-held-out-seeds
+```
+
+This preserves the original checkpoints and run directories, checks all resolved policy/scenario settings,
+verifies checkpoint hashes and seed separation, and backs up the 20-seed CSVs and dashboard.
+For six policies and worker counts 2--6, the fixed plan contains 3,000 runs: 600 reused and 2,400 new.
+This is a documented follow-up extension of an already inspected study, not a new pre-registration.
+Do not stop early when a comparison becomes significant.
+
+Run the extension in a hidden background process (replace the absolute result path):
+
+```powershell
+$prepared = 'C:\Github\ManSim\experiments\mfg_flow_shop_paper\results\<result_directory>'
+$env:OMP_NUM_THREADS = '1'
+$env:MKL_NUM_THREADS = '1'
+$env:OPENBLAS_NUM_THREADS = '1'
+Start-Process -FilePath "$PWD\.venv\Scripts\python.exe" `
+  -ArgumentList @('-u', 'experiments/mfg_flow_shop_paper/run_evaluation.py',
+    '--prepared', $prepared, '--jobs', '10', '--pending-only',
+    '--allow-undeclared-held-out-seeds') `
+  -WorkingDirectory $PWD -WindowStyle Hidden `
+  -RedirectStandardOutput "$prepared\evaluation_100seed_console.log" `
+  -RedirectStandardError "$prepared\evaluation_100seed_stderr.log"
+```
+
+`live_evaluation.html` opens in Chrome (default-browser fallback) and refreshes every five seconds,
+without a web server. It shows audited completion, reused/new counts, pending/running/failed runs,
+per-policy/per-worker progress, active run day and simulation progress, elapsed time and approximate ETA.
+An expired heartbeat is visibly flagged rather than presented as a healthy running process.
+The previous 20-seed dashboard is explicitly labelled and preserved separately.
+Simulation progress of 100% is not counted as complete until artifact and KPI audits pass.
+Only the fully audited 100-seed block produces the final statistical dashboard; partial results are not ranked.
+After aggregation and fairness checks pass, the existing standard comparison dashboard opens automatically.
+
+The runner defaults to ten parallel jobs. `--no-open-dashboard` suppresses browser opening;
+`--no-live` disables the monitor. After interruption, repeat the same `--pending-only` command to retain
+verified results and resume missing/failed runs. An OS file lock prevents duplicate evaluators from writing
+the same experiment concurrently. CSV/JSON monitor updates are atomic.
+
+For this extension, the preceding 600-run evaluation took about 2.16 hours with ten concurrent jobs;
+2,400 additional runs are therefore initially estimated at about 8.6 hours. This estimate is machine- and
+workload-dependent and is separate from the older pilot estimates below. Replay and detailed events remain off.
 
 On the current workstation, the reduced checkpoint-validation schedule is expected to take roughly 9.5--16.5
 hours per worker-specific training job. Five sequential jobs should take about 47--82 hours. The 300 final
@@ -160,6 +267,39 @@ with a plus-one finite-resample correction; worker-level multiplicity uses Holm 
 One training replicate has no estimable between-training standard deviation (blank, not zero).
 Production reference calculations use the archived resolved configuration for paper results.
 Aggregation `pass` and simulation validity are separate statuses.
+
+The ideal process/movement capacity and operational planning references are approximations,
+not certified scheduling bounds or empirical expectations. Average machine routes, a steady-state
+cycle and threshold-based charging are planning assumptions. Do not use proximity to these
+references as proof of saturation or optimality. The separately labelled material-only bound
+relaxes all processing and transport constraints; legacy `theoretical_*` JSON keys are retained.
+
+### Inventory Stress Audit
+
+Warehouse deadlocks in the 20/40 inventory study are intentional extreme-scenario behavior.
+Do not remove them or change warehouse geometry, route selection or yielding as an audit fix.
+The earlier 30-material study has a different warehouse layout, so comparing 20/30/40 does
+not isolate inventory alone. The 20 and 40 conditions share the expanded 40-slot layout.
+
+```powershell
+.\.venv\Scripts\python.exe -m experiments.mfg_flow_shop_paper.audit_inventory_results `
+  --prepared <materials_20> <materials_40> <previous_materials_30> --output <audit_dir> --jobs 10
+.\.venv\Scripts\python.exe -m experiments.mfg_flow_shop_paper.audit_inventory_results `
+  --prepared <materials_20> <materials_40> <previous_materials_30> --output <audit_dir> --statistics-only
+```
+
+These checks independently reconcile daily outputs, worker state integrals, snapshot capacity,
+Gantt coverage, KPI ratios, per-seed statistics and paired fleet marginal gains. Minute snapshots
+cannot establish per-edge movement continuity or item custody. Detailed-event qualification
+is still needed for those claims. Gantt `CHARGING` is a power overlay that can also cover blocked
+availability; do not simply add every charging segment to execution time. New Gantt CSVs retain
+the underlying `availability` and a `charging` flag. Legacy CSVs allow only overlap-aware checks.
+
+Restock fairness compares the configured refill schedule and target, not identical positive-quantity event
+times: a warehouse already at its target legitimately skips a refill. A missing event is accepted only when
+the exact boundary inventory snapshot proves the shelf is at target and within capacity. Missing evidence,
+underfilled shelves, duplicate events and off-schedule additions still fail. `evaluation_raw.csv` retains the
+actual event times, verified no-op boundaries and audit errors; `fairness_report.csv` reports verified no-ops.
 
 - All runs must end with `objective_status=complete` at exactly 2,400 simulated minutes.
 - Scenario, timing, reliability, buffer and policy-independent fingerprints must match within each

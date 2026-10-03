@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime, timezone
 import html
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -58,7 +60,100 @@ def _link(base: Path, path: Path) -> str:
         return path.resolve().as_uri()
 
 
-def render_monitor(job_dir: Path, state: dict[str, Any], runs: list[dict[str, str]]) -> None:
+def _number(value: Any) -> float | None:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _performance_cards(output: Path, progress: dict[str, Any],
+                       summary: dict[str, Any]) -> list[tuple[str, str, str]]:
+    try:
+        with (output / "iteration_metrics.csv").open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+    except (OSError, csv.Error, UnicodeError):
+        rows = []
+    # Only published, completed screening evaluations may compete for best.
+    evaluated = [row for row in rows if _number(row.get("iteration")) is not None
+                 and _number(row.get("validation_products_mean")) is not None]
+    evaluated.sort(key=lambda row: float(row["iteration"]))
+    ranked = sorted(evaluated, key=lambda row: (
+        -float(row["validation_products_mean"]),
+        _number(row.get("validation_products_std")) if _number(row.get("validation_products_std")) is not None else math.inf,
+        float(row["iteration"])))
+    latest = evaluated[-1] if evaluated else {}
+    screening_best = ranked[0] if ranked else {}
+    final = summary.get("status") == "completed"
+    best_iteration = _number(summary.get("best_iteration") if final else screening_best.get("iteration"))
+    best_mean = _number(summary.get("best_validation_completed_products_avg") if final
+                        else screening_best.get("validation_products_mean"))
+    best_std = _number(summary.get("best_validation_completed_products_std") if final
+                       else screening_best.get("validation_products_std"))
+    partition = "final_selection_validation" if final else "screening_validation"
+    workers = summary.get("worker_counts", [])
+    seeds = summary.get("seed_partitions", {}).get(partition, [])
+    sample_count = (len(seeds) * len(workers)) if seeds and workers else None
+    if not final:
+        sample_count = _number(screening_best.get("validation_episode_count")) or sample_count
+    evaluation_kind = "최종 선정 validation" if final else "Screening validation · 잠정 best"
+    spread = f"표준편차 {best_std:.2f}개" if best_std is not None else "표준편차 미기록"
+    samples = f"평가 {int(sample_count)} episodes" if sample_count is not None else "평가 표본 수 미기록"
+    cards = [
+        ("Best iteration (최종)" if final else "Best iteration (잠정)",
+         str(int(best_iteration)) if best_iteration is not None and best_iteration >= 0 else "평가 전", evaluation_kind),
+        ("Best validation 평균 생산량", f"{best_mean:.2f}개" if best_mean is not None else "평가 전",
+         f"{spread} · {samples} · greedy 평가" if best_mean is not None else "완료된 평가만 반영"),
+    ]
+    latest_mean = _number(latest.get("validation_products_mean"))
+    if latest_mean is None:
+        cards.append(("최근 screening 생산량", "평가 전", "최종 선정 validation과 별도"))
+    else:
+        delta = latest_mean - float(screening_best["validation_products_mean"])
+        cards.append(("최근 screening 생산량", f"{latest_mean:.2f}개 (I{int(float(latest['iteration']))})",
+                      f"Screening best 대비 {delta:+.2f}개 · 동일 seed 집합"))
+
+    stopped = bool(progress.get("stop_reason") or summary.get("stop_reason"))
+    terminal = progress.get("status") in TERMINAL or summary.get("status") in TERMINAL
+    scheduled = [_number(value) for value in summary.get("screening_iterations", [])]
+    completed_indices = {int(float(row["iteration"])) for row in evaluated}
+    current = _number(progress.get("iteration")) or 0
+    upcoming = sorted(int(value) for value in scheduled if value is not None
+                      and value >= current and int(value) not in completed_indices)
+    if final or terminal:
+        next_value = "종료"
+    elif stopped or progress.get("phase") == "final_selection_validation":
+        next_value = "최종 선정 평가"
+    else:
+        next_value = f"Iteration {upcoming[0]}" if upcoming else "일정 미기록"
+    cards.append(("다음 validation", next_value, "Checkpoint 업데이트 후 평가"))
+
+    early = summary.get("early_stopping", {})
+    history = summary.get("early_stopping_history", [])
+    if not early.get("enabled"):
+        cards.append(("조기 종료 점검", "비활성" if early else "미기록", "생산량 기준"))
+    elif history:
+        check = history[-1]
+        stagnant = check.get("early_stop_stagnant_iterations", "-")
+        checks = int(early.get("consecutive_checks", 1))
+        consecutive = 0
+        for row in reversed(history):
+            if not row.get("early_stop_low_gain"):
+                break
+            consecutive += 1
+        detail = (f"최근 I{check['iteration']} 평가 기준 · 최소 I{early.get('min_iterations', '-')}"
+                  f" · 낮은 개선 연속 {min(consecutive, checks)}/{checks}회")
+        value = ("종료 조건 충족" if check.get("early_stop_triggered")
+                 else f"평균 개선 없음 {stagnant}/{early.get('patience_iterations', '-')} iterations")
+        cards.append(("조기 종료 점검", value, detail))
+    else:
+        cards.append(("조기 종료 점검", "평가 전", f"최소 iteration {early.get('min_iterations', '-')} 이후 판단"))
+    return cards
+
+
+def render_monitor(job_dir: Path, state: dict[str, Any], runs: list[dict[str, str]],
+                   *, filename: str = "live_training.html", dashboard_filename: str = "training_dashboard.html") -> None:
     esc = lambda value: html.escape(str(value), quote=True)
     records = []
     for run in runs:
@@ -79,8 +174,10 @@ def render_monitor(job_dir: Path, state: dict[str, Any], runs: list[dict[str, st
     completed = progress.get("completed_episode_count", 0)
     total = progress.get("expected_episode_count", 0)
     wave_done, wave_total = progress.get("wave_completed", 0), progress.get("wave_episode_count", 0)
-    current_iteration = (summary.get("policy_iterations", progress.get("iteration", "-"))
-                         if progress.get("status") == "completed" else progress.get("iteration", "-"))
+    training_finished = (progress.get("status") == "completed" or progress.get("stop_reason")
+                         or summary.get("stop_reason"))
+    current_iteration = (summary.get("completed_policy_iterations", summary.get("policy_iterations", progress.get("iteration", "-")))
+                         if training_finished else progress.get("iteration", "-"))
     cards = [("현재 학습", run["label"]), ("현재 단계", stage),
              ("Iteration", f"{current_iteration} / {progress.get('policy_iterations', '-') }"),
              ("완료된 가치망 업데이트", progress.get("completed_update_count", summary.get("value_update_count", 0))),
@@ -88,17 +185,33 @@ def render_monitor(job_dir: Path, state: dict[str, Any], runs: list[dict[str, st
              ("현재 wave 완료 episode", f"{wave_done} / {wave_total or '-'}"),
              ("Wave", progress.get("wave_id", "-")),
              ("Wall-clock 경과", duration),
+             ("학습 종료 사유", progress.get("stop_reason") or summary.get("stop_reason") or "-"),
              ("CPU rollout process", progress.get("process_count", "-")),
              ("가치망 학습 장치", progress.get("training_device", summary.get("training_device", "-"))),
              ("마지막 학습 진행 갱신", progress.get("updated_at", "-"))]
-    cards_html = "".join(f"<div class='metric'><dt>{esc(k)}</dt><dd>{esc(v)}</dd></div>" for k, v in cards)
+    detailed_cards = [(label, value, "") for label, value in cards]
+    if run.get("output"):
+        detailed_cards[2:2] = _performance_cards(Path(run["output"]), progress, summary)
+    workers = summary.get("worker_counts", [])
+    horizon = summary.get("horizon_days")
+    detailed_cards[0] = ("현재 학습", run["label"],
+                         f"Worker {', '.join(map(str, workers)) or '-'} · {horizon if horizon is not None else '-'}일 episode")
+    detailed_cards = [(label, value,
+                       f"완료 wave 기준: 학습 {summary.get('training_episode_count', '-')} / 평가 {summary.get('validation_episode_count', '-')}"
+                       if label == "전체 episode (학습 + 평가)" else detail)
+                      for label, value, detail in detailed_cards]
+    cards_html = "".join(f"<div class='metric'><dt>{esc(k)}</dt><dd>{esc(v)}</dd>"
+                         f"<div class='metric-detail'>{esc(detail)}</div></div>" for k, v, detail in detailed_cards)
     table = []
     dashboard_html = ""
     for item, pr, su in records:
-        path = Path(item["output"]) / "training_dashboard.html"
+        path = Path(item["output"]) / dashboard_filename
+        if not path.exists():
+            path = Path(item["output"]) / "training_dashboard.html"
         link = f"<a href='{esc(_link(job_dir, path))}' target='_blank'>학습 그래프</a>" if path.exists() else "-"
-        displayed_iteration = (su.get("policy_iterations", pr.get("iteration", "-"))
-                               if pr.get("status") == "completed" else pr.get("iteration", "-"))
+        displayed_iteration = (su.get("completed_policy_iterations", su.get("policy_iterations", pr.get("iteration", "-")))
+                               if pr.get("status") == "completed" or pr.get("stop_reason") or su.get("stop_reason")
+                               else pr.get("iteration", "-"))
         table.append(f"<tr><td>{esc(item['label'])}</td><td>{esc(pr.get('status', su.get('status', 'pending')))}</td>"
                      f"<td>{esc(displayed_iteration)}</td><td>{link}</td></tr>")
         if item == run and path.exists():
@@ -123,6 +236,7 @@ main{{max-width:1500px;margin:auto;padding:20px}}header{{display:flex;gap:20px;a
 h1{{font-size:24px;margin:0}}h2{{font-size:18px;margin:20px 0 10px}}.status{{color:#087759;font-weight:700}}
 .metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));margin:16px 0;border-top:1px solid #ccd4dc}}
 .metric{{min-width:0;padding:12px 14px 12px 0;border-bottom:1px solid #ccd4dc}}dt{{color:#52616d}}dd{{margin:4px 0 0;overflow-wrap:anywhere;font-weight:600}}
+.metric-detail{{color:#586773;font-size:12px;margin-top:4px;overflow-wrap:anywhere}}
 progress{{width:100%;height:12px;accent-color:#168873}}table{{width:100%;table-layout:fixed;border-collapse:collapse}}td,th{{text-align:left;padding:8px;border-bottom:1px solid #ccd4dc;overflow-wrap:anywhere}}
 a{{color:#086aba}}iframe{{width:100%;height:1000px;border:0;background:white}}pre{{background:#172229;color:#e5edf1;padding:12px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}}
 [role=alert]{{color:#af302e}}.muted{{color:#586773}}@media(max-width:500px){{main{{padding:12px}}.metrics{{grid-template-columns:1fr 1fr}}td,th{{padding:5px}}}}
@@ -136,7 +250,40 @@ document.getElementById('status').textContent='모니터 응답 없음: 프로�
 try{{window.scrollTo(0,Number(sessionStorage.getItem(location.pathname)||0));
 window.addEventListener('beforeunload',()=>sessionStorage.setItem(location.pathname,String(window.scrollY)));}}catch(e){{}}</script>
 </body></html>"""
-    atomic_text(job_dir / "live_training.html", page)
+    atomic_text(job_dir / filename, page)
+
+
+def watch_monitor(job_dir: Path, *, open_browser: bool = True) -> Path:
+    """Refresh the display of an older supervisor without restarting training."""
+    runs = read_json(job_dir / "job.json")["runs"]
+    path = job_dir / "live_training_latest.html"
+    rendered: dict[str, tuple[Any, ...]] = {}
+    dashboard_filename = "training_dashboard_latest.html"
+    while True:
+        state = read_json(job_dir / "status.json")
+        # An already running trainer keeps its old renderer in memory. Publish a
+        # separate view only when source artifacts change; never race its HTML.
+        for run in runs:
+            output = Path(run["output"])
+            if read_json(output / "training_summary.json").get("return_estimator") != "n_step_td":
+                continue
+            sources = [output / name for name in ("episode_metrics.csv", "iteration_metrics.csv",
+                                                   "wave_metrics.csv", "training_summary.json", "result_validity.json")]
+            try:
+                stamp = tuple((file.stat().st_mtime_ns, file.stat().st_size) if file.exists() else None for file in sources)
+                if stamp != rendered.get(run["output"]):
+                    from .td_dashboard import render_from_files
+                    render_from_files(output, filename=dashboard_filename)
+                    rendered[run["output"]] = stamp
+            except (OSError, ValueError, csv.Error) as exc:
+                print(f"Dashboard refresh deferred: {exc}", flush=True)
+        render_monitor(job_dir, state, runs, filename=path.name, dashboard_filename=dashboard_filename)
+        if open_browser:
+            open_monitor(path)
+            open_browser = False
+        if state.get("status") in TERMINAL or time.time() - state.get("heartbeat_epoch", 0) > 30:
+            return path
+        time.sleep(5)
 
 
 def launch(*, command: list[str], job_dir: Path, runs: list[dict[str, str]],
@@ -265,17 +412,20 @@ def supervise(job_dir: Path) -> int:
                 progress = read_json(Path(run["output"]) / "training_progress.json")
                 if progress.get("status") == "running":
                     TrainingProgress(Path(run["output"])).update(status=state["status"])
-        persist()
-        for path in manifest.get("claims", []):
-            claim = Path(path)
-            if read_json(claim).get("job_dir") == str(job_dir):
-                claim.unlink(missing_ok=True)
+        try:
+            persist()
+        finally:
+            # A final monitor write failure must not permanently lock the output.
+            for path in manifest.get("claims", []):
+                claim = Path(path)
+                if read_json(claim).get("job_dir") == str(job_dir):
+                    claim.unlink(missing_ok=True)
     return 0 if state["status"] == "completed" else 1
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect or stop a detached ADP training job.")
-    parser.add_argument("action", choices=["status", "stop", "open", "_supervise"])
+    parser.add_argument("action", choices=["status", "stop", "open", "watch", "_supervise"])
     parser.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
     directory = args.job.resolve()
@@ -283,6 +433,9 @@ def main() -> None:
         parser.error(f"Unknown background job: {directory}")
     if args.action == "_supervise":
         raise SystemExit(supervise(directory))
+    if args.action == "watch":
+        watch_monitor(directory)
+        return
     if args.action == "stop":
         state = read_json(directory / "status.json")
         if state.get("status") not in TERMINAL:

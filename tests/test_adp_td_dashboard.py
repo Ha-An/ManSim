@@ -3,11 +3,13 @@ import json
 import math
 from pathlib import Path
 import re
+import xml.etree.ElementTree as ET
 
 import pytest
 
-from manufacturing_sim.adp.td_dashboard import paired_production_changes, render_td_dashboard, _interval
+from manufacturing_sim.adp.td_dashboard import paired_production_changes, render_td_dashboard, _interval, cell
 from manufacturing_sim.adp.train import _svg_chart
+from manufacturing_sim.adp.td_formulas import FORMULAS, render_formula
 
 
 def fixture():
@@ -114,3 +116,65 @@ def test_unknown_values_are_na_and_invalidity_warning_survives(tmp_path: Path):
     assert "N/A" in page and "NaN" not in page and "Infinity" not in page
     assert "&lt;unsafe&gt;" in page
     assert "WAIT 비활성 계약" in page
+
+
+@pytest.mark.parametrize("value", [5e-5, 2e-5, 1e-5, -1e-7])
+def test_small_nonzero_metrics_are_not_displayed_as_zero(value):
+    assert float(cell(value)) == pytest.approx(value)
+    assert cell(value) != "0.000"
+
+
+def test_random_batch_entropy_is_unavailable_and_legacy_idle_is_flagged(tmp_path):
+    episodes = [{"phase": "initial_random", "iteration": 0,
+                 "beam_value_entropy_avg": 0., "beam_value_entropy_decision_count": 0}]
+    iterations = [{"iteration": 0, "beam_entropy": 0.}]
+    page = render_td_dashboard(tmp_path, episodes, iterations, [], {"wait_action_enabled": False}).read_text(encoding="utf-8")
+    assert "원본 로그 없이 복원할 수 없습니다" in page
+    assert "유효 decision이 없는 초기 random batch 등은 N/A" in page
+    assert "<td>N/A</td>" in page
+    assert iterations[0]["beam_entropy"] == 0.
+
+
+@pytest.mark.parametrize("key", list(FORMULAS))
+def test_offline_equations_have_well_formed_accessible_mathml(key):
+    page = render_formula(key)
+    root = ET.fromstring(page)
+    math_ns = "{http://www.w3.org/1998/Math/MathML}"
+    equations = root.findall(f".//{math_ns}math")
+    assert len(equations) == len(FORMULAS[key][0])
+    for equation in equations:
+        assert equation.attrib["display"] == "block"
+        assert equation.attrib["aria-label"]
+        for node in equation.iter():
+            if node.tag in {math_ns + tag for tag in ("mfrac", "msub", "msup", "mover", "munder")}:
+                assert len(node) == 2
+            if node.tag in {math_ns + tag for tag in ("msubsup", "munderover")}:
+                assert len(node) == 3
+    assert not root.findall(".//script")
+    assert "&lt;mfrac" not in page
+
+
+def test_production_formulas_use_subscripts_sample_sd_and_separate_ci():
+    page = render_formula("production")
+    ns = {"m": "http://www.w3.org/1998/Math/MathML"}
+    equations = ET.fromstring(page).findall(".//m:math", ns)
+    assert len(equations) == 3
+    variance = equations[1].find(".//m:msqrt/m:mfrac", ns)
+    assert "".join(variance[1].itertext()).strip() == "Nk−1"
+    assert equations[1].find(".//m:msup/m:mn", ns).text == "2"
+    assert "1.96" in "".join(equations[2].itertext())
+    assert len(equations[0].findall(".//m:msub", ns)) >= 3
+
+
+def test_display_only_refresh_does_not_overwrite_trainer_page(tmp_path):
+    episodes, iterations = fixture()
+    original = tmp_path / "training_dashboard.html"
+    original.write_text("trainer-owned", encoding="utf-8")
+    page = render_td_dashboard(tmp_path, episodes, iterations, [], {"n_step": 30},
+                               filename="training_dashboard_latest.html")
+    assert page.name == "training_dashboard_latest.html"
+    assert original.read_text(encoding="utf-8") == "trainer-owned"
+    content = page.read_text(encoding="utf-8")
+    assert content.count("<math ") >= 20
+    assert "MathJax" not in content and "cdn.jsdelivr" not in content
+    assert "overflow-x:auto" in content

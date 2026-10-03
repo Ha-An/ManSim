@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import heapq
 import builtins
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 
@@ -177,6 +177,17 @@ class TileGridMap:
         blocked_threshold = float(map_cfg.get("blocked_replan_threshold_min", 5.0) or 5.0)
 
         zones = cls._default_zones(width, height)
+        if "warehouse_height_tiles" in map_cfg:
+            warehouse = replace(zones["Warehouse"], height=int(map_cfg["warehouse_height_tiles"]))
+            if warehouse.height < 6 or warehouse.y1 >= height:
+                raise ValueError("map.warehouse_height_tiles does not fit the map")
+            for name, other in zones.items():
+                if name != "Warehouse" and not (
+                    warehouse.x1 < other.x or warehouse.x > other.x1
+                    or warehouse.y1 < other.y or warehouse.y > other.y1
+                ):
+                    raise ValueError(f"Expanded Warehouse overlaps {name}")
+            zones["Warehouse"] = warehouse
         doors = cls._default_doors(zones)
         walls = cls._perimeter_walls(zones, doors)
         warehouse_cfg = cfg.get("warehouse", {}) if isinstance(cfg.get("warehouse", {}), dict) else {}
@@ -206,6 +217,17 @@ class TileGridMap:
         )
         walls |= cls._object_wall_tiles(objects)
         service_tiles = cls._build_object_service_tiles(width, height, walls, objects)
+        warehouse = zones["Warehouse"]
+        for object_id, obj in objects.items():
+            if obj.object_type != "material_slot":
+                continue
+            required = (*obj.tiles, (obj.x, obj.y + obj.height))
+            if not all(warehouse.x < x < warehouse.x1 and warehouse.y < y < warehouse.y1
+                       for x, y in required) or not service_tiles.get(object_id):
+                raise ValueError(
+                    f"Warehouse shelf capacity {material_shelf_capacity} does not fit: "
+                    f"{object_id} needs an interior pickup aisle; increase map.warehouse_height_tiles"
+                )
         zone_service_tiles = cls._build_zone_service_tiles(width, height, zones, walls, objects)
         desk_tiles = service_tiles.get(inspection_workstation_id, [])
         if desk_tiles:

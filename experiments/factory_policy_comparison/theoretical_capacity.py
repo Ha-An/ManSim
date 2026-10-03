@@ -108,7 +108,8 @@ def calculate_theoretical_capacity(
 ) -> dict[str, Any]:
     """Build ideal and realistic scenario-level production references.
 
-    The ideal bound uses triangular minima and relaxes stochastic disruption.
+    The ideal capacity reference uses triangular minima and relaxes disruption.
+    Its steady-state cycle and charging assumptions do not certify a bound.
     The realistic reference uses triangular expectations and configured
     reliability, charging, quality, and first-order incident burden. It remains
     policy-independent; queueing, dispatch delay, and dynamic traffic are left
@@ -680,6 +681,13 @@ def calculate_theoretical_capacity(
         "schema_version": 4,
         "scenario": scenario_key,
         "available": True,
+        "certified_bound": False,
+        "interpretation": (
+            "공정·작업·이동시간을 반영한 이상적 생산능력 근사치입니다. "
+            "평균 설비 경로, 정상상태 cycle과 충전 주기를 가정하므로 "
+            "수학적으로 보장된 상한이나 최적해가 아니며 최적성 격차 산정에 사용할 수 없습니다. "
+            "기존 theoretical_* 필드명은 결과 파일 호환성을 위해 유지합니다."
+        ),
         "method": "parallel_resource_finite_buffer_shortest_path_bound_v3",
         "timing_basis": "triangular_minimum",
         "movement_basis": "static shortest-path tiles with item-load multipliers",
@@ -692,9 +700,10 @@ def calculate_theoretical_capacity(
         "assumptions": [
             "모든 제품이 검사를 통과한다고 가정하고 설비 고장, 예방정비, incident, 동적 교통 대기와 확률적 queue 대기는 제외합니다.",
             "모든 필수 출발지-도착지 item 이동과 최초 charging dock 접근 이동을 포함합니다.",
-            "Station 1·2의 병렬 설비 대수, 단일 inspection desk, 전체 worker 작업량과 직접 충전 duty cycle을 자원 제약으로 반영합니다.",
-            "유한 버퍼는 실제 설정 용량을 사용하며, 상한에서는 slot reservation을 지키는 무대기 인계가 가능하다고 가정합니다.",
-            "연속 작업 사이의 빈 이동은 최적으로 배치된다고 가정하므로 실제 기대 생산량이 아니라 낙관적 상한입니다.",
+            "Station 1·2의 병렬 설비 대수, 단일 inspection desk, 전체 worker 작업량과 표준 직접 충전 duty cycle을 참고 모델에 반영합니다.",
+            "유한 버퍼의 실제 설정 용량을 기록하되, 근사 계산에서는 버퍼 대기를 제외한 인계가 가능하다고 가정합니다.",
+            "연속 작업 사이의 빈 이동과 버퍼 대기를 생략하고 설비 경로를 평균하므로 엄밀한 유한기간 스케줄링 상한은 아닙니다.",
+            "충전 duty cycle은 저전력 임계치에서 충전하는 표준 운영 가정입니다. 위험 행동 허용 정책에서 강제되는 제약은 아닙니다.",
         ],
         "expected_reference": {
             "method": "configuration_derived_stochastic_mean_reference_v3",
@@ -713,8 +722,8 @@ def calculate_theoretical_capacity(
                 "설비 cycle과 downstream 작업을 정책이 얼마나 잘 중첩하는지는 관측 결과에서 평가합니다.",
             ],
             "interpretation": (
-                "이론적 상한과 실제 관측치 사이에서 정책 독립적인 현실적 기준점으로 사용합니다. "
-                "보장 구간이나 최적해가 아니라 설정값으로 계산한 기대 기준입니다."
+                "설정값으로 계산한 보수적인 운영 계획 기준입니다. "
+                "실제 생산량의 통계적 기댓값, 보장 구간 또는 최적해가 아니며 실제 관측치가 이를 초과할 수 있습니다."
             ),
             "components": expected_component_template or {},
         },

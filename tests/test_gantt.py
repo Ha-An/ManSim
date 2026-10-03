@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from dashboards.gantt import export_gantt
+from experiments.mfg_flow_shop_paper.audit_inventory_results import gantt_state_checks
 
 
 def _state_event(
@@ -48,6 +49,32 @@ def _state_event(
 
 
 class GanttExportTests(unittest.TestCase):
+    def test_charging_overlay_preserves_blocked_availability(self) -> None:
+        events = [
+            _state_event(0, "A1", "EXECUTING", power="CHARGING"),
+            _state_event(2, "A1", "BLOCKED", power="CHARGING"),
+            _state_event(3, "A1", "EXECUTING", power="CHARGING"),
+            _state_event(5, "A1", "AVAILABLE"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            export_gantt(events, path)
+            with (path / "gantt_segments.csv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            content = (path / "gantt.html").read_text(encoding="utf-8")
+        self.assertEqual(["CHARGING"] * 3, [row["status"] for row in rows])
+        self.assertEqual(["EXECUTING", "BLOCKED", "EXECUTING"], [row["availability"] for row in rows])
+        self.assertTrue(all(row["charging"] == "True" for row in rows))
+        self.assertIn("Availability=BLOCKED", content)
+        axes = {"availability": {"EXECUTING": 4, "BLOCKED": 1}, "power": {"CHARGING": 5}}
+        for code, actual, expected in gantt_state_checks(rows, axes):
+            self.assertAlmostEqual(actual, expected, msg=code)
+        legacy = [{k: v for k, v in row.items() if k not in ("availability", "charging")} for row in rows]
+        for code, actual, expected in gantt_state_checks(legacy, axes):
+            self.assertAlmostEqual(actual, expected, msg=code)
+        bad_axes = {"availability": {"EXECUTING": 5}, "power": {"CHARGING": 5}}
+        self.assertTrue(any(abs(a-b) > 0.01 for _, a, b in gantt_state_checks(rows, bad_axes)))
+
     def test_open_machine_downtime_is_retained_at_horizon(self) -> None:
         events = [
             {"t": 2, "type": "MACHINE_PM_START", "entity_id": "S1M1", "details": {}},

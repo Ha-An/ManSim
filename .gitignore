@@ -23,3 +23,12 @@ knowledge/llm_knowledge/
 llm_knowledge/
 
 openclaw/workspaces/*/.openclaw/
+
+# Research manuscripts and formulation drafts are local-only.
+/docs/paper/
+/docs/adp_formulation*
+/paper/
+/manuscript/
+/manuscripts/
+*.tex
+*.bib

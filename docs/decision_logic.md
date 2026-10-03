@@ -201,8 +201,8 @@ joint matching을 선택합니다. 기본 action set에는 명시적 `WAIT`가 �
 
 기본 `mfg_flow_shop_throughput.yaml`은 초기 Random Feasible 50 episode부터 동일한 n-step TD를
 사용합니다. n=30은 의사결정 수의 상한이며, 중간 행동이 업데이트 시작 시 고정한 greedy 정책과
-다르면 그 행동 전에 bootstrap합니다. 이후 10 episode마다 50회 업데이트합니다. 최근 50 episode를
-보유하되, 매 업데이트에는 현재 10 episode와 과거에서 균등 추출한 10 episode만 사용합니다.
+다르면 그 행동 전에 bootstrap합니다. 이후 10 episode마다 75회 업데이트합니다. 최근 100 episode를
+보유하되, 매 업데이트에는 현재 10 episode와 과거에서 균등 추출한 20 episode만 사용합니다.
 Target network는 SGD마다 tau=0.03으로 갱신하며 gamma=1, terminal bootstrap=0입니다.
 Conservative gate, shaping, WAIT와 pairwise loss는 비활성화입니다. 현재 시나리오의 배터리 충전은
 강제 safety action이 아니라 일반 정책 선택 대상입니다.
@@ -326,6 +326,7 @@ Checkpoint에는 scenario, objective, HumanoidSim timing fingerprint, ADP featur
 지원 worker 집합과 worker 수별 environment fingerprint를 기록합니다. Environment fingerprint에는 설비 ID와 수,
 가공시간 분포, 유한 버퍼 용량, inspection capacity와 지도 구조가 포함됩니다. 하나라도 현재
 run과 다르면 rule-based fallback 없이 오류로 종료합니다. 위 feature 변경으로 schema는
-`mfg_flow_shop_adp_v9`이며 이전 checkpoint는 재사용하지 않습니다. v9는 terminal output까지의
+`mfg_flow_shop_adp_v10`이며 이전 checkpoint는 재사용하지 않습니다. v10은 중복 global 입력 5개를
+제거하고 실제 창고 재고와 실시간 설비 잔여시간을 반영합니다. v9에서 추가된 terminal output까지의
 예상 잔여시간을 task feature로 포함하며, fingerprint에는 active-processing 고장, PM, battery risk
 선택과 익일 복귀 계약도 포함됩니다.

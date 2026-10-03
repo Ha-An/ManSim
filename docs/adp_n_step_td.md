@@ -3,16 +3,20 @@
 ## Default
 
 `python -m manufacturing_sim.adp.train` reads `configs/adp/mfg_flow_shop_throughput.yaml`.
-The simulator, feature schema v9, value-network architecture, cyclic beam search and inference API are unchanged.
+Feature schema v10 removes five algebraically redundant global inputs (35 to 30)
+and corrects warehouse occupancy and live processing-time observations. Worker,
+task and pair dimensions, attention architecture and cyclic beam rules are unchanged.
+Previous schemas are rejected; train a new checkpoint for the corrected inputs.
+See [efficiency changes and rollback](adp_efficiency.md).
 Training and validation use worker 3, five days of 480 minutes, raw completed products, no explicit WAIT.
 Worker 3 remains the default profile. The trainer also accepts one fleet-specific worker count from 2 through 6;
 one checkpoint supports exactly the worker count on which it was trained. The confirmatory paper suite therefore
 trains separate checkpoints instead of claiming cross-fleet generalization.
 
 - Initial: 50 Random Feasible episodes collected in five waves, trained with TD, not MC pretraining.
-- Policy: 75 updates, 10 new episodes per update.
+- Policy: at most 75 updates, 10 new episodes per update.
 - Collection: 10 CPU processes, 10 episodes per wave. The policy is frozen within each wave.
-- Total: 800 collected training episodes; 76 value updates including initialization.
+- Maximum: 800 collected training episodes; 76 value updates including initialization.
 - Replay: retain the most recent 100 complete episodes. Each policy update includes all 10 current-wave
   episodes plus 20 complete episodes sampled uniformly from older retained history.
 - Stable holdout: episode IDs divisible by 10 never enter SGD, even when replayed later.
@@ -22,10 +26,39 @@ trains separate checkpoints instead of claiming cross-fleet generalization.
   `(60, 2e-5)`, `(75, 1e-5)`.
 - Target network: initialized as an identical copy, no gradients, soft update tau=0.03 per SGD step.
 - Conservative validation gate and pairwise MC loss are disabled. There is no performance rollback.
-- Screening: iterations 0, 5, 10, ..., 75, ten fixed seeds each. The top three checkpoints are each
+- Screening: iterations 0, 5, 10, ..., 75 until stopping, ten fixed seeds each. The top two checkpoints are each
   evaluated on 20 separate final-selection seeds; final mean, lower standard deviation and earlier
   iteration break ties in that order.
 - Final policy tests remain separate: ADP, Random Feasible and Immediate Shared.
+
+## Production Early Stopping
+
+The default `training.early_stopping.enabled: true` stops additional rollout collection,
+not acceptance of a value-network update. There is no rollback or loss-based stopping.
+
+- Minimum policy iteration: 45; maximum remains 75.
+- At least 20 iterations without a strictly higher best screening mean. Any positive
+  increase, including less than 0.5 products, resets this count.
+- At each screening, pair the current checkpoint with the best preceding screening
+  checkpoint using exactly the same seeds. Compute `mean(current-best) + 1.96 * sd(diff) / sqrt(N)`.
+- Both of the last two screening upper bounds must be strictly below 0.5 products.
+- Final selection still evaluates the two screening finalists on 20 separate seeds each.
+  It never uses held-out policy-test seeds. `best.pt` need not be the last checkpoint.
+
+This is a practical compute-budget rule, not proof of convergence or an absence of later gains;
+repeated screening and selection affect its statistical interpretation. Epsilon/LR schedules
+are not rescaled when stopping early. Use `enabled: false` in YAML for a fixed-budget ablation.
+Completed runs report `completed_policy_iterations`, `early_stopped`, `stop_reason` and
+actual counts. Original maximum budgets remain visible, and the live progress denominator
+is adjusted when entering final selection. Best/last manifests distinguish consumed training
+seeds from the planned seed budget in intermediate checkpoints.
+
+Worker 2 with the default schedule, nonblocking execution and live monitor:
+
+```powershell
+.\.venv\Scripts\python.exe -m manufacturing_sim.adp.train --worker-counts 2 --background `
+  --output outputs/adp_worker2_new_run
+```
 
 ## Target Contract
 
@@ -40,6 +73,14 @@ If an intermediate recorded action differs from this map, stop BEFORE taking tha
 This is a truncated off-policy return, not an uncorrected n-step return under a historical epsilon-greedy policy.
 Early random data and stale replay can therefore have effective n close to 1 even when configured n is 30.
 The target network's endpoint values are recomputed for each mini-batch; old fixed MC targets are never optimized.
+
+When a decision admits only one joint assignment under the same worker order and
+constraints, target construction skips the unnecessary online ranking call.
+It still retains the transition, off-policy comparison and target-network bootstrap.
+Replay episode IDs are sampled before merging tensors. RNG draws, ordered full
+episodes and full-history padding widths remain identical to merge-then-sample.
+`replay_mib` reports the actual retained chunks, not a redundant fully padded copy;
+`update_mib` reports the merged selected batch. Neither is total process RSS.
 
 CPU replay retains pre/afterstate tensors, rewards, terminal flags, decision indices and small primitive
 metadata for feasible task/resource contracts. It retains no simulator, worker or domain Task objects.
@@ -68,6 +109,23 @@ All plot descriptions are in Korean, and each plot has explicit axes.
 
 Missing validation or holdout values show N/A, never fabricated zeros. OOD compares against the previous
 collection batch and uses exploratory future MC returns, so it is not a counterfactual greedy action-ranking test.
+Small nonzero numbers (including learning rates) use significant digits instead of rounding to `0.000`.
+Beam entropy is averaged over episodes with at least one eligible greedy decision; a random-only batch
+has undefined entropy (`N/A`), not zero entropy. The renderer can derive this from older episode CSVs
+without changing saved training data.
+
+Episode logs with `idle_metrics_version: 2` count no-candidate idle workers even when WAIT is disabled.
+`unassigned_count` includes both voluntary and forced non-assignment; worker ratios use
+`assigned_task_count + unassigned_count` as their denominator. `joint_no_candidate_count` counts
+decisions where every decision worker lacks a candidate, independently of the WAIT action setting.
+Older WAIT-disabled logs did not record these idle counts. Their zeros cannot be treated as observed
+absence of idle time, or reconstructed without detailed events/re-execution. The dashboard and audit
+explicitly warn about that limitation. These are event counts, not elapsed idle-time ratios.
+
+`scripts/audit_adp_training.py <run>` recomputes episode-group production means/standard deviations,
+decision-pooled greedy MC errors, wave durations/hashes, and final selection from episode records.
+It rejects non-finite CSV data, missing/duplicate validation seeds and worker-count mismatches.
+This statistical audit does not replace a spatial/event audit when detailed event logs were disabled.
 The checkpoint-selection table ranks screening production, then lower standard deviation, then earlier iteration.
 Best selection is not a gate: training always continues from the newly updated policy.
 

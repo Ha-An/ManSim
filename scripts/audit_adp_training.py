@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import csv
 import json
 import math
+import statistics
 from pathlib import Path
+import sys
 from typing import Any
 
 import yaml
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 TRAINING_PHASES = {"initial_random", "warm_start_replay", "policy_iteration"}
@@ -32,6 +37,127 @@ def _json_canonical(value: object) -> object:
     return json.loads(json.dumps(value, sort_keys=True, ensure_ascii=False))
 
 
+def _nonfinite_metric_errors(rows, name: str) -> list[str]:
+    errors = []
+    for index, row in enumerate(rows):
+        for key, value in row.items():
+            # Hex digests can resemble an overflowing scientific-notation float.
+            if key.endswith("_hash"):
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric):
+                errors.append(f"{name} row {index}: non-finite {key}={value}")
+    return errors
+
+
+def audit_metric_aggregates(episodes, iterations, waves, summary, selection) -> list[str]:
+    """Recompute reported statistics from episode records, not from other summaries."""
+    errors: list[str] = []
+
+    def check(row, key, expected, context, tolerance=1e-6):
+        actual = _number(row, key)
+        if ((actual is None) != (expected is None)
+                or actual is not None and (not math.isfinite(actual)
+                    or not math.isclose(actual, expected, abs_tol=tolerance, rel_tol=1e-8))):
+            errors.append(f"{context}: {key}={actual}, recomputed={expected}")
+
+    def moments(rows):
+        values = [float(row['products']) for row in rows]
+        return statistics.fmean(values), statistics.stdev(values) if len(values) > 1 else 0.0
+
+    grouped, by_wave = defaultdict(list), defaultdict(list)
+    for row in episodes:
+        grouped[(row['phase'], int(float(row['iteration'])))].append(row)
+        by_wave[row.get('wave_id')].append(row)
+    for row in iterations:
+        i = int(float(row['iteration']))
+        context = f"iteration {i}"
+        training = [e for phase in TRAINING_PHASES for e in grouped[(phase, i)]]
+        validation = grouped[('screening_validation', i)]
+        if training:
+            mean, std = moments(training)
+            check(row, 'rollout_products_mean', mean, context)
+            check(row, 'rollout_products_std', std, context)
+            check(row, 'batch_episode_count', len(training), context)
+            if 'decision_count_mean' in row:
+                check(row, 'decision_count_mean', statistics.fmean(float(e['decision_count']) for e in training), context)
+            if 'voluntary_wait_count' in row:
+                check(row, 'voluntary_wait_count', sum(float(e['candidate_available_wait_count']) for e in training), context)
+        else:
+            errors.append(f'{context}: no training episodes')
+        if validation:
+            mean, std = moments(validation)
+            check(row, 'validation_products_mean', mean, context)
+            check(row, 'validation_products_std', std, context)
+            check(row, 'validation_episode_count', len(validation), context)
+            if all('greedy_mc_sample_count' in e for e in validation):
+                count = sum(int(e['greedy_mc_sample_count']) for e in validation)
+                check(row, 'greedy_mc_sample_count', count, context)
+                sums = {key: sum(float(e[key]) for e in validation) for key in (
+                    'greedy_mc_squared_error_sum', 'greedy_mc_error_sum',
+                    'greedy_mc_prediction_sum', 'greedy_mc_target_sum')}
+                for metric, total in [('greedy_mc_rmse', 'greedy_mc_squared_error_sum'),
+                                      ('greedy_mc_bias', 'greedy_mc_error_sum'),
+                                      ('greedy_mc_prediction_mean', 'greedy_mc_prediction_sum'),
+                                      ('greedy_mc_target_mean', 'greedy_mc_target_sum')]:
+                    expected = sums[total] / count if count else None
+                    if metric == 'greedy_mc_rmse' and expected is not None:
+                        expected = math.sqrt(expected)
+                    check(row, metric, expected, context)
+        elif _number(row, 'validation_products_mean') is not None:
+            errors.append(f'{context}: validation mean has no episode records')
+
+    for row in waves:
+        name = row.get('wave_id')
+        members = by_wave.get(name, [])
+        check(row, 'episode_count', len(members), f'wave {name}')
+        if not members:
+            continue
+        if any(e['phase'] != row['phase'] or int(e['iteration']) != int(row['iteration']) for e in members):
+            errors.append(f'wave {name}: episode phase/iteration mismatch')
+        if any(e.get('snapshot_hash') != row.get('snapshot_hash') for e in members):
+            errors.append(f'wave {name}: actual episode snapshot hash mismatch')
+        elapsed = [float(e['elapsed_sec']) for e in members]
+        for key, value in [('episode_elapsed_sum_sec', sum(elapsed)),
+                           ('episode_elapsed_avg_sec', statistics.fmean(elapsed)),
+                           ('episode_elapsed_min_sec', min(elapsed)),
+                           ('episode_elapsed_max_sec', max(elapsed))]:
+            if key in row:
+                check(row, key, value, f'wave {name}', tolerance=2e-5)
+
+    final = []
+    for row in selection:
+        i = int(float(row['iteration']))
+        screening = grouped[('screening_validation', i)]
+        if screening:
+            mean, std = moments(screening)
+            check(row, 'screening_mean', mean, f'selection {i}')
+            check(row, 'screening_std', std, f'selection {i}')
+        records = grouped[('final_selection_validation', i)]
+        if records:
+            mean, std = moments(records)
+            check(row, 'final_mean', mean, f'selection {i}')
+            check(row, 'final_std', std, f'selection {i}')
+            final.append((i, mean, std))
+            it_row = next((r for r in iterations if int(float(r['iteration'])) == i), {})
+            check(it_row, 'final_validation_products_mean', mean, f'iteration {i}')
+            check(it_row, 'final_validation_products_std', std, f'iteration {i}')
+        elif _number(row, 'final_mean') is not None:
+            errors.append(f'selection {i}: final mean has no episode records')
+    if final:
+        best, mean, std = min(final, key=lambda r: (-r[1], r[2], r[0]))
+        check(summary, 'best_iteration', best, 'summary')
+        check(summary, 'best_validation_completed_products_avg', mean, 'summary')
+        check(summary, 'best_validation_completed_products_std', std, 'summary')
+    for key in ('target_build_sec', 'update_sec'):
+        if key in summary:
+            check(summary, key, sum(_number(row, key) or 0 for row in iterations), 'summary', tolerance=.001)
+    return errors
+
+
 def audit_training(root: Path, *, load_checkpoints: bool = True) -> dict[str, Any]:
     root = root.resolve()
     errors: list[str] = []
@@ -53,6 +179,19 @@ def audit_training(root: Path, *, load_checkpoints: bool = True) -> dict[str, An
     waves = _csv_rows(root / "wave_metrics.csv")
     selection = _csv_rows(root / "checkpoint_selection.csv")
 
+    for name, rows in [('episodes', episodes), ('iterations', iterations), ('waves', waves), ('selection', selection)]:
+        errors.extend(_nonfinite_metric_errors(rows, name))
+    if errors:
+        return {'root': str(root), 'status': 'fail', 'errors': errors, 'warnings': warnings}
+    try:
+        errors.extend(audit_metric_aggregates(episodes, iterations, waves, summary, selection))
+    except (KeyError, TypeError, ValueError) as exc:
+        errors.append(f'metric aggregation audit failed: {exc}')
+    if summary.get('wait_action_enabled') is False and any(
+        int(row.get('idle_metrics_version') or 1) < 2 for row in episodes
+    ):
+        warnings.append('Legacy WAIT-disabled logs did not count forced idle; zero idle counts are unavailable data, not measured absence.')
+
     if summary.get("status") != "completed":
         errors.append(f"training status is {summary.get('status')!r}, expected 'completed'")
     if summary.get("return_estimator") != "n_step_td":
@@ -60,7 +199,16 @@ def audit_training(root: Path, *, load_checkpoints: bool = True) -> dict[str, An
 
     training_cfg = cfg.get("training", {})
     validation_cfg = cfg.get("validation", {})
-    policy_iterations = int(training_cfg.get("policy_iterations", -1))
+    max_iterations = int(training_cfg.get("policy_iterations", -1))
+    policy_iterations = int(summary.get("completed_policy_iterations", max_iterations))
+    stop_config = training_cfg.get("early_stopping", {})
+    if not 0 <= policy_iterations <= max_iterations:
+        errors.append("completed_policy_iterations is outside configured iteration budget")
+    if policy_iterations < max_iterations:
+        if not stop_config.get("enabled") or not summary.get("early_stopped") or summary.get("stop_reason") != "production_plateau":
+            errors.append("shortened training has no declared production early stop")
+    elif summary.get("early_stopped"):
+        errors.append("early_stopped is true although the full iteration budget was used")
     expected_training = int(training_cfg.get("initial_random_episodes", 0)) + (
         policy_iterations * int(training_cfg.get("episodes_per_iteration", 0))
     )
@@ -71,6 +219,32 @@ def audit_training(root: Path, *, load_checkpoints: bool = True) -> dict[str, An
 
     training_rows = [row for row in episodes if row.get("phase") in TRAINING_PHASES]
     validation_rows = [row for row in episodes if row.get("phase") in VALIDATION_PHASES]
+    if stop_config.get("enabled"):
+        from manufacturing_sim.adp.early_stopping import ProductionEarlyStopping, validate_early_stopping
+        try:
+            validate_early_stopping(stop_config, max_iterations=max_iterations,
+                                   seed_count=int(validation_cfg["screening_seed_count"]))
+            stopper = ProductionEarlyStopping(stop_config)
+            last_check = {}
+            for row in iterations:
+                i = int(float(row["iteration"]))
+                samples = [r for r in validation_rows if r["phase"] == "screening_validation" and int(float(r["iteration"])) == i]
+                if not samples:
+                    continue
+                products = {int(r["seed"]): float(r["products"]) for r in samples}
+                if len(products) != len(samples) or len(products) != int(validation_cfg["screening_seed_count"]):
+                    raise ValueError("Incomplete or duplicated screening seeds for early stop")
+                last_check = stopper.observe(i, products)
+                for key in ("early_stop_paired_mean", "early_stop_paired_ci_upper"):
+                    actual, expected = _number(row, key), last_check[key]
+                    if (actual is None) != (expected is None) or (actual is not None and abs(actual - expected) > 1e-6):
+                        errors.append(f"iteration {i} has an incorrect {key}")
+                if last_check["early_stop_triggered"] and i < policy_iterations:
+                    errors.append(f"training continued past its early stop at iteration {i}")
+            if policy_iterations < max_iterations and not last_check.get("early_stop_triggered"):
+                errors.append("production early stop could not be reproduced from screening samples")
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"early stopping audit failed: {exc}")
     if len(training_rows) != expected_training:
         errors.append(f"training episode count mismatch: {len(training_rows)} != {expected_training}")
     if len(training_rows) != int(summary.get("training_episode_count", -1)):
@@ -114,18 +288,21 @@ def audit_training(root: Path, *, load_checkpoints: bool = True) -> dict[str, An
         actual = {int(float(row["seed"])) for row in episodes if row.get("phase") == phase}
         if actual != partition_sets[partition]:
             errors.append(f"actual {phase} seeds do not match declared partition")
+        checkpoint_groups = defaultdict(list)
+        for row in episodes:
+            if row.get('phase') == phase:
+                checkpoint_groups[int(float(row['iteration']))].append(row)
+        for i, records in checkpoint_groups.items():
+            seeds = [int(float(row['seed'])) for row in records]
+            if len(seeds) != len(set(seeds)) or set(seeds) != partition_sets[partition]:
+                errors.append(f'{phase} iteration {i} has incomplete or duplicate seeds')
+
+    configured_workers = {int(w) for w in cfg.get('worker_counts', [])}
+    if {int(float(row['worker_count'])) for row in episodes} != configured_workers:
+        errors.append('episode worker counts disagree with resolved configuration')
 
     for row in iterations:
         iteration = int(float(row["iteration"]))
-        for key, value in row.items():
-            if value == "":
-                continue
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(numeric):
-                errors.append(f"iteration {iteration} has non-finite {key}={value}")
         ratio_keys = ("td_off_policy_cut_ratio", "td_terminal_ratio", "td_n_limit_ratio")
         ratios = [_number(row, key) for key in ratio_keys]
         if all(value is not None for value in ratios) and abs(sum(ratios) - 1.0) > 1e-7:
@@ -172,7 +349,8 @@ def audit_training(root: Path, *, load_checkpoints: bool = True) -> dict[str, An
         errors.append("checkpoint_selection.csv does not identify training_summary best iteration")
     final_results = summary.get("final_candidate_results", []) or []
     if final_results:
-        if len(final_results) != int(validation_cfg.get("final_candidate_count", 1)):
+        available = sum(bool(row.get("validation_products_mean")) for row in iterations)
+        if len(final_results) != min(available, int(validation_cfg.get("final_candidate_count", 1))):
             errors.append("final candidate result count does not match resolved config")
         selected_final = [row for row in final_results if row.get("selected")]
         if len(selected_final) != 1 or int(selected_final[0]["iteration"]) != best_iteration:
@@ -189,6 +367,11 @@ def audit_training(root: Path, *, load_checkpoints: bool = True) -> dict[str, An
     manifest_json = json.loads((root / "checkpoint_manifest.json").read_text(encoding="utf-8"))
     if int(manifest_json.get("iteration", -1)) != best_iteration:
         errors.append("checkpoint_manifest iteration does not match best iteration")
+    for field, source in [('validation_completed_products_avg', 'best_validation_completed_products_avg'),
+                          ('validation_completed_products_std', 'best_validation_completed_products_std')]:
+        value, expected = manifest_json.get(field), summary.get(source)
+        if value is not None and expected is not None and not math.isclose(float(value), float(expected), abs_tol=1e-6):
+            errors.append(f'checkpoint manifest {field} disagrees with the selected validation result')
 
     if load_checkpoints:
         try:
@@ -205,6 +388,20 @@ def audit_training(root: Path, *, load_checkpoints: bool = True) -> dict[str, An
                 errors.append("best.pt is missing target_model_state_dict")
             elif any(not bool(torch.isfinite(tensor).all()) for tensor in target_state.values()):
                 errors.append("best.pt contains non-finite target-network tensors")
+            last = torch.load(root / 'last.pt', map_location='cpu', weights_only=False)
+            for name, payload, index in [('best', best, best_iteration), ('last', last, policy_iterations)]:
+                if int(payload.get('manifest', {}).get('iteration', -1)) != index:
+                    errors.append(f'{name}.pt has an incorrect iteration')
+                checkpoint_path = root / 'checkpoints' / f'iteration_{index:03d}.pt'
+                if not checkpoint_path.is_file():
+                    errors.append(f'missing iteration checkpoint: {checkpoint_path.name}')
+                    continue
+                original = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                actual_state, expected_state = payload.get('model_state_dict', {}), original.get('model_state_dict', {})
+                if not actual_state or actual_state.keys() != expected_state.keys() or any(
+                    not torch.equal(tensor, expected_state[key]) for key, tensor in actual_state.items()
+                ):
+                    errors.append(f'{name}.pt model does not match iteration {index}')
         except ModuleNotFoundError:
             warnings.append("PyTorch is unavailable; checkpoint tensors were not audited")
 

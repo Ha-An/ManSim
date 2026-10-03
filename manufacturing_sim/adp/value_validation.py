@@ -40,6 +40,7 @@ def regression_stats(predicted: Any, actual: Any) -> dict[str, Any]:
 
 def score_episode(model: Any, transitions: list[dict], device: Any) -> list[dict]:
     from .model import predict_values
+    from .schema import REMAINING_HORIZON_INDEX
     from .train import monte_carlo_samples
 
     samples = monte_carlo_samples(transitions)
@@ -49,7 +50,7 @@ def score_episode(model: Any, transitions: list[dict], device: Any) -> list[dict
         predictions = predict_values(model, [state for state, _ in chunk], device=device)
         for offset, ((state, target), prediction) in enumerate(zip(chunk, predictions)):
             rows.append({"decision": start + offset + 1,
-                         "remaining_fraction": float(state.global_features[1]),
+                         "remaining_fraction": float(state.global_features[REMAINING_HORIZON_INDEX]),
                          "target": float(target), "prediction": float(prediction)})
     regression_stats([r["prediction"] for r in rows], [r["target"] for r in rows])
     return rows

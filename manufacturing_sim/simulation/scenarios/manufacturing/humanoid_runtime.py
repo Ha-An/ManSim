@@ -187,6 +187,7 @@ class HumanoidTaskRuntime:
                 expand_task_steps,
             )
             from humanoidsim.task_schema import TaskInstance
+            from humanoidsim.state_schema import load_state_schema
         except ModuleNotFoundError as exc:
             policy = str(humanoidsim_cfg.get("missing_package_policy", "error")).strip().lower()
             if policy == "disable":
@@ -199,6 +200,8 @@ class HumanoidTaskRuntime:
 
         catalog_root = humanoidsim_cfg.get("catalog_root")
         self.catalog = load_task_catalog(catalog_root if catalog_root else None)
+        # The schema is immutable during a run; still validate every snapshot.
+        self._state_schema = load_state_schema()
         self._imports = {
             "HumanoidProfile": HumanoidProfile,
             "StateReason": StateReason,
@@ -282,7 +285,7 @@ class HumanoidTaskRuntime:
             metadata=event_metadata,
         )
         try:
-            snapshot = self._imports["transition_humanoid_state"](current, transition_event, strict=True)
+            snapshot = self._imports["transition_humanoid_state"](current, transition_event, strict=True, schema=self._state_schema)
         except Exception as exc:
             raise RuntimeError(
                 f"HumanoidSim state transition failed for worker={worker.agent_id} "
@@ -325,7 +328,7 @@ class HumanoidTaskRuntime:
             return
         current = self.ensure_humanoid_state(worker)
         try:
-            snapshot = self._imports["transition_humanoid_state"](current, transition_event, strict=True)
+            snapshot = self._imports["transition_humanoid_state"](current, transition_event, strict=True, schema=self._state_schema)
         except Exception as exc:
             event_type = getattr(transition_event, "event_type", "")
             primitive = getattr(transition_event, "primitive_call_code", "")
@@ -454,7 +457,7 @@ class HumanoidTaskRuntime:
         normalized.setdefault("metadata", {})
         self._clear_resolved_incident_metadata(normalized)
         try:
-            issues = self._imports["validate_state_snapshot"](normalized)
+            issues = self._imports["validate_state_snapshot"](normalized, schema=self._state_schema)
         except Exception as exc:
             raise RuntimeError(f"HumanoidSim state validation failed for {worker.agent_id}: {type(exc).__name__}: {exc}") from exc
         if issues:

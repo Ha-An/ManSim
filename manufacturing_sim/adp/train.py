@@ -86,6 +86,8 @@ class EpisodeResult:
     candidate_available_wait_count: int = 0
     no_candidate_unassigned_count: int = 0
     assigned_task_count: int = 0
+    unassigned_count: int = 0
+    idle_metrics_version: int = 1
     joint_all_wait_count: int = 0
     joint_all_wait_with_candidate_count: int = 0
     joint_no_candidate_count: int = 0
@@ -468,6 +470,8 @@ def run_training_episode(
             world.adp_coordinator.metrics["no_candidate_unassigned_count"]
         ),
         assigned_task_count=int(world.adp_coordinator.metrics["assigned_task_count"]),
+        unassigned_count=int(world.adp_coordinator.metrics["unassigned_count"]),
+        idle_metrics_version=2,
         joint_all_wait_count=int(world.adp_coordinator.metrics["joint_all_wait_count"]),
         joint_all_wait_with_candidate_count=int(
             world.adp_coordinator.metrics["joint_all_wait_with_candidate_count"]
@@ -520,6 +524,34 @@ def run_training_episode(
     del env
     gc.collect()
     return result, compact_batch
+
+
+def _record_rollout_failure(output_dir: Path, episode_rows: list[dict[str, Any]],
+                            wave_rows: list[dict[str, Any]], error: str) -> None:
+    from .live import atomic_json, read_json
+
+    _write_csv(output_dir / "episode_metrics.csv", episode_rows)
+    _write_csv(output_dir / "wave_metrics.csv", wave_rows)
+    summary = read_json(output_dir / "training_summary.json")
+    training_phases = {"initial_random", "warm_start_replay", "policy_iteration"}
+    training_count = sum(row.get("phase") in training_phases
+                         or str(row.get("phase", "")).startswith("policy_iteration_") for row in episode_rows)
+    summary.update({
+        "status": "failed", "failure": error,
+        "training_episode_count": training_count,
+        "validation_episode_count": len(episode_rows) - training_count,
+        "failed_wave_count": sum(row.get("status") == "failed" for row in wave_rows),
+        "cancelled_episode_count": sum(int(row.get("cancelled_episode_count", 0)) for row in wave_rows),
+    })
+    atomic_json(output_dir / "training_summary.json", summary)
+    if summary.get("return_estimator") == "n_step_td":
+        from .td_dashboard import render_from_files
+        render_from_files(output_dir)
+    else:
+        path = output_dir / "iteration_metrics.csv"
+        with path.open(encoding="utf-8-sig", newline="") if path.exists() else io.StringIO("") as stream:
+            iterations = [dict(row) for row in csv.DictReader(stream)]
+        render_training_dashboard(output_dir, episode_rows, iterations, wave_rows, summary)
 
 
 def _run_rollout_jobs_parallel(
@@ -589,34 +621,12 @@ def _run_rollout_jobs_parallel(
                 failed_row["completed_episode_count"] = len(wave_results)
                 failed_row["cancelled_episode_count"] = cancelled_count
                 wave_rows.append(failed_row)
-                _write_csv(output_dir / "episode_metrics.csv", episode_rows)
-                _write_csv(output_dir / "wave_metrics.csv", wave_rows)
-                partial_summary = {
-                    "training_episode_count": sum(
-                        1 for row in episode_rows if row.get("phase") != "validation"
-                    ),
-                    "validation_episode_count": sum(
-                        1 for row in episode_rows if row.get("phase") == "validation"
-                    ),
-                    "configured_process_count": max_processes,
-                    "actual_process_count_max": max(
-                        (int(row.get("actual_process_count", 0)) for row in wave_rows), default=0
-                    ),
-                    "wave_size": wave_size,
-                    "multiprocessing_start_method": start_method,
-                    "rollout_device": "cpu",
-                    "training_device": "unknown",
-                    "torch_threads_per_process": torch_threads,
-                    "total_wave_count": len(wave_rows),
-                    "failed_wave_count": 1,
-                    "cancelled_episode_count": cancelled_count,
-                    "retried_episode_count": 0,
-                    "failure": failed_row["error"],
-                }
-                (output_dir / "training_summary.json").write_text(
-                    json.dumps(partial_summary, indent=2), encoding="utf-8"
-                )
-                render_training_dashboard(output_dir, episode_rows, [], wave_rows, partial_summary)
+                episode_rows.extend({**_episode_metric_row(result), "wave_status": "failed"}
+                                    for result in sorted(wave_results, key=lambda item: item.episode))
+                _record_rollout_failure(output_dir, episode_rows, wave_rows, failed_row["error"])
+                report_progress({**progress_event, "event": "wave_failed",
+                                 "wave_completed": len(wave_results), "error": failed_row["error"],
+                                 "completed_episode_count": len(episode_rows)})
                 raise RuntimeError(
                     f"ADP rollout wave {wave_jobs[0].wave_id} failed; no partial value update was applied."
                 ) from exc
@@ -1048,12 +1058,14 @@ def fit_mc_value(
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    from .live import atomic_text
+
     fieldnames = sorted({key for row in rows for key in row}) if rows else ["status"]
-    with path.open("w", newline="", encoding="utf-8-sig") as fp:
-        writer = csv.DictWriter(fp, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    atomic_text(path, "\ufeff" + stream.getvalue())
 
 
 def _format_axis_tick(value: float) -> str:
@@ -2370,6 +2382,9 @@ def _as_bool(value: Any, *, default: bool = False) -> bool:
 
 
 def _episode_metric_row(result: EpisodeResult) -> dict[str, Any]:
+    worker_decisions = max(1, result.assigned_task_count + (
+        result.unassigned_count if result.idle_metrics_version >= 2 else result.wait_count
+    ))
     return {
         "episode": result.episode,
         "phase": result.phase,
@@ -2388,11 +2403,13 @@ def _episode_metric_row(result: EpisodeResult) -> dict[str, Any]:
         "candidate_available_wait_count": result.candidate_available_wait_count,
         "no_candidate_unassigned_count": result.no_candidate_unassigned_count,
         "assigned_task_count": result.assigned_task_count,
-        "worker_wait_ratio": result.wait_count / max(1, result.wait_count + result.assigned_task_count),
+        "unassigned_count": result.unassigned_count,
+        "idle_metrics_version": result.idle_metrics_version,
+        "worker_wait_ratio": result.wait_count / worker_decisions,
         "candidate_available_wait_ratio": result.candidate_available_wait_count
-        / max(1, result.wait_count + result.assigned_task_count),
+        / worker_decisions,
         "no_candidate_unassigned_ratio": result.no_candidate_unassigned_count
-        / max(1, result.wait_count + result.assigned_task_count),
+        / worker_decisions,
         "joint_all_wait_count": result.joint_all_wait_count,
         "joint_all_wait_ratio": result.joint_all_wait_count / max(1, result.decisions),
         "joint_all_wait_with_candidate_count": result.joint_all_wait_with_candidate_count,

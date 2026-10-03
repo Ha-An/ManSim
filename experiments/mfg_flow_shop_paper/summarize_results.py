@@ -182,6 +182,45 @@ def _bootstrap_interval(
     return _percentile(samples, 0.025), _percentile(samples, 0.975), samples
 
 
+def _restock_schedule_evidence(
+    run_dir: Path, meta: dict, observed_times: list, horizon_min: float,
+) -> dict[str, object]:
+    """Distinguish scheduled refill opportunities from positive-quantity events."""
+    interval = float(meta["throughput_restock_interval_days"]) * float(meta["minutes_per_day"])
+    target = int(meta["throughput_restock_target_fill"])
+    if not math.isfinite(interval) or interval <= 0 or target < 0:
+        raise ValueError("Invalid throughput restock configuration")
+    planned = [round(index * interval, 6) for index in range(math.ceil(horizon_min / interval))]
+    observed = [round(float(value), 6) for value in observed_times]
+    errors = []
+    if observed != sorted(set(observed)) or any(value not in planned for value in observed):
+        errors.append("duplicate, unordered or off-schedule restock event")
+    missing = [value for value in planned if value not in observed]
+    snapshots = {}
+    if missing and (run_dir / "minute_snapshots.json").is_file():
+        snapshots = {
+            round(float(row["t"]), 6): row
+            for row in _read_json(run_dir / "minute_snapshots.json").get("snapshots", [])
+        }
+    noops = []
+    for boundary in missing:
+        snapshot = snapshots.get(boundary, {})
+        count = _as_float(snapshot.get("warehouse_material_shelf_count"))
+        capacity = _as_float(snapshot.get("warehouse_material_shelf_capacity"))
+        # The initial fill is not a daily top-up. Do not infer it from the refill target.
+        if boundary > 0 and count is not None and capacity is not None and target <= count <= capacity:
+            noops.append(boundary)
+        else:
+            errors.append(f"restock missing at {boundary}: no boundary inventory evidence at target")
+    return {
+        "restock_schedule_json": json.dumps(planned, separators=(",", ":")),
+        "restock_target_fill": target,
+        "restock_noop_times_json": json.dumps(noops, separators=(",", ":")),
+        "restock_schedule_valid": not errors,
+        "restock_audit_errors_json": json.dumps(errors, separators=(",", ":")),
+    }
+
+
 def collect_runs(prepared: Path) -> tuple[list[dict[str, object]], list[str]]:
     plan_path = prepared / "evaluation_plan.csv"
     status_path = prepared / "evaluation_status.csv"
@@ -217,6 +256,10 @@ def collect_runs(prepared: Path) -> tuple[list[dict[str, object]], list[str]]:
         kpi = _read_json(kpi_path)
         meta = _read_json(meta_path)
         identity_errors = _identity_errors(source, meta, kpi, _read_json(diagnostic_path), experiment)
+        if experiment.get("scenario_overrides"):
+            from experiments.mfg_flow_shop_paper.run_evaluation import _scenario_override_errors
+
+            identity_errors.extend(_scenario_override_errors(run_dir, experiment["scenario_overrides"]))
         if identity_errors:
             errors.extend(f"{run_id}: {error}" for error in identity_errors)
             continue
@@ -255,6 +298,9 @@ def collect_runs(prepared: Path) -> tuple[list[dict[str, object]], list[str]]:
             ),
             "restock_times_json": json.dumps(signature.get("restock_times", []), separators=(",", ":")),
         }
+        row.update(_restock_schedule_evidence(
+            run_dir, meta, signature.get("restock_times", []), expected_minutes,
+        ))
         for metric in METRICS:
             value = kpi.get(metric, "")
             if metric == "repair_response_time_avg_min" and int(kpi.get("machine_failure_count", 0) or 0) == 0:
@@ -291,7 +337,10 @@ def fairness_report(
             _observed_prefixes_consistent([mapping.get(machine, []) for mapping in repair_maps])
             for machine in repair_machines
         )
-        restock_schedules = {str(row["restock_times_json"]) for row in group}
+        restock_schedules = {
+            (str(row["restock_schedule_json"]), int(row["restock_target_fill"])) for row in group
+        }
+        restock_consistent = len(restock_schedules) == 1 and all(row["restock_schedule_valid"] for row in group)
         mode_replicates = {
             (str(row["mode"]), str(row["training_replicate"])) for row in group
         }
@@ -309,7 +358,7 @@ def fairness_report(
             and len(stochastic) == 1
             and quality_consistent
             and repair_consistent
-            and len(restock_schedules) == 1
+            and restock_consistent
         )
         report.append({
             "worker_count": worker_count,
@@ -322,7 +371,9 @@ def fairness_report(
             "stochastic_streams_fingerprint_count": len(stochastic),
             "quality_rng_prefix_consistent": quality_consistent,
             "repair_rng_prefix_consistent": repair_consistent,
-            "restock_schedule_consistent": len(restock_schedules) == 1,
+            "restock_schedule_consistent": restock_consistent,
+            "restock_positive_event_times_identical": len({str(row["restock_times_json"]) for row in group}) == 1,
+            "restock_verified_noop_count": sum(len(json.loads(str(row["restock_noop_times_json"]))) for row in group),
             "fairness_pass": passed,
         })
         if not passed:
@@ -561,12 +612,12 @@ def summarize(prepared: Path, *, repetitions: int = 5000) -> dict[str, object]:
         "bootstrap_repetitions": repetitions,
         "overall_resampling_unit": "common environment seed block across all worker counts",
         "p_value_method": "two-sided null-centered bootstrap with plus-one Monte Carlo correction; approximate",
-        "adp_unit_of_analysis": (
+        "adp_unit_of_analysis": "not applicable; no ADP runs" if ADP_MODE not in experiment["policies"] else (
             "environment seed after averaging independent training replicates"
             if training_replicates > 1
             else "environment seed for one fixed worker-specific ADP checkpoint"
         ),
-        "uncertainty_method": (
+        "uncertainty_method": "environment-seed bootstrap within each policy and worker group" if ADP_MODE not in experiment["policies"] else (
             "hierarchical bootstrap over ADP training replicates and common environment seeds"
             if training_replicates > 1
             else "paired bootstrap over common environment seeds; training-seed uncertainty is not estimated"

@@ -152,7 +152,9 @@ def _episode(job: dict) -> tuple[dict, list[dict]]:
     target = samples.targets.numpy().astype(float)
     assert len(counts) == len(samples)
     before = np.asarray(counts, dtype=float)
-    encoded_count = samples.global_features[:, 2].numpy().astype(float) * 30.0
+    from manufacturing_sim.adp.schema import COMPLETED_PRODUCT_COUNT_INDEX, REMAINING_HORIZON_INDEX
+
+    encoded_count = samples.global_features[:, COMPLETED_PRODUCT_COUNT_INDEX].numpy().astype(float) * 30.0
     clipped_count = int(np.count_nonzero(abs(encoded_count - before) > 1e-4))
     identity_error = float(np.max(abs(target - (result.products - before))))
     assert identity_error < 1e-4, identity_error
@@ -171,8 +173,8 @@ def _episode(job: dict) -> tuple[dict, list[dict]]:
     for index in range(len(samples)):
         rows.append({
             "condition": job["condition"], "seed": job["seed"], "decision": index + 1,
-            "time_min": float(samples.global_features[index, 0]) * 2400.,
-            "remaining_fraction": float(samples.global_features[index, 1]),
+            "time_min": (1.0 - float(samples.global_features[index, REMAINING_HORIZON_INDEX])) * 2400.,
+            "remaining_fraction": float(samples.global_features[index, REMAINING_HORIZON_INDEX]),
             "products": result.products, "products_before": float(before[index]),
             "encoded_products_before": float(encoded_count[index]),
             "target": float(target[index]),

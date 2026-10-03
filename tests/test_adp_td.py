@@ -218,7 +218,8 @@ class TDTests(unittest.TestCase):
         self.assertEqual(cfg["training"]["replay_sample_episodes_per_update"], 30)
         self.assertEqual(cfg["training"]["initial_update_epochs"], 1)
         self.assertEqual(cfg["training"]["max_epochs_per_iteration"], 2)
-        self.assertEqual(cfg["validation"]["final_candidate_count"], 3)
+        self.assertEqual(cfg["validation"]["final_candidate_count"], 2)
+        self.assertTrue(cfg["training"]["early_stopping"]["enabled"])
         self.assertEqual(cfg["validation"]["final_selection_seed_count"], 20)
         for path, value in (("gamma", .99), ("loss_type", "huber"), ("target_tau", 0)):
             changed = copy.deepcopy(cfg)
@@ -323,7 +324,8 @@ class TDTests(unittest.TestCase):
 
     def test_td_driver_writes_current_contract_and_default_schedule(self):
         from unittest.mock import patch
-        from manufacturing_sim.adp.train import build_parser, EpisodeResult, RolloutBatchMetrics, _episode_metric_row
+        from manufacturing_sim.adp.train import (build_parser, EpisodeResult, RolloutBatchMetrics,
+                                                _episode_metric_row, _wave_performance_row, _write_csv)
         from manufacturing_sim.adp.td_train import train_td
         cfg = OmegaConf.to_container(OmegaConf.load("configs/adp/mfg_flow_shop_n_step_td_smoke.yaml"), resolve=True)
         cfg["diagnostics"]["ood_support"]["enabled"] = False
@@ -332,10 +334,20 @@ class TDTests(unittest.TestCase):
         cfg["training"]["initial_random_episodes"] = 10
         cfg["training"]["replay_capacity_episodes"] = 10
         cfg["training"]["replay_sample_episodes_per_update"] = 4
+        cfg["training"]["policy_iterations"] = 4
+        cfg["training"]["early_stopping"] = {"enabled": True, "min_iterations": 1,
+            "patience_iterations": 2, "consecutive_checks": 2, "paired_ci_upper_threshold": .5}
+        cfg["validation"]["screening_seed_count"] = 2
+        cfg["seed_partitions"]["screening_validation"] = [172026, 172028]
         cfg["validation"]["final_candidate_count"] = 2
         fingerprint = {"environment_fingerprint": "fixture", "reward_mode": "completed_product_td"}
+        live_snapshots = []
+        validation_updates = []
 
         def fake_rollout(**kw):
+            if kw["jobs"][0].phase == "screening_validation":
+                progress = json.loads((kw["output_dir"] / "training_progress.json").read_text())
+                validation_updates.append(progress["completed_update_count"])
             results, batches = [], []
             for job in kw["jobs"]:
                 compact = episode(job.episode)[0] if job.collect_compact_samples else None
@@ -343,14 +355,22 @@ class TDTests(unittest.TestCase):
                     batches.append(compact)
                 results.append(EpisodeResult(job.episode, job.phase, 3, job.seed, 5, 0, 5., 2,
                     fingerprint, iteration=job.iteration, simulation_end_min=480., termination_reason="completed_horizon",
+                    wave_id=job.wave_id,
+                    snapshot_hash=job.snapshot_hash,
                     greedy_mc_sample_count=2 if not job.collect_compact_samples else 0,
                     greedy_mc_squared_error_sum=8., greedy_mc_error_sum=2.))
             for start in range(0, len(results), kw["wave_size"]):
                 chunk = results[start:start + kw["wave_size"]]
                 kw["episode_rows"].extend(_episode_metric_row(result) for result in chunk)
+                kw["wave_rows"].append(_wave_performance_row(
+                    wave_jobs=kw["jobs"][start:start + kw["wave_size"]], results=chunk,
+                    wave_wall_sec=1.0, configured_process_count=kw["process_count"]))
+                _write_csv(kw["output_dir"] / "episode_metrics.csv", kw["episode_rows"])
+                _write_csv(kw["output_dir"] / "wave_metrics.csv", kw["wave_rows"])
                 kw["progress_callback"]({"event": "wave_completed", "phase": job.phase,
                     "iteration": job.iteration, "wave_completed": len(chunk),
                     "wave_episode_count": len(chunk), "completed_episode_count": len(kw["episode_rows"])})
+                live_snapshots.append(json.loads((kw["output_dir"] / "training_summary.json").read_text()))
             return results, merge_compact_batches(batches), RolloutBatchMetrics(wall_sec=.01)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -365,12 +385,31 @@ class TDTests(unittest.TestCase):
                 iteration_rows = list(csv.DictReader(stream))
             self.assertTrue((Path(directory) / "checkpoint_selection.csv").is_file())
             self.assertTrue((Path(directory) / "last.pt").is_file())
+            from scripts.audit_adp_training import audit_training
+            report = audit_training(Path(directory))
+            self.assertEqual(report["errors"], [])
+            # A truncated run cannot claim success just by setting early_stopped.
+            summary["early_stopped"] = False
+            (Path(directory) / "training_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            self.assertTrue(any("no declared" in error for error in audit_training(Path(directory))["errors"]))
+            summary["early_stopped"] = True
         self.assertEqual(summary["status"], "completed")
+        self.assertEqual(validation_updates, [1, 2, 3])
+        self.assertGreater(live_snapshots[0]["training_rollout_sec"], 0)
+        self.assertGreater(live_snapshots[-1]["validation_sec"], 0)
         self.assertEqual(summary["training_episode_count"], 14)
         self.assertEqual(summary["value_update_count"], 3)
-        self.assertEqual(summary["validation_episode_count"], 5)
-        self.assertEqual(progress["completed_episode_count"], 19)
-        self.assertEqual(progress["expected_episode_count"], 19)
+        self.assertEqual(summary["validation_episode_count"], 8)
+        self.assertEqual(progress["completed_episode_count"], 22)
+        self.assertEqual(progress["expected_episode_count"], 22)
+        self.assertTrue(summary["early_stopped"])
+        self.assertEqual(summary["stop_reason"], "production_plateau")
+        self.assertEqual(summary["completed_policy_iterations"], 2)
+        self.assertEqual(summary["policy_iterations"], 4)
+        self.assertEqual(summary["planned_training_episode_count"], 18)
+        self.assertEqual(summary["expected_training_episode_count"], 14)
+        self.assertEqual(len(manifest["seed_partitions"]["training"]), 14)
+        self.assertEqual(manifest["training_run"]["completed_policy_iterations"], 2)
         self.assertEqual(progress["completed_update_count"], 3)
         self.assertEqual(progress["iteration"], 2)
         self.assertEqual(progress["status"], "completed")

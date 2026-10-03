@@ -6,8 +6,10 @@ from typing import Any
 import numpy as np
 
 
-FEATURE_SCHEMA_VERSION = "mfg_flow_shop_adp_v9"
-GLOBAL_FEATURE_DIM = 35
+FEATURE_SCHEMA_VERSION = "mfg_flow_shop_adp_v10"
+GLOBAL_FEATURE_DIM = 30
+REMAINING_HORIZON_INDEX = 0
+COMPLETED_PRODUCT_COUNT_INDEX = 1
 WORKER_FEATURE_DIM = 16
 TASK_FEATURE_DIM = 21
 PAIR_FEATURE_DIM = 8
@@ -61,8 +63,7 @@ class EncodedDecisionState:
                 max(0.0, horizon_min - time_min),
             )
             time_min += wait_delay
-            global_features[0] = np.float32(max(-2.0, min(2.0, time_min / horizon_min)))
-            global_features[1] = np.float32(
+            global_features[REMAINING_HORIZON_INDEX] = np.float32(
                 max(-2.0, min(2.0, (horizon_min - time_min) / horizon_min))
             )
         return EncodedDecisionState(

@@ -20,6 +20,7 @@ from .compact import merge_compact_batches
 from .model import build_value_network, require_torch
 from .ood_diagnostics import build_ood_support_bank, evaluate_ood_selected_actions
 from .schema import FEATURE_SCHEMA_VERSION
+from .early_stopping import ProductionEarlyStopping, validate_early_stopping
 from .td import build_target_plan, fit_td_value, retain_recent_episodes, sample_replay_episodes
 
 
@@ -159,6 +160,8 @@ def validate_td_config(cfg: dict[str, Any]) -> None:
         raise ValueError("validation.final_candidate_count must be positive.")
     if int(cfg["validation"].get("screening_interval_iterations", 0)) < 1:
         raise ValueError("screening_interval_iterations must be positive.")
+    validate_early_stopping(training.get("early_stopping", {}), max_iterations=total_iterations,
+                           seed_count=int(cfg["validation"].get("screening_seed_count", 0)))
     for key in ("learning_rate", "gradient_clip"):
         if not math.isfinite(float(training[key])) or float(training[key]) <= 0:
             raise ValueError(f"{key} must be finite and positive.")
@@ -367,6 +370,10 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
     support_bank = None
     ood_cfg = cfg.get("diagnostics", {}).get("ood_support", {})
     best_mean, best_std, best_iteration = -math.inf, math.inf, -1
+    stopper = ProductionEarlyStopping(t.get("early_stopping", {}))
+    summary.update(early_stopping=dict(stopper.config), early_stopped=False,
+                   stop_reason=None, completed_policy_iterations=None,
+                   planned_training_episode_count=total_episodes)
     screening_candidates: list[dict[str, Any]] = []
     progress = TrainingProgress(output)
     expected_validation = (len(screening) * len(partitions["screening_validation"])
@@ -376,6 +383,8 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                     expected_episode_count=total_episodes + expected_validation,
                     completed_episode_count=0, completed_update_count=0,
                     training_device=str(device), process_count=processes)
+    summary["planned_episode_count"] = total_episodes + expected_validation
+    active_rollout: tuple[str, float, float] | None = None
 
     def write() -> Path:
         before = time.perf_counter()
@@ -398,14 +407,22 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
              "selected": r["iteration"] == best_iteration}
             for r in iterations if "validation_products_mean" in r
         ])
-        atomic_json(output / "training_summary.json", summary)
-        path = render_td_dashboard(output, episode_rows, iterations, wave_rows, summary)
+        snapshot = dict(summary)
+        if active_rollout is not None:
+            key, phase_started, writes_before = active_rollout
+            snapshot[key] += max(0.0, before - phase_started - (summary["write_sec"] - writes_before))
+        atomic_json(output / "training_summary.json", snapshot)
+        path = render_td_dashboard(output, episode_rows, iterations, wave_rows, snapshot)
         summary["write_sec"] += time.perf_counter() - before
         return path
 
     def report_rollout(event: dict[str, Any]) -> None:
         progress.rollout(event)
-        if event["event"] == "wave_completed":
+        if event["event"] in {"wave_completed", "wave_failed"}:
+            if event["event"] == "wave_failed":
+                summary.update(status="failed", failure=event["error"],
+                               failed_wave_count=sum(row.get("status") == "failed" for row in wave_rows),
+                               cancelled_episode_count=sum(int(row.get("cancelled_episode_count", 0)) for row in wave_rows))
             summary["training_episode_count"] = sum(
                 row["phase"] in {"initial_random", "warm_start_replay", "policy_iteration"}
                 for row in episode_rows
@@ -414,7 +431,7 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
             write()
 
     def rollout(iteration: int, phase: str, seeds: list[int], epsilon: float, force_random: bool = False):
-        nonlocal episode_id, evaluation_id, fingerprint
+        nonlocal episode_id, evaluation_id, fingerprint, active_rollout
         training_phase = phase in {"initial_random", "warm_start_replay", "policy_iteration"}
         count_key = "training_episode_count" if training_phase else "validation_episode_count"
         previous_count = summary[count_key]
@@ -435,12 +452,21 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                 adp_cfg=adp_cfg, collect_compact_samples=training_phase, gamma=1.0,
                 wave_id=f"{phase}-I{iteration:02d}-W{i // wave_size + 1:02d}", snapshot_hash=snapshot_hash,
             ))
-        results, batch, metrics = _run_rollout_jobs_parallel(
-            jobs=jobs, model_state=state, model_cfg=model_cfg, process_count=processes, wave_size=wave_size,
-            start_method="spawn", torch_threads=int(cfg["rollout"]["torch_threads_per_process"]),
-            output_dir=output, episode_rows=episode_rows, wave_rows=wave_rows,
-            progress_callback=report_rollout,
-        )
+        time_key = "training_rollout_sec" if training_phase else "validation_sec"
+        phase_started = time.perf_counter()
+        active_rollout = (time_key, phase_started, previous_write_sec)
+        try:
+            results, batch, metrics = _run_rollout_jobs_parallel(
+                jobs=jobs, model_state=state, model_cfg=model_cfg, process_count=processes, wave_size=wave_size,
+                start_method="spawn", torch_threads=int(cfg["rollout"]["torch_threads_per_process"]),
+                output_dir=output, episode_rows=episode_rows, wave_rows=wave_rows,
+                progress_callback=report_rollout,
+            )
+        finally:
+            # Include partial/failed collection, without charging live rendering twice.
+            summary[time_key] += max(0.0, time.perf_counter() - phase_started
+                                    - (summary["write_sec"] - previous_write_sec))
+            active_rollout = None
         for result in results:
             if result.termination_reason != "completed_horizon":
                 raise RuntimeError(f"TD episode {result.episode} ended early: {result.termination_reason}")
@@ -459,10 +485,6 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                         "Warm-start environment fingerprint mismatch: "
                         f"source={source_environment}, rollout={actual_environment}."
                     )
-        # Live rendering is already counted as write time, not simulation time.
-        summary["training_rollout_sec" if training_phase else "validation_sec"] += max(
-            0.0, metrics.wall_sec - (summary["write_sec"] - previous_write_sec)
-        )
         summary[count_key] = previous_count + len(results)
         return results, batch
 
@@ -489,14 +511,13 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                 force_random=initial and not warm_start_enabled,
             )
             history = retain_recent_episodes([*history, current], int(t["replay_capacity_episodes"]))
-            replay = merge_compact_batches(history)
             current_episode_ids = {int(value) for value in current.episode_ids.tolist()}
             if initial:
-                update_replay = replay
+                update_replay = merge_compact_batches(history)
                 update_epochs = int(t["initial_update_epochs"])
             else:
                 update_replay = sample_replay_episodes(
-                    replay,
+                    history,
                     required_episode_ids=current_episode_ids,
                     episode_count=int(t["replay_sample_episodes_per_update"]),
                     rng=rng,
@@ -508,8 +529,9 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                 "batch_episode_count": count,
                 "rollout_products_mean": statistics.fmean(r.products for r in results),
                 "rollout_products_std": statistics.stdev(r.products for r in results) if len(results) > 1 else 0.0,
-                "replay_episode_count": replay.episode_count, "replay_sample_count": len(replay),
-                "replay_mib": replay.memory_bytes / 1024 ** 2,
+                "replay_episode_count": len({int(e) for batch in history for e in batch.episode_ids.tolist()}),
+                "replay_sample_count": sum(len(batch) for batch in history),
+                "replay_mib": sum(batch.memory_bytes for batch in history) / 1024 ** 2,
                 "update_episode_count": update_replay.episode_count,
                 "update_current_episode_count": len(update_episode_ids & current_episode_ids),
                 "update_history_episode_count": len(update_episode_ids - current_episode_ids),
@@ -518,7 +540,9 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                 "update_epochs_requested": update_epochs,
                 "decision_count_mean": statistics.fmean(r.decisions for r in results),
                 "voluntary_wait_count": sum(r.candidate_available_wait_count for r in results),
-                "beam_entropy": statistics.fmean(r.beam_value_entropy_avg for r in results),
+                "beam_entropy": statistics.fmean(
+                    r.beam_value_entropy_avg for r in results if r.beam_value_entropy_decision_count > 0
+                ) if any(r.beam_value_entropy_decision_count > 0 for r in results) else None,
             }
             summary["peak_replay_mib"] = max(summary["peak_replay_mib"], row["replay_mib"])
             progress.update(phase="diagnostics", iteration=iteration)
@@ -554,11 +578,12 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                 row["gpu_peak_allocated_mib"] = torch.cuda.max_memory_allocated(device) / 1024 ** 2 if device.type == "cuda" else 0.0
                 summary["update_sec"] += row["update_sec"]
                 summary["value_update_count"] += 1
+                progress.update(completed_update_count=summary["value_update_count"])
                 del plan
             else:
                 row.update({"target_build_sec": 0.0, "update_sec": 0.0, "gpu_peak_allocated_mib": 0.0,
                             "epochs": 0, "sgd_steps": 0})
-            del update_replay, replay, current
+            del update_replay, current
             gc.collect()
             if iteration in screening:
                 validation, _ = rollout(iteration, "screening_validation", partitions["screening_validation"], 0.0)
@@ -571,6 +596,7 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                             "greedy_mc_bias": sum(r.greedy_mc_error_sum for r in validation) / num if num else None,
                             "greedy_mc_prediction_mean": sum(r.greedy_mc_prediction_sum for r in validation) / num if num else None,
                             "greedy_mc_target_mean": sum(r.greedy_mc_target_sum for r in validation) / num if num else None})
+                row.update(stopper.observe(iteration, {result.seed: float(result.products) for result in validation}))
             progress.update(phase="checkpoint", iteration=iteration)
             manifest = {**(fingerprint or {}), "return_estimator": "n_step_td",
                 "checkpoint_id": f"ADP-TD-{output.name}-I{iteration:02d}", "iteration": iteration,
@@ -580,7 +606,7 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                     str(training_worker_count): fingerprint["environment_fingerprint"]
                 },
                 "model": model_cfg, "horizon_days": cfg["horizon_days"],
-                "seed_partitions": partitions, "seed_overlap": False,
+                "seed_partitions": partitions, "seed_overlap": False, "seed_partition_scope": "planned_budget",
                 "training": {**t, **a, "mc_return_only": False, "target_network": True,
                               "initial_return_estimator": "n_step_td", "conservative_validation_gate": False},
                 "warm_start": dict(warm_start) if warm_start_enabled else {"enabled": False}}
@@ -608,7 +634,8 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                 best_mean = screening_candidates[0]["screening_mean"]
                 best_std = screening_candidates[0]["screening_std"]
                 best_iteration = screening_candidates[0]["iteration"]
-            summary.update({"best_iteration": best_iteration, "best_screening_mean": best_mean})
+            summary.update({"best_iteration": best_iteration, "best_screening_mean": best_mean,
+                            "completed_policy_iterations": iteration, "early_stopping_history": stopper.history})
             iterations.append(row)
             progress.update(completed_update_count=summary["value_update_count"])
             write()
@@ -618,8 +645,29 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
             else:
                 print(f"TD I{iteration:02d}: warm-start replay={row['rollout_products_mean']:.2f}, "
                       "source checkpoint unchanged", flush=True)
+            if row.get("early_stop_triggered") and iteration < total_iterations:
+                summary.update(early_stopped=True, stop_reason="production_plateau")
+                print(f"Early stop at I{iteration:02d}: production plateau; proceeding to final selection.", flush=True)
+                break
         if not screening_candidates:
             raise RuntimeError("No validated TD checkpoint was produced.")
+        completed_iterations = int(summary["completed_policy_iterations"])
+        summary["stop_reason"] = summary["stop_reason"] or "max_policy_iterations"
+        summary["expected_training_episode_count"] = episode_id
+        summary["screening_iterations_completed"] = [int(row["iteration"]) for row in iterations
+                                                      if "validation_products_mean" in row]
+        partitions["training"] = list(range(seed, seed + episode_id))
+        run_contract = {"completed_policy_iterations": completed_iterations,
+                        "max_policy_iterations": total_iterations,
+                        "early_stopped": summary["early_stopped"], "stop_reason": summary["stop_reason"]}
+        manifest = {**manifest, "seed_partitions": copy.deepcopy(partitions),
+                    "seed_partition_scope": "consumed_training", "training_run": run_contract}
+        save_checkpoint(output / "last.pt", model=model, optimizer=optimizer, target_model=target, manifest=manifest)
+        expected_total = episode_id + summary["validation_episode_count"] + len(screening_candidates) * len(partitions["final_selection_validation"])
+        summary["expected_episode_count"] = expected_total
+        progress.update(expected_episode_count=expected_total, completed_policy_iterations=completed_iterations,
+                        stop_reason=summary["stop_reason"], early_stopped=summary["early_stopped"])
+        write()
         final_candidates: list[dict[str, Any]] = []
         for rank, candidate in enumerate(screening_candidates, start=1):
             model.load_state_dict(candidate["model"])
@@ -661,7 +709,9 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
         model.load_state_dict(best_payload["model"])
         target.load_state_dict(best_payload["target"])
         optimizer.load_state_dict(best_payload["optimizer"])
-        manifest = {**best_payload["manifest"], "final_validation_completed_products_avg": final_mean,
+        manifest = {**best_payload["manifest"], "seed_partitions": copy.deepcopy(partitions),
+                    "seed_partition_scope": "consumed_training", "training_run": run_contract,
+                    "final_validation_completed_products_avg": final_mean,
                     "validation_completed_products_avg": final_mean,
                     "validation_completed_products_std": final_std}
         save_checkpoint(output / "best.pt", model=model, optimizer=optimizer, target_model=target, manifest=manifest)
@@ -688,7 +738,7 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
         write()
         raise
     path = write()
-    progress.update(status="completed", phase="completed", iteration=total_iterations)
+    progress.update(status="completed", phase="completed", iteration=completed_iterations)
     if not args.no_open_dashboard and cfg["runtime"].get("auto_open_dashboard", True):
         webbrowser.open(path.as_uri())
     return path

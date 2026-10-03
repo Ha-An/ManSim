@@ -17,6 +17,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(ROOT))
 
 from experiments.mfg_flow_shop_paper.run_evaluation import _run
+from experiments.mfg_flow_shop_paper.audit_inventory_results import gantt_state_checks
 
 
 def read_json(path: Path):
@@ -54,7 +55,6 @@ def audit_run(row: dict[str, str]) -> dict[str, object]:
     lanes = defaultdict(list)
     for segment in read_csv(directory / "gantt_segments.csv"):
         lanes[(segment["entity_group"], segment["lane"])].append(segment)
-    duration_by_status = defaultdict(float)
     worker_lanes = 0
     for (group, lane), segments in lanes.items():
         previous = 0.0
@@ -68,15 +68,16 @@ def audit_run(row: dict[str, str]) -> dict[str, object]:
             if stop < start or stop > end + 0.002:
                 errors.append(f"gantt invalid interval: {lane} {start}..{stop}")
             previous = stop
-            if group == "Worker":
-                duration_by_status[segment["status"]] += stop - start
         if group == "Worker":
             equal(f"gantt horizon {lane}", previous, end, 0.002)
+            for label, actual, expected in gantt_state_checks(segments, kpi["humanoid_state_time_by_worker"][lane]):
+                equal(f"{label} {lane}", actual, expected, 0.01)
         worker_lanes += group == "Worker"
     equal("gantt worker count", worker_lanes, row["worker_count"])
-    for name, statuses in (("execution", {"EXECUTING", "CHARGING"}), ("blocked", {"BLOCKED"}), ("unavailable", {"OFFLINE", "DISABLED"})):
+    for name, statuses in (("execution", {"EXECUTING"}), ("blocked", {"BLOCKED"}), ("unavailable", {"OFFLINE", "DISABLED"})):
         metric = f"humanoid_{name}_ratio_avg"
-        equal(f"gantt {metric}", sum(duration_by_status[s] for s in statuses) / (end * worker_lanes), kpi[metric], 0.0001)
+        duration = sum(axes["availability"].get(s, 0) for axes in kpi["humanoid_state_time_by_worker"].values() for s in statuses)
+        equal(f"state integral {metric}", duration / (end * worker_lanes), kpi[metric], 2e-6)
     for key in ("buffer_overflow_attempt_count", "buffer_reservation_leak_count", "rolling_horizon_late_boundary_count"):
         if kpi.get(key, 0):
             errors.append(f"{key}={kpi[key]}")

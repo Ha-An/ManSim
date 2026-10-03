@@ -329,6 +329,7 @@ def render(prepared: Path) -> Path:
         output / "experiment_plan.json",
         {
             "scenario": cfg.scenario,
+            "condition_label": plan.get("condition_label", ""),
             "horizon_days": cfg.horizon_days,
             "makespan_max_sim_days": cfg.makespan_max_sim_days,
             "minutes_per_day": cfg.minutes_per_day,
@@ -341,7 +342,7 @@ def render(prepared: Path) -> Path:
             "policy_contract": {
                 "explicit_wait_action_enabled": False,
                 "forced_idle_without_feasible_task_allowed": True,
-                "beam_worker_order_strategy": "cyclic",
+                "beam_worker_order_strategy": "cyclic" if "simulation_based_adp" in cfg.modes else "not applicable",
             },
             "confirmatory_analysis": str((prepared / "analysis_summary.json").resolve()),
         },

@@ -96,6 +96,7 @@ class ADPDecisionCoordinator:
             "wait_count": 0,
             "candidate_available_wait_count": 0,
             "no_candidate_unassigned_count": 0,
+            "unassigned_count": 0,
             "assigned_task_count": 0,
             "joint_all_wait_count": 0,
             "joint_all_wait_with_candidate_count": 0,
@@ -188,6 +189,24 @@ class ADPDecisionCoordinator:
         task = queue.popleft()
         self.dispatch_events[worker_id] = self.env.event()
         return task
+
+    def cancel_pending_assignments(self, *, reason: str) -> None:
+        """Release unstarted assignments when the simulation stops."""
+        for worker_id, queue in self.dispatch_queues.items():
+            worker = self.world.workers[worker_id]
+            while queue:
+                task = queue.popleft()
+                self.world._release_task_domain_owner(worker, task, reason=reason)
+                self.world._release_task_item_reservations(task, reason=reason)
+                self.world._release_task_buffer_slot(task, reason=reason)
+                self.world.logger.log(
+                    t=self.env.now,
+                    day=self.world.day_for_time(self.env.now),
+                    event_type="ADP_TASK_ASSIGNMENT_CANCELLED",
+                    entity_id=worker_id,
+                    location=self.world.agent_display_location(worker),
+                    details={"task_id": task.task_id, "reason": reason, "started": False},
+                )
 
     def _wake(self, worker_id: str) -> None:
         event = self.dispatch_events.get(worker_id)
@@ -460,6 +479,7 @@ class ADPDecisionCoordinator:
         unassigned_workers = [
             worker_id for worker_id, value in selection.assignment.items() if value is None
         ]
+        self.metrics["unassigned_count"] += len(unassigned_workers)
         wait_workers = unassigned_workers if self.allow_wait_action else []
         candidate_available_wait_workers = [
             worker_id
@@ -468,7 +488,7 @@ class ADPDecisionCoordinator:
         ]
         no_candidate_unassigned_workers = [
             worker_id
-            for worker_id in wait_workers
+            for worker_id in unassigned_workers
             if not state.tasks_by_worker.get(worker_id, {})
         ]
         self.metrics["wait_count"] += len(wait_workers)
@@ -480,7 +500,10 @@ class ADPDecisionCoordinator:
         )
         all_wait = bool(workers) and len(wait_workers) == len(workers)
         all_wait_with_candidate = all_wait and bool(int(state.feasibility.sum()))
-        all_wait_without_candidate = all_wait and not bool(int(state.feasibility.sum()))
+        all_idle_without_candidate = (
+            bool(workers) and len(unassigned_workers) == len(workers)
+            and not bool(int(state.feasibility.sum()))
+        )
         if all_wait:
             self.metrics["joint_all_wait_count"] += 1
             self.consecutive_all_wait_decisions += 1
@@ -499,7 +522,7 @@ class ADPDecisionCoordinator:
             )
         else:
             self.consecutive_candidate_all_wait_decisions = 0
-        if all_wait_without_candidate:
+        if all_idle_without_candidate:
             self.metrics["joint_no_candidate_count"] += 1
         self.world.logger.log(
             t=self.env.now,
@@ -520,7 +543,9 @@ class ADPDecisionCoordinator:
                 "unassigned_workers": unassigned_workers,
                 "all_wait": all_wait,
                 "all_wait_with_candidate": all_wait_with_candidate,
-                "all_wait_without_candidate": all_wait_without_candidate,
+                "all_wait_without_candidate": all_wait and all_idle_without_candidate,
+                "all_idle_without_candidate": all_idle_without_candidate,
+                "idle_metrics_version": 2,
                 "wait_action_enabled": self.allow_wait_action,
                 "predicted_value": round(float(selection.predicted_value), 6),
                 "beam_value_entropy": (
@@ -558,7 +583,9 @@ class ADPDecisionCoordinator:
 
     def summary(self) -> dict[str, Any]:
         decisions = max(1, int(self.metrics["decision_count"]))
+        worker_decisions = max(1, int(self.metrics["unassigned_count"]) + int(self.metrics["assigned_task_count"]))
         return {
+            "idle_metrics_version": 2,
             "enabled": True,
             "checkpoint_id": str(self.checkpoint_manifest.get("checkpoint_id", "training" if self.training else "")),
             "checkpoint_path": str(self.checkpoint_manifest.get("checkpoint_path", "")),
@@ -580,24 +607,17 @@ class ADPDecisionCoordinator:
                 self.metrics["no_candidate_unassigned_count"]
             ),
             "assigned_task_count": int(self.metrics["assigned_task_count"]),
+            "unassigned_count": int(self.metrics["unassigned_count"]),
             "worker_wait_ratio": float(self.metrics["wait_count"])
-            / max(1, int(self.metrics["wait_count"]) + int(self.metrics["assigned_task_count"])),
+            / worker_decisions,
             "candidate_available_wait_ratio": float(
                 self.metrics["candidate_available_wait_count"]
             )
-            / max(
-                1,
-                int(self.metrics["wait_count"])
-                + int(self.metrics["assigned_task_count"]),
-            ),
+            / worker_decisions,
             "no_candidate_unassigned_ratio": float(
                 self.metrics["no_candidate_unassigned_count"]
             )
-            / max(
-                1,
-                int(self.metrics["wait_count"])
-                + int(self.metrics["assigned_task_count"]),
-            ),
+            / worker_decisions,
             "joint_all_wait_count": int(self.metrics["joint_all_wait_count"]),
             "joint_all_wait_ratio": float(self.metrics["joint_all_wait_count"]) / decisions,
             "joint_all_wait_with_candidate_count": int(

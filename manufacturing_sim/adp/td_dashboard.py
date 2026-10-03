@@ -9,6 +9,8 @@ from pathlib import Path
 import statistics
 from typing import Any
 
+from .td_formulas import FORMULA_CSS, render_formula
+
 
 def number(row: dict[str, Any], key: str) -> float | None:
     try:
@@ -21,7 +23,9 @@ def number(row: dict[str, Any], key: str) -> float | None:
 def cell(value: Any) -> str:
     if value is None or isinstance(value, float) and not math.isfinite(value):
         return "N/A"
-    return html.escape(f"{value:.3f}" if isinstance(value, float) else str(value))
+    if isinstance(value, float):
+        return format(value, ".3g" if 0 < abs(value) < .001 else ".3f")
+    return html.escape(str(value))
 
 
 def _interval(mean: float, std: float | None, count: float | None) -> tuple[float | None, float | None]:
@@ -91,19 +95,30 @@ def _table(rows: list[dict[str, Any]], fields: list[tuple[str, str]]) -> str:
             + "</tbody></table></div>")
 
 
-def _panel(key: str, title: str, graph: str, interpretation: str, formula: str, caveats: str, extra: str = "") -> str:
+def _panel(key: str, title: str, graph: str, interpretation: str, caveats: str, extra: str = "") -> str:
     return (f"<section class='panel' id='{key}' data-metric-id='{key}'><h3>{html.escape(title)}</h3>{graph}"
             f"<p><strong>해석</strong> {html.escape(interpretation)}</p>"
-            f"<p class='formula'><strong>산출식</strong> {html.escape(formula)}</p>"
-            f"<p class='caveat'><strong>유의사항</strong> {html.escape(caveats)}</p>{extra}</section>")
+            + render_formula(key)
+            + f"<p class='caveat'><strong>유의사항</strong> {html.escape(caveats)}</p>{extra}</section>")
 
 
 def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations: list[dict[str, Any]],
-                        waves: list[dict[str, Any]], summary: dict[str, Any]) -> Path:
+                        waves: list[dict[str, Any]], summary: dict[str, Any],
+                        *, filename: str = "training_dashboard.html") -> Path:
     from .train import _svg_chart
     from .live import atomic_text, read_json
 
-    iterations = sorted(iterations, key=lambda row: float(row.get("iteration", 0)))
+    iterations = sorted((dict(row) for row in iterations), key=lambda row: float(row.get("iteration", 0)))
+    # Rebuild optional entropy from its actual observations, including older CSVs
+    # that encoded an initial random batch's undefined entropy as zero.
+    for row in iterations:
+        collected = [e for e in episodes if e.get("phase") in {"initial_random", "warm_start_replay", "policy_iteration"}
+                     and number(e, "iteration") == number(row, "iteration")]
+        if collected and all("beam_value_entropy_decision_count" in e for e in collected):
+            observed = [number(e, "beam_value_entropy_avg") for e in collected
+                        if (number(e, "beam_value_entropy_decision_count") or 0) > 0]
+            observed = [value for value in observed if value is not None]
+            row["beam_entropy"] = statistics.fmean(observed) if observed else None
     validity = read_json(output / "result_validity.json")
     banner = ("<aside role='alert'><strong>시뮬레이션 오류 수정 전 학습 결과</strong><p>"
               + html.escape(str(validity.get("message", ""))) + "</p></aside>"
@@ -113,6 +128,8 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
         violations = sum(number(row, "voluntary_wait_count") or 0 for row in iterations)
         if violations:
             warnings.append(f"WAIT 비활성 계약인데 자발적 WAIT가 {violations:g}회 기록되었습니다.")
+        if any((number(row, "idle_metrics_version") or 1) < 2 for row in episodes):
+            warnings.append("이전 로그는 WAIT 비활성 시 후보 없는 강제 유휴를 기록하지 않았습니다. 해당 유휴 지표의 0은 실제 유휴가 없었다는 뜻이 아니며 원본 로그 없이 복원할 수 없습니다. 생산량과 보상에는 영향이 없습니다.")
     warning_html = "".join(f"<p role='alert'>{html.escape(message)}</p>" for message in warnings)
 
     def chart(keys: list[tuple[str, str, str]], y_label: str, rows=None, *, x_key="iteration",
@@ -149,7 +166,6 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
               f"{summary.get('horizon_days', 5)}일 완료 제품 수", production_rows,
               ci={"validation_products_mean": ("ci_low", "ci_high")}, dashed=["학습용 rollout (업데이트 전)"]),
         "정책 성능은 보라색의 고정 validation seed 생산량으로 봅니다. 회색 k는 업데이트 k 이전 정책의 ε-greedy 수집이고, 보라색 k는 업데이트 후 ε=0 평가입니다. " + initial,
-        "평균 P̄k = Σe Pk,e / Nk. 표본 표준편차 sk = √[Σe(Pk,e − P̄k)²/(Nk − 1)]. 오차막대 = P̄k ± 1.96 sk/√Nk.",
         "오차막대는 평균의 근사 95% CI이며 episode 산포 범위가 아닙니다. 작은 seed 수에서는 불확실성이 큽니다. N=1은 막대를 생략합니다. "
         "회색·보라색은 정책과 seed가 달라 간격만으로 과적합을 판정할 수 없습니다. 고정 screening seed는 학습 gradient에는 쓰지 않지만 checkpoint 선택에는 쓰므로 최종 독립 test와 다릅니다.",
         _table(validation[-1:], [("최근 검증 iteration", "iteration"), ("평균", "validation_products_mean"),
@@ -158,7 +174,6 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
         chart([("동일 seed의 생산량 차이", "paired_mean", "#138d75")], "완료 제품 차이 (현재 − I0)", paired,
               ci={"paired_mean": ("ci_low", "ci_high")}),
         "같은 worker·seed에서 초기 checkpoint보다 실제로 더 생산했는지를 비교합니다. 양수는 개선, 음수는 저하입니다. 초기 모델을 다시 평가하거나 추가 episode를 실행하지 않고 기존 screening 원본을 짝지었습니다.",
-        "dk,e = Pk,e − P0,e. Δk = Σe dk,e / N. 오차막대 = Δk ± 1.96 sd(dk,e)/√N. Win/tie/loss는 dk,e가 양수/0/음수인 seed 수입니다.",
         "두 checkpoint의 worker·seed 집합과 완료 episode 수가 정확히 같을 때만 계산합니다. 독립 평균 CI 두 개를 빼는 계산이 아닙니다. "
         "I0의 0은 자기 자신과의 차이입니다. 반복 screening·선택과 같은 I0 재사용으로 점들이 의존하므로 CI를 최종 유의성 검정이나 전체 구간 동시 CI로 보지 마세요.",
         warning_html + _table(paired[-1:], [("Iteration", "iteration"), ("평균 차이", "paired_mean"), ("차이 표준편차", "paired_std"),
@@ -166,8 +181,6 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
     panels.append(_panel("td-fit", "3. n-step TD 적합 오차",
         chart([("학습 표본", "td_train_mse", "#c6811d"), ("Episode holdout", "td_holdout_mse", "#138d75")], "TD MSE (제품 수²)"),
         "현재 bootstrap target에 가치망이 얼마나 잘 맞는지를 봅니다. 학습 오차만 줄고 holdout 오차가 커지면 replay 표본에 대한 과적합 가능성을 점검합니다.",
-        "Yj = Σℓ=0..hj−1 Rj+ℓ + 1{비종료} Vtarget(Sx,greedyj+hj), γ=1. MSE = Σj[Vθ(Sxj) − Yj]² / J. "
-        "각 SGD 뒤 θtarget ← (1−τ)θtarget + τθ. 그래프는 업데이트 종료 후의 online/target network로 재계산한 오차입니다.",
         "Greedy 행동 map은 해당 업데이트 시작 때 고정하고 endpoint 값은 target network로 계산합니다. Episode ID가 10의 배수인 표본은 holdout이며 gradient에 쓰지 않습니다. "
         "표본이 없는 holdout은 N/A입니다. 업데이트마다 replay와 target이 달라지므로 같은 시험지를 반복한 loss가 아닙니다. 낮은 TD MSE만으로 실제 미래 생산량이나 행동 순위가 정확하다고 결론낼 수 없습니다.",
         _table(iterations[-1:], [("TD 학습 표본", "td_train_sample_count"), ("TD holdout 표본", "td_holdout_sample_count")])))
@@ -176,8 +189,6 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
         chart([("Greedy MC RMSE", "greedy_mc_rmse", "#c6811d"), ("평균 편향", "greedy_mc_bias", "#d75b48")], "잔여 완료 제품 수"),
         "학습에 쓰지 않은 greedy validation에서 실제 잔여 생산량을 얼마나 정확히 예측하는지 봅니다. RMSE는 작을수록 좋고, 편향은 0에 가까울수록 좋습니다. "
         "양의 편향은 과대예측, 음의 편향은 과소예측입니다. 기존 평균 예측·MC 평균 그래프는 아래 가치 보정 표로 합쳤습니다.",
-        "Gj = Σu=j..terminal Ru, ej = Vθ(Sxj) − Gj. RMSE = √[Σj ej²/J], Bias = Σj ej/J = 평균 예측 − 평균 MC return. "
-        "표의 평균 예측 = ΣjVθ(Sxj)/J, 실제 MC 평균 = ΣjGj/J.",
         "J는 validation의 의사결정 표본 수입니다. Episode 평균 오차가 아니라 모든 decision을 합치므로 decision이 많은 episode의 가중치가 큽니다. "
         "MC return은 진단 전용이며 TD 학습 target에 섞지 않습니다. 작은 평균 편향만으로 개별 오차가 작다고 볼 수 없고, 정확한 절대값도 같은 상태의 행동 순위 정확성을 보장하지 않습니다. 표는 시작 시점의 총 생산량이 아닙니다.",
         "<h4>미래 생산량 가치 보정</h4>" + _table(calibration[-1:], [("Iteration", "iteration"), ("가치망 평균 예측", "greedy_mc_prediction_mean"),
@@ -189,8 +200,6 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
     details.append(_panel("target-span", "5. TD target의 관측 범위와 중단 사유", target_graph,
         "설정 n보다 실제 관측 길이가 짧아지는 이유를 봅니다. 이벤트 간 시간이 다르므로 step 수와 simulation 분을 별도 축으로 표시합니다. "
         "평균 step이 작으면 n을 올리기 전에 off-policy 중단 비율을 확인해야 합니다.",
-        f"설정 상한 n={summary.get('n_step', 30)}. hj는 최대 n개의 reward를 누적하되 중간 행동 불일치 직전 또는 terminal에서 중단한 길이입니다. "
-        "평균 n = Σj hj/J. 평균 시간 = Σj(tendpoint − tj)/J. 중단 사유 비율 = 해당 사유 표본 수/J.",
         "중간 행동 비교는 업데이트 시작 online network의 고정 greedy map 기준입니다. 평균 구간은 미래를 완전히 예측하는 lookahead 길이가 아닙니다. "
         "n 도달·정책 불일치·terminal은 코드의 우선순위에 따라 배타적으로 기록되며 세 비율 합은 1입니다. n은 분이 아닌 decision 개수입니다.",
         _table([row for row in iterations if number(row, "effective_n_mean") is not None][-1:],
@@ -200,8 +209,6 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
         chart([("보유 episode", "replay_episode_count", "#227ab7"),
                ("현재 수집", "update_current_episode_count", "#c6811d"), ("과거 replay", "update_history_episode_count", "#a955cf")], "Episode 수"),
         "Replay에 남아 있는 양과 한 번의 업데이트에 실제로 선택한 양을 구분합니다. 현재 수집과 과거 episode가 계획한 비율로 들어가는지 확인합니다.",
-        "업데이트 episode 수 = 현재 episode 수 + 선택된 과거 episode 수. 초기 학습은 fill 전체를 사용하고 이후에는 현재 수집 전체와 과거 완전 episode를 추출합니다. "
-        "Replay MiB = 보관 tensor 및 직렬화 기준 제약 metadata byte 수 / 2²⁰.",
         "선택된 episode에도 holdout이 포함되므로 모든 표본이 gradient에 쓰이지는 않습니다. Warm-start I0의 epoch=0이면 fill만 하고 업데이트는 하지 않습니다. "
         "Replay MiB는 전체 RAM이 아니며 Python overhead·복사본·GPU 메모리는 별도입니다. 메모리와 학습률·epsilon은 아래 운영 표에서 확인합니다.",
         _table(iterations[-1:], [("업데이트 episode 합계", "update_episode_count"), ("Replay MiB", "replay_mib"),
@@ -210,8 +217,6 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
         "<h4>OOD 선택 비율</h4>" + chart([("OOD 선택률", "ood_selection_rate", "#d75b48")], "선택 비율 (0~1)")
         + "<h4>관측 범위 대비 추가 편향</h4>" + chart([("OOD − 관측 범위", "ood_overestimation_excess", "#a955cf")], "잔여 제품 수 차이"),
         "직전 수집 batch와 다른 상태·행동이 선택되는 정도와 그 선택의 추가 편향을 함께 봅니다. 둘 다 크면 분포 이탈과 과대예측 가능성을 추가 조사할 근거가 됩니다.",
-        "표준화 afterstate 요약벡터의 거리 d = min‖z−zref‖₂/√차원. 직전 batch calibration 거리의 설정 quantile을 q라 할 때 "
-        "OOD 비율 = #{d>q}/평가한 greedy 선택 수. 추가 편향 = mean(V−G | OOD) − mean(V−G | 범위 안).",
         "이 진단은 이번 업데이트 이전 정책이 수집한 값이며 업데이트 후 validation과 시점이 다릅니다. G는 이후 ε-greedy trajectory의 MC return입니다. "
         "과거 전체 데이터에 한 번도 없었다는 뜻이 아니며, reference가 없거나 어느 한 집단이 비면 N/A입니다. 미선택 행동과 직접 비교하지 않아 인과적 행동 우열을 증명하지 않습니다."))
     completed_waves = [{**row, "wave": index + 1} for index, row in enumerate(waves) if row.get("status") == "completed"]
@@ -240,8 +245,6 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
     details.append(_panel("runtime", "8. 병렬 수집 소요시간과 처리량",
         chart(phase_keys, "Wave wall-clock 초", phase_rows, x_key="wave", x_label="Wave 번호 (실행 순서)"),
         "학습과 validation wave를 색으로 구분해 어느 단계에서 수집 시간이 증가하는지 봅니다. GPU update·target 구성 시간은 별도 표로 내려 중복 시간 그래프를 줄였습니다.",
-        "Wave 시간 Tw = wave 시작부터 모든 결과 수신까지의 실제 경과시간. Phase 처리량 = 3600 Σw episode_countw / Σw Tw. "
-        "슬롯 활용률 = ΣwΣe Te / Σw(pw Tw), pw = 실제 배정한 병렬 슬롯 수.",
         "Elapsed는 process 시간 합이 아니므로 process 수로 나누지 않습니다. 슬롯 활용률은 CPU 사용률이나 단일 process 대비 실측 speedup이 아닙니다. "
         "Partial wave는 슬롯 수가 다릅니다. Phase 표는 완료 wave만 포함하며 pool 초기화·wave 사이 처리·가치망 학습을 제외하므로 전체 end-to-end 시간과 다릅니다. 같은 phase의 연결선도 중간에 다른 phase가 끼어 있을 수 있습니다.",
         _table(wave_summary, [("Phase", "phase"), ("Wave", "waves"), ("Episode", "episodes"), ("Wave 초 합", "wall_sec"),
@@ -258,6 +261,10 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
     overview = [("상태", summary.get("status")), ("Training episode", summary.get("training_episode_count")),
                 ("Validation episode", summary.get("validation_episode_count")), ("업데이트 수", summary.get("value_update_count")),
                 ("Best iteration", summary.get("best_iteration")), ("최종 별도 seed 생산량", summary.get("best_validation_completed_products_avg"))]
+    if summary.get("early_stopping", {}).get("enabled"):
+        completed = summary.get("completed_policy_iterations")
+        overview.extend([("완료 / 상한 iteration", f"{completed if completed is not None else '-'} / {summary.get('policy_iterations')}"),
+                         ("학습 종료 사유", summary.get("stop_reason") or "학습 중")])
     settings = [("n 상한", summary.get("n_step")), ("CPU processes / wave", f"{summary.get('configured_process_count')} / {summary.get('wave_size')}"),
                 ("학습 장치", f"{summary.get('training_device')} {meta.get('gpu_name', '')}"),
                 ("Replay episode 상한", summary.get("replay_capacity_episodes")), ("Final 평가 후보 수", len(summary.get("final_candidate_results", []))),
@@ -274,6 +281,12 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
     settings.append(("Initial / policy epoch", f"{summary.get('initial_update_epochs')} / {summary.get('policy_update_epochs')}"))
     if warm:
         settings.extend([("Warm-start checkpoint", summary.get("warm_start_checkpoint_id")), ("Source iteration", summary.get("warm_start_source_iteration"))])
+    stopping = summary.get("early_stopping", {})
+    if stopping.get("enabled"):
+        settings.extend([("조기 종료 최소 iteration", stopping.get("min_iterations")),
+                         ("최고 생산량 미개선 iteration", stopping.get("patience_iterations")),
+                         ("연속 paired 검증 수", stopping.get("consecutive_checks")),
+                         ("Paired CI 상한 기준 (제품)", stopping.get("paired_ci_upper_threshold"))])
 
     fields = [("Iteration", "iteration"), ("Epsilon", "epsilon"), ("Learning rate", "learning_rate"),
               ("Rollout 평균 제품", "rollout_products_mean"), ("Rollout 표준편차", "rollout_products_std"),
@@ -291,19 +304,32 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
               ("Target 구성 초", "target_build_sec"), ("신경망 update 초", "update_sec"),
               ("Final 후보 순위", "final_candidate_rank"), ("Final 평균 제품", "final_validation_products_mean"),
               ("Final 표준편차", "final_validation_products_std")]
+    if stopping.get("enabled"):
+        fields.extend([("종료 판단 기준 checkpoint", "early_stop_reference_iteration"),
+                       ("최고 생산량 미개선 iteration", "early_stop_stagnant_iterations"),
+                       ("현재 - 최고 제품 차이", "early_stop_paired_mean"),
+                       ("Paired 근사 CI 상한", "early_stop_paired_ci_upper"),
+                       ("조기 종료 조건 충족", "early_stop_triggered")])
     contract_text = ("<p><strong>운영 지표 해석</strong> Epsilon은 수집 시 random 분기 확률이며 validation은 0입니다. "
                      "초기 Random 수집은 1이며 warm-start는 설정값을 사용합니다. Learning rate는 해당 iteration의 Adam 설정값입니다. "
                      "자발적 WAIT는 실행 가능한 후보가 있는데 WAIT를 선택한 worker 횟수이고, WAIT 비활성 계약에서는 0이어야 합니다. "
                      "강제 유휴는 포함하지 않으며 episode 수가 다르면 단순 횟수 비교가 공정하지 않습니다.</p>"
-                     "<p><strong>엔트로피 산출식·유의사항</strong> Greedy beam 후보 B개의 가치 v를 z=(v−mean(v))/sd(v)로 표준화한 후 "
-                     "p=softmax(z), H=−Σb pb log(pb)/log(B)입니다. 후보가 하나면 계산하지 않고, 같은 가치의 복수 후보는 1입니다. "
-                     "Episode의 유효 decision 평균을 구한 뒤 episode 평균으로 집계합니다. 유효 decision이 없는 episode의 기존 집계는 0일 수 있습니다. "
+                     + render_formula("entropy", heading="엔트로피 산출식")
+                     + "<p><strong>엔트로피 유의사항</strong> 후보가 하나면 계산하지 않고, 같은 가치의 복수 후보는 1입니다. "
+                     "Episode의 유효 decision 평균을 구한 뒤 유효 episode만 평균합니다. 유효 decision이 없는 초기 random batch 등은 N/A입니다. "
                      "값의 절대 scale을 제거하므로 H가 비슷해도 생산량이나 행동 간 실제 가치 차이가 같다는 뜻이 아닙니다. 이것은 정책 확률의 엔트로피가 아닙니다.</p>"
                      "<p><strong>메모리·시간</strong> GPU peak는 update에서 PyTorch가 할당한 peak이며 전체 장치 사용량이 아닙니다. "
                      "Target 구성은 replay의 greedy 행동 재탐색, update 시간은 SGD와 진단 오차 계산입니다. GPU 실행 시 동기화된 wall-clock 시간이며 순수 kernel 시간은 아닙니다.</p>")
     times = [("Training rollout", summary.get("training_rollout_sec")), ("Validation", summary.get("validation_sec")),
              ("TD target 구성", summary.get("target_build_sec")), ("신경망 업데이트", summary.get("update_sec")),
              ("대시보드/통계 저장", summary.get("write_sec"))]
+    if stopping.get("enabled"):
+        contract_text += (render_formula("early-stop", heading="조기 종료 산출식")
+                          + "<p><strong>조기 종료</strong> 최소 학습 횟수와 미개선 기간을 "
+                          "충족하고 최근 연속 검증의 상한이 설정값 미만일 때 수집을 종료합니다. 작은 평균 개선도 "
+                          "최고 checkpoint와 미개선 기간을 갱신합니다. MSE 기반 종료나 모델 롤백이 아닙니다. "
+                          "반복 검증과 checkpoint 선택 편향이 있으므로 통계적 수렴 증명은 아닙니다. 종료 후 별도 "
+                          "final-selection을 완료하며 진행률 분모는 실제 필요 episode 수로 조정됩니다.</p>")
     wall = number(summary, "wall_sec")
     known = [number({"value": value}, "value") for _, value in times]
     times.append(("기타 및 checkpoint 저장", max(0, wall - sum(known)) if wall is not None and all(v is not None for v in known) else None))
@@ -314,7 +340,7 @@ main{max-width:1560px;margin:auto;padding:24px}h1{font-size:26px;margin:0}h2{fon
 header{border-bottom:1px solid #c8d4dc;padding-bottom:12px;margin-bottom:16px}p{overflow-wrap:anywhere}nav{display:flex;gap:20px;flex-wrap:wrap;margin:12px 0 22px}a{color:#0969a2}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));margin:16px 0;gap:14px}.cards>div{min-width:0;border-bottom:1px solid #c8d4dc;padding:8px 0}dt{font-size:13px;color:#526773}dd{margin:4px 0;overflow-wrap:anywhere}
 .charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:32px}.panel{min-width:0;border-top:2px solid #bfd0db;padding:18px 0}
-.panel p{font-size:14px;margin:10px 0}.formula{background:#eaf0f4;padding:10px;font-family:ui-monospace,monospace}.caveat{color:#586470}
+.panel p{font-size:14px;margin:10px 0}.caveat{color:#586470}
 svg{display:block;width:100%;height:auto;background:white}.tick{fill:#4b6576;font-size:12px;text-anchor:end}.x-tick{text-anchor:middle}.axis-label{fill:#263e4d;font-size:13px;text-anchor:middle}
 .grid-line{stroke:#d8e1e6;stroke-width:1}.axis-line{stroke:#8ba6b4}.point-label{fill:#172a36;font-size:12px}.chart-legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:13px}
 .chart-legend span{display:inline-flex;align-items:center;gap:6px}.chart-legend i{display:inline-block;width:18px;height:3px}.empty{padding:30px 12px;color:#526773;background:#eaf0f4}
@@ -325,7 +351,7 @@ details{border-top:1px solid #b4c5d0;margin-top:24px;padding-top:12px}summary{cu
 """
     derived = json.dumps({"paired_production_changes": paired, "warnings": warnings}, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c")
     content = ("<!doctype html><html lang='ko'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-               f"<title>ADP n-step TD 학습 진단</title><style>{css}</style></head><body><main>{banner}"
+               f"<title>ADP n-step TD 학습 진단</title><style>{css}{FORMULA_CSS}</style></head><body><main>{banner}"
                "<header class='run-overview'><h1>ADP n-step TD 학습 진단</h1>"
                "<p>n-step TD · MSE · 완료 제품 reward · target network · 최근 episode replay</p></header>"
                + (f"<p role='alert'>{html.escape(str(summary['failure']))}</p>" if summary.get("failure") else "")
@@ -347,12 +373,12 @@ details{border-top:1px solid #b4c5d0;margin-top:24px;padding-top:12px}summary{cu
                "window.addEventListener('scroll',()=>sessionStorage.setItem(key+':scroll',String(window.scrollY)),{passive:true});"
                "document.querySelectorAll('nav a').forEach(a=>a.addEventListener('click',()=>{const d=document.querySelector(a.hash);if(d?.tagName==='DETAILS')d.open=true;}));"
                "}catch(e){}</script></body></html>")
-    path = output / "training_dashboard.html"
+    path = output / filename
     atomic_text(path, content)
     return path
 
 
-def render_from_files(output: Path) -> Path:
+def render_from_files(output: Path, *, filename: str = "training_dashboard.html") -> Path:
     def read_csv(name: str) -> list[dict[str, Any]]:
         def parse(value: str) -> Any:
             if value == "":
@@ -368,7 +394,7 @@ def render_from_files(output: Path) -> Path:
     if summary.get("return_estimator") != "n_step_td":
         raise ValueError("Use the legacy renderer for MC experiment results.")
     return render_td_dashboard(output, read_csv("episode_metrics.csv"), read_csv("iteration_metrics.csv"),
-                               read_csv("wave_metrics.csv"), summary)
+                               read_csv("wave_metrics.csv"), summary, filename=filename)
 
 
 if __name__ == "__main__":

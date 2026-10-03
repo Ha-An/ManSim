@@ -185,7 +185,9 @@ def compact_episode_transitions(
     )
 
 
-def merge_compact_batches(episodes: list[CompactMCBatch]) -> CompactMCBatch:
+def merge_compact_batches(
+    episodes: list[CompactMCBatch], *, padding_shape: tuple[int, int] | None = None,
+) -> CompactMCBatch:
     torch = require_torch()
     if not episodes:
         return CompactMCBatch(
@@ -205,6 +207,9 @@ def merge_compact_batches(episodes: list[CompactMCBatch]) -> CompactMCBatch:
     sample_count = sum(len(episode) for episode in episodes)
     max_workers = max(int(episode.worker_features.shape[1]) for episode in episodes)
     max_tasks = max(int(episode.task_features.shape[1]) for episode in episodes)
+    if padding_shape is not None:
+        max_workers = max(max_workers, padding_shape[0])
+        max_tasks = max(max_tasks, padding_shape[1])
     merged = CompactMCBatch(
         global_features=torch.zeros((sample_count, GLOBAL_FEATURE_DIM), dtype=torch.float32),
         worker_features=torch.zeros((sample_count, max_workers, WORKER_FEATURE_DIM), dtype=torch.float32),
@@ -244,7 +249,7 @@ def merge_compact_batches(episodes: list[CompactMCBatch]) -> CompactMCBatch:
             raise ValueError("Cannot merge MC-only and TD replay samples.")
         from .td import CompactTDData
 
-        merged.td_data = CompactTDData.merge(td_episodes)
+        merged.td_data = CompactTDData.merge(td_episodes, padding_shape=padding_shape)
     return merged
 
 

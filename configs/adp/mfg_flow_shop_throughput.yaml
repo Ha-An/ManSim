@@ -56,6 +56,13 @@ training:
   initial_random_episodes: 50
   policy_iterations: 75
   episodes_per_iteration: 10
+  # Stop collection, not SGD acceptance; always finish separate final selection.
+  early_stopping:
+    enabled: true
+    min_iterations: 45
+    patience_iterations: 20
+    consecutive_checks: 2
+    paired_ci_upper_threshold: 0.5
   replay_scope: recent_episodes
   replay_capacity_episodes: 100
   # Initial update sees all 50 episodes once. Policy updates include the
@@ -106,7 +113,7 @@ validation:
   screening_iterations: [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75]
   screening_include_initial: true
   screening_seed_count: 10
-  final_candidate_count: 3
+  final_candidate_count: 2
   final_selection_seed_count: 20
 
 model:

@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 import csv
+import io
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import time
+import yaml
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
@@ -20,6 +24,8 @@ from experiments.factory_policy_comparison.run_experiment import validate_adp_he
 from experiments.mfg_flow_shop_paper.render_standard_dashboard import render as render_dashboard, _experiment_timing
 from experiments.mfg_flow_shop_paper.summarize_results import summarize
 from manufacturing_sim.simulation.scenarios.manufacturing.entities import MACHINE_LIFECYCLE_CONTRACT
+from manufacturing_sim.adp.live import atomic_json, atomic_text
+from experiments.mfg_flow_shop_paper.evaluation_live import EvaluationMonitor
 
 
 def _read_rows(path: Path) -> list[dict[str, str]]:
@@ -34,10 +40,11 @@ def _write_status(path: Path, rows: list[dict[str, object]]) -> None:
         "artifact_audit", "kpi_audit", "ntfs_compressed",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
+    handle = io.StringIO(newline="")
+    writer = csv.DictWriter(handle, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+    atomic_text(path, handle.getvalue())
 
 
 def _compact(run_dir: Path) -> bool:
@@ -67,7 +74,7 @@ def _record_evaluation_timing(prepared: Path, prior: dict, *, jobs: int, started
         "last_session_wall_sec": round(elapsed, 3),
         "measurement": "sum of recorded evaluation session wall clocks including per-run audits",
     }
-    (prepared / "evaluation_timing.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_json(prepared / "evaluation_timing.json", payload)
 
 
 def _archive_existing(path: Path) -> Path | None:
@@ -106,6 +113,23 @@ def _command_overrides(command: list[str]) -> dict[str, str]:
     return values
 
 
+def _scenario_override_errors(run_dir: Path, overrides: dict) -> list[str]:
+    if not overrides:
+        return []
+    try:
+        config = yaml.safe_load((run_dir / ".hydra/config.yaml").read_text(encoding="utf-8"))
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        return [f"Cannot verify archived scenario overrides: {exc}"]
+    errors = []
+    for key, expected in overrides.items():
+        actual = config
+        for part in key.lstrip("+").split("."):
+            actual = actual.get(part) if isinstance(actual, dict) else None
+        if actual != expected:
+            errors.append(f"{key}: {actual!r} != planned {expected!r}")
+    return errors
+
+
 def _completed_kpi_is_valid(path: Path, command: list[str]) -> bool:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -114,6 +138,16 @@ def _completed_kpi_is_valid(path: Path, command: list[str]) -> bool:
     if payload.get("objective_status") != "complete":
         return False
     overrides = _command_overrides(command)
+    inventory_keys = (
+        "scenario.warehouse.material_shelf.capacity",
+        "scenario.warehouse.material_shelf.initial_fill",
+        "scenario.objective.throughput.restock_target_fill",
+        "scenario.map.warehouse_height_tiles",
+    )
+    if _scenario_override_errors(path.parent, {
+        key: int(overrides[key]) for key in inventory_keys if key in overrides
+    }):
+        return False
     run_meta = payload.get("run_meta", {})
     if not isinstance(run_meta, dict):
         return False
@@ -169,6 +203,7 @@ def _audit_run(run_dir: Path) -> tuple[str, str]:
 def _preflight_adp_checkpoints(
     rows: list[dict[str, str]],
     *,
+    allow_undeclared: bool = False,
     validator=validate_adp_held_out_seeds,
 ) -> list[dict[str, object]]:
     groups: dict[tuple[Path, int], set[int]] = {}
@@ -189,7 +224,7 @@ def _preflight_adp_checkpoints(
             checkpoint,
             sorted(seeds),
             [worker_count],
-            allow_undeclared=False,
+            allow_undeclared=allow_undeclared,
         )
         reports.append({
             **report,
@@ -274,21 +309,77 @@ def _run(row: dict[str, str], force: bool, audit: bool, compress: bool) -> dict[
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the prepared confirmatory policy evaluations.")
     parser.add_argument("--prepared", type=Path, default=HERE / "prepared")
-    parser.add_argument("--jobs", type=int, default=5)
+    parser.add_argument("--jobs", type=int, default=10)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--modes", nargs="+", default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--allow-undeclared-held-out-seeds", action="store_true",
+        help="Allow an explicitly recorded test-seed extension; training/validation overlap is still rejected.",
+    )
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--pending-only", action="store_true",
+                        help="Retain validated successful statuses and execute only missing/failed runs.")
     parser.add_argument("--skip-audit", action="store_true")
     parser.add_argument("--no-compress", action="store_true")
     parser.add_argument("--no-open-dashboard", action="store_true")
+    parser.add_argument("--no-live", action="store_true")
     return parser.parse_args()
+
+
+def _pending_rows(rows: list[dict], previous: dict) -> list[dict]:
+    pending = []
+    for row in rows:
+        status = previous.get(row["run_id"], {})
+        if (status.get("status") in {"completed", "skipped_existing"}
+                and status.get("artifact_audit") == "pass" and status.get("kpi_audit") == "pass"
+                and _completed_kpi_is_valid(Path(row["run_dir"]) / "kpi.json", json.loads(row["command_json"]))):
+            continue
+        pending.append(row)
+    return pending
+
+
+@contextmanager
+def _evaluation_lock(prepared: Path):
+    # OS locks are released automatically after a crash or Windows restart.
+    with (prepared / ".evaluation.lock").open("a+b") as handle:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError(f"An evaluator already owns this experiment: {prepared}") from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def main() -> int:
     args = parse_args()
+    if args.dry_run:
+        return _main(args)
+    with _evaluation_lock(args.prepared.resolve()):
+        return _main(args)
+
+
+def _main(args) -> int:
     if args.jobs < 1:
         raise ValueError("jobs must be at least 1")
+    if args.force and args.pending_only:
+        raise ValueError("--force and --pending-only are mutually exclusive")
     prepared = args.prepared.resolve()
     all_rows = _read_rows(prepared / "evaluation_plan.csv")
     rows = all_rows
@@ -304,7 +395,37 @@ def main() -> int:
         for row in rows:
             print(row["command"])
         return 0
-    preflight = _preflight_adp_checkpoints(rows)
+    status_path = prepared / "evaluation_status.csv"
+    previous = {row["run_id"]: row for row in _read_rows(status_path)} if status_path.exists() else {}
+    if args.pending_only:
+        rows = _pending_rows(rows, previous)
+    rows.sort(key=lambda row: (int(row["seed"]), int(row["worker_count"]), row["mode"]))
+    selected_ids = {row["run_id"] for row in rows}
+    planned_ids = {row["run_id"] for row in all_rows}
+    statuses = [row for key, row in previous.items() if key in planned_ids and key not in selected_ids]
+    live = None if args.no_live else EvaluationMonitor(prepared, all_rows, statuses, args.jobs)
+    try:
+        if live:
+            live.start()
+            if not args.no_open_dashboard:
+                from manufacturing_sim.adp.background import open_monitor
+
+                open_monitor(prepared / "live_evaluation.html")
+        return _evaluate(args, prepared, all_rows, rows, previous, statuses, live)
+    except Exception as exc:
+        if live:
+            live.set_phase("failed", f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        if live:
+            live.close()
+
+
+def _evaluate(args, prepared, all_rows, rows, previous, statuses, live) -> int:
+    # Check all checkpoints even when some results are reused or only rule modes run.
+    preflight = _preflight_adp_checkpoints(
+        all_rows, allow_undeclared=args.allow_undeclared_held_out_seeds,
+    )
     prior_timing = _experiment_timing(prepared, parallel_jobs=args.jobs) if (prepared / "evaluation_status.csv").is_file() else {}
     started_at = datetime.now(timezone.utc).isoformat()
     session_started = time.perf_counter()
@@ -313,18 +434,15 @@ def main() -> int:
         encoding="utf-8",
     )
     status_path = prepared / "evaluation_status.csv"
-    previous = {row["run_id"]: row for row in _read_rows(status_path)} if status_path.exists() else {}
-    selected_ids = {row["run_id"] for row in rows}
-    planned_ids = {row["run_id"] for row in all_rows}
-    statuses: list[dict[str, object]] = [
-        row for key, row in previous.items() if key in planned_ids and key not in selected_ids
-    ]
+    if live:
+        live.set_phase("running")
     executor = ThreadPoolExecutor(max_workers=args.jobs)
     interrupted = False
     futures = {}
     try:
         futures = {
-            executor.submit(_run, row, args.force, not args.skip_audit, not args.no_compress): row
+            (executor.submit(live.execute, _run, row, args.force, not args.skip_audit, not args.no_compress)
+             if live else executor.submit(_run, row, args.force, not args.skip_audit, not args.no_compress)): row
             for row in rows
         }
         for future in as_completed(futures):
@@ -344,6 +462,8 @@ def main() -> int:
             prior = previous.get(str(result["run_id"]), {})
             if result["status"] == "skipped_existing" and prior.get("elapsed_sec"):
                 result["elapsed_sec"] = prior["elapsed_sec"]
+            if live:
+                live.finish_run(result)
             statuses.sort(key=lambda item: str(item["run_id"]))
             _write_status(status_path, statuses)
             _record_evaluation_timing(prepared, prior_timing, jobs=args.jobs, started_at=started_at,
@@ -361,19 +481,33 @@ def main() -> int:
                                   elapsed=time.perf_counter() - session_started,
                                   status="interrupted" if interrupted else "finished")
     if interrupted:
+        if live:
+            live.set_phase("interrupted", "Execution interrupted; final comparison has not been verified.")
         return 130
     failures = [row for row in statuses if row["status"] not in {"completed", "skipped_existing"}]
     if failures:
+        if live:
+            live.set_phase("failed", f"{len(failures)} runs failed. Final comparison is unavailable.")
         return 1
+    if len(statuses) != len(all_rows) or args.skip_audit:
+        if live:
+            live.set_phase("partial", "Full audited coverage is required before generating final statistics.")
+        return 0
     if not args.skip_audit:
+        if live:
+            live.set_phase("postprocessing", "Verifying common seeds, computing paired statistics and building the dashboard.")
         analysis = summarize(prepared)
         if analysis["status"] != "pass":
+            if live:
+                live.set_phase("failed", "Final fairness/statistical audit failed; see analysis_summary.json.")
             return 1
         dashboard = render_dashboard(prepared)
+        if live:
+            live.set_phase("completed")
         if not args.no_open_dashboard:
-            import webbrowser
+            from manufacturing_sim.adp.background import open_monitor
 
-            webbrowser.open(dashboard.as_uri())
+            open_monitor(dashboard)
     return 0
 
 

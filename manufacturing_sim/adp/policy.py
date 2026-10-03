@@ -157,6 +157,45 @@ def probe_feasible_matchings(
     return rows[:limit]
 
 
+def _feasible_choices(
+    state: EncodedDecisionState, worker_id: str, used: dict[str, int],
+    used_resources: set[str], repair_capacity: int, allow_wait_action: bool,
+) -> list[tuple[str | None, set[str]]]:
+    choices: list[tuple[str | None, set[str]]] = []
+    for opportunity in sorted(state.tasks_by_worker.get(worker_id, {})):
+        limit = repair_capacity if _task_is_shareable(state, worker_id, opportunity) else 1
+        if used.get(opportunity, 0) >= limit:
+            continue
+        resources = _resource_keys(state, worker_id, opportunity)
+        if not resources & used_resources:
+            choices.append((opportunity, resources))
+    if allow_wait_action or not choices:
+        choices.insert(0, (None, set()))
+    return choices
+
+
+def unique_feasible_assignment(
+    state: EncodedDecisionState, *, worker_order: list[str], repair_capacity: int,
+    allow_wait_action: bool,
+) -> dict[str, str | None] | None:
+    """Return the sole beam action, or None as soon as a choice needs scoring."""
+    if set(worker_order) != set(state.decision_worker_ids) or len(worker_order) != len(state.decision_worker_ids):
+        raise ValueError("worker_order must contain every decision worker exactly once")
+    assignment: dict[str, str | None] = {}
+    used: dict[str, int] = {}
+    resources: set[str] = set()
+    for worker_id in worker_order:
+        choices = _feasible_choices(state, worker_id, used, resources, max(1, repair_capacity), allow_wait_action)
+        if len(choices) != 1:
+            return None
+        opportunity, keys = choices[0]
+        assignment[worker_id] = opportunity
+        if opportunity is not None:
+            used[opportunity] = used.get(opportunity, 0) + 1
+        resources.update(keys)
+    return assignment
+
+
 def _expand_matchings(
     state: EncodedDecisionState,
     *,
@@ -176,17 +215,9 @@ def _expand_matchings(
     for worker_id in ordered_workers:
         expanded: list[tuple[dict[str, str | None], dict[str, int], set[str], float]] = []
         for assignment, used, used_resources, _ in beams:
-            feasible_choices: list[tuple[str | None, set[str]]] = []
-            for opportunity in sorted(state.tasks_by_worker.get(worker_id, {})):
-                limit = repair_capacity if _task_is_shareable(state, worker_id, opportunity) else 1
-                if used.get(opportunity, 0) >= limit:
-                    continue
-                resources = _resource_keys(state, worker_id, opportunity)
-                if resources & used_resources:
-                    continue
-                feasible_choices.append((opportunity, resources))
-            if allow_wait_action or not feasible_choices:
-                feasible_choices.insert(0, (None, set()))
+            feasible_choices = _feasible_choices(
+                state, worker_id, used, used_resources, repair_capacity, allow_wait_action,
+            )
             for opportunity, resources in feasible_choices:
                 next_assignment = dict(assignment)
                 next_assignment[worker_id] = opportunity

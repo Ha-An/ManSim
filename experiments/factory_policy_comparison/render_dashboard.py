@@ -210,6 +210,8 @@ def _capacity_dashboard_rows(
                 "worker_count": str(worker_count),
                 "horizon_min": f"{float(raw.get('horizon_min', 0.0) or 0.0):.1f}",
                 "theoretical_max_products": str(int(upper_bound)),
+                "ideal_capacity_reference_products": str(int(upper_bound)),
+                "material_only_upper_bound": str(bound_values["material"]),
                 "upper_bound_products_per_hour": f"{float(raw.get('theoretical_max_throughput_per_sim_hour', 0.0) or 0.0):.4f}",
                 "realistic_expected_products": f"{expected_products:.2f}",
                 "expected_products_per_hour": f"{float(raw.get('realistic_expected_throughput_per_sim_hour', 0.0) or 0.0):.4f}",
@@ -223,6 +225,9 @@ def _capacity_dashboard_rows(
                 "quality_yield_pct": f"{100.0 * float(raw.get('quality_yield', 0.0) or 0.0):.2f}%",
                 "best_observed_products": "-" if best_products is None else f"{best_products:g}",
                 "best_capacity_utilization_pct": (
+                    "-" if best_products is None or upper_bound <= 0.0 else f"{100.0 * best_products / upper_bound:.2f}%"
+                ),
+                "best_vs_ideal_reference_pct": (
                     "-" if best_products is None or upper_bound <= 0.0 else f"{100.0 * best_products / upper_bound:.2f}%"
                 ),
                 "best_vs_expected_pct": (
@@ -249,10 +254,15 @@ def _capacity_dashboard_rows(
                 "worker_count": str(worker_count),
                 "initial_batch_products": str(int(raw.get("initial_batch_product_count", 0) or 0)),
                 "theoretical_min_makespan_min": f"{theoretical_makespan:.2f}",
+                "ideal_makespan_reference_min": f"{theoretical_makespan:.2f}",
                 "best_observed_makespan_min": "-" if best_makespan is None else f"{best_makespan:.3f}",
                 "best_optimality_gap_pct": (
                     "-"
                     if best_makespan is None or theoretical_makespan <= 0.0
+                    else f"{100.0 * (best_makespan / theoretical_makespan - 1.0):.2f}%"
+                ),
+                "best_vs_reference_difference_pct": (
+                    "-" if best_makespan is None or theoretical_makespan <= 0.0
                     else f"{100.0 * (best_makespan / theoretical_makespan - 1.0):.2f}%"
                 ),
                 "bottleneck_cycle_min": f"{float(raw.get('bottleneck_cycle_min', 0.0) or 0.0):.2f}",
@@ -973,20 +983,20 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
     capacity_method_html = (
         f"""
         <section class="panel section">
-          <h2>이론적 최대 생산량 산정</h2>
-          <p><strong>산정 방식:</strong> {_esc(capacity_report.get('method', ''))}. 기대 생산량 예측이 아니라 모든 조건이 이상적으로 맞는 경우의 결정론적 상한입니다.</p>
+          <h2>이상적 생산능력 근사치 산정</h2>
+          <p><strong>산정 방식:</strong> {_esc(capacity_report.get('method', ''))}. 평균 설비 경로·정상상태 cycle·충전 주기를 가정한 근사치이며, 수학적으로 보장된 상한이나 최적해가 아닙니다. 이 값만으로 정책이 포화되었다고 판단할 수 없습니다.</p>
           <p><code>{_esc(capacity_report.get('formula', ''))}</code></p>
           <p>삼각분포 최솟값, 모든 필수 생산 태스크, 적재물별 배수를 적용한 정적 최단경로 이동거리, Station 1·Station 2·Inspection의 독점 자원 cycle, 전체 worker 작업량, 직접 충전 duty cycle, 최초 제품 도달시간과 material 공급량을 사용합니다.</p>
           <ul>{''.join(f'<li>{_esc(item)}</li>' for item in capacity_assumptions if str(item).strip())}</ul>
         </section>
         """
         if capacity_available
-        else f"<section class='panel section'><h2>이론적 최대 생산량 산정</h2><p>{_esc(capacity_report.get('reason', '계산할 수 없습니다.'))}</p></section>"
+        else f"<section class='panel section'><h2>이상적 생산능력 근사치 산정</h2><p>{_esc(capacity_report.get('reason', '계산할 수 없습니다.'))}</p></section>"
     )
     expected_reference_html = (
         f"""
         <section class="panel section">
-          <h2>현실적 기대 생산량 산정</h2>
+          <h2>운영 계획 생산량 기준 산정</h2>
           <p><strong>산정 방식:</strong> {_esc(expected_reference.get('method', ''))}. {_esc(expected_reference.get('interpretation', ''))}</p>
           <p><code>{_esc(expected_reference.get('formula', ''))}</code></p>
           <p>먼저 품질 판정 전 기대 공정 완료량을 계산하고 설정된 검사 양품률을 적용합니다. 후속 작업의 완전한 중첩을 가정하지 않는 보수적인 표준 작업 cycle을 사용하므로, 조정 능력이 좋은 정책은 후속 작업을 중첩하여 이 기준을 초과할 수 있습니다.</p>
@@ -1002,18 +1012,18 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
     throughput_content = f"""
       <section class="panel section">
         <h2>Worker 수별 생산능력 기준</h2>
-        <p>이론적 최대 생산량은 이상적인 상한입니다. 현실적 기대 생산량은 확률분포의 평균시간과 설정된 운영 손실을 반영한 계획 기준이며 강제되는 상한이 아닙니다. 품질 판정 전 기대 완료량에는 검사 불량률을 적용하기 전의 공정 완료 기회를 표시합니다.</p>
+        <p>이상적 생산능력과 운영 계획 생산량은 근사 기준이며, 최적해나 실제 생산량의 통계적 기댓값이 아닙니다. 기준 대비 비율은 최적성 격차가 아닙니다. 별도 자재 상한은 floor((초기 자재 + 보충 횟수 × 보충 목표)/2)이며 시간·교통 제약을 완화한 상한입니다. 교착과 정책별 작업 중첩 효과는 실제 결과에서 확인해야 합니다.</p>
         {_table(
             capacity_throughput_rows,
             [
-                "worker_count", "horizon_min", "theoretical_max_products",
+                "worker_count", "horizon_min", "ideal_capacity_reference_products", "material_only_upper_bound",
                 "realistic_expected_products", "expected_attempts_before_quality",
                 "expected_operational_cycle_min", "machine_availability_pct",
                 "effective_processing_mttf_min", "pm_due_processing_min",
                 "pm_hazard_multiplier",
                 "battery_duty_pct", "quality_yield_pct",
                 "best_observed_products", "best_vs_expected_pct",
-                "best_capacity_utilization_pct", "binding_bound",
+                "best_vs_ideal_reference_pct", "binding_bound",
                 "first_product_min", "bottleneck_cycle_min",
             ],
         )}
@@ -1061,13 +1071,13 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
     """
     makespan_content = f"""
       <section class="panel section">
-        <h2>Theoretical Minimum Batch Makespan by Worker Count</h2>
-        <p>This lower bound completes the full initial material batch under the same ideal minimum-time process-and-movement model. The observed gap is measured from the best valid run.</p>
+        <h2>Ideal Batch Makespan Reference by Worker Count</h2>
+        <p>This steady-state process-and-movement approximation is not a certified scheduling lower bound. Differences from the best valid run are not optimality gaps.</p>
         {_table(
             capacity_makespan_rows,
             [
-                "worker_count", "initial_batch_products", "theoretical_min_makespan_min",
-                "best_observed_makespan_min", "best_optimality_gap_pct", "bottleneck_cycle_min",
+                "worker_count", "initial_batch_products", "ideal_makespan_reference_min",
+                "best_observed_makespan_min", "best_vs_reference_difference_pct", "bottleneck_cycle_min",
             ],
         )}
       </section>
@@ -1150,6 +1160,7 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
     .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 22px; }}
     .card, .panel {{ min-width: 0; background: #fff; border: 1px solid #d9e2ef; border-radius: 8px; padding: 18px; box-shadow: 0 1px 2px rgba(15, 27, 45, 0.06); }}
     .panel {{ overflow-x: auto; }}
+    .panel p, .panel li, .card .value {{ overflow-wrap: anywhere; }}
     .card .label {{ color: #59708f; font-size: 0.82rem; text-transform: uppercase; letter-spacing: .04em; }}
     .card .value {{ font-size: 1.55rem; font-weight: 700; margin-top: 8px; }}
     .grid {{ display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 18px; margin-bottom: 22px; }}
@@ -1192,6 +1203,7 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
 <body>
 <header>
   <h1>{_esc(plan_scenario)} Policy Comparison</h1>
+  {('<div class="sub">' + _esc(experiment_plan['condition_label']) + '</div>') if experiment_plan.get('condition_label') else ''}
   <div class="sub">{_esc(duration_summary)} | workers: {_esc(', '.join(worker_counts))} | {_esc(seed_summary)}{_esc(' | ' + rolling_window_summary if rolling_window_summary else '')}</div>
 </header>
 <main>
@@ -1203,8 +1215,8 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
     <div class="card"><div class="label">ADP Beam Order</div><div class="value">{_esc(beam_order_label)}</div></div>
     <div class="card"><div class="label">ADP Beam Value Entropy</div><div class="value">{_esc(adp_entropy_label)}</div><div>0은 가치 집중, 1은 후보 가치가 유사함을 뜻합니다.</div></div>
     <div class="card"><div class="label">Voluntary WAIT Violations</div><div class="value">{voluntary_wait_violation_count}</div></div>
-    <div class="card"><div class="label">이론적 최대 생산량</div><div class="value">{_esc(upper_bound_label)}</div></div>
-    <div class="card"><div class="label">현실적 기대 양품</div><div class="value">{_esc(expected_reference_label)}</div></div>
+    <div class="card"><div class="label">이상적 생산능력 근사치</div><div class="value">{_esc(upper_bound_label)}</div></div>
+    <div class="card"><div class="label">운영 계획 양품 기준</div><div class="value">{_esc(expected_reference_label)}</div></div>
     <div class="card"><div class="label">Expected Runs</div><div class="value">{expected_runs}</div></div>
     <div class="card"><div class="label">Completed</div><div class="value">{completed_count}</div></div>
     <div class="card"><div class="label">{'Aggregation-Eligible Historical Runs' if validity_banner else 'Valid Comparison Runs'}</div><div class="value">{comparison_count}</div></div>

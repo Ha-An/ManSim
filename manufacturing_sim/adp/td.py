@@ -10,7 +10,7 @@ import numpy as np
 
 from .compact import CompactMCBatch, compact_episode_transitions, merge_compact_batches, select_compact_samples
 from .model import predict_values, require_torch
-from .policy import greedy_beam_matching
+from .policy import greedy_beam_matching, unique_feasible_assignment
 from .schema import EncodedDecisionState
 
 
@@ -71,9 +71,9 @@ class CompactTDData:
                              self.dones[ix], [self.descriptors[i] for i in indices])
 
     @classmethod
-    def merge(cls, rows: list["CompactTDData"]) -> "CompactTDData":
+    def merge(cls, rows: list["CompactTDData"], *, padding_shape: tuple[int, int] | None = None) -> "CompactTDData":
         torch = require_torch()
-        return cls(merge_compact_batches([r.pre for r in rows]),
+        return cls(merge_compact_batches([r.pre for r in rows], padding_shape=padding_shape),
                    torch.cat([r.rewards for r in rows]), torch.cat([r.dones for r in rows]),
                    [d for row in rows for d in row.descriptors])
 
@@ -110,14 +110,15 @@ def retain_recent_episodes(history: list[CompactMCBatch], capacity: int) -> list
 
 
 def sample_replay_episodes(
-    replay: CompactMCBatch,
+    replay: CompactMCBatch | list[CompactMCBatch],
     *,
     required_episode_ids: set[int],
     episode_count: int,
     rng: random.Random,
 ) -> CompactMCBatch:
-    """Select complete episodes while always retaining the current rollout wave."""
-    available = sorted({int(value) for value in replay.episode_ids.tolist()})
+    """Select before merging history, retaining identical RNG/order/padding."""
+    batches = replay if isinstance(replay, list) else [replay]
+    available = sorted({int(value) for batch in batches for value in batch.episode_ids.tolist()})
     available_set = set(available)
     required = sorted({int(value) for value in required_episode_ids})
     missing = sorted(set(required) - available_set)
@@ -132,12 +133,18 @@ def sample_replay_episodes(
     optional = [episode_id for episode_id in available if episode_id not in required_episode_ids]
     selected = set(required)
     selected.update(rng.sample(optional, episode_count - len(required)))
-    indices = [
-        index
-        for index, episode_id in enumerate(replay.episode_ids.tolist())
-        if int(episode_id) in selected
-    ]
-    sampled = select_compact_samples(replay, indices)
+    chunks = []
+    for batch in batches:
+        indices = [index for index, eid in enumerate(batch.episode_ids.tolist()) if int(eid) in selected]
+        if indices:
+            chunks.append(batch if len(indices) == len(batch) else select_compact_samples(batch, indices))
+    # Keep the old full-history padding shape: changing attention widths can
+    # perturb nearly tied scores even when padding is correctly masked.
+    padding = (
+        max(int(batch.worker_features.shape[1]) for batch in batches),
+        max(int(batch.task_features.shape[1]) for batch in batches),
+    )
+    sampled = merge_compact_batches(chunks, padding_shape=padding)
     if sampled.episode_count != episode_count:
         raise RuntimeError("Episode-level replay sampling produced an incomplete update batch.")
     return sampled
@@ -214,10 +221,19 @@ def build_target_plan(samples: CompactMCBatch, model: Any, device: Any, *, n: in
         offset = step % len(state.worker_ids) if worker_order_strategy == "cyclic" else 0
         order = state.worker_ids[offset:] + state.worker_ids[:offset]
         order = [w for w in order if w in state.decision_worker_ids]
-        selected = greedy_beam_matching(state, model=model, device=device, beam_width=beam_width,
-                                       repair_capacity=int(descriptor.get("repair_capacity", repair_capacity)), worker_order=order,
-                                       allow_wait_action=state.wait_action_enabled)
-        post = state.post_decision(selected.assignment)
+        capacity = int(descriptor.get("repair_capacity", repair_capacity))
+        assignment = unique_feasible_assignment(
+            state, worker_order=order, repair_capacity=capacity,
+            allow_wait_action=state.wait_action_enabled,
+        )
+        if assignment is None:
+            assignment = greedy_beam_matching(
+                state, model=model, device=device, beam_width=beam_width,
+                repair_capacity=capacity, worker_order=order,
+                allow_wait_action=state.wait_action_enabled,
+            ).assignment
+        # No choice means no online ranking call; target bootstrap still runs.
+        post = state.post_decision(assignment)
         nw, nt = len(state.worker_ids), len(state.opportunity_ids)
         matches.append(np.array_equal(post.selected_assignment_mask,
                        samples.selected_assignment_mask[i, :nw, :nt].numpy()))

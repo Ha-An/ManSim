@@ -39,6 +39,8 @@ from experiments.mfg_flow_shop_paper.summarize_results import (
     _plan_errors,
     _normalize_legacy_repair_samples,
     _observed_prefixes_consistent,
+    _restock_schedule_evidence,
+    fairness_report,
     paired_contrasts,
     policy_worker_summary,
 )
@@ -46,6 +48,30 @@ from manufacturing_sim.simulation.scenarios.manufacturing.run import _event_audi
 from scripts.audit_adp_training import _json_canonical
 from experiments.mfg_flow_shop_paper.extend_evaluation import build_extension
 from experiments.mfg_flow_shop_paper.render_standard_dashboard import _experiment_timing
+from experiments.mfg_flow_shop_paper.prepare_saved_checkpoints import bind_checkpoints
+
+
+def test_saved_checkpoint_binding_preserves_baselines_and_source_rows(tmp_path):
+    checkpoint = tmp_path / "saved model" / "best.pt"
+    source = {
+        "mode": "simulation_based_adp", "worker_count": 3, "checkpoint_path": "old.pt",
+        "command_json": json.dumps(["python", "main.py", "seed=910001",
+                                    "decision.adp.checkpoint_path=old.pt"]),
+        "command": "old command",
+    }
+    baseline = {"mode": "immediate_shared", "worker_count": 3, "command_json": "[]"}
+    rebound = bind_checkpoints([source, baseline], {3: checkpoint})
+    assert source["checkpoint_path"] == "old.pt"
+    assert rebound[1] == baseline
+    assert rebound[0]["checkpoint_path"] == str(checkpoint.resolve())
+    command = json.loads(rebound[0]["command_json"])
+    assert command[-1] == f"decision.adp.checkpoint_path={checkpoint.resolve().as_posix()}"
+    assert command[2] == "seed=910001"
+
+
+def test_saved_checkpoint_binding_requires_every_requested_fleet(tmp_path):
+    with pytest.raises(KeyError):
+        bind_checkpoints([{"mode": "simulation_based_adp", "worker_count": 6}], {3: tmp_path / "best.pt"})
 
 
 def test_training_background_keeps_plan_and_does_not_run_inline(tmp_path: Path, monkeypatch) -> None:
@@ -356,7 +382,8 @@ def test_incomplete_outputs_are_archived_without_deletion() -> None:
         assert not evaluation.exists()
 
 
-def test_paper_evaluation_preflight_groups_adp_seeds_by_checkpoint_and_worker() -> None:
+@pytest.mark.parametrize("allow_extension", [False, True])
+def test_paper_evaluation_preflight_groups_adp_seeds_by_checkpoint_and_worker(allow_extension) -> None:
     calls: list[tuple[Path, list[int], list[int], bool]] = []
 
     def validator(path: Path, seeds: list[int], workers: list[int], *, allow_undeclared: bool):
@@ -394,10 +421,10 @@ def test_paper_evaluation_preflight_groups_adp_seeds_by_checkpoint_and_worker() 
             "checkpoint_path": "",
         },
     ]
-    reports = _preflight_adp_checkpoints(rows, validator=validator)
+    reports = _preflight_adp_checkpoints(rows, validator=validator, allow_undeclared=allow_extension)
     assert len(reports) == 1
     assert calls == [(
-        Path("checkpoint_a.pt").resolve(), [910001, 910002], [3], False
+        Path("checkpoint_a.pt").resolve(), [910001, 910002], [3], allow_extension
     )]
 
 
@@ -454,6 +481,61 @@ def test_paper_fairness_accepts_different_observation_lengths_but_rejects_rng_mi
     assert _observed_prefixes_consistent([["P", "F", "P"], ["P", "F"], []])
     assert not _observed_prefixes_consistent([["P", "F"], ["P", "P"]])
     assert not _observed_prefixes_consistent([["P"], ["P", "F"], ["P", "P"]])
+
+
+def test_paper_restock_fairness_accepts_evidenced_full_shelf_noop(tmp_path: Path) -> None:
+    meta = {"throughput_restock_interval_days": 1, "minutes_per_day": 480,
+            "throughput_restock_target_fill": 30}
+    observed = [0, 480, 1440, 1920]
+    (tmp_path / "minute_snapshots.json").write_text(json.dumps({"snapshots": [
+        {"t": 960, "warehouse_material_shelf_count": 30, "warehouse_material_shelf_capacity": 30},
+    ]}), encoding="utf-8")
+    evidence = _restock_schedule_evidence(tmp_path, meta, observed, 2400)
+    assert evidence["restock_schedule_valid"] is True
+    assert json.loads(evidence["restock_noop_times_json"]) == [960]
+    rows = []
+    for mode, times in (("random_feasible_dispatch", observed),
+                        ("immediate_shared", [0, 480, 960, 1440, 1920])):
+        rows.append({
+            "mode": mode, "worker_count": 2, "seed": 910034, "training_replicate": "",
+            "environment_fingerprint": "env", "timing_profile_fingerprint": "timing",
+            "stochastic_streams_fingerprint": "rng", "quality_rng_prefix_json": "[]",
+            "repair_rng_prefix_json": "{}", "restock_times_json": json.dumps(times),
+            **_restock_schedule_evidence(tmp_path, meta, times, 2400),
+        })
+    report, errors = fairness_report(rows, policies=[row["mode"] for row in rows], training_replicates=1)
+    assert errors == []
+    assert report[0]["fairness_pass"] is True
+    assert report[0]["restock_positive_event_times_identical"] is False
+    assert report[0]["restock_verified_noop_count"] == 1
+    rows[0]["restock_schedule_valid"] = False
+    assert fairness_report(rows, policies=[row["mode"] for row in rows], training_replicates=1)[1]
+
+
+@pytest.mark.parametrize("count,timestamp", [(29, 960), (31, 960), (30, 959), (None, 960)])
+def test_paper_restock_audit_requires_boundary_evidence(tmp_path: Path, count, timestamp) -> None:
+    meta = {"throughput_restock_interval_days": 1, "minutes_per_day": 480,
+            "throughput_restock_target_fill": 30}
+    (tmp_path / "minute_snapshots.json").write_text(json.dumps({"snapshots": [
+        {"t": timestamp, "warehouse_material_shelf_count": count, "warehouse_material_shelf_capacity": 30},
+    ]}), encoding="utf-8")
+    result = _restock_schedule_evidence(tmp_path, meta, [0, 480, 1440, 1920], 2400)
+    assert result["restock_schedule_valid"] is False
+
+
+@pytest.mark.parametrize("times", [[0, 480, 480], [0, 481], [480, 0], [0, 480, 960]])
+def test_paper_restock_audit_rejects_invalid_events(tmp_path: Path, times) -> None:
+    meta = {"throughput_restock_interval_days": 1, "minutes_per_day": 480,
+            "throughput_restock_target_fill": 30}
+    assert not _restock_schedule_evidence(tmp_path, meta, times, 960)["restock_schedule_valid"]
+
+
+def test_paper_restock_audit_honors_non_daily_interval(tmp_path: Path) -> None:
+    meta = {"throughput_restock_interval_days": 2, "minutes_per_day": 480,
+            "throughput_restock_target_fill": 30}
+    result = _restock_schedule_evidence(tmp_path, meta, [0, 960, 1920], 2400)
+    assert result["restock_schedule_valid"] is True
+    assert json.loads(result["restock_schedule_json"]) == [0, 960, 1920]
 
 
 def test_common_seed_blocks_preserve_opposite_fleet_effects() -> None:

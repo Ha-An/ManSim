@@ -178,11 +178,11 @@ class SimulationBasedADPTests(unittest.TestCase):
 
         encoded = ADPStateEncoder().encode(world, [], {})
 
-        self.assertAlmostEqual(0.5, float(encoded.global_features[12]))
-        self.assertAlmostEqual(0.5, float(encoded.global_features[20]))
-        self.assertGreater(float(encoded.global_features[23]), 0.0)
-        self.assertAlmostEqual(0.5, float(encoded.global_features[31]))
-        self.assertGreater(float(encoded.global_features[34]), 0.0)
+        self.assertAlmostEqual(0.5, float(encoded.global_features[11]))
+        self.assertAlmostEqual(0.5, float(encoded.global_features[17]))
+        self.assertGreater(float(encoded.global_features[20]), 0.0)
+        self.assertAlmostEqual(0.5, float(encoded.global_features[26]))
+        self.assertGreater(float(encoded.global_features[29]), 0.0)
 
     def test_encoder_represents_buffer_occupancy_reservations_and_free_capacity(self) -> None:
         cfg = _compose_episode_cfg(
@@ -205,9 +205,9 @@ class SimulationBasedADPTests(unittest.TestCase):
 
         encoded = ADPStateEncoder().encode(world, [], {})
 
+        self.assertAlmostEqual(0.25, float(encoded.global_features[12]))
         self.assertAlmostEqual(0.25, float(encoded.global_features[13]))
-        self.assertAlmostEqual(0.25, float(encoded.global_features[14]))
-        self.assertAlmostEqual(0.50, float(encoded.global_features[15]))
+        self.assertAlmostEqual(0.50, 1.0 - float(encoded.global_features[12:14].sum()))
 
     def test_action_effect_features_capture_blockage_and_destination_capacity(self) -> None:
         cfg = _compose_episode_cfg(
@@ -356,7 +356,7 @@ class SimulationBasedADPTests(unittest.TestCase):
 
         first_fingerprint = checkpoint_fingerprint(first)
         second_fingerprint = checkpoint_fingerprint(second)
-        self.assertEqual("mfg_flow_shop_adp_v9", first_fingerprint["feature_schema_version"])
+        self.assertEqual("mfg_flow_shop_adp_v10", first_fingerprint["feature_schema_version"])
         self.assertNotEqual(
             first_fingerprint["environment_fingerprint"],
             second_fingerprint["environment_fingerprint"],
@@ -629,12 +629,10 @@ class SimulationBasedADPTests(unittest.TestCase):
     def test_all_wait_afterstate_advances_only_the_encoded_review_clock(self) -> None:
         state = _state()
         state.wait_action_enabled = True
-        state.global_features[0] = 0.1
-        state.global_features[1] = 0.9
+        state.global_features[0] = 0.9
         post = state.post_decision({"A1": None, "A2": None})
         self.assertAlmostEqual(post.time_min, 121.0)
-        self.assertAlmostEqual(float(post.global_features[0]), 121.0 / 1200.0, places=6)
-        self.assertAlmostEqual(float(post.global_features[1]), 1079.0 / 1200.0, places=6)
+        self.assertAlmostEqual(float(post.global_features[0]), 1079.0 / 1200.0, places=6)
         self.assertEqual(int(post.selected_assignment_mask.sum()), 0)
 
         partial = state.post_decision({"A1": None})
@@ -888,8 +886,13 @@ class SimulationBasedADPTests(unittest.TestCase):
             validation["final_selection_seed_count"]
         )
         self.assertEqual(screening_episodes, 160)
-        self.assertEqual(selection_episodes, 60)
-        self.assertEqual(screening_episodes + selection_episodes, 220)
+        self.assertEqual(selection_episodes, 40)
+        self.assertEqual(screening_episodes + selection_episodes, 200)
+        self.assertTrue(training["early_stopping"]["enabled"])
+        self.assertEqual(training["early_stopping"]["min_iterations"], 45)
+        self.assertEqual(training["early_stopping"]["patience_iterations"], 20)
+        self.assertEqual(training["early_stopping"]["consecutive_checks"], 2)
+        self.assertEqual(training["early_stopping"]["paired_ci_upper_threshold"], .5)
         self.assertEqual(training["learning_rate"], 0.00005)
         self.assertEqual(training["loss_type"], "mse")
         self.assertNotIn("huber_delta", training)

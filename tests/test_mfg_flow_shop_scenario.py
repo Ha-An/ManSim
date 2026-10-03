@@ -1387,6 +1387,60 @@ class MfgFlowShopScenarioTests(unittest.TestCase):
             finally:
                 logger.close()
 
+    def test_horizon_close_releases_unstarted_joint_assignment_reservations(self) -> None:
+        cfg = _load_cfg()
+        cfg["decision"] = yaml.safe_load(
+            (ROOT / "configs" / "decision" / "immediate_shared.yaml").read_text(encoding="utf-8")
+        )
+        cfg["decision"].update(yaml.safe_load(
+            (ROOT / "configs" / "decision" / "random_feasible_dispatch.yaml").read_text(encoding="utf-8")
+        ))
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = EventLogger(Path(tmp))
+            try:
+                world = ManufacturingWorld(
+                    simpy.Environment(), cfg, logger, SimpleNamespace(worker_queue_limit=8)
+                )
+                world._restock_material_shelf(reason="test", target_fill=1)
+                slot_id, slot = next(iter(world.warehouse_material_shelf_slots.items()))
+                item_id = slot["material_item_id"]
+                supply = Task(
+                    "MAT-QUEUED", "TRANSFER", "replenish_material", 1.0, "Warehouse",
+                    payload={
+                        "transfer_kind": "material_supply", "station": 2,
+                        "source_slot_id": slot_id, "material_item_id": item_id,
+                        "transfer_item_id": item_id,
+                    },
+                )
+                setup = Task(
+                    "SET-QUEUED", "SETUP_MACHINE", "setup_machine", 1.0, "Station1",
+                    payload={"station": 1, "machine_id": "S1M1"},
+                )
+                for worker_id, task in (("A1", supply), ("A2", setup)):
+                    selected = world._finalize_selected_task(world.agents[worker_id], task)
+                    self.assertIsNotNone(selected)
+                    world.adp_coordinator.dispatch_queues[worker_id].append(selected)
+                    self.assertIsNone(world.agents[worker_id].current_task_id)
+                self.assertEqual(1, world._buffer_reserved_count("material_queue_2"))
+                self.assertIn(item_id, world.item_reservations)
+                self.assertEqual("A2", world.machines["S1M1"].setup_owner)
+
+                world.close_open_activity_at_horizon()
+                world.close_open_activity_at_horizon()
+
+                self.assertFalse(any(world.adp_coordinator.dispatch_queues.values()))
+                self.assertFalse(world.buffer_slot_reservations)
+                self.assertFalse(world.item_reservations)
+                self.assertIsNone(world.machines["S1M1"].setup_owner)
+                self.assertEqual(item_id, world.warehouse_material_shelf_slots[slot_id]["material_item_id"])
+                self.assertEqual(0, world.product_count)
+                self.assertEqual(1, world.buffer_metrics["reservation_release_count"])
+                cancellations = [e for e in logger.events if e["type"] == "ADP_TASK_ASSIGNMENT_CANCELLED"]
+                self.assertEqual(2, len(cancellations))
+                self.assertFalse(any(e["type"] == "AGENT_TASK_END" for e in logger.events))
+            finally:
+                logger.close()
+
     def test_direct_charge_soc_increases_linearly(self) -> None:
         cfg = _load_cfg()
         with tempfile.TemporaryDirectory() as tmp:

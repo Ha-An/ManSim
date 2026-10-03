@@ -290,13 +290,15 @@ shaping과 pairwise MC loss는 기본 비활성화입니다.
 
 Rollout은 CPU process 10개가 wave당 10 episode를 생성합니다. Main process만 <code>cuda:0</code>에서
 network를 업데이트합니다. 초기 random 50 episode를 5 wave로 수집해 전체 50 episode로
-1 epoch 초기 학습하고, 이후 매 10-episode wave마다 75번 업데이트합니다. 정책 업데이트는
-현재 10 episode와 과거 replay에서 추출한 20 episode를 2 epoch 학습합니다. 총 800 training
-episode와 76번의 가치망 업데이트를 수행합니다.
+1 epoch 초기 학습하고, 이후 매 10-episode wave마다 최대 75번 업데이트합니다. 정책 업데이트는
+현재 10 episode와 과거 replay에서 추출한 20 episode를 2 epoch 학습합니다. 상한은 800 training
+episode와 76번의 가치망 업데이트입니다. 최소 45회 이후, 최고 screening 평균을 20 iteration 동안
+갱신하지 못하고 최근 두 검증의 현재-최고 paired 근사 CI 상한이 모두 +0.5개 미만이면 조기 종료합니다.
+작은 평균 개선도 미개선 기간을 초기화합니다. MSE 기반 종료나 모델 롤백은 아닙니다.
 Epsilon은 iteration <code>0/25/50/75</code>에서 <code>0.50/0.15/0.08/0.05</code>, learning rate는
 iteration <code>0/20/30/60/75</code>에서 <code>5e-5/5e-5/2e-5/2e-5/1e-5</code>가 되도록 구간별
 선형 감소합니다. Validation은 checkpoint <code>0, 5, 10, ..., 75</code>에서 표시하며, screening
-상위 3개 checkpoint를 각각 별도 seed 20개로 평가해 최종 checkpoint를 정합니다. Beam search는
+상위 2개 checkpoint를 각각 별도 seed 20개로 평가해 최종 checkpoint를 정합니다. Beam search는
 의사결정마다 첫 worker를 순환해 고정된 worker 순서의 선점 편향을 줄입니다.
 
 ~~~powershell
@@ -357,9 +359,17 @@ Checkpoint fingerprint에는 scenario, objective, 정확한 지원 worker 집합
 timing profile, feature schema,
 설비 ID와 수, processing distribution, finite-buffer capacity, inspection capacity와 지도 구조가
 포함됩니다. 하나라도 현재 환경과 다르면 fallback 없이 오류로 종료합니다.
-현재 feature schema는 <code>mfg_flow_shop_adp_v9</code>이며 terminal output까지의 예상 잔여시간을
-task feature로 포함합니다. 이전 schema의 checkpoint는
+현재 feature schema는 <code>mfg_flow_shop_adp_v10</code>입니다. Global 입력은 중복 elapsed-time과
+buffer free-ratio 4개를 제거해 35개에서 30개로 줄였습니다. Remaining horizon과 buffer의
+점유·예약 비율은 보존하므로 제거한 정보는 복원할 수 있습니다. Warehouse는 실제 재고 수,
+설비 잔여시간은 현재 시각까지의 가공을 반영합니다. Terminal output까지의 예상 잔여시간도
+계속 사용합니다. 이전 schema의 checkpoint는
 명확한 불일치 오류로 거부됩니다.
+
+속도 개선은 schema 재사용, CPU에서의 일괄 tensor 구성, 필요한 replay만 병합,
+선택지가 하나인 TD 상태의 online ranking 생략에 한정하며 학습 episode 수·seed·TD 정의는
+바꾸지 않습니다. Bootstrap 평가와 모든 transition은 그대로 유지합니다. 상세 범위와 실측,
+복구 방법은 [ADP 효율 개선](docs/adp_efficiency.md)을 참고하세요.
 
 ~~~powershell
 .\.venv\Scripts\python.exe main.py scenario=mfg_flow_shop decision=simulation_based_adp decision.adp.checkpoint_path=C:/path/to/best.pt

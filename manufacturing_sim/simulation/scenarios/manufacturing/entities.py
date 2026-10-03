@@ -93,6 +93,7 @@ class Machine:
     active_cycle_id: Optional[str] = None
     cycle_sampled_process_min: float = 0.0
     cycle_remaining_process_min: float = 0.0
+    cycle_processing_started_at: Optional[float] = None
     repair_sampled_work_min: float = 0.0
 
 

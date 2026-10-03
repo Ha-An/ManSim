@@ -89,34 +89,33 @@ def collate_states(states: list[EncodedDecisionState], device: Any) -> dict[str,
     batch = len(states)
     max_workers = max(1, max(len(state.worker_ids) for state in states))
     max_tasks = max(1, max(len(state.opportunity_ids) for state in states))
-    global_features = torch.zeros((batch, GLOBAL_FEATURE_DIM), dtype=torch.float32, device=device)
-    workers = torch.zeros((batch, max_workers, WORKER_FEATURE_DIM), dtype=torch.float32, device=device)
-    tasks = torch.zeros((batch, max_tasks, TASK_FEATURE_DIM), dtype=torch.float32, device=device)
-    pairs = torch.zeros((batch, max_workers, max_tasks, PAIR_FEATURE_DIM), dtype=torch.float32, device=device)
-    worker_mask = torch.zeros((batch, max_workers), dtype=torch.bool, device=device)
-    task_mask = torch.zeros((batch, max_tasks), dtype=torch.bool, device=device)
-    feasibility = torch.zeros((batch, max_workers, max_tasks), dtype=torch.bool, device=device)
-    selected_assignment_mask = torch.zeros((batch, max_workers, max_tasks), dtype=torch.bool, device=device)
+    # Assemble on CPU, then transfer each complete field once (not per state).
+    global_features = np.zeros((batch, GLOBAL_FEATURE_DIM), dtype=np.float32)
+    workers = np.zeros((batch, max_workers, WORKER_FEATURE_DIM), dtype=np.float32)
+    tasks = np.zeros((batch, max_tasks, TASK_FEATURE_DIM), dtype=np.float32)
+    pairs = np.zeros((batch, max_workers, max_tasks, PAIR_FEATURE_DIM), dtype=np.float32)
+    worker_mask = np.zeros((batch, max_workers), dtype=bool)
+    task_mask = np.zeros((batch, max_tasks), dtype=bool)
+    feasibility = np.zeros((batch, max_workers, max_tasks), dtype=bool)
+    selected_assignment_mask = np.zeros((batch, max_workers, max_tasks), dtype=bool)
     for index, state in enumerate(states):
         worker_count = len(state.worker_ids)
         task_count = len(state.opportunity_ids)
-        global_features[index] = torch.as_tensor(state.global_features, dtype=torch.float32, device=device)
+        global_features[index] = state.global_features
         if worker_count:
-            workers[index, :worker_count] = torch.as_tensor(state.worker_features, dtype=torch.float32, device=device)
+            workers[index, :worker_count] = state.worker_features
             worker_mask[index, :worker_count] = True
         if task_count:
-            tasks[index, :task_count] = torch.as_tensor(state.task_features, dtype=torch.float32, device=device)
+            tasks[index, :task_count] = state.task_features
             task_mask[index, :task_count] = True
-            pairs[index, :worker_count, :task_count] = torch.as_tensor(state.pair_features, dtype=torch.float32, device=device)
-            feasibility[index, :worker_count, :task_count] = torch.as_tensor(state.feasibility, dtype=torch.bool, device=device)
-            selected_assignment_mask[index, :worker_count, :task_count] = torch.as_tensor(
-                state.selected_assignment_mask, dtype=torch.bool, device=device
-            )
+            pairs[index, :worker_count, :task_count] = state.pair_features
+            feasibility[index, :worker_count, :task_count] = state.feasibility
+            selected_assignment_mask[index, :worker_count, :task_count] = state.selected_assignment_mask
         else:
             # A zero-valued sentinel keeps attention numerically defined when
             # no task is currently feasible for any idle worker.
             task_mask[index, 0] = True
-    return {
+    arrays = {
         "global_features": global_features,
         "worker_features": workers,
         "task_features": tasks,
@@ -126,13 +125,15 @@ def collate_states(states: list[EncodedDecisionState], device: Any) -> dict[str,
         "feasibility": feasibility,
         "selected_assignment_mask": selected_assignment_mask,
     }
+    return {name: torch.from_numpy(value).to(device) for name, value in arrays.items()}
 
 
 def predict_values(model: Any, states: list[EncodedDecisionState], device: Any) -> np.ndarray:
     torch = require_torch()
     if not states:
         return np.asarray([], dtype=np.float32)
-    model.eval()
+    if model.training:
+        model.eval()
     with torch.no_grad():
         batch = collate_states(states, device)
         return model(**batch).detach().cpu().numpy()

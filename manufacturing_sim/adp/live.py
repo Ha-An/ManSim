@@ -21,7 +21,7 @@ def atomic_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(text, encoding="utf-8")
+        temporary.write_text(text, encoding="utf-8", newline="")
         # A browser/virus scanner can briefly hold a Windows file handle.
         for attempt in range(10):
             try:
@@ -50,4 +50,4 @@ class TrainingProgress:
                                "updated_at": now, "pid": os.getpid()})
 
     def rollout(self, event: dict[str, Any]) -> None:
-        self.update(status="running", **event)
+        self.update(status="failed" if event.get("event") == "wave_failed" else "running", **event)

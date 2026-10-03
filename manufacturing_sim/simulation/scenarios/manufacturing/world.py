@@ -8969,10 +8969,14 @@ class ManufacturingWorld:
             str(task.task_id),
         )
 
-    def _task_battery_risk_metadata(self, agent: Agent, task: Task) -> dict[str, Any]:
+    def _task_battery_risk_metadata(
+        self, agent: Agent, task: Task, *, estimated_duration: float | None = None,
+    ) -> dict[str, Any]:
         payload = task.payload if isinstance(task.payload, dict) else {}
         family = self._task_priority_key(task)
-        estimated_duration = max(0.0, float(self._task_estimated_duration(agent, task)))
+        estimated_duration = max(0.0, float(
+            self._task_estimated_duration(agent, task) if estimated_duration is None else estimated_duration
+        ))
         if family in {"battery_swap", "battery_charge"}:
             return_to_dock = 0.0
         else:
@@ -15174,6 +15178,12 @@ class ManufacturingWorld:
                     machine.pm_owner = None
         return False
 
+    def machine_remaining_processing_min(self, machine: Machine) -> float:
+        remaining = float(machine.cycle_remaining_process_min)
+        if machine.state == MachineState.PROCESSING and machine.cycle_processing_started_at is not None:
+            remaining -= max(0.0, float(self.env.now) - machine.cycle_processing_started_at)
+        return max(0.0, remaining)
+
     def start_machine_cycle(self, machine: Machine) -> str:
         resumed = bool(machine.active_cycle_id and machine.cycle_remaining_process_min > 0.0)
         if resumed:
@@ -15198,6 +15208,7 @@ class ManufacturingWorld:
                 machine_id=machine.machine_id,
                 station=machine.station,
             )
+        machine.cycle_processing_started_at = float(self.env.now)
         self._set_machine_state(machine, MachineState.PROCESSING, reason="cycle_resumed" if resumed else "cycle_started")
         if machine.input_material:
             self._set_item_state(machine.input_material, ItemState.PROCESSING, location=f"Station{machine.station}", ref=machine.machine_id, item_type="material")
@@ -15279,6 +15290,7 @@ class ManufacturingWorld:
         machine.active_cycle_id = None
         machine.cycle_sampled_process_min = 0.0
         machine.cycle_remaining_process_min = 0.0
+        machine.cycle_processing_started_at = None
         machine.input_material = None
         machine.input_intermediate = None
         machine.setup_ready = False
@@ -15313,6 +15325,7 @@ class ManufacturingWorld:
             0.0,
             float(machine.cycle_remaining_process_min) - max(0.0, float(elapsed_min)),
         )
+        machine.cycle_processing_started_at = None
         machine.setup_ready = True
         if input_material_id:
             self._set_item_state(
@@ -15436,7 +15449,7 @@ class ManufacturingWorld:
         return "coordination"
 
     def close_open_activity_at_horizon(self, *, reason: str = "horizon_reached") -> None:
-        """Close observation events that are still open when the run horizon stops SimPy."""
+        """Close active observations and release unstarted dispatch reservations."""
         for agent in self.agents.values():
             if agent.current_move_id:
                 self._close_current_move_segment(
@@ -15524,6 +15537,10 @@ class ManufacturingWorld:
                 status="interrupted",
                 reason=reason,
             )
+
+        # A joint assignment may still be queued while its worker finishes recovery.
+        if self.adp_coordinator is not None:
+            self.adp_coordinator.cancel_pending_assignments(reason=reason)
 
     def finalize_day(self, day: int) -> dict[str, Any]:
         products_today = self.product_count - int(self.day_baseline["products"])
@@ -15933,6 +15950,8 @@ class ManufacturingWorld:
             "humanoid_primitive_minutes": humanoid_primitive_minutes,
             "humanoid_task_taxonomy": humanoid_task_taxonomy,
             "adp_checkpoint_id": str(adp_summary.get("checkpoint_id", "")),
+            "adp_idle_metrics_version": int(adp_summary.get("idle_metrics_version", 1)),
+            "adp_unassigned_count": int(adp_summary.get("unassigned_count", 0)),
             "adp_decision_count": int(adp_summary.get("decision_count", 0) or 0),
             "adp_wait_count": int(adp_summary.get("wait_count", 0) or 0),
             "adp_candidate_available_wait_count": int(

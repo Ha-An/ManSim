@@ -93,7 +93,7 @@ def _machine_release_delay(world: Any, station: int) -> float:
         elif machine.state == MachineState.UNDER_PM:
             release_delays.append(pm_min)
         elif machine.state == MachineState.PROCESSING:
-            release_delays.append(max(0.0, float(machine.cycle_remaining_process_min)))
+            release_delays.append(world.machine_remaining_processing_min(machine))
         elif machine.state == MachineState.DONE_WAIT_UNLOAD or machine.output_intermediate is not None:
             release_delays.append(unload_min)
         elif machine.state == MachineState.SETUP:
@@ -262,13 +262,12 @@ class ADPStateEncoder:
         horizon = max(1.0, float(world.num_days * world.minutes_per_day))
         machine_values = sorted(world.machines.values(), key=lambda machine: machine.machine_id)
         global_features = np.zeros(GLOBAL_FEATURE_DIM, dtype=np.float32)
-        global_features[:13] = np.asarray(
+        global_features[:12] = np.asarray(
             [
-                _norm(world.env.now, horizon),
                 _norm(horizon - world.env.now, horizon),
                 _norm(world.product_count, 30.0),
                 _norm(world.scrap_count, 30.0),
-                _norm(len(world.warehouse_material_shelf_slots), 30.0),
+                _norm(world._material_shelf_count(), 30.0),
                 _norm(sum(len(q) for q in world.material_queues.values()), 20.0),
                 _norm(sum(len(q) for q in world.intermediate_queues.values()), 20.0),
                 _norm(sum(len(q) for q in world.output_buffers.values()), 20.0),
@@ -284,27 +283,25 @@ class ADPStateEncoder:
         # aggregates. The representation stays fixed while retaining the
         # bottleneck context of parallel machines.
         for index, station in enumerate(sorted(world.stations)[:2]):
-            base = 13 + index * 11
+            base = 12 + index * 9
             station_machines = [machine for machine in machine_values if machine.station == station]
             input_buffer_ids = [f"material_queue_{station}"]
             if world._station_requires_intermediate(station):
                 input_buffer_ids.append(f"intermediate_queue_{station}")
-            input_occupancy, input_reserved, input_free = _buffer_group_features(
+            input_occupancy, input_reserved, _ = _buffer_group_features(
                 world,
                 input_buffer_ids,
             )
-            output_occupancy, output_reserved, output_free = _buffer_group_features(
+            output_occupancy, output_reserved, _ = _buffer_group_features(
                 world,
                 [f"output_buffer_station_{station}"],
             )
-            global_features[base : base + 6] = np.asarray(
+            global_features[base : base + 4] = np.asarray(
                 [
                     input_occupancy,
                     input_reserved,
-                    input_free,
                     output_occupancy,
                     output_reserved,
-                    output_free,
                 ],
                 dtype=np.float32,
             )
@@ -331,11 +328,11 @@ class ADPStateEncoder:
                 or machine.state in {MachineState.BROKEN, MachineState.UNDER_REPAIR}
             )
             remaining_values = [
-                max(0.0, float(machine.cycle_remaining_process_min))
+                world.machine_remaining_processing_min(machine)
                 for machine in station_machines
                 if machine.state == MachineState.PROCESSING
             ]
-            global_features[base + 6 : base + 10] = np.asarray(
+            global_features[base + 4 : base + 8] = np.asarray(
                 [
                     idle_count / machine_count,
                     processing_count / machine_count,
@@ -344,7 +341,7 @@ class ADPStateEncoder:
                 ],
                 dtype=np.float32,
             )
-            global_features[base + 10] = np.float32(
+            global_features[base + 8] = np.float32(
                 _norm(
                     float(np.mean(remaining_values)) if remaining_values else 0.0,
                     max(
@@ -358,6 +355,7 @@ class ADPStateEncoder:
             )
 
         all_workers = sorted(world.workers.values(), key=lambda worker: worker.agent_id)
+        decision_worker_ids = {worker.agent_id for worker in workers}
         worker_features = np.zeros((len(all_workers), WORKER_FEATURE_DIM), dtype=np.float32)
         for row, worker in enumerate(all_workers):
             tile = worker.tile or (0, 0)
@@ -376,14 +374,15 @@ class ADPStateEncoder:
                 float(worker.charging_started_at is not None),
                 _norm(len(tasks_by_worker.get(worker.agent_id, {})), 20.0),
             ]
-            elapsed = max(0.0, float(world.env.now) - float(worker.current_task_started_at or world.env.now))
+            started_at = worker.current_task_started_at
+            elapsed = max(0.0, float(world.env.now) - float(started_at if started_at is not None else world.env.now))
             expected = (
                 float(world.timing.expected_task_duration(str(worker.current_task_code).upper()))
                 if str(worker.current_task_code or "").upper() in world.timing.task_steps
                 else 0.0
             )
             worker_features[row, 14] = _norm(max(0.0, expected - elapsed), 60.0)
-            worker_features[row, 15] = float(worker.agent_id in {candidate.agent_id for candidate in workers})
+            worker_features[row, 15] = float(worker.agent_id in decision_worker_ids)
 
         task_features = np.zeros((len(opportunity_ids), TASK_FEATURE_DIM), dtype=np.float32)
         role_count = 19.0
@@ -438,7 +437,7 @@ class ADPStateEncoder:
                     world,
                     task,
                 )
-                battery_risk = world._task_battery_risk_metadata(worker, task)
+                battery_risk = world._task_battery_risk_metadata(worker, task, estimated_duration=duration)
                 pair_features[row, col] = [
                     _norm(travel, 30.0),
                     _norm(duration, 60.0),
