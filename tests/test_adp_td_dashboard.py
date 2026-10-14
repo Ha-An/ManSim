@@ -24,6 +24,17 @@ def fixture():
     return episodes, iterations
 
 
+def test_speedup_configuration_is_visible_without_changing_curves(tmp_path):
+    episodes, iterations = fixture()
+    summary = {"target_state_batch_size": 64, "target_candidate_batch_size": 1024,
+               "persistent_rollout_processes": True, "rollout_pool_start_count": 1}
+    path = render_td_dashboard(tmp_path, episodes, iterations, [], summary)
+    page = path.read_text(encoding="utf-8")
+    assert "64 / 1024" in page
+    assert "Rollout process reuse" in page
+    assert "Rollout pool starts" in page
+
+
 def test_paired_change_uses_seed_matches_not_subtracted_independent_intervals():
     episodes, iterations = fixture()
     episodes.reverse()

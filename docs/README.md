@@ -26,6 +26,7 @@
 9. [openclaw_adaptive_priority_call_flow.md](openclaw_adaptive_priority_call_flow.md): OpenClaw manager loop
 10. [v0.6_release_notes.md](v0.6_release_notes.md): v0.6 변경 사항, ADP와 정책 비교, 검증 범위
 11. [v0.5_release_notes.md](v0.5_release_notes.md): v0.5 이전 릴리스 이력
+12. [development.md](development.md): 전체 테스트, 정적 검사, frontend build와 업로드 점검
 
 Simulation-Based ADP의 worker 3 기본학습, checkpoint validation, cyclic beam search와 held-out
 정책 비교 계약은 [decision_logic.md](decision_logic.md#simulation-based-adp)에 정리되어 있습니다.
@@ -47,6 +48,10 @@ Simulation-Based ADP의 worker 3 기본학습, checkpoint validation, cyclic bea
 `factory_mfg_basic`은 Warehouse, Station 1, Station 2, Inspection을 거치는 제조 공정입니다. Accepted product, scrap, queue wait, machine state, humanoid state가 주요 관찰 대상입니다.
 
 `mfg_flow_shop`은 Station 1/2에 설비를 두 대씩 두고 유한 input/output buffer, worker별 전용 charging dock와 단일 Inspection Desk를 사용하는 제조 공정입니다. 실제 가공 누적시간 기준 고장과 예방정비를 반영하고, handover와 battery delivery/swap은 제외하며 machine repair만 공동 작업을 허용합니다.
+
+현재 Warehouse는 26 x 15 tiles, 4행 40슬롯이며 초기 재고와 일일 보충 목표는 30개입니다.
+20/30/40 자재 비교는 같은 geometry를 사용합니다. 이전 30슬롯 결과와 혼합하지 않습니다.
+Worker 2~6 학습과 대규모 평가는 [Fleet·자재 비교](../experiments/mfg_flow_shop_paper/README.md)를 참고하세요.
 
 이 시나리오는 `objective.mode=minimize_makespan|maximize_throughput`을 지원합니다. Makespan은 time-zero warehouse material의 product/폐기 계보가 모두 종결될 때 조기 종료하고 중간 보충을 하지 않으며, Throughput은 매일 material을 보충하고 설정된 일수까지 실행합니다. 세부 계약과 실행 예시는 [simulator_core_guide.md](simulator_core_guide.md#flow-shop-objective-and-termination)를 참고합니다.
 
@@ -99,3 +104,7 @@ Run이 끝난 뒤 다음 두 audit를 기본으로 사용합니다.
 - rolling horizon task id, requeue, skip, dispatch 일관성
 - replay worker position/state 보존
 - battery가 이미 방전된 worker의 추가 tile 이동 금지
+
+상세 events가 없는 실행은 이벤트 단위 이동·소유권 검사를 수행할 수 없습니다.
+과거 산출물 정리 후에는 남은 KPI·CSV만 검증하며, 삭제된 Replay나 checkpoint 링크가 복원되지는 않습니다.
+`audits/` 문서는 작성 시점의 검토 기록입니다. 그 안의 예전 설정·결과 경로가 현재 기본값이나 보존 상태를 뜻하지 않습니다.

@@ -26,7 +26,7 @@ ADDITIONAL_MODES = (
 )
 
 
-def build_extension(rows: list[dict[str, str]], window: float) -> list[dict[str, str]]:
+def build_extension(rows: list[dict[str, str]], window: float, *, run_root: Path | None = None) -> list[dict[str, str]]:
     existing = {row["run_id"] for row in rows}
     result = []
     for mode in ADDITIONAL_MODES:
@@ -37,7 +37,9 @@ def build_extension(rows: list[dict[str, str]], window: float) -> list[dict[str,
             if run_id in existing:
                 continue
             old_dir = Path(source["run_dir"])
-            run_dir = old_dir.parents[2] / mode / old_dir.parent.name / old_dir.name
+            # Imported baselines remain read-only references to another study.
+            destination = run_root if run_root is not None else old_dir.parents[2]
+            run_dir = destination / mode / old_dir.parent.name / old_dir.name
             command = [
                 f"decision={mode}" if value.startswith("decision=") else
                 f"hydra.run.dir={run_dir.as_posix()}" if value.startswith("hydra.run.dir=") else value
@@ -82,7 +84,8 @@ def extend(prepared: Path) -> dict:
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     with (prepared / "evaluation_plan.csv").open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    added = build_extension(rows, float(plan["rolling_horizon_window_min"]))
+    added = build_extension(rows, float(plan["rolling_horizon_window_min"]),
+                            run_root=prepared / "evaluation" / "runs")
     if not added:
         return {"status": "already_extended", "run_count": len(rows)}
     if len(added) != 3 * len(plan["worker_counts"]) * len(plan["test_seeds"]):
@@ -99,11 +102,13 @@ def extend(prepared: Path) -> dict:
         shutil.copytree(dashboard, backup / dashboard.name)
     old_start = (prepared / "evaluation_preflight.json").stat().st_mtime
     old_end = (prepared / "evaluation_status.csv").stat().st_mtime
+    timing_path = prepared / "evaluation_timing.json"
+    timing = json.loads(timing_path.read_text(encoding="utf-8")) if timing_path.exists() else {}
     report = {
         "status": "pass", "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "added_modes": list(ADDITIONAL_MODES), "reused_run_count": len(rows),
         "added_run_count": len(added), "config_checks": checks,
-        "original_evaluation_wall_sec": max(0.0, old_end - old_start),
+        "original_evaluation_wall_sec": float(timing.get("run_phase_wall_sec", max(0.0, old_end - old_start))),
         "backup_path": str(backup),
     }
     rows.extend(added)
@@ -114,6 +119,8 @@ def extend(prepared: Path) -> dict:
     plan["policies"] = list(dict.fromkeys([*plan["policies"], *ADDITIONAL_MODES]))
     plan["counts"]["baseline_evaluation_runs"] += len(added)
     plan["counts"]["evaluation_runs"] = len(rows)
+    if "new_evaluation_runs" in plan["counts"]:
+        plan["counts"]["new_evaluation_runs"] += len(added)
     plan["extension"] = report
     plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     (prepared / "evaluation_extension.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

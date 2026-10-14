@@ -26,13 +26,13 @@ SEEDS = list(range(910001, 910101))
 
 
 def inventory_overrides(fill: int) -> dict[str, int]:
-    if fill not in (20, 40):
-        raise ValueError("Inventory study supports initial/top-up targets 20 and 40")
+    if fill not in (20, 30, 40):
+        raise ValueError("Inventory study supports initial/top-up targets 20, 30 and 40")
     return {
         "scenario.warehouse.material_shelf.capacity": 40,
         "scenario.warehouse.material_shelf.initial_fill": fill,
         "scenario.objective.throughput.restock_target_fill": fill,
-        "+scenario.map.warehouse_height_tiles": 15,
+        "++scenario.map.warehouse_height_tiles": 15,
     }
 
 

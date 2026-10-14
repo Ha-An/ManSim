@@ -121,36 +121,49 @@ def _runtime_summary_rows(
     if not rows_with_elapsed:
         return "-", [{"metric": "Run command time", "value": "No elapsed_sec rows found"}]
 
-    elapsed_values = [float(_float_or_none(row, "elapsed_sec") or 0.0) for row in rows_with_elapsed]
+    reused_rows, current_rows = [], []
+    for row in rows_with_elapsed:
+        reused = (row.get("execution_scope") == "reused_external"
+                  or str(row.get("reason", "")).startswith("Reused from "))
+        (reused_rows if reused else current_rows).append(row)
+    # A resumed run belongs to the recorded evaluation wall time; an imported
+    # baseline belongs to another experiment and must not inflate this ratio.
+    elapsed_values = [float(_float_or_none(row, "elapsed_sec") or 0.0) for row in current_rows]
     total_elapsed = sum(elapsed_values)
+    reused_elapsed = sum(float(_float_or_none(row, "elapsed_sec") or 0.0) for row in reused_rows)
     average_elapsed = total_elapsed / len(elapsed_values) if elapsed_values else 0.0
-    slowest = max(rows_with_elapsed, key=lambda row: float(_float_or_none(row, "elapsed_sec") or 0.0))
+    slowest = max(current_rows, key=lambda row: float(_float_or_none(row, "elapsed_sec") or 0.0), default={})
     slowest_label = (
         f"{_format_duration(_float_or_none(slowest, 'elapsed_sec'))} "
         f"({slowest.get('mode', '')}, workers={slowest.get('worker_count', '')}, seed={slowest.get('seed', '')})"
-    )
+    ) if slowest else "-"
     successful_elapsed = sum(
         float(_float_or_none(row, "elapsed_sec") or 0.0)
-        for row in rows_with_elapsed
+        for row in current_rows
         if row.get("status") in {"completed", "skipped_existing"}
     )
     other_elapsed = total_elapsed - successful_elapsed
     wall_sec = experiment_wall_sec if experiment_wall_sec is not None else total_elapsed
     rows = [
-        {"metric": "Experiment wall time", "value": _format_duration(wall_sec)},
+        {"metric": "Evaluation wall time (excludes reused runs)" if reused_rows else "Experiment wall time", "value": _format_duration(wall_sec)},
         {"metric": "Configured parallel jobs", "value": str(max(1, int(parallel_jobs)))},
-        {"metric": "Sum of run command times", "value": _format_duration(total_elapsed)},
+        {"metric": "Current evaluation run command time" if reused_rows else "Sum of run command times", "value": _format_duration(total_elapsed)},
         {"metric": "Successful-run command time", "value": _format_duration(successful_elapsed)},
         {"metric": "Failed/other command time", "value": _format_duration(other_elapsed)},
-        {"metric": "Average run command time", "value": _format_duration(average_elapsed)},
+        {"metric": "Average run command time", "value": _format_duration(average_elapsed) if current_rows else "-"},
         {"metric": "Slowest run", "value": slowest_label},
-        {"metric": "Runs with elapsed_sec", "value": str(len(rows_with_elapsed))},
+        {"metric": "Current runs with elapsed_sec" if reused_rows else "Runs with elapsed_sec", "value": str(len(current_rows))},
     ]
-    if wall_sec > 0:
+    if reused_rows:
+        rows.extend([
+            {"metric": "Reused baseline runs", "value": str(len(reused_rows))},
+            {"metric": "Reused baseline historical command time (excluded)", "value": _format_duration(reused_elapsed)},
+        ])
+    if wall_sec > 0 and current_rows:
         rows.insert(
             3,
             {
-                "metric": "Aggregate compute / wall ratio",
+                "metric": "Current run time / evaluation wall ratio" if reused_rows else "Aggregate compute / wall ratio",
                 "value": f"{total_elapsed / wall_sec:.2f}x",
             },
         )
@@ -666,6 +679,9 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
         experiment_wall_sec=experiment_wall_sec,
         parallel_jobs=parallel_jobs,
     )
+    runtime_heading = ("Current Evaluation Wall Time"
+                       if any(row["metric"] == "Reused baseline runs" for row in runtime_rows)
+                       else "Experiment Wall Time")
     display_run_rows = _merge_run_status_rows(status_rows, run_rows)
     display_run_rows.sort(
         key=lambda row: (
@@ -1222,7 +1238,7 @@ def render_dashboard(output_root: Path, cfg: ExperimentConfig) -> Path:
     <div class="card"><div class="label">{'Aggregation-Eligible Historical Runs' if validity_banner else 'Valid Comparison Runs'}</div><div class="value">{comparison_count}</div></div>
     <div class="card"><div class="label">Excluded Completed Runs</div><div class="value">{excluded_count}</div></div>
     <div class="card"><div class="label">Incomplete Runs</div><div class="value">{incomplete_count}</div></div>
-    <div class="card"><div class="label">Experiment Wall Time</div><div class="value">{_esc(total_runtime_label)}</div></div>
+    <div class="card"><div class="label">{_esc(runtime_heading)}</div><div class="value">{_esc(total_runtime_label)}</div></div>
     {f'<div class="card"><div class="label">Rolling Window</div><div class="value">{_esc(rolling_window_summary.removeprefix("Rolling window: ").removeprefix("Rolling windows: "))}</div></div>' if rolling_window_summary else ''}
     <div class="card"><div class="label">Validation-Failed Runs</div><div class="value">{len(validation_issue_keys)}</div></div>
     {primary_card if not validity_banner else '<div class="card"><div class="label">Policy Superiority</div><div class="value">재실험 전 판단 보류</div></div>'}

@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 
 REQUIRED_ARTIFACTS = [
@@ -631,6 +632,23 @@ def _event_log_enabled(run_dir: Path) -> bool:
     if isinstance(event_log, dict) and "enabled" in event_log:
         return bool(event_log.get("enabled", False))
     return (run_dir / "events.jsonl").exists()
+
+
+def _replay_log_enabled(run_dir: Path, audit: Audit) -> bool:
+    config_path = run_dir / ".hydra" / "config.yaml"
+    if not config_path.exists():
+        # Legacy runs exported Replay by default. Missing files are not evidence
+        # that export was disabled; callers can explicitly skip that audit.
+        return True
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        enabled = config.get("runtime", {}).get("ui", {}).get("export_replay_artifacts", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("runtime.ui.export_replay_artifacts must be Boolean")
+        return enabled
+    except (OSError, ValueError, AttributeError, yaml.YAMLError) as exc:
+        audit.error(f"cannot verify Replay export configuration: {exc}")
+        return True
 
 
 def check_required_files(
@@ -1695,19 +1713,29 @@ def check_strict_periodic_rolling_horizon(
     )
 
 
-def audit_run(run_dir: Path, *, require_replay_log: bool = True) -> Audit:
+def audit_run(run_dir: Path, *, require_replay_log: bool | None = None) -> Audit:
     audit = Audit()
     event_log_enabled = _event_log_enabled(run_dir)
+    if require_replay_log is None:
+        # Runtime only exports Replay from persisted events. Still inspect a
+        # retained Replay when detailed events were subsequently removed.
+        require_replay_log = _replay_log_enabled(run_dir, audit) and (
+            event_log_enabled or (run_dir / "replay_studio_log.json").is_file()
+        )
     check_required_files(
         run_dir,
         audit,
-        require_replay_log=require_replay_log and event_log_enabled,
+        require_replay_log=require_replay_log,
         require_event_log=event_log_enabled,
     )
     if not event_log_enabled:
         check_kpi(run_dir, audit)
         check_layout(run_dir, audit, _scenario_type(run_dir))
         check_gantt(run_dir, [], audit, _scenario_type(run_dir))
+        if require_replay_log:
+            check_replay_log(run_dir, audit, _scenario_type(run_dir))
+        else:
+            audit.note("replay log audit skipped by export configuration or explicit override")
         audit.note(
             "event log audit skipped because runtime.artifacts.export_events=false; "
             "KPI, Gantt intervals and compact layout contracts were checked"
@@ -1726,7 +1754,7 @@ def audit_run(run_dir: Path, *, require_replay_log: bool = True) -> Audit:
     if require_replay_log:
         check_replay_log(run_dir, audit, scenario_type)
     else:
-        audit.note("replay log audit skipped; experiment retained core events and compact layout")
+        audit.note("replay log audit skipped by export configuration or explicit override")
     check_layout(run_dir, audit, scenario_type)
     check_strict_periodic_rolling_horizon(run_dir, events, audit)
     if scenario_type in MANUFACTURING_SCENARIOS:
@@ -1747,7 +1775,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-replay-log", action="store_true")
     args = parser.parse_args(argv)
     run_dir = args.run_dir.resolve()
-    audit = audit_run(run_dir, require_replay_log=not args.skip_replay_log)
+    audit = audit_run(run_dir, require_replay_log=False if args.skip_replay_log else None)
     print(f"AUDIT {run_dir}")
     for note in audit.notes:
         print(f"NOTE  {note}")

@@ -15,7 +15,7 @@ from manufacturing_sim.simulation.scenarios.manufacturing.grid_map import TileGr
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def config(fill=30, capacity=30, height=None):
+def config(fill=30, capacity=30, height=12):
     cfg = yaml.safe_load((ROOT / "configs/scenario/mfg_flow_shop.yaml").read_text(encoding="utf-8"))
     cfg["warehouse"]["material_shelf"].update(capacity=capacity, initial_fill=fill)
     cfg["objective"]["throughput"]["restock_target_fill"] = fill
@@ -29,6 +29,19 @@ def grid(cfg):
 
 
 class InventoryStudyTests(unittest.TestCase):
+    def test_default_30_matches_expanded_20_and_40_geometry(self):
+        cfg = yaml.safe_load((ROOT / "configs/scenario/mfg_flow_shop.yaml").read_text(encoding="utf-8"))
+        self.assertEqual({"capacity": 40, "initial_fill": 30}, cfg["warehouse"]["material_shelf"])
+        self.assertEqual(30, cfg["objective"]["throughput"]["restock_target_fill"])
+        default = grid(cfg)
+        for fill in (20, 40):
+            other = grid(config(fill, 40, 15))
+            self.assertEqual(default.objects, other.objects)
+            self.assertEqual(default.walls, other.walls)
+            self.assertEqual(default.doors, other.doors)
+            self.assertEqual(default.service_tiles, other.service_tiles)
+        self.assertEqual(15, default.zones["Warehouse"].height)
+
     def test_existing_layout_unchanged(self):
         g = grid(config())
         self.assertEqual((37, 4, 26, 12), tuple(vars(g.zones["Warehouse"])[k] for k in ("x", "y", "width", "height")))

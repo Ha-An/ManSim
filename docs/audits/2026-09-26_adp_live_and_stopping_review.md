@@ -5,13 +5,13 @@
 - ADP TD driver, episode replay/target/update 흐름, 병렬 rollout 실패 처리,
   백그라운드 supervisor, 진행 JSON, CSV 저장, TD 그래프 및 집계를 확인했다.
 - 이전 효율화 변경과 기존 작업 트리를 유지했다. 학습 파라미터 기본값은 이번 검토에서 바꾸지 않았다.
-- 최근 paper 실험의 worker 2~6 학습 5개와 worker 3 n=30 본학습/파인튜닝 2개를 읽었다.
-  논문용 5개 학습은 각 800 training + 80 validation episode이며 screening은 I0/15/30/45/60/75이다.
+- 최근 fleet별 비교 실험의 worker 2~6 학습 5개와 worker 3 n=30 본학습/파인튜닝 2개를 읽었다.
+  fleet별 5개 학습은 각 800 training + 80 validation episode이며 screening은 I0/15/30/45/60/75이다.
 - `scripts/analyze_adp_training_plateau.py`는 원본을 수정하지 않고 평균, paired difference,
   검증 최고 checkpoint, 후반 비용과 기존 artifact audit 결과를 JSON으로 저장한다.
 - 결과: `outputs/adp_live_audit_20260926/historical_plateau.json`.
 
-**중요한 한계:** paper 결과에는 이미 `result_validity.json`의 PM/processing 중첩 오류 경고가 있다.
+**중요한 한계:** 기존 결과에는 이미 `result_validity.json`의 PM/processing 중첩 오류 경고가 있다.
 이번 집계 검산 통과가 과거 시뮬레이션 오류를 무효화하지 않는다. 과거 곡선은 학습 경향과 비용
 분석용이지 수정된 환경의 성능 증명이 아니다. 현재 v10 입력 의미도 달라져 새 학습에서 확인해야 한다.
 
@@ -83,7 +83,7 @@ replay 100, batch 512, epoch 2, CPU 10 process는 우선 유지한다.
 
 1. 최대 75회는 유지하고, 최소 45회까지 학습한다.
 2. 같은 screening seed 10개로 5 iteration마다 평가한다. 이미 기본 profile은 이 간격이다.
-   Paper의 15회 간격은 종료 시점을 판별하기에 거칠다.
+   이 실험의 15회 간격은 종료 시점을 판별하기에 거칠다.
 3. 최근 20 iteration 동안 best screening 평균을 갱신하지 못했을 때 종료 검토를 시작한다.
    작은 개선도 best 저장에는 반영한다. 이것은 candidate를 롤백하는 conservative gate가 아니다.
 4. 최근 두 번의 검증에서 현재-best의 paired 근사 CI 상한이 +0.5개 미만이면

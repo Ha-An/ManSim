@@ -41,14 +41,14 @@ CPU 10 process: simulation rollout / epsilon-greedy joint assignment
 
 - 기본 학습: 초기 50 + 75회 x 10 = 800 training episodes.
 - 기본 profile validation: screening 160 + final 60 = 220 episodes.
-- 논문 실험 profile은 screening 60 + final 20 = 80 episodes로 덮어쓴다.
+- fleet별 비교 실험 profile은 screening 60 + final 20 = 80 episodes로 덮어쓴다.
 - Policy iteration의 update는 현재 10개뿐 아니라 과거 replay 20개도 사용한다.
 - 따라서 800회 simulation과 별개로, 초기 50 + 75 x 30 = 2,300 episode 분량의 target 재구성 방문이 있다.
 - WAIT, shaping, pairwise MC loss, conservative gate는 현재 TD 기본 경로에서 비활성이다.
 
 ## 실제 시간 분해
 
-과거 논문 실험의 단일 fleet 학습 800 + validation 80 episode 기준이다.
+과거 fleet별 비교 실험의 단일 fleet 학습 800 + validation 80 episode 기준이다.
 각 비율은 해당 run의 전체 wall-clock에 대한 비율이며 process 시간을 합산한 값이 아니다.
 
 | Worker | 전체 시간 | Training rollout | Validation | TD target 구성 | 신경망 update |

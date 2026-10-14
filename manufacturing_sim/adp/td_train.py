@@ -104,6 +104,9 @@ def validate_td_config(cfg: dict[str, Any]) -> None:
         raise ValueError("TD uses a stable 10% episode holdout (episode ID divisible by 10).")
     if not 0 < float(training.get("target_tau", 0)) <= 1:
         raise ValueError("target_tau must be in (0,1].")
+    for key in ("target_state_batch_size", "target_candidate_batch_size"):
+        if int(training.get(key, 1)) < 1:
+            raise ValueError(f"training.{key} must be positive.")
     for key in ("initial_random_episodes", "episodes_per_iteration", "batch_size", "max_epochs_per_iteration"):
         if int(training[key]) < 1:
             raise ValueError(f"training.{key} must be positive.")
@@ -188,9 +191,10 @@ def validate_td_config(cfg: dict[str, Any]) -> None:
 
 def train_td(cfg: dict[str, Any], args: Any) -> Path:
     from .train import (
+        RolloutPool,
         RolloutJob, _configure_training_determinism, _process_rss_mib,
         _resolve_training_device, _resolve_screening_iterations, _run_rollout_jobs_parallel, _snapshot_state_dict,
-        _training_device_metadata, _write_csv,
+        _training_device_metadata, _write_csv, _scenario_override_arguments,
     )
     from .td_dashboard import render_td_dashboard
     from .live import TrainingProgress, atomic_json
@@ -218,6 +222,7 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
     if args.rollout_processes is not None:
         cfg["rollout"]["process_count"] = int(args.rollout_processes)
     validate_td_config(cfg)
+    _scenario_override_arguments(cfg.get("scenario_overrides", {}))
     total_iterations = int(t["policy_iterations"])
     epsilon_points = _piecewise_schedule_points(
         t,
@@ -362,14 +367,22 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
         ),
         "training_rollout_sec": 0.0, "validation_sec": 0.0, "target_build_sec": 0.0,
         "update_sec": 0.0, "write_sec": 0.0, "peak_replay_mib": 0.0,
+        "target_state_batch_size": int(t.get("target_state_batch_size", 1)),
+        "target_candidate_batch_size": int(t.get("target_candidate_batch_size", 1024)),
+        "persistent_rollout_processes": bool(cfg["rollout"].get("reuse_processes", False)),
+        "scenario_overrides": dict(cfg.get("scenario_overrides", {})),
     }
+    rollout_pool = (RolloutPool(process_count=processes, model_cfg=model_cfg,
+                               torch_threads=int(cfg["rollout"]["torch_threads_per_process"]))
+                    if summary["persistent_rollout_processes"] else None)
     adp_cfg = {"_collect_td_replay": True, "beam_width": int(model_cfg["beam_width"]),
+               "_scenario_overrides": dict(cfg.get("scenario_overrides", {})),
                "max_review_interval_min": float(t["max_review_interval_min"]),
                "allow_wait_action": bool(a["allow_wait_action"]), "worker_order_strategy": a["worker_order_strategy"]}
     episode_id, evaluation_id = 0, 1_000_000
     support_bank = None
     ood_cfg = cfg.get("diagnostics", {}).get("ood_support", {})
-    best_mean, best_std, best_iteration = -math.inf, math.inf, -1
+    best_mean, best_iteration = -math.inf, -1
     stopper = ProductionEarlyStopping(t.get("early_stopping", {}))
     summary.update(early_stopping=dict(stopper.config), early_stopped=False,
                    stop_reason=None, completed_policy_iterations=None,
@@ -390,6 +403,7 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
         before = time.perf_counter()
         summary["wall_sec"] = time.perf_counter() - started
         summary["parent_peak_rss_mib"] = _process_rss_mib(peak=True)
+        summary["rollout_pool_start_count"] = rollout_pool.start_count if rollout_pool else None
         summary["phase_wave_counts"] = {
             phase: sum(r["phase"] == phase for r in wave_rows)
             for phase in (
@@ -461,6 +475,7 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                 start_method="spawn", torch_threads=int(cfg["rollout"]["torch_threads_per_process"]),
                 output_dir=output, episode_rows=episode_rows, wave_rows=wave_rows,
                 progress_callback=report_rollout,
+                rollout_pool=rollout_pool,
             )
         finally:
             # Include partial/failed collection, without charging live rendering twice.
@@ -559,8 +574,12 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
             if update_epochs > 0:
                 progress.update(phase="target_build", iteration=iteration)
                 before = time.perf_counter()
+                target_stats = {}
                 plan = build_target_plan(update_replay, model, device, n=int(a.get("n_step", 30)),
-                                          beam_width=int(model_cfg["beam_width"]), worker_order_strategy=a["worker_order_strategy"])
+                    beam_width=int(model_cfg["beam_width"]), worker_order_strategy=a["worker_order_strategy"],
+                    state_batch_size=summary["target_state_batch_size"],
+                    candidate_batch_size=summary["target_candidate_batch_size"], stats=target_stats)
+                row.update(target_stats)
                 row["target_build_sec"] = time.perf_counter() - before
                 summary["target_build_sec"] += row["target_build_sec"]
                 if device.type == "cuda":
@@ -606,6 +625,8 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                     str(training_worker_count): fingerprint["environment_fingerprint"]
                 },
                 "model": model_cfg, "horizon_days": cfg["horizon_days"],
+                "rollout": dict(cfg["rollout"]),
+                "scenario_overrides": dict(cfg.get("scenario_overrides", {})),
                 "seed_partitions": partitions, "seed_overlap": False, "seed_partition_scope": "planned_budget",
                 "training": {**t, **a, "mc_return_only": False, "target_network": True,
                               "initial_return_estimator": "n_step_td", "conservative_validation_gate": False},
@@ -632,7 +653,6 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
                 )
                 del screening_candidates[int(v["final_candidate_count"]):]
                 best_mean = screening_candidates[0]["screening_mean"]
-                best_std = screening_candidates[0]["screening_std"]
                 best_iteration = screening_candidates[0]["iteration"]
             summary.update({"best_iteration": best_iteration, "best_screening_mean": best_mean,
                             "completed_policy_iterations": iteration, "early_stopping_history": stopper.history})
@@ -737,6 +757,11 @@ def train_td(cfg: dict[str, Any], args: Any) -> Path:
         progress.update(status="failed", error=summary["failure"])
         write()
         raise
+    finally:
+        if rollout_pool is not None:
+            before = time.perf_counter()
+            rollout_pool.close()
+            summary["rollout_shutdown_sec"] = time.perf_counter() - before
     path = write()
     progress.update(status="completed", phase="completed", iteration=completed_iterations)
     if not args.no_open_dashboard and cfg["runtime"].get("auto_open_dashboard", True):

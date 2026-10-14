@@ -93,8 +93,9 @@ class FactoryPolicyComparisonTests(unittest.TestCase):
         rows = report["rows"]
         self.assertEqual([3, 4, 5, 6], [row["worker_count"] for row in rows])
         self.assertEqual([75, 75, 75, 75], [row["theoretical_max_products"] for row in rows])
-        self.assertAlmostEqual(37.59, rows[0]["realistic_expected_products"], places=2)
-        self.assertAlmostEqual(41.77, rows[0]["expected_flow_attempts_before_quality"], places=2)
+        # The shared 40-slot warehouse changes travel from the old three-row map.
+        self.assertAlmostEqual(37.463176, rows[0]["realistic_expected_products"], places=6)
+        self.assertAlmostEqual(41.625751, rows[0]["expected_flow_attempts_before_quality"], places=6)
         self.assertLess(
             rows[0]["realistic_expected_products"],
             rows[0]["theoretical_max_products"],

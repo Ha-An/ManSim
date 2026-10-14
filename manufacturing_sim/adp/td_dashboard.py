@@ -271,6 +271,11 @@ def render_td_dashboard(output: Path, episodes: list[dict[str, Any]], iterations
                 ("전체 경과시간(초)", summary.get("wall_sec")), ("Parent peak RSS(MiB)", summary.get("parent_peak_rss_mib")),
                 ("Target τ (SGD step마다)", summary.get("target_tau")), ("Epsilon schedule", schedule_text("epsilon_schedule")),
                 ("Learning-rate schedule", schedule_text("learning_rate_schedule"))]
+    settings.extend([
+        ("TD target state / candidate batch", f"{summary.get('target_state_batch_size', 1)} / {summary.get('target_candidate_batch_size', 1024)}"),
+        ("Rollout process reuse", summary.get("persistent_rollout_processes", False)),
+        ("Rollout pool starts", summary.get("rollout_pool_start_count")),
+    ])
     initial_phase = "warm_start_replay" if warm else "initial_random"
     settings.append((("Warm-start fill" if warm else "Initial") + " / policy / diagnostic / final waves", " / ".join(str(sum(
         row.get("phase") == phase for row in waves)) for phase in (initial_phase, "policy_iteration", "screening_validation", "final_selection_validation"))))

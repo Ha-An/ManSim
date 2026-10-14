@@ -10,7 +10,7 @@ import numpy as np
 
 from .compact import CompactMCBatch, compact_episode_transitions, merge_compact_batches, select_compact_samples
 from .model import predict_values, require_torch
-from .policy import greedy_beam_matching, unique_feasible_assignment
+from .policy import greedy_beam_matching, greedy_beam_matching_many, unique_feasible_assignment
 from .schema import EncodedDecisionState
 
 
@@ -203,43 +203,66 @@ class TDTargetPlan:
 
 
 def build_target_plan(samples: CompactMCBatch, model: Any, device: Any, *, n: int,
-                      beam_width: int, worker_order_strategy: str, repair_capacity: int = 3) -> TDTargetPlan:
+                      beam_width: int, worker_order_strategy: str, repair_capacity: int = 3,
+                      state_batch_size: int = 1, candidate_batch_size: int = 1024,
+                      stats: dict[str, int] | None = None) -> TDTargetPlan:
     torch = require_torch()
     data = samples.td_data
     if data is None:
         raise ValueError("n-step training requires transition replay, not fixed MC targets.")
+    if state_batch_size < 1 or candidate_batch_size < 1:
+        raise ValueError("TD target batch sizes must be positive.")
     model.eval()
     posts, matches = [], []
     previous_episode, previous_index = None, -1
+    episode_ids = samples.episode_ids.tolist()
     for i, descriptor in enumerate(data.descriptors):
-        episode = int(samples.episode_ids[i])
+        episode = int(episode_ids[i])
         step = int(descriptor["decision_index"])
         if step != (previous_index + 1 if episode == previous_episode else 0):
             raise ValueError("TD replay must preserve complete ordered episode sequences.")
         previous_episode, previous_index = episode, step
-        state = data.state(i)
-        offset = step % len(state.worker_ids) if worker_order_strategy == "cyclic" else 0
-        order = state.worker_ids[offset:] + state.worker_ids[:offset]
-        order = [w for w in order if w in state.decision_worker_ids]
-        capacity = int(descriptor.get("repair_capacity", repair_capacity))
-        assignment = unique_feasible_assignment(
-            state, worker_order=order, repair_capacity=capacity,
-            allow_wait_action=state.wait_action_enabled,
-        )
-        if assignment is None:
-            assignment = greedy_beam_matching(
-                state, model=model, device=device, beam_width=beam_width,
-                repair_capacity=capacity, worker_order=order,
+    for start in range(0, len(data.descriptors), state_batch_size):
+        states = [data.state(i) for i in range(start, min(start + state_batch_size, len(samples)))]
+        assignments, orders, capacities, choices = [], [], [], []
+        for local, state in enumerate(states):
+            descriptor = data.descriptors[start + local]
+            step = int(descriptor["decision_index"])
+            offset = step % len(state.worker_ids) if worker_order_strategy == "cyclic" else 0
+            order = state.worker_ids[offset:] + state.worker_ids[:offset]
+            order = [w for w in order if w in state.decision_worker_ids]
+            capacity = int(descriptor.get("repair_capacity", repair_capacity))
+            assignment = unique_feasible_assignment(
+                state, worker_order=order, repair_capacity=capacity,
                 allow_wait_action=state.wait_action_enabled,
-            ).assignment
-        # No choice means no online ranking call; target bootstrap still runs.
-        post = state.post_decision(assignment)
-        nw, nt = len(state.worker_ids), len(state.opportunity_ids)
-        matches.append(np.array_equal(post.selected_assignment_mask,
-                       samples.selected_assignment_mask[i, :nw, :nt].numpy()))
-        # Free transient Task adapters; only compact tensors survive this function.
-        post.tasks_by_worker = {}
-        posts.append({"post_state": post, "raw_reward": 0.0})
+            )
+            assignments.append(assignment)
+            orders.append(order)
+            capacities.append(capacity)
+            if assignment is None:
+                choices.append(local)
+        if state_batch_size == 1:
+            for local in choices:
+                assignments[local] = greedy_beam_matching(
+                    states[local], model=model, device=device, beam_width=beam_width,
+                    repair_capacity=capacities[local], worker_order=orders[local],
+                    allow_wait_action=states[local].wait_action_enabled,
+                ).assignment
+        elif choices:
+            selections = greedy_beam_matching_many(
+                [states[i] for i in choices], model=model, device=device, beam_width=beam_width,
+                worker_orders=[orders[i] for i in choices], repair_capacities=[capacities[i] for i in choices],
+                candidate_batch_size=candidate_batch_size, stats=stats,
+            )
+            for local, selection in zip(choices, selections, strict=True):
+                assignments[local] = selection.assignment
+        for local, state in enumerate(states):
+            post = state.post_decision(assignments[local])
+            nw, nt = len(state.worker_ids), len(state.opportunity_ids)
+            matches.append(np.array_equal(post.selected_assignment_mask,
+                           samples.selected_assignment_mask[start + local, :nw, :nt].numpy()))
+            post.tasks_by_worker = {}
+            posts.append({"post_state": post, "raw_reward": 0.0})
     sums, ends, steps, reasons = truncated_return_plan(
         data.rewards.tolist(), data.dones.tolist(), samples.episode_ids.tolist(), matches, n,
     )

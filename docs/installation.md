@@ -150,7 +150,7 @@ Legacy `factory_mfg_basic` 6-policy, worker 3~8명, seed 5개의 180-run 실험�
 이전 `mfg_flow_shop` 4-policy, 두 목적함수, worker 3~6명의 32-run 실험은
 `config_mfg_flow_shop_4policy_objectives.yaml`로 실행합니다.
 
-논문용 worker 2~6 확증 실험은 별도 suite로 준비하고 실행합니다. 이 경로는 worker별 ADP
+Worker 2~6 비교 실험은 별도 suite로 준비하고 실행합니다. 이 경로는 worker별 ADP
 학습 1회, ADP·Immediate Shared·Random Feasible과 20개 공통 seed의 300-run 평가를 사용합니다.
 각 학습 checkpoint는 재사용할 수 있도록 독립 폴더에 보존됩니다. 먼저 전용 README의 예상
 시간과 디스크 요구량을 확인합니다.
@@ -161,7 +161,7 @@ Legacy `factory_mfg_basic` 6-policy, worker 3~8명, seed 5개의 180-run 실험�
 .\.venv\Scripts\python.exe experiments\mfg_flow_shop_paper\run_evaluation.py --jobs 5
 ```
 
-자세한 계약은 [mfg_flow_shop Confirmatory Policy Experiment](../experiments/mfg_flow_shop_paper/README.md)에 있습니다.
+자재 20/30/40 비교, 100-seed 확장과 자세한 계약은 [Fleet·자재 비교](../experiments/mfg_flow_shop_paper/README.md)에 있습니다.
 
 Policy experiment runner는 `events.jsonl`, 대용량 `replay_studio_log.json`, `operations_replay.json`과 관련 Replay HTML을 기본 생성하지 않습니다. KPI와 Gantt는 메모리 event에서 생성되고, compact stochastic signature와 `replay_studio_layout.json`은 유지됩니다. 이벤트 단위 감사 또는 시각 Replay까지 보존하려면 experiment config의 `common_overrides`에 `runtime.artifacts.export_events=true`와 `runtime.ui.export_replay_artifacts=true`를 추가합니다.
 

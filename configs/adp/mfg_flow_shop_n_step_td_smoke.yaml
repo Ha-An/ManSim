@@ -37,6 +37,8 @@ training:
   replay_sample_episodes_per_update: 4
   initial_update_epochs: 1
   target_tau: 0.03
+  target_state_batch_size: 64
+  target_candidate_batch_size: 1024
   validation_episode_fraction: 0.1
   epsilon_start: 0.5
   epsilon_end: 0.1
@@ -61,6 +63,7 @@ model:
   beam_width: 8
 rollout:
   parallel: true
+  reuse_processes: true
   process_count: 2
   wave_size: 2
   device: cpu

@@ -10,7 +10,7 @@ Previous schemas are rejected; train a new checkpoint for the corrected inputs.
 See [efficiency changes and rollback](adp_efficiency.md).
 Training and validation use worker 3, five days of 480 minutes, raw completed products, no explicit WAIT.
 Worker 3 remains the default profile. The trainer also accepts one fleet-specific worker count from 2 through 6;
-one checkpoint supports exactly the worker count on which it was trained. The confirmatory paper suite therefore
+one checkpoint supports exactly the worker count on which it was trained. The multi-fleet experiment suite therefore
 trains separate checkpoints instead of claiming cross-fleet generalization.
 
 - Initial: 50 Random Feasible episodes collected in five waves, trained with TD, not MC pretraining.

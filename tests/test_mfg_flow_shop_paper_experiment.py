@@ -135,6 +135,28 @@ def test_extension_timing_adds_prior_active_session_without_idle_gap(tmp_path: P
     assert _experiment_timing(tmp_path, parallel_jobs=5)["run_phase_wall_sec"] == 400
 
 
+def test_extension_of_imported_baselines_writes_only_to_target_study(tmp_path: Path) -> None:
+    old_dir = tmp_path / "archived/runs/immediate_shared/workers_6/seed_910001"
+    root = tmp_path / "new_study/evaluation/runs"
+    source = {"run_id": "immediate_shared__workers_6__seed_910001", "mode": "immediate_shared",
+              "worker_count": "6", "seed": "910001", "run_dir": str(old_dir),
+              "command_json": json.dumps(["python", "main.py", "decision=immediate_shared",
+                                          "scenario.warehouse.material_shelf.initial_fill=40",
+                                          f"hydra.run.dir={old_dir.as_posix()}"])}
+    before = dict(source)
+    added = build_extension([source], 5.0, run_root=root)
+    assert source == before
+    assert len(added) == 3
+    for row in added:
+        directory = Path(row["run_dir"])
+        assert directory.is_relative_to(root)
+        command = json.loads(row["command_json"])
+        assert f"hydra.run.dir={directory.as_posix()}" in command
+        assert "scenario.warehouse.material_shelf.initial_fill=40" in command
+        assert not any(str(old_dir.as_posix()) in arg for arg in command)
+    assert build_extension([source, *added], 5.0, run_root=root) == []
+
+
 def test_paper_config_has_pre_registered_factorial_design() -> None:
     cfg = load_config(DEFAULT_CONFIG)
     assert cfg.worker_counts == [2, 3, 4, 5, 6]

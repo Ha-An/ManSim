@@ -70,6 +70,9 @@ training:
   replay_sample_episodes_per_update: 30
   initial_update_epochs: 1
   target_tau: 0.03
+  # Computation only; set state batch size to 1 for the reference search.
+  target_state_batch_size: 64
+  target_candidate_batch_size: 1024
   compact_episode_tensors: true
   # Compact batches are released as soon as they expire from the replay window.
   release_samples_after_update: true
@@ -124,6 +127,8 @@ model:
 
 rollout:
   parallel: true
+  # Opt-in: measured rollout gain was negligible; avoid retaining idle child RSS.
+  reuse_processes: false
   process_count: 10
   wave_size: 10
   device: cpu

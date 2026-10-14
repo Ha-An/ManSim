@@ -19,6 +19,7 @@ import sys
 import time
 import webbrowser
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -156,6 +157,8 @@ class RolloutBatchMetrics:
 
 _ROLLOUT_MODEL: Any | None = None
 _ROLLOUT_DEVICE: Any | None = None
+_ROLLOUT_SNAPSHOT_HASH: str = "RANDOM"
+_ROLLOUT_MODEL_CFG: dict[str, Any] = {}
 
 
 def _snapshot_state_dict(model: Any | None) -> tuple[dict[str, Any] | None, str]:
@@ -227,7 +230,7 @@ def _initialize_rollout_process(
     model_cfg: dict[str, Any],
     torch_threads: int,
 ) -> None:
-    global _ROLLOUT_MODEL, _ROLLOUT_DEVICE
+    global _ROLLOUT_MODEL, _ROLLOUT_DEVICE, _ROLLOUT_SNAPSHOT_HASH, _ROLLOUT_MODEL_CFG
     thread_count = max(1, int(torch_threads))
     os.environ["OMP_NUM_THREADS"] = str(thread_count)
     os.environ["MKL_NUM_THREADS"] = str(thread_count)
@@ -240,6 +243,8 @@ def _initialize_rollout_process(
         pass
     _ROLLOUT_DEVICE = torch.device("cpu")
     _ROLLOUT_MODEL = None
+    _ROLLOUT_MODEL_CFG = dict(model_cfg)
+    _ROLLOUT_SNAPSHOT_HASH = "RANDOM"
     if model_state is not None:
         _ROLLOUT_MODEL = build_value_network(
             embedding_dim=int(model_cfg["embedding_dim"]),
@@ -248,6 +253,74 @@ def _initialize_rollout_process(
         ).to(_ROLLOUT_DEVICE)
         _ROLLOUT_MODEL.load_state_dict(model_state)
         _ROLLOUT_MODEL.eval()
+        _, _ROLLOUT_SNAPSHOT_HASH = _snapshot_state_dict(_ROLLOUT_MODEL)
+
+
+def _execute_snapshot_rollout(job: RolloutJob, model_state: dict[str, Any] | None):
+    global _ROLLOUT_MODEL, _ROLLOUT_SNAPSHOT_HASH
+    if job.snapshot_hash != _ROLLOUT_SNAPSHOT_HASH:
+        if model_state is None:
+            _ROLLOUT_MODEL = None
+        else:
+            if _ROLLOUT_MODEL is None:
+                _ROLLOUT_MODEL = build_value_network(
+                    embedding_dim=int(_ROLLOUT_MODEL_CFG["embedding_dim"]),
+                    heads=int(_ROLLOUT_MODEL_CFG["heads"]), layers=int(_ROLLOUT_MODEL_CFG["layers"]),
+                ).to(_ROLLOUT_DEVICE)
+            _ROLLOUT_MODEL.load_state_dict(model_state)
+            _ROLLOUT_MODEL.eval()
+        _, _ROLLOUT_SNAPSHOT_HASH = _snapshot_state_dict(_ROLLOUT_MODEL)
+    if job.snapshot_hash != _ROLLOUT_SNAPSHOT_HASH:
+        raise RuntimeError("Rollout loaded model hash does not match requested snapshot.")
+    result, compact = _execute_rollout_job(job)
+    result.snapshot_hash = _ROLLOUT_SNAPSHOT_HASH
+    return result, compact
+
+
+class RolloutPool:
+    """One CPU process pool per training run; worlds remain episode-local."""
+
+    def __init__(self, *, process_count: int, model_cfg: dict[str, Any], torch_threads: int,
+                 start_method: str = "spawn"):
+        self.process_count = int(process_count)
+        self.model_cfg = dict(model_cfg)
+        self.torch_threads = int(torch_threads)
+        self.start_method = start_method
+        self.executor = None
+        self.closed = False
+        self.start_count = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def validate(self, process_count, model_cfg, torch_threads, start_method):
+        if self.closed:
+            raise RuntimeError("Rollout pool is closed.")
+        if (int(process_count), dict(model_cfg), int(torch_threads), start_method) != (
+            self.process_count, self.model_cfg, self.torch_threads, self.start_method
+        ):
+            raise ValueError("Persistent rollout pool configuration changed.")
+
+    def submit_job(self, job: RolloutJob, model_state: dict[str, Any] | None):
+        if self.closed:
+            raise RuntimeError("Rollout pool is closed.")
+        if self.executor is None:
+            self.executor = ProcessPoolExecutor(
+                max_workers=self.process_count, mp_context=multiprocessing.get_context(self.start_method),
+                initializer=_initialize_rollout_process,
+                initargs=(None, self.model_cfg, self.torch_threads),
+            )
+            self.start_count += 1
+        return self.executor.submit(_execute_snapshot_rollout, job, model_state)
+
+    def close(self):
+        if self.executor is not None:
+            self.executor.shutdown(wait=True, cancel_futures=True)
+            self.executor = None
+        self.closed = True
 
 
 def _execute_rollout_job(job: RolloutJob) -> tuple[EpisodeResult, CompactMCBatch | None]:
@@ -337,7 +410,24 @@ def _wave_performance_row(
     }
 
 
+def _scenario_override_arguments(overrides: dict[str, Any]) -> list[str]:
+    if not isinstance(overrides, dict):
+        raise ValueError("scenario_overrides must be a mapping of Hydra scenario keys.")
+    reserved = {"scenario.factory.num_workers", "scenario.horizon.num_days", "scenario.objective.mode"}
+    seen: set[str] = set()
+    arguments = []
+    for key, value in overrides.items():
+        normalized = str(key).lstrip("+")
+        if not normalized.startswith("scenario.") or normalized in reserved or normalized in seen:
+            raise ValueError(f"Invalid or duplicate training scenario override: {key}")
+        seen.add(normalized)
+        arguments.append(f"{key}={json.dumps(value, allow_nan=False)}")
+    return arguments
+
+
 def _compose_episode_cfg(*, worker_count: int, seed: int, days: int, adp_cfg: dict[str, Any]) -> dict[str, Any]:
+    adp_cfg = dict(adp_cfg)
+    scenario_arguments = _scenario_override_arguments(adp_cfg.pop("_scenario_overrides", {}))
     config_dir = str((Path(__file__).resolve().parents[2] / "configs").resolve())
     with initialize_config_dir(version_base=None, config_dir=config_dir):
         cfg = compose(
@@ -353,7 +443,7 @@ def _compose_episode_cfg(*, worker_count: int, seed: int, days: int, adp_cfg: di
                 "decision.adp.force_random_policy=true",
                 "runtime.ui.auto_open_results=false",
                 "runtime.ui.auto_start_replay_studio_3d=false",
-            ],
+            ] + scenario_arguments,
         )
     payload = build_legacy_experiment_cfg(cfg)
     payload["decision"]["adp"].update(adp_cfg)
@@ -567,6 +657,7 @@ def _run_rollout_jobs_parallel(
     episode_rows: list[dict[str, Any]],
     wave_rows: list[dict[str, Any]],
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    rollout_pool: RolloutPool | None = None,
 ) -> tuple[list[EpisodeResult], CompactMCBatch, RolloutBatchMetrics]:
     if not jobs:
         return [], merge_compact_batches([]), RolloutBatchMetrics()
@@ -578,12 +669,15 @@ def _run_rollout_jobs_parallel(
     from .live import TrainingProgress
     report_progress = progress_callback or TrainingProgress(output_dir).rollout
     context = multiprocessing.get_context(start_method)
-    with ProcessPoolExecutor(
+    if rollout_pool is not None:
+        rollout_pool.validate(max_processes, model_cfg, torch_threads, start_method)
+    executor_context = nullcontext(rollout_pool) if rollout_pool is not None else ProcessPoolExecutor(
         max_workers=max_processes,
         mp_context=context,
         initializer=_initialize_rollout_process,
         initargs=(model_state, model_cfg, torch_threads),
-    ) as executor:
+    )
+    with executor_context as executor:
         for wave_jobs in chunks:
             wave_started = time.perf_counter()
             progress_event = {
@@ -593,7 +687,10 @@ def _run_rollout_jobs_parallel(
             }
             report_progress({**progress_event, "event": "wave_started", "wave_completed": 0,
                              "completed_episode_count": len(episode_rows)})
-            futures = {executor.submit(_execute_rollout_job, job): job for job in wave_jobs}
+            futures = {
+                (executor.submit_job(job, model_state) if rollout_pool is not None else
+                 executor.submit(_execute_rollout_job, job)): job for job in wave_jobs
+            }
             wave_results: list[EpisodeResult] = []
             wave_compact: list[CompactMCBatch] = []
             try:
@@ -609,6 +706,8 @@ def _run_rollout_jobs_parallel(
                 cancelled_count = 0
                 for future in futures:
                     cancelled_count += int(future.cancel())
+                if rollout_pool is not None:
+                    rollout_pool.close()
                 wave_wall = time.perf_counter() - wave_started
                 failed_row = _wave_performance_row(
                     wave_jobs=wave_jobs,
@@ -653,6 +752,7 @@ def _run_rollout_jobs_parallel(
                     configured_process_count=max_processes,
                 )
             )
+            wave_rows[-1]["persistent_pool"] = rollout_pool is not None
             _write_csv(output_dir / "episode_metrics.csv", episode_rows)
             _write_csv(output_dir / "wave_metrics.csv", wave_rows)
             report_progress({**progress_event, "event": "wave_completed",
@@ -1441,10 +1541,6 @@ def render_training_dashboard(
     ]
     pairwise_mse_after = [
         float(row.get("pairwise_mc_advantage_mse_after", 0.0))
-        for row in iteration_rows
-    ]
-    pairwise_sign_accuracy = [
-        100.0 * float(row.get("pairwise_mc_advantage_sign_accuracy", 0.0))
         for row in iteration_rows
     ]
     ood_rows = [
@@ -3102,6 +3198,7 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
     optimizer = torch.optim.Adam(model.parameters(), lr=float(training["learning_rate"]))
     rng = random.Random(int(cfg["base_seed"]))
     adp_runtime_cfg = {
+        "_scenario_overrides": dict(cfg.get("scenario_overrides", {})),
         "beam_width": int(model_cfg["beam_width"]),
         "max_review_interval_min": float(training.get("max_review_interval_min", 1.0)),
         "allow_wait_action": allow_wait_action,
@@ -3158,7 +3255,7 @@ def train(config_path: Path, args: argparse.Namespace) -> Path:
     pairwise_replay_history: list[tuple[int, CompactPairwiseMCBatch]] = []
     pairwise_rows: list[dict[str, Any]] = []
 
-    def register_fingerprint(result: RolloutResult) -> None:
+    def register_fingerprint(result: EpisodeResult) -> None:
         nonlocal fingerprint
         current = dict(result.fingerprint)
         worker_count = int(result.worker_count)

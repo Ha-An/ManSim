@@ -94,6 +94,8 @@ def _compatibility_status(
         "return_code": source.get("return_code", ""),
         "elapsed_sec": source.get("elapsed_sec", ""),
         "reason": source.get("reason", ""),
+        "execution_scope": ("reused_external" if str(source.get("reason", "")).startswith("Reused from ")
+                            else source.get("execution_scope", "current_evaluation")),
         "command": "",
     }
 
@@ -140,7 +142,9 @@ def _compatibility_fairness(
 def _experiment_timing(prepared: Path, *, parallel_jobs: int) -> dict[str, object]:
     recorded = prepared / "evaluation_timing.json"
     if recorded.is_file():
-        return _read_json(recorded)
+        timing = _read_json(recorded)
+        timing.setdefault("parallel_jobs", parallel_jobs)
+        return timing
     start_path = prepared / "evaluation_preflight.json"
     end_path = prepared / "evaluation_status.csv"
     start = start_path.stat().st_mtime if start_path.is_file() else prepared.stat().st_mtime
@@ -221,7 +225,7 @@ def render(prepared: Path) -> Path:
         raise RuntimeError("Confirmatory analysis must pass before dashboard rendering.")
 
     cfg = _dashboard_config(plan)
-    timing = _experiment_timing(prepared, parallel_jobs=5)
+    timing = _experiment_timing(prepared, parallel_jobs=int(plan.get("parallel_jobs", 10)))
     objective_mode = cfg.objective_modes[0]
     status_sources = _read_csv(prepared / "evaluation_status.csv")
     fairness_groups = {

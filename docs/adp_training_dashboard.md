@@ -70,7 +70,7 @@ CI_{\Delta_k}\approx\Delta_k\pm1.96\frac{s(d_{k,e})}{\sqrt N}.
 - 아직 완료하지 않은 validation, final selection, policy test, training rollout은 포함하지 않습니다.
 - I0의 0은 자기 자신과의 차이입니다. 여러 worker 수가 혼합된 결과의 CI는 임의로 합산하지 않습니다.
 - 고정 screening seed와 I0를 여러 번 재사용하므로 checkpoint 간 점들이 독립적이지 않습니다.
-  작은 N의 근사 CI이기도 하므로 최종 논문 유의성 검정이나 전체 곡선 동시 CI로 쓰지 않습니다.
+  작은 N의 근사 CI이기도 하므로 최종 성능 유의성 검정이나 전체 곡선 동시 CI로 쓰지 않습니다.
 
 ### 3. TD MSE
 

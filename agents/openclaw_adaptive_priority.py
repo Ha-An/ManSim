@@ -1940,7 +1940,6 @@ class OpenClawAdaptivePriorityDecisionModule(OpenClawOrchestratedDecisionModule)
             "priority_bias_candidates": list(dict.fromkeys([bias for bias in biases if bias in self.allowed_task_priority_keys]))[:5],
             "open_closeout_gap": inspection_output_open,
             "inspection_output_wait_avg": round(inspection_output_wait_avg, 3),
-            "inspection_passes": inspection_passes,
             "top_failure_modes": list(dict.fromkeys(top_failure_modes))[:4],
             "top_recovery_actions": [],
             "current_policy_focus_summary": self._current_policy_focus_summary(),

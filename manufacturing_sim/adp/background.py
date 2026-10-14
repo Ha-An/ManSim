@@ -170,6 +170,14 @@ def render_monitor(job_dir: Path, state: dict[str, Any], runs: list[dict[str, st
                     "failed": "실패", "stopped": "중단됨", "stopping": "중단 처리 중"}.get(status, status)
     elapsed = float(state.get("elapsed_sec", 0))
     duration = f"{int(elapsed // 3600):02d}:{int(elapsed % 3600 // 60):02d}:{int(elapsed % 60):02d}"
+    training_elapsed = summary.get("wall_sec")
+    if progress.get("status") == "running" and progress.get("started_at"):
+        try:
+            training_elapsed = max(0.0, time.time() - datetime.fromisoformat(progress["started_at"]).timestamp())
+        except (TypeError, ValueError):
+            pass
+    run_duration = (f"{int(training_elapsed // 3600):02d}:{int(training_elapsed % 3600 // 60):02d}:{int(training_elapsed % 60):02d}"
+                    if isinstance(training_elapsed, (int, float)) and math.isfinite(training_elapsed) else "-")
     stage = PHASES.get(progress.get("phase", "starting"), progress.get("phase", "시작 준비"))
     completed = progress.get("completed_episode_count", 0)
     total = progress.get("expected_episode_count", 0)
@@ -181,10 +189,11 @@ def render_monitor(job_dir: Path, state: dict[str, Any], runs: list[dict[str, st
     cards = [("현재 학습", run["label"]), ("현재 단계", stage),
              ("Iteration", f"{current_iteration} / {progress.get('policy_iterations', '-') }"),
              ("완료된 가치망 업데이트", progress.get("completed_update_count", summary.get("value_update_count", 0))),
-             ("전체 episode (학습 + 평가)", f"{completed} / {total or '-'}"),
+             ("현재 학습의 episode (학습 + 평가)", f"{completed} / {total or '-'}"),
              ("현재 wave 완료 episode", f"{wave_done} / {wave_total or '-'}"),
              ("Wave", progress.get("wave_id", "-")),
-             ("Wall-clock 경과", duration),
+             ("백그라운드 작업 전체 경과", duration),
+             ("현재 학습 경과", run_duration),
              ("학습 종료 사유", progress.get("stop_reason") or summary.get("stop_reason") or "-"),
              ("CPU rollout process", progress.get("process_count", "-")),
              ("가치망 학습 장치", progress.get("training_device", summary.get("training_device", "-"))),
@@ -198,8 +207,23 @@ def render_monitor(job_dir: Path, state: dict[str, Any], runs: list[dict[str, st
                          f"Worker {', '.join(map(str, workers)) or '-'} · {horizon if horizon is not None else '-'}일 episode")
     detailed_cards = [(label, value,
                        f"완료 wave 기준: 학습 {summary.get('training_episode_count', '-')} / 평가 {summary.get('validation_episode_count', '-')}"
-                       if label == "전체 episode (학습 + 평가)" else detail)
+                       if label == "현재 학습의 episode (학습 + 평가)" else
+                       "모든 학습과 작업에 포함된 사전 검사·후속 평가를 포함합니다."
+                       if label == "백그라운드 작업 전체 경과" else detail)
                       for label, value, detail in detailed_cards]
+    pipeline = read_json(job_dir.parent / "pipeline_status.json")
+    if pipeline.get("phase"):
+        phase_label = {
+            "baseline_reproduction": "기존 결과 재현 검사", "training": "ADP 학습",
+            "evaluation_preflight": "정책 비교 사전 검사",
+            "waiting_for_disk_space": "저장 공간 확보 대기", "policy_comparison": "정책 비교",
+            "completed": "전체 완료", "failed": "실험 실패",
+        }.get(pipeline["phase"], pipeline["phase"])
+        detail = str(pipeline.get("error", ""))
+        if pipeline["phase"] == "waiting_for_disk_space":
+            detail = (f"여유 {pipeline.get('free_gib', '-')} GiB / 필요 {pipeline.get('required_free_gib', '-')} GiB. "
+                      "체크포인트를 보존하고 공간 확보 후 비교를 자동 시작합니다.")
+        detailed_cards.append(("전체 실험 단계", phase_label, detail))
     cards_html = "".join(f"<div class='metric'><dt>{esc(k)}</dt><dd>{esc(v)}</dd>"
                          f"<div class='metric-detail'>{esc(detail)}</div></div>" for k, v, detail in detailed_cards)
     table = []
@@ -212,8 +236,12 @@ def render_monitor(job_dir: Path, state: dict[str, Any], runs: list[dict[str, st
         displayed_iteration = (su.get("completed_policy_iterations", su.get("policy_iterations", pr.get("iteration", "-")))
                                if pr.get("status") == "completed" or pr.get("stop_reason") or su.get("stop_reason")
                                else pr.get("iteration", "-"))
-        table.append(f"<tr><td>{esc(item['label'])}</td><td>{esc(pr.get('status', su.get('status', 'pending')))}</td>"
-                     f"<td>{esc(displayed_iteration)}</td><td>{link}</td></tr>")
+        run_status = pr.get("status", su.get("status", "pending"))
+        elapsed_sec = _number(su.get("wall_sec"))
+        elapsed_hours = (f"{elapsed_sec / 3600:.2f}시간"
+                         if run_status == "completed" and elapsed_sec is not None and elapsed_sec >= 0 else "-")
+        table.append(f"<tr><td>{esc(item['label'])}</td><td>{esc(run_status)}</td>"
+                     f"<td>{esc(displayed_iteration)}</td><td>{esc(elapsed_hours)}</td><td>{link}</td></tr>")
         if item == run and path.exists():
             dashboard_html = (f"<section><h2>학습 곡선</h2><iframe title='현재 학습 대시보드' "
                               f"src='{esc(_link(job_dir, path))}?embedded=1'></iframe></section>")
@@ -243,7 +271,8 @@ a{{color:#086aba}}iframe{{width:100%;height:1000px;border:0;background:white}}pr
 </style></head><body><main><header><h1>ADP 실시간 학습</h1><span id="status" class="status">{esc(status_label)}</span></header>
 {notice}<p class="muted">PID {esc(state.get('child_pid', '-'))} · 모니터 갱신 {esc(state.get('updated_at', '-'))}</p>
 <dl class="metrics">{cards_html}</dl><progress max="{max(1, int(total or 0))}" value="{int(completed)}"></progress>
-<section><h2>학습 실행 목록</h2><table><thead><tr><th>학습</th><th>상태</th><th>Iteration</th><th>결과</th></tr></thead><tbody>{''.join(table)}</tbody></table></section>
+<section><h2>학습 실행 목록</h2><table><thead><tr><th>학습</th><th>상태</th><th>Iteration</th><th>학습 소요시간</th><th>결과</th></tr></thead><tbody>{''.join(table)}</tbody></table>
+<p class="muted">완료된 학습의 실제 경과시간입니다. 샘플 수집·가치망 업데이트·validation을 포함하며, 병렬 process 시간의 합이나 후속 정책 비교 시간은 아닙니다.</p></section>
 {dashboard_html}<section><h2>최근 로그</h2><pre>{esc(log) or '아직 기록된 로그가 없습니다.'}</pre></section></main>
 <script>if({json.dumps(status not in TERMINAL)} && Date.now()/1000-{heartbeat}>30){{
 document.getElementById('status').textContent='모니터 응답 없음: 프로세스 상태 확인 필요';}}
@@ -313,23 +342,23 @@ def launch(*, command: list[str], job_dir: Path, runs: list[dict[str, str]],
             claim.unlink(missing_ok=True)
         atomic_json(job_dir / "status.json", {"status": "failed", "error": "Output is locked by another background job."})
         raise
-    manifest = read_json(job_dir / "job.json")
-    manifest["claims"] = [str(path) for path in claims]
-    atomic_json(job_dir / "job.json", manifest)
     state = {"status": "starting", "heartbeat_epoch": time.time()}
-    atomic_json(job_dir / "status.json", state)
-    render_monitor(job_dir, state, runs)
-    options: dict[str, Any] = {}
-    if os.name == "nt":
-        options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        startup = subprocess.STARTUPINFO()
-        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startup.wShowWindow = subprocess.SW_HIDE
-        options["startupinfo"] = startup
-    else:
-        options["start_new_session"] = True
-    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"}
     try:
+        manifest = read_json(job_dir / "job.json")
+        manifest["claims"] = [str(path) for path in claims]
+        atomic_json(job_dir / "job.json", manifest)
+        atomic_json(job_dir / "status.json", state)
+        render_monitor(job_dir, state, runs)
+        options: dict[str, Any] = {}
+        if os.name == "nt":
+            options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            startup = subprocess.STARTUPINFO()
+            startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startup.wShowWindow = subprocess.SW_HIDE
+            options["startupinfo"] = startup
+        else:
+            options["start_new_session"] = True
+        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"}
         with (job_dir / "supervisor.log").open("ab") as log:
             supervisor = subprocess.Popen([sys.executable, "-u", "-m", "manufacturing_sim.adp.background",
                                            "_supervise", "--job", str(job_dir)], cwd=cwd,
@@ -337,12 +366,16 @@ def launch(*, command: list[str], job_dir: Path, runs: list[dict[str, str]],
                                           close_fds=True, env=env, **options)
         # Reap the handle if the launcher remains alive; never wait on application exit.
         threading.Thread(target=supervisor.wait, daemon=True).start()
-    except OSError as exc:
+    except BaseException as exc:
         state.update(status="failed", error=str(exc))
-        atomic_json(job_dir / "status.json", state)
-        render_monitor(job_dir, state, runs)
-        for claim in claims:
-            claim.unlink(missing_ok=True)
+        try:
+            atomic_json(job_dir / "status.json", state)
+            render_monitor(job_dir, state, runs)
+        except (OSError, ValueError):
+            pass
+        finally:
+            for claim in claims:
+                claim.unlink(missing_ok=True)
         raise
     monitor = job_dir / "live_training.html"
     if open_browser:

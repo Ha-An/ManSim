@@ -107,6 +107,8 @@ map:
   enabled: true
   width_tiles: 100
   height_tiles: 70
+  # Match the 20/40-material conditions: four shelf rows and doors at y=18.
+  warehouse_height_tiles: 15
   blocked_replan_threshold_min: 5.0
 
 quality:
@@ -116,7 +118,8 @@ quality:
 
 warehouse:
   material_shelf:
-    capacity: 30
+    # Physical slots stay fixed; only occupied inventory varies by condition.
+    capacity: 40
     initial_fill: 30
 
 machine_failure:

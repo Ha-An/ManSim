@@ -5,7 +5,6 @@ import csv
 from html import escape
 import json
 from pathlib import Path
-import sys
 import webbrowser
 
 

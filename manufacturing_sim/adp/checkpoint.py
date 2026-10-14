@@ -111,6 +111,11 @@ def checkpoint_fingerprint(
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "timing_fingerprint": str(world.timing.profile_fingerprint),
         "environment_fingerprint": _environment_fingerprint(world),
+        "material_supply_contract": {
+            "capacity": int(getattr(world, "material_shelf_capacity", 0)),
+            "initial_fill": int(getattr(world, "material_shelf_initial_fill", 0)),
+            "restock_target_fill": int(getattr(world, "throughput_restock_target_fill", 0)),
+        },
         "reward_mode": "completed_product_td" if return_estimator == "n_step_td" else "completed_product_mc",
         "loss_type": "mse",
         "random_policy": (
@@ -186,6 +191,13 @@ def load_checkpoint(
         if str(manifest.get(key, "")) != str(expected[key])
     }
     worker_count = int(world.num_workers)
+    # Older checkpoints predate the inventory study. New ones bind the supply
+    # condition as well as the map, whose geometry is shared by fills 20 and 40.
+    if "material_supply_contract" in manifest and manifest["material_supply_contract"] != expected["material_supply_contract"]:
+        mismatches["material_supply_contract"] = {
+            "expected": expected["material_supply_contract"],
+            "actual": manifest["material_supply_contract"],
+        }
     supported_counts = manifest.get("supported_worker_counts")
     if isinstance(supported_counts, list) and supported_counts:
         normalized_counts = sorted({int(value) for value in supported_counts})

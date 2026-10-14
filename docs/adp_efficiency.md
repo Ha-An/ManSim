@@ -58,13 +58,98 @@ change the source or configuration used by an active training process.
 
 Feature schema is now `mfg_flow_shop_adp_v10`. No automatic old-checkpoint weight
 conversion is attempted because corrected input semantics are not equivalent to
-v9. Baseline checkpoints remain untouched and can be used with their original
-code/environment, not the new schema.
+v9. Retained baseline checkpoints require their original code/environment, not
+the new schema. Git rollback does not restore deleted local checkpoints.
 
 No smaller network, attention-kernel switch, GPU-to-CPU target search switch,
 episode reduction or seed change is included. Numerically small score differences
 can change near-tied actions, so those options need separate trajectory ablations.
 Candidate-age lifecycle changes and pathfinder redesign are also deferred.
+
+## Batched TD Search And Persistent Rollouts (2026-10-04)
+
+The rollback tag `baseline-adp-speedup-20261004` preserves the preceding code.
+Generated artifacts and checkpoints are not included in the Git rollback tag.
+
+The default TD training profile uses these computation-only options:
+
+```yaml
+training:
+  target_state_batch_size: 64
+  target_candidate_batch_size: 1024
+rollout:
+  reuse_processes: false
+```
+
+TD search batches independent replay states at each beam expansion. States with
+different worker/task widths are scored separately to retain attention padding
+semantics. Close scores at the pruning or final selection boundary are rerun with
+the scalar search. Beam width, cyclic order, feasibility, rewards and off-policy
+truncation do not change. Target-network values are still recomputed during SGD;
+they are not cached across target-network updates.
+
+With `reuse_processes: true`, one CPU pool is retained across training/validation
+phases. Each process installs
+and verifies the requested model snapshot before starting a job, but constructs a
+new simulation environment and seeded policy for each episode. Episode-ID merge
+order is unchanged. The pool closes on completion or failure. Retained child
+processes also retain their Python/Torch allocator memory during GPU updates;
+this is a memory/time tradeoff, not free memory reduction.
+
+The summary, checkpoint manifest and live dashboard record the active batching
+and pool settings. Iteration metrics include batched scoring calls and scalar
+tie fallbacks. Wave metrics record whether the pool is persistent.
+
+Set `target_state_batch_size: 1` and `reuse_processes: false` to use the reference
+computation paths without changing training semantics. The 75-update cap,
+50 initial episodes, 10 new episodes per update, 30 sampled replay episodes,
+100-episode replay capacity, validation seeds and learning schedules are unchanged.
+Replay 20 vs 30 is a separate benchmark, not a new production default.
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_adp_speedup.py tests/test_adp_td.py tests/test_adp_efficiency.py -q
+.\.venv\Scripts\python.exe scripts/benchmark_adp_speedup.py --checkpoint <worker3-best.pt> --second-checkpoint <worker3-other.pt> --output outputs/adp_speedup_benchmark/<timestamp> --minutes 30
+```
+
+The benchmark uses two distinct compatible worker-3 checkpoints, 5-day episodes,
+10 CPU processes and CUDA target search. It compares exact rollout tensors,
+actions, TD endpoints/targets and update parameters, then measures replay-budget
+cost separately. It does not replace a checkpoint or establish long-run production
+noninferiority. Timing limits are checked between phases/repetitions; already
+running episodes are allowed to finish and skipped measurements are reported.
+
+### Measured Result
+
+The verified worker-3 benchmark is stored locally at
+`outputs/adp_speedup_benchmark/20261004_worker3_verified/report.json`.
+Two 10-episode, 5-day waves with distinct trained snapshots produced identical
+products, decisions and compact replay tensors with/without pool reuse.
+Reference/reused wall times summed to 250.480/250.308 seconds: the difference is
+too small to establish a useful speedup, so pool reuse remains opt-in.
+These are collection-call sums; the reusable pool's one-time final shutdown was
+outside those calls. Future reports also record that shutdown separately.
+
+For 11,466 states, median scalar/batched target construction was 33.562/5.112
+seconds (6.57x). Greedy afterstates, truncation endpoints, TD targets and model
+parameters after SGD were identical. The maximum TD-target difference was zero.
+There were 41 scalar near-tie fallbacks. This is a compute result, not a claim
+that full training is 6.57x faster or that unseen environments are fully tested.
+
+Replay 30/20 cost 17.717/9.604 seconds for target construction plus updating.
+These are different sample sets, so their training/holdout MSE values are not a
+controlled productivity comparison. Replay size and update count stay unchanged.
+The verified benchmark took 758.5 seconds; parent peak RSS was 2027.4 MiB.
+Child process peak RSS is recorded separately, not as an exact simultaneous total.
+
+An earlier failed benchmark is retained for traceability. Its comparison harness
+shared Adam CPU step tensors between trials via `load_state_dict`; it is not a
+valid SGD-equivalence result. The corrected harness deep-copies optimizer state
+for every trial, with a regression test. No saved checkpoint was modified.
+
+The broader regression suite passed 212 tests and 5 subtests. A separate CUDA
+smoke training completed 6 training plus 4 validation episodes, saved its final
+checkpoint and dashboard, and passed the training-artifact audit with zero errors
+or warnings. Its reusable pool started once across all seven waves.
 
 ## Input Layout
 

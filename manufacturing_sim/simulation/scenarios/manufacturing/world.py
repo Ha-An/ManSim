@@ -22,6 +22,7 @@ from agents.base import (
 )
 from agents.modes import normalize_decision_mode
 from manufacturing_sim.simulation.scenarios.manufacturing.entities import (
+    Agent,
     Item,
     ItemState,
     Machine,

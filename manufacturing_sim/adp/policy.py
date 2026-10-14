@@ -196,16 +196,14 @@ def unique_feasible_assignment(
     return assignment
 
 
-def _expand_matchings(
+def _matching_score_requests(
     state: EncodedDecisionState,
     *,
     beam_width: int,
     repair_capacity: int,
-    model: Any,
-    device: Any,
     allow_wait_action: bool,
     worker_order: list[str] | None = None,
-) -> list[tuple[dict[str, str | None], float]]:
+):
     beams: list[tuple[dict[str, str | None], dict[str, int], set[str], float]] = [({}, {}, set(), 0.0)]
     ordered_workers = list(worker_order or state.decision_worker_ids)
     if set(ordered_workers) != set(state.decision_worker_ids) or len(ordered_workers) != len(
@@ -227,7 +225,7 @@ def _expand_matchings(
                 expanded.append((next_assignment, next_used, set(used_resources) | resources, 0.0))
         if len(expanded) > beam_width:
             partial_states = [state.post_decision(row[0]) for row in expanded]
-            values = predict_values(model, partial_states, device)
+            values = yield partial_states, beam_width
             ranked = sorted(
                 zip(expanded, values),
                 key=lambda row: (
@@ -243,11 +241,98 @@ def _expand_matchings(
         else:
             beams = expanded
     post_states = [state.post_decision(row[0]) for row in beams]
-    values = predict_values(model, post_states, device)
+    values = yield post_states, 1
     return [
         (row[0], float(value))
         for row, value in zip(beams, values)
     ]
+
+
+def _expand_matchings(state: EncodedDecisionState, *, model: Any, device: Any, **kwargs):
+    search = _matching_score_requests(state, **kwargs)
+    request = next(search)
+    while True:
+        states, _ = request
+        values = predict_values(model, states, device)
+        try:
+            request = search.send(values)
+        except StopIteration as done:
+            return done.value
+
+
+def _select_matching(rows, ordered_workers: list[str]) -> ActionSelection:
+    if not rows:
+        return ActionSelection({w: None for w in ordered_workers}, 0.0, 0,
+                               "value_beam_search", worker_order=ordered_workers)
+    chosen, value = max(rows, key=lambda row: (row[1], str(sorted(row[0].items()))))
+    values = [float(value) for _, value in rows]
+    return ActionSelection(chosen, float(value), len(rows), "value_beam_search",
+                           worker_order=ordered_workers,
+                           candidate_value_entropy=normalized_beam_value_entropy(values),
+                           candidate_value_count=len(values))
+
+
+def greedy_beam_matching_many(
+    states: list[EncodedDecisionState], *, model: Any, device: Any, beam_width: int,
+    worker_orders: list[list[str]], repair_capacities: list[int],
+    candidate_batch_size: int = 1024, stats: dict[str, int] | None = None,
+) -> list[ActionSelection]:
+    """Batch independent searches, preserving masks and scalar near-tie ordering."""
+    if not (len(states) == len(worker_orders) == len(repair_capacities)):
+        raise ValueError("Batched beam inputs must have equal lengths.")
+    if candidate_batch_size < 1:
+        raise ValueError("candidate_batch_size must be positive.")
+    searches, requests, results = {}, {}, {}
+    for i, state in enumerate(states):
+        search = _matching_score_requests(
+            state, beam_width=max(1, beam_width), worker_order=worker_orders[i],
+            repair_capacity=max(1, repair_capacities[i]), allow_wait_action=state.wait_action_enabled,
+        )
+        searches[i] = search
+        requests[i] = next(search)
+    while requests:
+        # Identical padding widths avoid changing the attention problem itself.
+        groups: dict[tuple[int, int], list[int]] = {}
+        for i in requests:
+            key = (len(states[i].worker_ids), len(states[i].opportunity_ids))
+            groups.setdefault(key, []).append(i)
+        scored = {}
+        for ids in groups.values():
+            flat, slices = [], {}
+            for i in ids:
+                begin = len(flat)
+                flat.extend(requests[i][0])
+                slices[i] = (begin, len(flat))
+            values = []
+            for start in range(0, len(flat), candidate_batch_size):
+                values.extend(predict_values(model, flat[start:start + candidate_batch_size], device))
+                if stats is not None:
+                    stats["batched_score_calls"] = stats.get("batched_score_calls", 0) + 1
+            for i, (begin, end) in slices.items():
+                scored[i] = values[begin:end]
+        next_requests = {}
+        for i, (_, keep) in requests.items():
+            values = scored[i]
+            ranked = sorted((float(value) for value in values), reverse=True)
+            near_tie = (len(ranked) > keep and
+                        ranked[keep - 1] - ranked[keep] <=
+                        1e-5 + 1e-6 * max(abs(ranked[keep - 1]), abs(ranked[keep])))
+            if near_tie:
+                searches[i].close()
+                results[i] = greedy_beam_matching(
+                    states[i], model=model, device=device, beam_width=beam_width,
+                    repair_capacity=repair_capacities[i], worker_order=worker_orders[i],
+                    allow_wait_action=states[i].wait_action_enabled,
+                )
+                if stats is not None:
+                    stats["scalar_tie_fallbacks"] = stats.get("scalar_tie_fallbacks", 0) + 1
+                continue
+            try:
+                next_requests[i] = searches[i].send(values)
+            except StopIteration as done:
+                results[i] = _select_matching(done.value, worker_orders[i])
+        requests = next_requests
+    return [results[i] for i in range(len(states))]
 
 
 def greedy_beam_matching(
@@ -270,22 +355,4 @@ def greedy_beam_matching(
         allow_wait_action=bool(allow_wait_action),
         worker_order=ordered_workers,
     )
-    if not rows:
-        return ActionSelection(
-            {worker_id: None for worker_id in state.decision_worker_ids},
-            0.0,
-            0,
-            "value_beam_search",
-            worker_order=ordered_workers,
-        )
-    chosen, value = max(rows, key=lambda row: (row[1], str(sorted(row[0].items()))))
-    candidate_values = [float(candidate_value) for _, candidate_value in rows]
-    return ActionSelection(
-        chosen,
-        float(value),
-        len(rows),
-        "value_beam_search",
-        worker_order=ordered_workers,
-        candidate_value_entropy=normalized_beam_value_entropy(candidate_values),
-        candidate_value_count=len(candidate_values),
-    )
+    return _select_matching(rows, ordered_workers)

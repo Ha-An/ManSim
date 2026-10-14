@@ -4,7 +4,6 @@ import argparse
 import csv
 import json
 import math
-import statistics
 import webbrowser
 from collections import defaultdict
 from pathlib import Path

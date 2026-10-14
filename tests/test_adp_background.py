@@ -30,6 +30,57 @@ def _launch_tracked(**kwargs):
 
 
 class LiveProgressTests(unittest.TestCase):
+    def test_inventory_pipeline_disk_wait_is_visible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = root / "background"
+            job.mkdir()
+            atomic_json(root / "pipeline_status.json", {
+                "phase": "waiting_for_disk_space", "free_gib": 11.5, "required_free_gib": 45.0,
+            })
+            render_monitor(job, {"status": "running"}, [{"label": "Workers 6", "output": str(root)}])
+            page = (job / "live_training.html").read_text(encoding="utf-8")
+            self.assertIn("전체 실험 단계", page)
+            self.assertIn("저장 공간 확보 대기", page)
+            self.assertIn("여유 11.5 GiB / 필요 45.0 GiB", page)
+            self.assertIn('http-equiv="refresh" content="5"', page)
+
+    def test_run_list_shows_each_completed_training_wall_hours(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = []
+            cases = [("W2", "completed", 5400, "1.50시간"),
+                     ("W3", "completed", 9000, "2.50시간"),
+                     ("W4", "running", 3600, "-"),
+                     ("W5", "pending", None, "-"),
+                     ("W6", "failed", 3600, "-"),
+                     ("missing", "completed", None, "-"),
+                     ("invalid", "completed", "NaN", "-"),
+                     ("negative", "completed", -1, "-"),
+                     ("zero", "completed", 0, "0.00시간")]
+            for label, status, seconds, _ in cases:
+                output = root / label
+                output.mkdir()
+                atomic_json(output / "training_summary.json", {"status": status, "wall_sec": seconds})
+                runs.append({"label": label, "output": str(output)})
+            render_monitor(root, {"status": "running", "elapsed_sec": 999999}, runs)
+            page = (root / "live_training.html").read_text(encoding="utf-8")
+            self.assertIn("<th>학습 소요시간</th>", page)
+            for label, status, _, expected in cases:
+                self.assertIn(f"<tr><td>{label}</td><td>{status}</td><td>-</td><td>{expected}</td><td>-</td></tr>", page)
+
+    def test_multirun_monitor_separates_pipeline_and_selected_training_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            atomic_json(root / "training_summary.json", {"status": "completed", "wall_sec": 3600})
+            TrainingProgress(root).update(status="completed", completed_episode_count=100, expected_episode_count=100)
+            render_monitor(root, {"status": "completed", "elapsed_sec": 7200},
+                           [{"label": "Workers 6", "output": str(root)}])
+            page = (root / "live_training.html").read_text(encoding="utf-8")
+            self.assertIn("백그라운드 작업 전체 경과</dt><dd>02:00:00", page)
+            self.assertIn("현재 학습 경과</dt><dd>01:00:00", page)
+            self.assertIn("현재 학습의 episode", page)
+
     def test_atomic_progress_preserves_run_contract_and_updates_counts(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -290,6 +341,18 @@ class MonitorPerformanceTests(unittest.TestCase):
 
 
 class BackgroundProcessTests(unittest.TestCase):
+    def test_initial_monitor_failure_releases_output_lock_without_starting_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("manufacturing_sim.adp.background.render_monitor", side_effect=OSError("write fixture")), \
+                    patch("manufacturing_sim.adp.background.subprocess.Popen") as spawn:
+                with self.assertRaisesRegex(OSError, "write fixture"):
+                    launch(command=[sys.executable, "-c", "pass"], job_dir=root / "job",
+                           runs=[{"label": "test", "output": str(root / "run")}], open_browser=False)
+            spawn.assert_not_called()
+            self.assertFalse((root / ".run.adp_background.lock").exists())
+            self.assertEqual(read_json(root / "job/status.json")["status"], "failed")
+
     def test_final_monitor_failure_still_releases_owned_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             job = Path(directory)

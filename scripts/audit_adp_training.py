@@ -349,7 +349,7 @@ def audit_training(root: Path, *, load_checkpoints: bool = True) -> dict[str, An
         errors.append("checkpoint_selection.csv does not identify training_summary best iteration")
     final_results = summary.get("final_candidate_results", []) or []
     if final_results:
-        available = sum(bool(row.get("validation_products_mean")) for row in iterations)
+        available = sum(_number(row, "validation_products_mean") is not None for row in iterations)
         if len(final_results) != min(available, int(validation_cfg.get("final_candidate_count", 1))):
             errors.append("final candidate result count does not match resolved config")
         selected_final = [row for row in final_results if row.get("selected")]
